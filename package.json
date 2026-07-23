@@ -1,0 +1,6 @@
+{
+  "name": "rv64.js",
+  "private": true,
+  "type": "module",
+  "description": "Node-side ESM marker so web/rv64.js loads as a module on all Node versions (the browser ignores this file)."
+}
