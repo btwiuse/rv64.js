@@ -239,6 +239,27 @@ impl JitState {
 static mut USER_JIT: Option<JitState> = None;
 static mut SYS_JIT: Option<JitState> = None;
 
+// Perf instrumentation: guest instructions retired inside JIT blocks vs
+// total, and dispatch counts (block calls). Exposed via jit_stat().
+static mut JIT_RETIRED: u64 = 0;
+static mut JIT_DISPATCHES: u64 = 0;
+
+/// jit_stat(0) = insns retired in JIT blocks, (1) = block dispatches,
+/// (2) = compiled blocks (user), (3) = compiled blocks (sys).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn jit_stat(which: u32) -> u64 {
+    unsafe {
+        match which {
+            0 => JIT_RETIRED,
+            1 => JIT_DISPATCHES,
+            2 => USER_JIT.as_ref().map_or(0, |j| j.cache.len() as u64),
+            3 => SYS_JIT.as_ref().map_or(0, |j| j.cache.len() as u64),
+            _ => 0,
+        }
+    }
+}
+
 const JIT_THRESHOLD: u32 = 16;
 /// Max chained block dispatches before returning to the interpreter (keeps
 /// interrupt/budget latency bounded in fully-jitted loops).
@@ -276,6 +297,10 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
             let b = *b;
             call_block(b.idx, m as *mut _ as *mut u8);
             m.cpu.insn_count += b.n as u64;
+            unsafe {
+                JIT_RETIRED += b.n as u64;
+                JIT_DISPATCHES += 1;
+            }
             remaining = remaining.saturating_sub(b.n as u64);
             chained += 1;
             if remaining == 0 {
@@ -462,6 +487,10 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             }
             call_block(b.idx, m as *mut _ as *mut u8);
             m.cpu.insn_count += b.n as u64;
+            unsafe {
+                JIT_RETIRED += b.n as u64;
+                JIT_DISPATCHES += 1;
+            }
             remaining = remaining.saturating_sub(b.n as u64);
             chained += 1;
         }
