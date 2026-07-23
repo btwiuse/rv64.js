@@ -6,15 +6,13 @@ Last full run: 2026-07-22.
 
 | | rv64.js | Spike 1.1.1-dev (golden model) |
 |---|---|---|
-| pass | **121/134** | 132/134 |
+| pass | **134/134** | 132/134 |
 
-Cross-check verdict: **zero unexpected disagreements.**
+rv64.js passes the complete suite. F/D is now a softfloat implementation
+(softfp.rs, ported from TinyEMU's softfp) with exact IEEE 754 exception
+flags and all five rounding modes — the earlier host-float fflags
+deviation is gone.
 
-- The **13 rv64.js failures** (rv64uf/ud: fadd, fcmp, fcvt, fcvt_w, fdiv,
-  fmadd, fmin) all pass on Spike and are all `fflags` assertions — the
-  documented host-float deviation: computed values are IEEE-correct
-  (bit-identical to QEMU), exception flags are approximated. Fix: softfloat
-  port (TinyEMU's softfp.c is the model).
 - The **2 Spike failures** are Spike-configuration artifacts, not rv64.js
   bugs:
   - `rv64mi-p-zicntr`: passes on Spike with `--isa=rv64gc_zicntr`

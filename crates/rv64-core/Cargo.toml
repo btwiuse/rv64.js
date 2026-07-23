@@ -6,4 +6,3 @@ license = "MIT"
 description = "Portable RV64 CPU core (no_std-friendly, no I/O) for rv64.js"
 
 [dependencies]
-libm = "0.2.16"

@@ -64,40 +64,6 @@ fn box32(v: f32) -> u64 {
     0xffff_ffff_0000_0000 | v.to_bits() as u64
 }
 
-/// Unbox an f32; improperly boxed values read as the canonical NaN.
-#[inline]
-fn unbox32(r: u64) -> f32 {
-    if r >> 32 == 0xffff_ffff {
-        f32::from_bits(r as u32)
-    } else {
-        f32::NAN
-    }
-}
-
-/// FCLASS result bits (same layout for f32/f64).
-fn fclass(
-    sign: bool,
-    is_inf: bool,
-    is_nan: bool,
-    is_snan: bool,
-    is_zero: bool,
-    is_sub: bool,
-) -> u64 {
-    if is_nan {
-        return if is_snan { 1 << 8 } else { 1 << 9 };
-    }
-    match (sign, is_inf, is_zero, is_sub) {
-        (true, true, _, _) => 1 << 0,  // -inf
-        (true, _, true, _) => 1 << 3,  // -0
-        (true, _, _, true) => 1 << 2,  // negative subnormal
-        (true, _, _, _) => 1 << 1,     // negative normal
-        (false, true, _, _) => 1 << 7, // +inf
-        (false, _, true, _) => 1 << 4, // +0
-        (false, _, _, true) => 1 << 5, // positive subnormal
-        (false, _, _, _) => 1 << 6,    // positive normal
-    }
-}
-
 impl Default for Cpu {
     fn default() -> Self {
         Self::new()
@@ -855,40 +821,50 @@ impl Cpu {
                     _ => return Err(Exception::IllegalInstruction { insn }),
                 }
             }
-            // FMADD/FMSUB/FNMSUB/FNMADD
+            // FMADD/FMSUB/FNMSUB/FNMADD (softfloat: exact flags)
             0x43 | 0x47 | 0x4b | 0x4f => {
                 self.fp_check(insn)?;
                 self.fp_dirty();
+                use crate::softfp::{sf32, sf64};
                 let rs3 = (insn >> 27) as usize;
                 let neg_prod = opcode(insn) == 0x4b || opcode(insn) == 0x4f;
                 let neg_c = opcode(insn) == 0x47 || opcode(insn) == 0x4f;
+                let rm = self
+                    .get_rm(funct3(insn))
+                    .ok_or(Exception::IllegalInstruction { insn })?;
+                let mut fl: u32 = 0;
                 match (insn >> 25) & 3 {
                     0 => {
-                        let (a, b, mut c) = (
-                            unbox32(self.f[rs1(insn)]),
-                            unbox32(self.f[rs2(insn)]),
-                            unbox32(self.f[rs3]),
-                        );
-                        let a = if neg_prod { -a } else { a };
-                        if neg_c {
-                            c = -c;
+                        let ub = |r: u64| -> u32 {
+                            if r >> 32 == 0xffff_ffff { r as u32 } else { 0x7fc0_0000 }
+                        };
+                        let mut a = ub(self.f[rs1(insn)]);
+                        let b = ub(self.f[rs2(insn)]);
+                        let mut c = ub(self.f[rs3]);
+                        if neg_prod {
+                            a ^= 0x8000_0000;
                         }
-                        self.f[rd(insn)] = box32(libm::fmaf(a, b, c));
+                        if neg_c {
+                            c ^= 0x8000_0000;
+                        }
+                        let r = sf32::fma(a, b, c, rm, &mut fl);
+                        self.f[rd(insn)] = 0xffff_ffff_0000_0000 | r as u64;
                     }
                     1 => {
-                        let (a, b, mut c) = (
-                            f64::from_bits(self.f[rs1(insn)]),
-                            f64::from_bits(self.f[rs2(insn)]),
-                            f64::from_bits(self.f[rs3]),
-                        );
-                        let a = if neg_prod { -a } else { a };
-                        if neg_c {
-                            c = -c;
+                        let mut a = self.f[rs1(insn)];
+                        let b = self.f[rs2(insn)];
+                        let mut c = self.f[rs3];
+                        if neg_prod {
+                            a ^= 1 << 63;
                         }
-                        self.f[rd(insn)] = libm::fma(a, b, c).to_bits();
+                        if neg_c {
+                            c ^= 1 << 63;
+                        }
+                        self.f[rd(insn)] = sf64::fma(a, b, c, rm, &mut fl);
                     }
                     _ => return Err(Exception::IllegalInstruction { insn }),
                 }
+                self.fcsr |= fl & 0x1f;
             }
             // OP-FP
             0x53 => {
@@ -1034,237 +1010,210 @@ impl Cpu {
         Ok(stop)
     }
 
-    /// OP-FP (opcode 0x53). Host-float implementation: results follow IEEE
-    /// 754 via the host FPU; fflags are only approximated (documented
-    /// deviation until a softfloat pass — TinyEMU's softfp.c is the model).
+    /// Resolve a rounding mode field (0b111 = dynamic via frm).
+    /// None = reserved encoding -> illegal instruction.
+    fn get_rm(&self, rm_field: u32) -> Option<u32> {
+        let rm = if rm_field == 7 {
+            (self.fcsr >> 5) & 7
+        } else {
+            rm_field
+        };
+        (rm <= 4).then_some(rm)
+    }
+
+    /// OP-FP (opcode 0x53), softfloat implementation (exact fflags).
+    /// Ported from TinyEMU's softfp (see softfp.rs).
     fn op_fp(&mut self, insn: u32) -> Result<(), Exception> {
+        use crate::softfp::{self as sfp, sf32, sf64};
+
+        /// f32 operand: NaN-boxed reads; improper boxes read as qNaN.
+        #[inline]
+        fn ub32(r: u64) -> u32 {
+            if r >> 32 == 0xffff_ffff {
+                r as u32
+            } else {
+                0x7fc0_0000
+            }
+        }
+        #[inline]
+        fn bx32(v: u32) -> u64 {
+            0xffff_ffff_0000_0000 | v as u64
+        }
+
         let f7 = funct7(insn);
         let fmt = f7 & 3;
         let op = f7 >> 2;
+        let f3 = funct3(insn);
         let (d, s1, s2) = (rd(insn), rs1(insn), rs2(insn));
-        let ill = Err(Exception::IllegalInstruction { insn });
-
-        // RISC-V float->int conversions: NaN and overflow saturate to the
-        // destination's extreme (NaN -> most-positive), unlike Rust's
-        // `as` which sends NaN to 0.
-        macro_rules! cvt {
-            ($v:expr, $ity:ty) => {{
-                let v = $v;
-                if v.is_nan() {
-                    <$ity>::MAX as u64
-                } else {
-                    (v as $ity) as u64
-                }
-            }};
-        }
+        let ill = Exception::IllegalInstruction { insn };
+        let mut fl: u32 = 0;
 
         match (op, fmt) {
-            // ---- f32 arithmetic ----
+            // ---- arithmetic ----
             (0x00..=0x03, 0) => {
-                let (a, b) = (unbox32(self.f[s1]), unbox32(self.f[s2]));
+                let rm = self.get_rm(f3).ok_or(ill)?;
+                let (a, b) = (ub32(self.f[s1]), ub32(self.f[s2]));
                 let r = match op {
-                    0 => a + b,
-                    1 => a - b,
-                    2 => a * b,
-                    _ => a / b,
+                    0 => sf32::add(a, b, rm, &mut fl),
+                    1 => sf32::sub(a, b, rm, &mut fl),
+                    2 => sf32::mul(a, b, rm, &mut fl),
+                    _ => sf32::div(a, b, rm, &mut fl),
                 };
-                self.f[d] = box32(r);
+                self.f[d] = bx32(r);
             }
-            (0x0b, 0) => self.f[d] = box32(libm::sqrtf(unbox32(self.f[s1]))),
-            // ---- f64 arithmetic ----
             (0x00..=0x03, 1) => {
-                let (a, b) = (f64::from_bits(self.f[s1]), f64::from_bits(self.f[s2]));
-                let r = match op {
-                    0 => a + b,
-                    1 => a - b,
-                    2 => a * b,
-                    _ => a / b,
+                let rm = self.get_rm(f3).ok_or(ill)?;
+                let (a, b) = (self.f[s1], self.f[s2]);
+                self.f[d] = match op {
+                    0 => sf64::add(a, b, rm, &mut fl),
+                    1 => sf64::sub(a, b, rm, &mut fl),
+                    2 => sf64::mul(a, b, rm, &mut fl),
+                    _ => sf64::div(a, b, rm, &mut fl),
                 };
-                self.f[d] = r.to_bits();
             }
-            (0x0b, 1) => self.f[d] = libm::sqrt(f64::from_bits(self.f[s1])).to_bits(),
+            (0x0b, 0) if s2 == 0 => {
+                let rm = self.get_rm(f3).ok_or(ill)?;
+                self.f[d] = bx32(sf32::sqrt(ub32(self.f[s1]), rm, &mut fl));
+            }
+            (0x0b, 1) if s2 == 0 => {
+                let rm = self.get_rm(f3).ok_or(ill)?;
+                self.f[d] = sf64::sqrt(self.f[s1], rm, &mut fl);
+            }
 
-            // ---- sign injection ----
+            // ---- sign injection (no flags) ----
             (0x04, 0) => {
-                let (a, b) = (unbox32(self.f[s1]).to_bits(), unbox32(self.f[s2]).to_bits());
-                let r = match funct3(insn) {
+                let (a, b) = (ub32(self.f[s1]), ub32(self.f[s2]));
+                let r = match f3 {
                     0 => (a & 0x7fff_ffff) | (b & 0x8000_0000),
                     1 => (a & 0x7fff_ffff) | (!b & 0x8000_0000),
                     2 => a ^ (b & 0x8000_0000),
-                    _ => return ill,
+                    _ => return Err(ill),
                 };
-                self.f[d] = box32(f32::from_bits(r));
+                self.f[d] = bx32(r);
             }
             (0x04, 1) => {
                 let (a, b) = (self.f[s1], self.f[s2]);
-                const SIGN: u64 = 1 << 63;
-                self.f[d] = match funct3(insn) {
-                    0 => (a & !SIGN) | (b & SIGN),
-                    1 => (a & !SIGN) | (!b & SIGN),
-                    2 => a ^ (b & SIGN),
-                    _ => return ill,
+                const S: u64 = 1 << 63;
+                self.f[d] = match f3 {
+                    0 => (a & !S) | (b & S),
+                    1 => (a & !S) | (!b & S),
+                    2 => a ^ (b & S),
+                    _ => return Err(ill),
                 };
             }
 
-            // ---- min/max (RISC-V: -0 < +0, NaN loses unless both NaN) ----
+            // ---- min / max ----
             (0x05, 0) => {
-                let (a, b) = (unbox32(self.f[s1]), unbox32(self.f[s2]));
-                let r = if a.is_nan() && b.is_nan() {
-                    f32::NAN
-                } else if a.is_nan() {
-                    b
-                } else if b.is_nan() {
-                    a
-                } else if a == b {
-                    // break ±0 tie by sign
-                    if (funct3(insn) == 0) == a.is_sign_negative() {
-                        a
-                    } else {
-                        b
-                    }
-                } else if (funct3(insn) == 0) == (a < b) {
-                    a
-                } else {
-                    b
+                let (a, b) = (ub32(self.f[s1]), ub32(self.f[s2]));
+                let r = match f3 {
+                    0 => sf32::min(a, b, &mut fl),
+                    1 => sf32::max(a, b, &mut fl),
+                    _ => return Err(ill),
                 };
-                self.f[d] = box32(r);
+                self.f[d] = bx32(r);
             }
             (0x05, 1) => {
-                let (a, b) = (f64::from_bits(self.f[s1]), f64::from_bits(self.f[s2]));
-                let r = if a.is_nan() && b.is_nan() {
-                    f64::NAN
-                } else if a.is_nan() {
-                    b
-                } else if b.is_nan() {
-                    a
-                } else if a == b {
-                    if (funct3(insn) == 0) == a.is_sign_negative() {
-                        a
-                    } else {
-                        b
-                    }
-                } else if (funct3(insn) == 0) == (a < b) {
-                    a
-                } else {
-                    b
+                let (a, b) = (self.f[s1], self.f[s2]);
+                self.f[d] = match f3 {
+                    0 => sf64::min(a, b, &mut fl),
+                    1 => sf64::max(a, b, &mut fl),
+                    _ => return Err(ill),
                 };
-                self.f[d] = r.to_bits();
             }
 
-            // ---- float<->float conversion ----
-            (0x08, 0) if s2 == 1 => self.f[d] = box32(f64::from_bits(self.f[s1]) as f32), // FCVT.S.D
-            (0x08, 1) if s2 == 0 => self.f[d] = (unbox32(self.f[s1]) as f64).to_bits(), // FCVT.D.S
+            // ---- float <-> float ----
+            (0x08, 0) if s2 == 1 => {
+                let rm = self.get_rm(f3).ok_or(ill)?;
+                self.f[d] = bx32(sfp::cvt_sf64_sf32(self.f[s1], rm, &mut fl)); // FCVT.S.D
+            }
+            (0x08, 1) if s2 == 0 => {
+                self.f[d] = sfp::cvt_sf32_sf64(ub32(self.f[s1]), &mut fl); // FCVT.D.S
+            }
 
-            // ---- comparisons (write to integer rd) ----
+            // ---- comparisons ----
             (0x14, 0) => {
-                let (a, b) = (unbox32(self.f[s1]), unbox32(self.f[s2]));
-                let r = match funct3(insn) {
-                    2 => a == b,
-                    1 => a < b,
-                    0 => a <= b,
-                    _ => return ill,
+                let (a, b) = (ub32(self.f[s1]), ub32(self.f[s2]));
+                let r = match f3 {
+                    2 => sf32::eq_quiet(a, b, &mut fl),
+                    1 => sf32::lt(a, b, &mut fl),
+                    0 => sf32::le(a, b, &mut fl),
+                    _ => return Err(ill),
                 };
                 self.wr(d, r as u64);
             }
             (0x14, 1) => {
-                let (a, b) = (f64::from_bits(self.f[s1]), f64::from_bits(self.f[s2]));
-                let r = match funct3(insn) {
-                    2 => a == b,
-                    1 => a < b,
-                    0 => a <= b,
-                    _ => return ill,
+                let (a, b) = (self.f[s1], self.f[s2]);
+                let r = match f3 {
+                    2 => sf64::eq_quiet(a, b, &mut fl),
+                    1 => sf64::lt(a, b, &mut fl),
+                    0 => sf64::le(a, b, &mut fl),
+                    _ => return Err(ill),
                 };
                 self.wr(d, r as u64);
             }
 
             // ---- float -> int ----
             (0x18, 0) => {
-                let v = unbox32(self.f[s1]);
+                let rm = self.get_rm(f3).ok_or(ill)?;
+                let a = ub32(self.f[s1]);
                 let r = match s2 {
-                    0 => cvt!(v, i32) as i32 as i64 as u64,
-                    1 => cvt!(v, u32) as u32 as i32 as i64 as u64,
-                    2 => cvt!(v, i64),
-                    3 => cvt!(v, u64),
-                    _ => return ill,
+                    0 => sf32::cvt_to_i32(a, rm, &mut fl, false) as i32 as i64 as u64,
+                    1 => sf32::cvt_to_i32(a, rm, &mut fl, true) as i32 as i64 as u64,
+                    2 => sf32::cvt_to_i64(a, rm, &mut fl, false),
+                    3 => sf32::cvt_to_i64(a, rm, &mut fl, true),
+                    _ => return Err(ill),
                 };
                 self.wr(d, r);
             }
             (0x18, 1) => {
-                let v = f64::from_bits(self.f[s1]);
+                let rm = self.get_rm(f3).ok_or(ill)?;
+                let a = self.f[s1];
                 let r = match s2 {
-                    0 => cvt!(v, i32) as i32 as i64 as u64,
-                    1 => cvt!(v, u32) as u32 as i32 as i64 as u64,
-                    2 => cvt!(v, i64),
-                    3 => cvt!(v, u64),
-                    _ => return ill,
+                    0 => sf64::cvt_to_i32(a, rm, &mut fl, false) as i32 as i64 as u64,
+                    1 => sf64::cvt_to_i32(a, rm, &mut fl, true) as i32 as i64 as u64,
+                    2 => sf64::cvt_to_i64(a, rm, &mut fl, false),
+                    3 => sf64::cvt_to_i64(a, rm, &mut fl, true),
+                    _ => return Err(ill),
                 };
                 self.wr(d, r);
             }
 
             // ---- int -> float ----
             (0x1a, 0) => {
+                let rm = self.get_rm(f3).ok_or(ill)?;
                 let x = self.x[s1];
                 let r = match s2 {
-                    0 => x as i32 as f32,
-                    1 => x as u32 as f32,
-                    2 => x as i64 as f32,
-                    3 => x as f32,
-                    _ => return ill,
+                    0 => sf32::cvt_from_i32(x as u32, rm, &mut fl, false),
+                    1 => sf32::cvt_from_i32(x as u32, rm, &mut fl, true),
+                    2 => sf32::cvt_from_i64(x, rm, &mut fl, false),
+                    3 => sf32::cvt_from_i64(x, rm, &mut fl, true),
+                    _ => return Err(ill),
                 };
-                self.f[d] = box32(r);
+                self.f[d] = bx32(r);
             }
             (0x1a, 1) => {
+                let rm = self.get_rm(f3).ok_or(ill)?;
                 let x = self.x[s1];
-                let r = match s2 {
-                    0 => x as i32 as f64,
-                    1 => x as u32 as f64,
-                    2 => x as i64 as f64,
-                    3 => x as f64,
-                    _ => return ill,
+                self.f[d] = match s2 {
+                    0 => sf64::cvt_from_i32(x as u32, rm, &mut fl, false),
+                    1 => sf64::cvt_from_i32(x as u32, rm, &mut fl, true),
+                    2 => sf64::cvt_from_i64(x, rm, &mut fl, false),
+                    3 => sf64::cvt_from_i64(x, rm, &mut fl, true),
+                    _ => return Err(ill),
                 };
-                self.f[d] = r.to_bits();
             }
 
-            // ---- moves / classify ----
-            (0x1c, 0) if funct3(insn) == 0 => {
-                self.wr(d, self.f[s1] as u32 as i32 as i64 as u64) // FMV.X.W
-            }
-            (0x1c, 0) => {
-                let v = unbox32(self.f[s1]);
-                let snan = v.is_nan() && (v.to_bits() & 0x0040_0000) == 0;
-                self.wr(
-                    d,
-                    fclass(
-                        v.is_sign_negative(),
-                        v.is_infinite(),
-                        v.is_nan(),
-                        snan,
-                        v == 0.0,
-                        v.is_subnormal(),
-                    ),
-                );
-            }
-            (0x1c, 1) if funct3(insn) == 0 => self.wr(d, self.f[s1]), // FMV.X.D
-            (0x1c, 1) => {
-                let v = f64::from_bits(self.f[s1]);
-                let snan = v.is_nan() && (v.to_bits() & 0x0008_0000_0000_0000) == 0;
-                self.wr(
-                    d,
-                    fclass(
-                        v.is_sign_negative(),
-                        v.is_infinite(),
-                        v.is_nan(),
-                        snan,
-                        v == 0.0,
-                        v.is_subnormal(),
-                    ),
-                );
-            }
-            (0x1e, 0) => self.f[d] = box32(f32::from_bits(self.x[s1] as u32)), // FMV.W.X
-            (0x1e, 1) => self.f[d] = self.x[s1],                               // FMV.D.X
+            // ---- moves / classify (no flags) ----
+            (0x1c, 0) if f3 == 0 => self.wr(d, self.f[s1] as u32 as i32 as i64 as u64), // FMV.X.W
+            (0x1c, 0) if f3 == 1 => self.wr(d, sf32::fclass(ub32(self.f[s1])) as u64),
+            (0x1c, 1) if f3 == 0 => self.wr(d, self.f[s1]), // FMV.X.D
+            (0x1c, 1) if f3 == 1 => self.wr(d, sf64::fclass(self.f[s1]) as u64),
+            (0x1e, 0) if f3 == 0 => self.f[d] = bx32(self.x[s1] as u32), // FMV.W.X
+            (0x1e, 1) if f3 == 0 => self.f[d] = self.x[s1],              // FMV.D.X
 
-            _ => return ill,
+            _ => return Err(ill),
         }
+        self.fcsr |= fl & 0x1f;
         Ok(())
     }
 

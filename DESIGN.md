@@ -68,9 +68,10 @@ multiple VMs = multiple instantiations.
 2. ✅ **User-mode Linux** (`rv64-linux`, `rv64-run`): ELF loader (ET_EXEC +
    static-pie), Linux ABI stack/auxv, ~45-syscall shim. Runs no_std and
    full-Rust-std musl static binaries, native and in the browser.
-3. ✅ **Extensions**: M, A (LR/SC + AMOs), F/D (host-float; fflags
-   approximated — softfloat pass still open, TinyEMU's softfp.c is the
-   model), C (16→32 expander in front of the one decoder), Zicsr.
+3. ✅ **Extensions**: M, A (LR/SC + AMOs), F/D (softfloat — softfp.rs,
+   ported from TinyEMU's softfp.c: exact IEEE 754 fflags, all five
+   rounding modes; passes all rv64uf/ud riscv-tests), C (16→32 expander
+   in front of the one decoder), Zicsr.
 4. ✅ **Privileged architecture**: M/S/U, full CSR file, trap delegation,
    MRET/SRET/WFI/SFENCE.VMA, sv39/sv48 MMU with per-access TLBs, hardware
    A/D, SUM/MXR/MPRV. Interrupt lines are sampled live from the bus each
@@ -105,8 +106,8 @@ multiple VMs = multiple instantiations.
 
 All six phases are complete. Post-1.0 roadmap (beyond the phase plan):
 inline-TLB memory ops in full-system JIT blocks and in-wasm block chaining;
-softfloat for exact fflags (results are already IEEE-correct via the host
-FPU); riscv-tests/RISCOF conformance runs (needs a riscv64 cross-toolchain);
+a host-FPU fast path in front of the softfloat (residual-based flag
+recovery) for FP-heavy workloads; RISCOF formal compliance runs;
 virtio-net and virtio-9p (TinyEMU features intentionally descoped from
 phase 5 — the boot target was console + blk, which is what "Linux shell in
 the browser" requires).

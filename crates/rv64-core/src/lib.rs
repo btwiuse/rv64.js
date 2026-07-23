@@ -14,6 +14,7 @@ pub mod cpu;
 pub mod csr;
 pub mod decode;
 pub mod exception;
+pub mod softfp;
 
 pub use bus::{Bus, FlatMemory};
 pub use cpu::{Cpu, StopReason};
