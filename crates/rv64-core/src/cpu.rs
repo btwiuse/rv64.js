@@ -26,6 +26,8 @@ pub struct Cpu {
     pub pc: u64,
     /// Retired instruction count (minstret / rdinstret).
     pub insn_count: u64,
+    /// LR/SC reservation address (A extension); None = no reservation.
+    pub reservation: Option<u64>,
 }
 
 impl Default for Cpu {
@@ -36,7 +38,7 @@ impl Default for Cpu {
 
 impl Cpu {
     pub fn new() -> Self {
-        Self { x: [0; 32], pc: 0, insn_count: 0 }
+        Self { x: [0; 32], pc: 0, insn_count: 0, reservation: None }
     }
 
     #[inline]
@@ -62,12 +64,18 @@ impl Cpu {
     /// `Err` = exception. PC already points at the *next* instruction when
     /// Ecall/Break is returned, so the host can service and resume directly.
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> Result<Option<StopReason>, Exception> {
-        let insn = bus.fetch32(self.pc)?;
-        if insn & 3 != 3 {
-            // Compressed (C extension) — phase 3. See decode.rs.
-            return Err(Exception::IllegalInstruction { insn });
-        }
-        let mut next_pc = self.pc.wrapping_add(4);
+        // Fetch 16 bits first: a compressed instruction may sit on the last
+        // halfword of a page/region, where a blind 32-bit fetch would fault.
+        let lo = bus.fetch16(self.pc)? as u32;
+        let (insn, ilen) = if lo & 3 == 3 {
+            let hi = bus.fetch16(self.pc.wrapping_add(2))? as u32;
+            (lo | (hi << 16), 4)
+        } else {
+            let exp = crate::compressed::expand(lo as u16)
+                .ok_or(Exception::IllegalInstruction { insn: lo })?;
+            (exp, 2)
+        };
+        let mut next_pc = self.pc.wrapping_add(ilen);
         let mut stop = None;
 
         match opcode(insn) {
@@ -187,7 +195,34 @@ impl Cpu {
                     (0x20, 5) => ((a as i64) >> shamt) as u64,       // SRA
                     (0x00, 6) => a | b,                              // OR
                     (0x00, 7) => a & b,                              // AND
-                    // funct7=0x01 is the M extension (phase 3)
+                    // M extension
+                    (0x01, 0) => a.wrapping_mul(b),                  // MUL
+                    (0x01, 1) => {
+                        (((a as i64 as i128) * (b as i64 as i128)) >> 64) as u64 // MULH
+                    }
+                    (0x01, 2) => {
+                        (((a as i64 as i128) * (b as u128 as i128)) >> 64) as u64 // MULHSU
+                    }
+                    (0x01, 3) => (((a as u128) * (b as u128)) >> 64) as u64, // MULHU
+                    (0x01, 4) => {
+                        // DIV: div-by-zero -> -1; overflow MIN/-1 -> MIN
+                        let (a, b) = (a as i64, b as i64);
+                        if b == 0 {
+                            u64::MAX
+                        } else {
+                            a.wrapping_div(b) as u64
+                        }
+                    }
+                    (0x01, 5) => {
+                        if b == 0 { u64::MAX } else { a / b } // DIVU
+                    }
+                    (0x01, 6) => {
+                        let (a, b) = (a as i64, b as i64);
+                        if b == 0 { a as u64 } else { a.wrapping_rem(b) as u64 } // REM
+                    }
+                    (0x01, 7) => {
+                        if b == 0 { a } else { a % b } // REMU
+                    }
                     _ => return Err(Exception::IllegalInstruction { insn }),
                 };
                 self.wr(rd(insn), val);
@@ -202,9 +237,93 @@ impl Cpu {
                     (0x00, 1) => a << shamt,
                     (0x00, 5) => a >> shamt,
                     (0x20, 5) => ((a as i32) >> shamt) as u32,
+                    // M extension (32-bit forms)
+                    (0x01, 0) => a.wrapping_mul(b), // MULW
+                    (0x01, 4) => {
+                        let (a, b) = (a as i32, b as i32);
+                        if b == 0 { u32::MAX } else { a.wrapping_div(b) as u32 } // DIVW
+                    }
+                    (0x01, 5) => {
+                        if b == 0 { u32::MAX } else { a / b } // DIVUW
+                    }
+                    (0x01, 6) => {
+                        let (a, b) = (a as i32, b as i32);
+                        if b == 0 { a as u32 } else { a.wrapping_rem(b) as u32 } // REMW
+                    }
+                    (0x01, 7) => {
+                        if b == 0 { a } else { a % b } // REMUW
+                    }
                     _ => return Err(Exception::IllegalInstruction { insn }),
                 };
                 self.wr(rd(insn), val32 as i32 as i64 as u64);
+            }
+            // AMO (A extension). Single hart: LR sets a reservation, SC
+            // succeeds iff it matches; AMOs are read-modify-write.
+            0x2f => {
+                let addr = self.x[rs1(insn)];
+                let src = self.x[rs2(insn)];
+                let funct5 = funct7(insn) >> 2;
+                let is64 = match funct3(insn) {
+                    2 => false,
+                    3 => true,
+                    _ => return Err(Exception::IllegalInstruction { insn }),
+                };
+                let load = |bus: &mut B, addr: u64| -> Result<u64, Exception> {
+                    if is64 {
+                        bus.read64(addr)
+                    } else {
+                        Ok(bus.read32(addr)? as i32 as i64 as u64)
+                    }
+                };
+                let store = |bus: &mut B, addr: u64, v: u64| -> Result<(), Exception> {
+                    if is64 {
+                        bus.write64(addr, v)
+                    } else {
+                        bus.write32(addr, v as u32)
+                    }
+                };
+                match funct5 {
+                    0x02 => {
+                        // LR
+                        let v = load(bus, addr)?;
+                        self.reservation = Some(addr);
+                        self.wr(rd(insn), v);
+                    }
+                    0x03 => {
+                        // SC
+                        if self.reservation == Some(addr) {
+                            store(bus, addr, src)?;
+                            self.wr(rd(insn), 0);
+                        } else {
+                            self.wr(rd(insn), 1);
+                        }
+                        self.reservation = None;
+                    }
+                    _ => {
+                        let old = load(bus, addr)?;
+                        let new = match funct5 {
+                            0x01 => src,                       // AMOSWAP
+                            0x00 => old.wrapping_add(src),     // AMOADD
+                            0x04 => old ^ src,                 // AMOXOR
+                            0x0c => old & src,                 // AMOAND
+                            0x08 => old | src,                 // AMOOR
+                            0x10 => {
+                                // AMOMIN (signed)
+                                if (old as i64) < (src as i64) { old } else { src }
+                            }
+                            0x14 => {
+                                if (old as i64) > (src as i64) { old } else { src } // AMOMAX
+                            }
+                            0x18 => old.min(src), // AMOMINU
+                            0x1c => old.max(src), // AMOMAXU
+                            _ => return Err(Exception::IllegalInstruction { insn }),
+                        };
+                        // 32-bit AMOs operate on the sign-extended old value
+                        // but store only the low 32 bits.
+                        store(bus, addr, new)?;
+                        self.wr(rd(insn), old);
+                    }
+                }
             }
             // MISC-MEM: FENCE/FENCE.I — no-ops for a single in-order hart
             0x0f => {}
@@ -317,6 +436,65 @@ mod tests {
         ]);
         assert_eq!(cpu.x[1], BASE + 4);
         assert_eq!(cpu.pc, BASE + 8); // pc after the ecall at BASE+4
+    }
+
+    #[test]
+    fn m_extension() {
+        // x1 = 7, x2 = -3; mul, mulh, div, rem, divw by zero
+        let (cpu, _) = run_program(&[
+            0x00700093, // addi x1, x0, 7
+            0xffd00113, // addi x2, x0, -3
+            0x022081b3, // mul  x3, x1, x2
+            0x02209233, // mulh x4, x1, x2
+            0x0220c2b3, // div  x5, x1, x2
+            0x0220e333, // rem  x6, x1, x2
+            0x0200c3bb, // divw x7, x1, x0  (div by zero -> -1)
+            0x00000073, // ecall
+        ]);
+        assert_eq!(cpu.x[3] as i64, -21);
+        assert_eq!(cpu.x[4] as i64, -1); // high bits of 7 * -3
+        assert_eq!(cpu.x[5] as i64, -2); // 7 / -3 truncates toward zero
+        assert_eq!(cpu.x[6] as i64, 1); // 7 rem -3
+        assert_eq!(cpu.x[7] as i64, -1); // div by zero
+    }
+
+    #[test]
+    fn a_extension_lr_sc_amo() {
+        // x5 = BASE; store 100 at 0x100(x5); lr.d x1; sc.d x2 (succeeds -> 0);
+        // amoadd.d x3 = old(100), mem += 5; ld x4 = 105... build:
+        let (cpu, _) = run_program(&[
+            0x000012b7, // lui x5, 0x1 (BASE)
+            0x10028293, // addi x5, x5, 0x100
+            0x06400313, // addi x6, x0, 100
+            0x0062b023, // sd x6, 0(x5)
+            0x1002b0af, // lr.d x1, (x5)
+            0x1862b12f, // sc.d x2, x6, (x5)
+            0x00500393, // addi x7, x0, 5
+            0x0072b1af, // amoadd.d x3, x7, (x5)
+            0x0002b203, // ld x4, 0(x5)
+            0x00000073, // ecall
+        ]);
+        assert_eq!(cpu.x[1], 100); // lr loaded
+        assert_eq!(cpu.x[2], 0); // sc succeeded
+        assert_eq!(cpu.x[3], 100); // amoadd returned old
+        assert_eq!(cpu.x[4], 105); // memory updated
+    }
+
+    #[test]
+    fn compressed_instructions_execute() {
+        // c.li a0, 21 (0x4555); c.mv a1, a0 (0x85aa); c.add a0, a1 (0x952e); ecall
+        let mut mem = vec![0u8; 0x10000];
+        let halves: [u16; 3] = [0x4555, 0x85aa, 0x952e];
+        for (i, h) in halves.iter().enumerate() {
+            mem[i * 2..i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+        }
+        mem[6..10].copy_from_slice(&0x00000073u32.to_le_bytes());
+        let mut cpu = Cpu::new();
+        cpu.pc = BASE;
+        let mut bus = FlatMemory::new(BASE, &mut mem);
+        assert_eq!(cpu.run(&mut bus, 100), StopReason::Ecall);
+        assert_eq!(cpu.x[10], 42); // a0 = 21 + 21
+        assert_eq!(cpu.x[11], 21); // a1
     }
 
     #[test]

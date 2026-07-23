@@ -24,6 +24,13 @@ pub trait Bus {
         self.read32(addr)
             .map_err(|_| Exception::InstructionAccessFault { addr })
     }
+
+    /// Halfword fetch — the CPU fetches 16 bits at a time so compressed
+    /// instructions on a page's last halfword don't over-fetch.
+    fn fetch16(&mut self, addr: u64) -> Result<u16, Exception> {
+        self.read16(addr)
+            .map_err(|_| Exception::InstructionAccessFault { addr })
+    }
 }
 
 /// Flat guest memory starting at `base` — the user-mode Bus.
