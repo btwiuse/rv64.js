@@ -41,6 +41,22 @@ Runner: `tests/run-isa-tests.sh` (needs gcc-riscv64-unknown-elf).
 - Interpreter-vs-JIT: guests produce bit-identical results with the JIT
   enabled; Linux boots to an interactive shell with system blocks live.
 
+## riscv-arch-test signature compliance (vs Spike golden model)
+
+`tests/run-arch-tests.sh`: official riscv-arch-test 3.9.1 suites
+(I M A C F D Zifencei privilege) compiled once against a shared HTIF/CLINT
+environment (tests/arch-env/) and executed on both rv64.js and Spike —
+**193/193 signatures bit-identical, 0 compile skips**. Same tests, golden
+model, and pass criterion as RISCOF.
+
+## Spike lockstep differential
+
+`tests/lockstep.py`: per-instruction x-register writeback streams
+(rv64-isa-test --trace vs spike --log-commits) — **109/109 riscv-tests
+lockstep-identical, ~24,000 writebacks compared** (rv64ui-p-ma_data
+skipped: documented spec-legal misaligned-access divergence). Suite stage
+5 in tests/run-all.sh.
+
 ## FP fast path
 
 FADD/FSUB/FMUL/FDIV use native FP (wasm f32/f64 instructions in the

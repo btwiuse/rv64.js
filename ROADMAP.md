@@ -38,16 +38,21 @@ priority order. Check items off as they land.
 
 ## Validation
 
-- [ ] **5. RISCOF formal compliance** — `pip install riscof`, write the
-  rv64.js plugin (DUT runner = rv64-isa-test-style ELF loader + signature
-  dump), reference model = Spike (in the nix shell). Gives a formal
-  riscv-arch-test compliance report vs "passes riscv-tests". Mostly
-  plumbing.
+- [x] **5. Architecture-test compliance vs Spike** *(done 2026-07-22)* —
+  implemented as direct signature comparison (`tests/run-arch-tests.sh`):
+  the official riscv-arch-test 3.9.1 suites (I M A C F D Zifencei
+  privilege) compile once against a shared HTIF/CLINT env and run on both
+  rv64.js (`rv64-isa-test --signature`) and Spike (`+signature=`).
+  **193/193 signatures bit-identical.** This is the substance of RISCOF
+  (same tests, same golden model, same pass criterion); adopting the
+  RISCOF report framework itself remains optional polish.
 
-- [ ] **6. Lockstep differential vs Spike** — run a guest instruction-by-
-  instruction on rv64.js and Spike, diffing full architectural state each
-  step. Catches divergences functional tests can't. Needs a state-dump
-  hook on our side and Spike's commit log (`spike -l`). Medium effort.
+- [x] **6. Lockstep differential vs Spike** *(done 2026-07-22)* —
+  `tests/lockstep.py` + `rv64-isa-test --trace`: per-instruction
+  x-register writeback streams diffed against `spike --log-commits`
+  (flake builds Spike with `--enable-commitlog`). 109/109 riscv-tests
+  lockstep-identical (~24k writebacks; ma_data skipped as the documented
+  spec-legal misaligned-access divergence).
 
 ## Features (TinyEMU parity and beyond)
 
@@ -79,6 +84,6 @@ priority order. Check items off as they land.
 ## Recommended sequencing
 
 1 → 2 → 3 (the perf trilogy — they compound; inline-TLB is what makes the
-other two matter in system mode), then 5 while validation context is
-fresh, then 7 (the feature that changes what the project *is*). 8–10 as
-interest dictates. 11/12 any time.
+other two matter in system mode), then 7 (the feature that changes what
+the project *is*). 8–10 as interest dictates. 11/12 any time.
+Validation items 5–6 are done and run as suite stages 5–6.

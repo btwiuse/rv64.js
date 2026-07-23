@@ -8,3 +8,4 @@ reference/tinyemu/slirp/*.d
 web/images/
 guests/*/target/
 tests/riscv-tests/
+tests/riscv-arch-test/

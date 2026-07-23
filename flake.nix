@@ -31,6 +31,12 @@
         # Bare-metal RISC-V cross compiler for building the official
         # riscv-tests ISA suite (tests/run-isa-tests.sh).
         riscvGcc = pkgs.pkgsCross.riscv64-embedded.buildPackages.gcc;
+
+        # Spike with commit logging enabled (tests/lockstep.py needs
+        # --log-commits, which is a compile-time option).
+        spike = pkgs.spike.overrideAttrs (old: {
+          configureFlags = (old.configureFlags or [ ]) ++ [ "--enable-commitlog" ];
+        });
       in
       {
         devShells.default = pkgs.mkShell {
@@ -51,7 +57,7 @@
 
             # validation oracles
             qemu # qemu-riscv64 (user) + qemu-system-riscv64
-            spike # riscv-isa-sim golden model
+            spike # riscv-isa-sim golden model (commit logging enabled above)
             dtc # device-tree-compiler (Spike runtime dependency)
 
             # wasm tooling: validate/disassemble JIT-emitted modules

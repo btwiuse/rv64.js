@@ -71,10 +71,85 @@ fn load_test(elf: &[u8], ram: &mut [u8]) -> Result<u64, String> {
     Err("no tohost symbol".into())
 }
 
+/// Look up any symbol's value (for begin_signature/end_signature).
+fn find_symbol(elf: &[u8], name: &str) -> Option<u64> {
+    let e_shoff = r64(elf, 40) as usize;
+    let e_shentsize = r16(elf, 58) as usize;
+    let e_shnum = r16(elf, 60) as usize;
+    let mut symtab = None;
+    let mut strtab = None;
+    for i in 0..e_shnum {
+        let off = e_shoff + i * e_shentsize;
+        match r32(elf, off + 4) {
+            2 => symtab = Some((r64(elf, off + 24) as usize, r64(elf, off + 32) as usize)),
+            3 if strtab.is_none() && i != r16(elf, 62) as usize => {
+                strtab = Some(r64(elf, off + 24) as usize)
+            }
+            _ => {}
+        }
+    }
+    let (sym_off, sym_size) = symtab?;
+    let str_off = strtab?;
+    for s in (0..sym_size).step_by(24) {
+        let name_off = str_off + r32(elf, sym_off + s) as usize;
+        let name_end = elf[name_off..].iter().position(|&b| b == 0).unwrap_or(0) + name_off;
+        if &elf[name_off..name_end] == name.as_bytes() {
+            return Some(r64(elf, sym_off + s + 8));
+        }
+    }
+    None
+}
+
+/// If the instruction at `pc` architecturally writes a non-zero x-register,
+/// return that register (best effort: physical read, satp=0 assumption —
+/// fine for the bare-metal p-variant tests lockstep runs on).
+fn insn_x_dest(m: &Machine, pc: u64) -> Option<usize> {
+    use rv64_system::RAM_BASE;
+    let off = pc.checked_sub(RAM_BASE)? as usize;
+    if off + 4 > m.bus.ram.len() {
+        return None;
+    }
+    let lo = u16::from_le_bytes(m.bus.ram[off..off + 2].try_into().unwrap()) as u32;
+    let insn = if lo & 3 == 3 {
+        lo | ((u16::from_le_bytes(m.bus.ram[off + 2..off + 4].try_into().unwrap()) as u32) << 16)
+    } else {
+        rv64_core::compressed::expand(lo as u16)?
+    };
+    use rv64_core::decode::{funct3, funct7, opcode, rd};
+    let writes = match opcode(insn) {
+        0x37 | 0x17 | 0x6f | 0x67 | 0x03 | 0x13 | 0x33 | 0x1b | 0x3b | 0x2f => true,
+        0x73 => funct3(insn) != 0 && funct3(insn) != 4, // CSR ops
+        // OP-FP forms whose destination is an x-register:
+        // fcmp (0x50/0x51), fcvt.int.fmt (0x60/0x61), fmv.x/fclass (0x70/0x71)
+        0x53 => matches!(funct7(insn), 0x50 | 0x51 | 0x60 | 0x61 | 0x70 | 0x71),
+        _ => false,
+    };
+    (writes && rd(insn) != 0).then(|| rd(insn))
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // --signature FILE : dump begin_signature..end_signature after the run
+    //                    (RISCOF DUT protocol; single test only)
+    // --trace FILE     : per-instruction commit log of x-register writes,
+    //                    normalizable against `spike --log-commits`
+    let mut sig_path = None;
+    let mut trace_path = None;
+    while args.len() >= 2 {
+        match args[0].as_str() {
+            "--signature" => {
+                sig_path = Some(args[1].clone());
+                args.drain(..2);
+            }
+            "--trace" => {
+                trace_path = Some(args[1].clone());
+                args.drain(..2);
+            }
+            _ => break,
+        }
+    }
     if args.is_empty() {
-        eprintln!("usage: rv64-isa-test <test-elf>...");
+        eprintln!("usage: rv64-isa-test [--signature FILE] [--trace FILE] <test-elf>...");
         std::process::exit(2);
     }
 
@@ -102,11 +177,57 @@ fn main() {
         }
 
         let mut result = None;
-        for _ in 0..200 {
-            m.run_slice(1_000_000);
-            if m.power_off {
-                result = m.bus.htif_exit;
-                break;
+        if let Some(tp) = &trace_path {
+            // Lockstep trace: single-step; for every instruction that
+            // architecturally writes an x-register, emit "pc reg value" —
+            // the same event stream `spike --log-commits` produces.
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(std::fs::File::create(tp).expect("trace file"));
+            for _ in 0..60_000_000u64 {
+                let pc = m.cpu.pc;
+                let dest = insn_x_dest(&m, pc);
+                let excs_before: u64 = m.cpu.exc_counts.iter().sum();
+                m.run_slice(1);
+                let trapped = m.cpu.exc_counts.iter().sum::<u64>() != excs_before;
+                if let Some(rd) = dest {
+                    if !trapped {
+                        writeln!(w, "{pc:#x} x{rd} {:#x}", m.cpu.x[rd]).unwrap();
+                    }
+                }
+                if m.power_off {
+                    result = m.bus.htif_exit;
+                    break;
+                }
+            }
+        } else {
+            for _ in 0..200 {
+                m.run_slice(1_000_000);
+                if m.power_off {
+                    result = m.bus.htif_exit;
+                    break;
+                }
+            }
+        }
+
+        // RISCOF signature dump (4 bytes per line, lowercase hex).
+        if let Some(sp) = &sig_path {
+            use std::io::Write;
+            let (b, e) = (
+                find_symbol(&elf, "begin_signature"),
+                find_symbol(&elf, "end_signature"),
+            );
+            if let (Some(b), Some(e)) = (b, e) {
+                let mut w =
+                    std::io::BufWriter::new(std::fs::File::create(sp).expect("signature file"));
+                let mut a = b;
+                while a < e {
+                    let off = (a - RAM_BASE) as usize;
+                    let word = u32::from_le_bytes(m.bus.ram[off..off + 4].try_into().unwrap());
+                    writeln!(w, "{word:08x}").unwrap();
+                    a += 4;
+                }
+            } else {
+                eprintln!("warning: no begin/end_signature symbols in {name}");
             }
         }
         match result {
