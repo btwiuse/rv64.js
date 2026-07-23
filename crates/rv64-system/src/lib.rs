@@ -11,6 +11,7 @@
 //! Boots the same bbl64.bin/kernel/rootfs images TinyEMU ships.
 
 pub mod dtb;
+pub mod virt;
 pub mod virtio;
 
 use rv64_core::csr::{IRQ_MEIP, IRQ_MSIP, IRQ_MTIP, IRQ_SEIP};
