@@ -139,6 +139,7 @@ pub extern "C" fn run(budget: u64) -> i32 {
         StopReason::Budget => STOP_BUDGET,
         StopReason::Ecall => STOP_ECALL,
         StopReason::Break => STOP_BREAK,
+        StopReason::Wfi => STOP_BUDGET, // raw API has no system mode yet
         StopReason::Trap(exc) => {
             unsafe { LAST_TRAP = exc.cause() as i32 };
             STOP_TRAP
