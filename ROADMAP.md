@@ -37,15 +37,27 @@ priority order. Check items off as they land.
     expensive `bus.jit_ram_offset` fill ran on nearly every interpreter
     memory op → the interpreter itself slowed ~45%. The probe was cheap; the
     fill placement + flush frequency was fatal.
-  - **The fix (identified, not yet built): privilege-tagged JTLB decoupled
-    from the priv-change flush.** Encode the effective privilege in the
-    entry tag (fold mode into the low 12 bits of `va & ~0xfff`, which are
-    free). Then `flush_tlb()` stops touching the JTLB; the JTLB is flushed
-    only at true mapping/permission-model changes (satp write, SFENCE.VMA,
-    SUM/MXR writes) — all rare, none per-interrupt. The JTLB stays warm
-    across timer interrupts, so fills are rare and the interpreter tax
-    amortizes away, while probes gain one cheap tag compare. Validate with
-    the full gate (md5 + arch-tests 193 + lockstep 109) before keeping.
+  - **Second attempt (2026-07-23) — privilege-tagged JTLB. Also reverted.**
+    Built exactly the fix above: mode folded into the free low-12 tag bits,
+    `jit_active` gate so the interpreter pays nothing when JIT is off, JTLB
+    flushed only on satp/SFENCE/SUM-MXR (not per-trap). It *did* remove the
+    interpreter-tax problem — but with the JIT actually engaged (slice 256)
+    **boot regressed to 0.90×** (compile + dispatch overhead on one-shot
+    boot code exceeds savings), and a benchmark reported an intermittent
+    md5 mismatch (not reproduced in a cleaner 12-run test, so likely a
+    harness artifact — but the perf regression alone made it non-viable).
+  - **Conclusion after two attempts: the system-mode JIT does not net
+    positive on real booted-Linux workloads with this architecture.** The
+    system interpreter (tight Rust→wasm) is fast; boot is one-shot (compile
+    cost unamortized), and memory-bound (md5) / indirect-heavy (shell)
+    loops don't benefit. Only a sustained pure-compute loop in a stable
+    address space would, and typical workloads aren't that. A real
+    system-mode win likely needs a different class of JIT (register
+    allocation + true block chaining that emits genuinely faster-than-
+    interpreter code), not incremental TLB tweaks — a large undertaking.
+    Meanwhile the system JIT is left dormant-neutral (slice 4096); consider
+    disabling it by default to shed complexity. **User-mode JIT (1.56×) is
+    the shipped, proven win.**
 
 - [ ] **3. FP ops inside JIT blocks** — FP instructions currently end
   blocks. Reuse the interpreter's sticky-NX/RNE eligibility guard (see
