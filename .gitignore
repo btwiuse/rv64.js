@@ -9,3 +9,5 @@ web/images/
 guests/*/target/
 tests/riscv-tests/
 tests/riscv-arch-test/
+tests/compile-bench/*.img
+tests/compile-bench/*.o
