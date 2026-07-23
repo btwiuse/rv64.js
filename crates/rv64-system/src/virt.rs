@@ -21,6 +21,12 @@ use crate::virtio::{Backend, VirtioDev};
 use rv64_core::csr::{IRQ_MEIP, IRQ_MSIP, IRQ_MTIP, IRQ_SEIP};
 use rv64_core::{Bus, Cpu, Exception, StopReason};
 
+fn plic_dbg() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RV_PLIC_DEBUG").is_ok())
+}
+
 pub const RAM_BASE: u64 = 0x8000_0000;
 pub const TEST_BASE: u64 = 0x0010_0000;
 pub const CLINT_BASE: u64 = 0x0200_0000;
@@ -108,6 +114,7 @@ impl Plic {
                         // claim: return best, mark in-service, clear pending
                         let id = self.best(ctx);
                         if id != 0 {
+                            if plic_dbg() { eprintln!("[plic] claim[ctx{ctx}] -> src={id}"); }
                             self.claimed |= 1 << id;
                         }
                         id
@@ -124,6 +131,7 @@ impl Plic {
             0x0000..=0x0fff => {
                 let id = (off / 4) as usize;
                 if id != 0 {
+                    if plic_dbg() { eprintln!("[plic] priority[{id}]={val}"); }
                     if let Some(p) = self.priority.get_mut(id) {
                         *p = val;
                     }
@@ -132,6 +140,7 @@ impl Plic {
             _ if (0x2000..0x2000 + (PLIC_CONTEXTS as u64) * 0x80).contains(&off) => {
                 let ctx = ((off - 0x2000) / 0x80) as usize;
                 if (off - 0x2000) % 0x80 == 0 {
+                    if plic_dbg() { eprintln!("[plic] enable[ctx{ctx}]={val:#x}"); }
                     self.enable[ctx] = val & !1; // source 0 never enabled
                 }
             }
@@ -140,9 +149,13 @@ impl Plic {
                 let reg = (off - 0x20_0000) % 0x1000;
                 if ctx >= PLIC_CONTEXTS { return; }
                 match reg {
-                    0x0 => self.threshold[ctx] = val,
+                    0x0 => {
+                        if plic_dbg() { eprintln!("[plic] threshold[ctx{ctx}]={val}"); }
+                        self.threshold[ctx] = val;
+                    }
                     0x4 => {
                         // complete: clear in-service for this source
+                        if plic_dbg() { eprintln!("[plic] complete[ctx{ctx}] src={val}"); }
                         if (val as usize) < PLIC_SOURCES {
                             self.claimed &= !(1 << val);
                         }
@@ -356,6 +369,10 @@ impl VirtBus {
                         let mut dev = self.virtio.remove(i);
                         dev.process(q as usize, &mut self.ram, RAM_BASE);
                         self.virtio.insert(i, dev);
+                        if plic_dbg() {
+                            eprintln!("[virtio{i}] notify q{q} -> irq_pending={}",
+                                self.virtio[i].irq_pending());
+                        }
                     }
                 }
                 true
@@ -428,6 +445,10 @@ pub struct VirtMachine {
     pub cpu: Cpu,
     pub bus: VirtBus,
     pub insns_per_tick: u64,
+    /// Guest timer ticks accrued while the hart was halted in WFI. Kept
+    /// separate from `insn_count` so idle time advances the guest clock
+    /// without inflating the (real) retired-instruction count.
+    pub idle_ticks: u64,
     pub power_off: bool,
     pub dtb: Vec<u8>,
 }
@@ -444,17 +465,47 @@ impl VirtMachine {
         ram[kbase..kbase + images.kernel.len()].copy_from_slice(images.kernel);
         let kend = kbase + images.kernel.len();
 
-        // Optional initrd, placed well above the kernel (page aligned).
+        let _ = kend;
+        // Place initrd + DTB near the TOP of RAM (as QEMU/U-Boot do) so the
+        // kernel's early allocations near the Image don't clobber them.
+        // Layout from the top down: [DTB][initrd][fw_dynamic_info], each
+        // aligned, leaving a small margin below the very top.
+        let ram_top = ram_size as usize;
+        let dtb = build_virt_fdt(ram_size, images.cmdline, 0, 0, {
+            let mut n = 0;
+            if images.disk.is_some() {
+                n += 1;
+            }
+            n
+        });
+        // Reserve DTB just below the top (2 MiB margin, page aligned).
+        let dtb_off = ((ram_top - 0x20_0000).saturating_sub(dtb.len())) & !0xfff;
+
+        // initrd below the DTB (1 MiB aligned).
         let mut initrd_start = 0u64;
         let mut initrd_end = 0u64;
-        let mut top = (kend + 0xfffff) & !0xfffff; // 1 MiB align
+        let mut below = dtb_off;
         if let Some(ir) = images.initrd {
-            let s = top;
+            let s = (below.saturating_sub(ir.len())) & !0xfffff;
             ram[s..s + ir.len()].copy_from_slice(ir);
             initrd_start = RAM_BASE + s as u64;
             initrd_end = initrd_start + ir.len() as u64;
-            top = (s + ir.len() + 0xfffff) & !0xfffff;
+            below = s;
         }
+
+        // fw_dynamic_info struct below the initrd (page aligned).
+        let dyn_off = (below.saturating_sub(0x1000)) & !0xfff;
+
+        // Rebuild the DTB now that initrd addresses are known, then place it.
+        let dtb = build_virt_fdt(
+            ram_size,
+            images.cmdline,
+            initrd_start,
+            initrd_end,
+            if images.disk.is_some() { 1 } else { 0 },
+        );
+        ram[dtb_off..dtb_off + dtb.len()].copy_from_slice(&dtb);
+        let dtb_addr = RAM_BASE + dtb_off as u64;
 
         // Virtio: one blk device if a disk is given (source 1).
         let mut virtio = Vec::new();
@@ -462,24 +513,33 @@ impl VirtMachine {
             virtio.push(VirtioDev::new(Backend::Block { disk }));
         }
 
-        // DTB above everything (page aligned).
-        let dtb = build_virt_fdt(
-            ram_size,
-            images.cmdline,
-            initrd_start,
-            initrd_end,
-            virtio.len(),
-        );
-        let dtb_off = (top + 0xfff) & !0xfff;
-        ram[dtb_off..dtb_off + dtb.len()].copy_from_slice(&dtb);
-        let dtb_addr = RAM_BASE + dtb_off as u64;
+        // fw_dynamic_info struct (OpenSBI reads it from a2). fw_jump.bin bakes
+        // the FDT/next-stage addresses at build time and ignores a1, which
+        // makes the kernel fault on a bogus DTB pointer; fw_dynamic forwards the
+        // real DTB in a1 and jumps to the address we specify here.
+        {
+            let info: [u64; 6] = [
+                0x4942_534f,                 // magic "OSBI"
+                2,                           // version
+                RAM_BASE + KERNEL_OFFSET,    // next_addr = kernel Image
+                1,                           // next_mode = PRV_S
+                0,                           // options
+                0,                           // boot_hart = 0
+            ];
+            for (i, v) in info.iter().enumerate() {
+                ram[dyn_off + i * 8..dyn_off + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        let dyn_addr = RAM_BASE + dyn_off as u64;
 
-        // Enter OpenSBI in M-mode directly: pc=RAM_BASE, a0=hartid, a1=dtb.
+        // Enter OpenSBI (fw_dynamic) in M-mode: pc=RAM_BASE, a0=hartid, a1=dtb,
+        // a2=&fw_dynamic_info.
         let mut cpu = Cpu::new();
         cpu.enable_system(0);
         cpu.pc = RAM_BASE;
         cpu.x[10] = 0; // a0 = hartid
         cpu.x[11] = dtb_addr; // a1 = dtb
+        cpu.x[12] = dyn_addr; // a2 = fw_dynamic_info
 
         VirtMachine {
             cpu,
@@ -495,7 +555,8 @@ impl VirtMachine {
                 jit_pages: vec![0u64; (ram_size as usize >> 12).div_ceil(64)],
                 jit_dirty_pages: Vec::new(),
             },
-            insns_per_tick: 10,
+            insns_per_tick: 100,
+            idle_ticks: 0,
             power_off: false,
             dtb,
         }
@@ -509,7 +570,7 @@ impl VirtMachine {
     }
 
     pub fn sync_devices(&mut self) {
-        self.bus.mtime = self.cpu.insn_count / self.insns_per_tick;
+        self.bus.mtime = self.cpu.insn_count / self.insns_per_tick + self.idle_ticks;
         if let Some(sys) = self.cpu.sys.as_mut() {
             sys.mtime = self.bus.mtime;
         }
@@ -520,9 +581,12 @@ impl VirtMachine {
         self.sync_devices();
         match self.cpu.run(&mut self.bus, max_insns) {
             StopReason::Wfi => {
+                // Halted: fast-forward the guest clock to the next timer
+                // deadline via `idle_ticks` (not `insn_count`, which must
+                // stay a true retired-instruction count for budgets/perf).
                 let next = self.bus.mtimecmp;
                 if next != u64::MAX && next > self.bus.mtime {
-                    self.cpu.insn_count += (next - self.bus.mtime) * self.insns_per_tick;
+                    self.idle_ticks += next - self.bus.mtime;
                 }
             }
             _ => {}
@@ -553,6 +617,17 @@ fn build_virt_fdt(
     f.begin_node("chosen");
     f.prop_str("bootargs", cmdline);
     f.prop_str("stdout-path", "/soc/serial@10000000");
+    // Seed the kernel CRNG from the DTB (as QEMU/U-Boot do). Without this the
+    // guest starves for entropy — jitterentropy can't init on our too-regular
+    // cycle counter, so every getrandom() blocks and boot stalls ~30s/step.
+    // CONFIG_RANDOM_TRUST_BOOTLOADER credits this as full entropy.
+    let mut seed = [0u8; 64];
+    for (i, b) in seed.iter_mut().enumerate() {
+        // Deterministic but well-mixed; a fixed seed is fine (the kernel only
+        // needs unpredictable-to-the-guest bytes to initialize the CRNG).
+        *b = ((i as u32).wrapping_mul(0x9e37_79b1) >> 13) as u8 ^ (i as u8).wrapping_mul(31);
+    }
+    f.prop("rng-seed", &seed);
     if initrd_end > initrd_start {
         f.prop("linux,initrd-start", &initrd_start.to_be_bytes());
         f.prop("linux,initrd-end", &initrd_end.to_be_bytes());
