@@ -57,9 +57,27 @@ fn main() {
     let mut ctrl_a = false;
     let t0 = std::time::Instant::now();
     let max_insns: Option<u64> = std::env::var("VBOOT_MAX_INSNS").ok().and_then(|v| v.parse().ok());
+    // Optional heartbeat: every N wall-seconds print retired-insn count,
+    // throughput, and current guest PC (privilege) — for diagnosing hangs.
+    let hb_secs: Option<u64> = std::env::var("VBOOT_HEARTBEAT").ok().and_then(|v| v.parse().ok());
+    let mut hb_last = std::time::Instant::now();
+    let mut hb_insns = 0u64;
 
     loop {
-        m.run_slice(4_000_000);
+        m.run_slice(2_000_000);
+        if let Some(hb) = hb_secs {
+            if hb_last.elapsed().as_secs() >= hb {
+                let now_insns = m.cpu.insn_count;
+                let dt = hb_last.elapsed().as_secs_f64();
+                let mips = (now_insns - hb_insns) as f64 / dt / 1e6;
+                let mode = m.cpu.sys.as_ref().map(|s| format!("{:?}", s.mode)).unwrap_or_default();
+                eprintln!("\r[hb] t={:.0}s insns={} {:.0} MIPS pc={:#x} mode={} {}",
+                    t0.elapsed().as_secs_f64(), now_insns, mips, m.cpu.pc, mode,
+                    m.debug_irq_state());
+                hb_last = std::time::Instant::now();
+                hb_insns = now_insns;
+            }
+        }
         let out = m.console_output();
         if !out.is_empty() {
             std::io::stdout().write_all(&out).unwrap();

@@ -369,15 +369,25 @@ impl VirtBus {
                         let mut dev = self.virtio.remove(i);
                         dev.process(q as usize, &mut self.ram, RAM_BASE);
                         self.virtio.insert(i, dev);
-                        if plic_dbg() {
-                            eprintln!("[virtio{i}] notify q{q} -> irq_pending={}",
-                                self.virtio[i].irq_pending());
-                        }
                     }
                 }
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Poll every ready virtqueue, servicing any buffers the guest made
+    /// available. QueueNotify normally drives this, but polling each slice
+    /// recovers from any missed notification (a synchronous device model can
+    /// otherwise lose a wakeup and hang the guest waiting on completed I/O).
+    fn poll_virtio(&mut self) {
+        for i in 0..self.virtio.len() {
+            let mut dev = self.virtio.remove(i);
+            for qi in 0..2 {
+                dev.process(qi, &mut self.ram, RAM_BASE);
+            }
+            self.virtio.insert(i, dev);
         }
     }
 }
@@ -576,8 +586,39 @@ impl VirtMachine {
         }
     }
 
+    /// One-line dump of interrupt-delivery state, for diagnosing idle hangs.
+    pub fn debug_irq_state(&self) -> String {
+        let p = &self.bus.plic;
+        let vio: Vec<String> = self
+            .bus
+            .virtio
+            .iter()
+            .enumerate()
+            .map(|(i, d)| format!("v{i}.irq={}", d.irq_pending()))
+            .collect();
+        let (mip, mie) = self
+            .cpu
+            .sys
+            .as_ref()
+            .map(|s| (s.mip, s.mie))
+            .unwrap_or((0, 0));
+        let (sepc, scause) = self
+            .cpu
+            .sys
+            .as_ref()
+            .map(|s| (s.sepc, s.scause))
+            .unwrap_or((0, 0));
+        format!(
+            "plic{{pend={:#x} claimed={:#x} best1={}}} {} mip={:#x} mie={:#x} mtime={} mtcmp={} timer_future={} sepc={:#x} scause={:#x}",
+            p.pending, p.claimed, p.best(1),
+            vio.join(","), mip, mie, self.bus.mtime, self.bus.mtimecmp,
+            self.bus.mtimecmp > self.bus.mtime, sepc, scause,
+        )
+    }
+
     pub fn run_slice(&mut self, max_insns: u64) -> u64 {
         let start = self.cpu.insn_count;
+        self.bus.poll_virtio();
         self.sync_devices();
         match self.cpu.run(&mut self.bus, max_insns) {
             StopReason::Wfi => {

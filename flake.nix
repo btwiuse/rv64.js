@@ -72,6 +72,15 @@
             e2fsprogs # mke2fs/debugfs/resize2fs — guest disk images
             util-linux # sfdisk/losetup helpers
             zstd # image (de)compression
+
+            # Debian rootfs bring-up (build-essential in the guest)
+            debootstrap # build a riscv64 Debian rootfs (--foreign)
+            fakeroot # run debootstrap without real root
+            dpkg # dpkg-deb -x for offline .deb extraction
+            gnutar
+            gzip
+            gnused
+            wget
           ];
 
           shellHook = ''

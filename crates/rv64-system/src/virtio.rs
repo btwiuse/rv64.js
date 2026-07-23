@@ -13,6 +13,12 @@ pub enum Backend {
 const QUEUE_NUM_MAX: u32 = 16;
 const MAX_QUEUES: usize = 2;
 
+fn vio_dbg() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RV_PLIC_DEBUG").is_ok())
+}
+
 #[derive(Default, Clone)]
 struct Queue {
     ready: u32,
@@ -115,7 +121,12 @@ impl VirtioDev {
             0x038 => self.qm().num = val.min(QUEUE_NUM_MAX),
             0x044 => self.qm().ready = val & 1,
             0x050 => return Some(val), // QueueNotify -> process queue `val`
-            0x064 => self.int_status &= !val,
+            0x064 => {
+                if vio_dbg() {
+                    eprintln!("[vio] ACK int_status {:#x} &= !{:#x}", self.int_status, val);
+                }
+                self.int_status &= !val;
+            }
             0x070 => {
                 self.status = val;
                 if val == 0 {
@@ -162,12 +173,21 @@ impl VirtioDev {
     /// `ram`/`ram_base` give access to guest physical memory.
     pub fn process(&mut self, qi: usize, ram: &mut [u8], ram_base: u64) {
         if qi >= MAX_QUEUES || self.queues[qi].ready == 0 {
+            if vio_dbg() {
+                eprintln!("[vio] notify q{qi} BAILED ready={}",
+                    self.queues.get(qi).map_or(0, |q| q.ready));
+            }
             return;
         }
+        let mut serviced = 0u32;
         loop {
             let q = self.queues[qi].clone();
             let avail_idx = read16(ram, ram_base, q.avail + 2);
             if q.last_avail_idx == avail_idx {
+                if vio_dbg() {
+                    eprintln!("[vio] notify q{qi} done serviced={serviced} last_avail={} avail_idx={avail_idx}",
+                        q.last_avail_idx);
+                }
                 break;
             }
             let slot = (q.last_avail_idx as u64) % (q.num as u64);
@@ -204,6 +224,7 @@ impl VirtioDev {
 
             self.queues[qi].last_avail_idx = self.queues[qi].last_avail_idx.wrapping_add(1);
             self.int_status |= 1;
+            serviced += 1;
         }
     }
 
