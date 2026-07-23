@@ -5,3 +5,4 @@ reference/tinyemu/*.d
 reference/tinyemu/temu
 reference/tinyemu/slirp/*.o
 reference/tinyemu/slirp/*.d
+web/images/

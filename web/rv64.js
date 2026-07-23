@@ -143,3 +143,35 @@ export class RV64 {
     return { pc: this.pc, x };
   }
 }
+
+// ---- full-system (boot Linux) API — appended to class via prototype ----
+
+RV64.prototype.bootLinux = function ({ bios, kernel, disk, cmdline, ramMB = 128 }) {
+  const stage = (bytes, fn) => {
+    if (!bytes) return;
+    const ptr = this.ex.staging_alloc(bytes.length);
+    new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
+    fn();
+  };
+  stage(bios, () => this.ex.sys_stage_bios());
+  stage(kernel, () => this.ex.sys_stage_kernel());
+  stage(disk, () => this.ex.sys_stage_disk());
+  if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.sys_stage_cmdline());
+  this.ex.sys_boot(ramMB);
+};
+
+/** Run a slice of the booted system. Returns true when powered off. */
+RV64.prototype.runSystem = function (maxInsns = 10_000_000n) {
+  return this.ex.sys_run(BigInt(maxInsns)) === 1;
+};
+
+/** Send keyboard input to the guest console. */
+RV64.prototype.consoleInput = function (bytes) {
+  const ptr = this.ex.staging_alloc(bytes.length);
+  new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
+  this.ex.sys_console_input();
+};
+
+RV64.prototype.sysInsnCount = function () {
+  return this.ex.sys_insn_count();
+};

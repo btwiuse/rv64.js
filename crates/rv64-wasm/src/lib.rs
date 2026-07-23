@@ -234,3 +234,85 @@ pub extern "C" fn user_pc() -> u64 {
 pub extern "C" fn user_insn_count() -> u64 {
     unsafe { USER.as_ref().map(|e| e.machine.cpu.insn_count).unwrap_or(0) }
 }
+
+// ---- full-system API (boot Linux in the browser) --------------------------
+
+static mut SYS_BIOS: Vec<u8> = Vec::new();
+static mut SYS_KERNEL: Vec<u8> = Vec::new();
+static mut SYS_DISK: Vec<u8> = Vec::new();
+static mut SYS_CMDLINE: Vec<u8> = Vec::new();
+static mut SYS: Option<rv64_system::Machine> = None;
+
+macro_rules! stage_into {
+    ($name:ident, $slot:ident) => {
+        #[no_mangle]
+        #[allow(static_mut_refs)]
+        pub extern "C" fn $name() {
+            unsafe {
+                $slot = core::mem::take(&mut STAGING);
+            }
+        }
+    };
+}
+
+stage_into!(sys_stage_bios, SYS_BIOS);
+stage_into!(sys_stage_kernel, SYS_KERNEL);
+stage_into!(sys_stage_disk, SYS_DISK);
+stage_into!(sys_stage_cmdline, SYS_CMDLINE);
+
+/// Assemble and boot the machine from the staged images.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_boot(ram_mb: u32) {
+    unsafe {
+        let cmdline = String::from_utf8_lossy(&SYS_CMDLINE).into_owned();
+        let cmdline = if cmdline.is_empty() {
+            "console=hvc0 root=/dev/vda rw"
+        } else {
+            &cmdline
+        };
+        let m = rv64_system::Machine::new(
+            ram_mb as usize,
+            rv64_system::BootImages {
+                bios: &SYS_BIOS,
+                kernel: if SYS_KERNEL.is_empty() { None } else { Some(&SYS_KERNEL) },
+                cmdline,
+                disk: if SYS_DISK.is_empty() { None } else { Some(core::mem::take(&mut SYS_DISK)) },
+            },
+        );
+        SYS_BIOS = Vec::new();
+        SYS_KERNEL = Vec::new();
+        SYS = Some(m);
+    }
+}
+
+/// Run a slice; streams console output through host_write(1, ...).
+/// Returns 1 if the guest powered off, else 0.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_run(max_insns: u64) -> i32 {
+    let m = unsafe { SYS.as_mut().expect("call sys_boot() first") };
+    m.run_slice(max_insns);
+    let out = m.console_output();
+    if !out.is_empty() {
+        unsafe { host_write(1, out.as_ptr(), out.len()) }
+    }
+    m.power_off as i32
+}
+
+/// Send keyboard bytes (staged via staging_alloc) to the guest console.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_console_input() {
+    let m = unsafe { SYS.as_mut().expect("call sys_boot() first") };
+    unsafe {
+        let bytes = core::mem::take(&mut STAGING);
+        m.console_input(&bytes);
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_insn_count() -> u64 {
+    unsafe { SYS.as_ref().map(|m| m.cpu.insn_count).unwrap_or(0) }
+}
