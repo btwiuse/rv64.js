@@ -66,6 +66,12 @@
 
             # riscv-tests cross build
             riscvGcc
+
+            # modern-system bring-up (virt machine): OpenSBI + kernel + rootfs
+            cpio # initramfs packing
+            e2fsprogs # mke2fs/debugfs/resize2fs — guest disk images
+            util-linux # sfdisk/losetup helpers
+            zstd # image (de)compression
           ];
 
           shellHook = ''
