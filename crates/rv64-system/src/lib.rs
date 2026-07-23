@@ -53,10 +53,13 @@ pub struct SystemBus {
     /// (riscv-tests: 0 = pass, n = failing test case number).
     pub htif_exit: Option<u64>,
     // JIT support: bitset of RAM pages holding compiled code. A store to a
-    // marked page sets jit_dirty; the JIT host then drops all blocks
-    // (self-modifying code / page reuse).
+    // marked page records that page in jit_dirty_pages, so the dispatcher
+    // can drop just the affected blocks (self-modifying code / page reuse).
     pub jit_pages: Vec<u64>,
-    pub jit_dirty: bool,
+    /// Physical pages (page number = (pa-RAM_BASE)>>12) written since the
+    /// last drain that held compiled code — the dispatcher invalidates just
+    /// those blocks instead of the whole cache.
+    pub jit_dirty_pages: Vec<u64>,
 }
 
 impl SystemBus {
@@ -209,9 +212,16 @@ impl SystemBus {
         }
     }
 
-    pub fn jit_clear_pages(&mut self) {
-        self.jit_pages.iter_mut().for_each(|w| *w = 0);
-        self.jit_dirty = false;
+    /// Clear a single compiled-code page's bit (after its blocks are dropped).
+    pub fn jit_unmark_page(&mut self, page: u64) {
+        if let Some(w) = self.jit_pages.get_mut(page as usize / 64) {
+            *w &= !(1 << (page % 64));
+        }
+    }
+
+    /// Take the list of dirtied compiled-code pages (drains it).
+    pub fn jit_take_dirty(&mut self) -> Vec<u64> {
+        core::mem::take(&mut self.jit_dirty_pages)
     }
 
     #[inline]
@@ -220,7 +230,7 @@ impl SystemBus {
             let page = ((addr - RAM_BASE) >> 12) as usize;
             if let Some(w) = self.jit_pages.get(page / 64) {
                 if w & (1 << (page % 64)) != 0 {
-                    self.jit_dirty = true;
+                    self.jit_dirty_pages.push(page as u64);
                 }
             }
         }
@@ -407,7 +417,7 @@ impl Machine {
                 power_off: false,
                 htif_exit: None,
                 jit_pages: vec![0u64; (ram_size >> 12).div_ceil(64)],
-                jit_dirty: false,
+                jit_dirty_pages: Vec::new(),
             },
             insns_per_tick: 10, // pretend 100 Minsn/s against the 10 MHz clock
             power_off: false,

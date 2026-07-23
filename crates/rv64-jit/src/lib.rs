@@ -24,8 +24,41 @@ use rv64_core::decode::*;
 use wasm_emit::*;
 
 const MAX_BLOCK: usize = 128;
-/// First scratch local (local 0 is the state-pointer parameter).
+// Scratch locals (local 0 is the state-pointer parameter).
+// SCR/SCR+1 are the general ALU scratch pair used by JALR etc.; the
+// memory path uses named i64 locals VA/PAGE/PA/VAL plus one i32 local IDXB.
 const SCR: u32 = 1;
+const VA: u32 = 1;
+const PAGE: u32 = 2;
+const PA: u32 = 3;
+const VAL: u32 = 4;
+/// i32 local (declared after the i64 locals).
+const IDXB: u32 = 5;
+/// Total i64 scratch locals to declare.
+const N_I64_LOCALS: u32 = 4;
+
+/// Full-system memory access layout: emitted loads/stores probe the
+/// interpreter's own Load/Store TLBs inline; on a hit within guest RAM
+/// they access memory directly, otherwise they bail to the interpreter
+/// (which walks the page table, fills the TLB, and handles MMIO/faults).
+#[derive(Clone, Copy)]
+pub struct SysMem {
+    /// TLB rows (tag then pa-va diff), Cpu::jit_tlb_ptrs() order.
+    pub tlb_load_tag: u32,
+    pub tlb_load_diff: u32,
+    pub tlb_store_tag: u32,
+    pub tlb_store_diff: u32,
+    /// Index mask: jit_tlb_size() - 1.
+    pub tlb_mask: u32,
+    /// Guest RAM: linear offset of ram[0], guest-physical base, byte size.
+    pub ram_off: u32,
+    pub ram_base: u64,
+    pub ram_size: u64,
+    /// Compiled-code page bitset (u64 words, bit set = page holds JIT
+    /// code): stores into such pages bail so the interpreter records the
+    /// dirty page for invalidation.
+    pub jit_pages_off: u32,
+}
 
 /// Where the emitted code finds emulator state in linear memory, and
 /// (optionally) guest RAM for direct load/store translation.
@@ -35,11 +68,17 @@ pub struct JitLayout {
     pub x_base: u32,
     /// Linear-memory offset of the pc slot.
     pub pc_addr: u32,
-    /// Guest RAM window for direct memory ops: (linear offset of guest
-    /// address 0, guest size in bytes). None => loads/stores end the block
-    /// (interpreter fallback) — used for full-system blocks where accesses
-    /// must go through the MMU.
+    /// Flat guest RAM (user-mode): (linear offset of guest address 0,
+    /// guest size). Loads/stores access it directly, bounds-checked.
     pub mem: Option<(u32, u64)>,
+    /// Full-system memory layout (mutually exclusive with `mem`). When
+    /// both are None, loads/stores end the block.
+    pub sys: Option<SysMem>,
+    /// Cell that every block writes with the number of guest instructions
+    /// it actually retired before returning. Sys blocks with inline memory
+    /// ops can bail mid-block (TLB miss / MMIO), so the dispatcher must read
+    /// this rather than assume the full block length.
+    pub retired_addr: u32,
 }
 
 impl JitLayout {
@@ -49,6 +88,8 @@ impl JitLayout {
             x_base: 0,
             pc_addr: 256,
             mem: None,
+            sys: None,
+            retired_addr: 264,
         }
     }
 }
@@ -60,6 +101,16 @@ pub struct Block {
     pub len: u64,
     /// Number of instructions translated.
     pub n_insns: u32,
+}
+
+/// wasm memarg alignment hint (log2 of the natural access size).
+fn len_align(len: u64) -> u64 {
+    match len {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        _ => 3,
+    }
 }
 
 /// Fetch helper over a code slice starting at `base` (guest address).
@@ -112,10 +163,112 @@ impl Ctx {
     /// RAM and leave the wrapped i32 index on the stack. Traps (wasm
     /// `unreachable`) on out-of-range — a fatal guest fault in user mode.
     fn guest_addr(&self, m: &mut WasmModule, size: u64, len: u64) {
-        m.local_set(SCR);
-        m.local_get(SCR).i64_const((size - len) as i64).op(I64_GT_U);
+        m.local_set(VA);
+        m.local_get(VA).i64_const((size - len) as i64).op(I64_GT_U);
         m.op(IF).op(VOID).op(UNREACHABLE).op(END);
-        m.local_get(SCR).op(I32_WRAP_I64);
+        m.local_get(VA).op(I32_WRAP_I64);
+    }
+
+    /// Write the retired-instruction count for this block exit.
+    fn set_retired(&self, m: &mut WasmModule, n: u32) {
+        m.i32_const(0).i64_const(n as i64).i64_store(self.lay.retired_addr as u64);
+    }
+
+    /// Bail out of the block at instruction index `n` (retired so far),
+    /// leaving pc at `pc` for the interpreter to resume.
+    fn bail(&self, m: &mut WasmModule, pc: u64, n: u32) {
+        self.set_pc_const(m, pc);
+        self.set_retired(m, n);
+        m.op(RETURN);
+    }
+
+    /// Emit an inline-TLB probe. `addr` (i64 va) must be on the stack.
+    /// On a hit that lands in guest RAM, leaves the i32 linear-memory index
+    /// on the stack and continues. On a miss (or MMIO / RAM-crossing), sets
+    /// VA-side state and jumps to `bail` — i.e. emits `if miss { bail }`.
+    /// `store` selects the store TLB and adds the compiled-code-page check.
+    fn tlb_index(&self, m: &mut WasmModule, sys: &SysMem, len: u64, store: bool, pc: u64, n: u32) {
+        let (tag_base, diff_base) = if store {
+            (sys.tlb_store_tag, sys.tlb_store_diff)
+        } else {
+            (sys.tlb_load_tag, sys.tlb_load_diff)
+        };
+        m.local_set(VA);
+        // page-crossing guard: if (va & 0xfff) > 0x1000 - len, the access
+        // spans two pages whose physical mappings need not be contiguous —
+        // bail so the interpreter splits it.
+        if len > 1 {
+            m.local_get(VA)
+                .i64_const(0xfff)
+                .op(I64_AND)
+                .i64_const((0x1000 - len) as i64)
+                .op(I64_GT_U);
+            m.op(IF).op(VOID);
+            self.bail(m, pc, n);
+            m.op(END);
+        }
+        // PAGE = va >> 12
+        m.local_get(VA).i64_const(12).op(I64_SHR_U).local_set(PAGE);
+        // IDXB (i32) = ((page & mask) << 3)
+        m.local_get(PAGE)
+            .op(I32_WRAP_I64)
+            .i32_const(sys.tlb_mask as i32)
+            .op(I32_AND)
+            .i32_const(3)
+            .op(I32_SHL)
+            .local_set_i32(IDXB);
+        // miss if tlb_tag[idx] != page  -> bail
+        m.local_get_i32(IDXB).i64_load_at(tag_base as u64);
+        m.local_get(PAGE).op(I64_NE);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+        // PA = va + diff
+        m.local_get(VA);
+        m.local_get_i32(IDXB).i64_load_at(diff_base as u64);
+        m.op(I64_ADD).local_set(PA);
+        // range check: (pa - ram_base) >u ram_size - len  -> bail (MMIO/cross)
+        m.local_get(PA)
+            .i64_const(sys.ram_base as i64)
+            .op(I64_SUB)
+            .i64_const((sys.ram_size - len) as i64)
+            .op(I64_GT_U);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+        if store {
+            // bail if the target physical page holds compiled code:
+            // ppage = (pa - ram_base) >> 12; word = jit_pages[ppage>>6];
+            // if (word >> (ppage & 63)) & 1 -> bail
+            m.local_get(PA)
+                .i64_const(sys.ram_base as i64)
+                .op(I64_SUB)
+                .i64_const(12)
+                .op(I64_SHR_U)
+                .local_set(PAGE); // PAGE now = ppage
+            // word address = jit_pages_off + (ppage >> 6) * 8
+            m.local_get(PAGE)
+                .i64_const(6)
+                .op(I64_SHR_U)
+                .op(I32_WRAP_I64)
+                .i32_const(3)
+                .op(I32_SHL)
+                .i64_load_at(sys.jit_pages_off as u64);
+            // >> (ppage & 63)
+            m.local_get(PAGE).i64_const(63).op(I64_AND).op(I64_SHR_U);
+            m.i64_const(1).op(I64_AND);
+            m.i64_const(0).op(I64_NE);
+            m.op(IF).op(VOID);
+            self.bail(m, pc, n);
+            m.op(END);
+        }
+        // linear index = ram_off + (pa - ram_base)   (i32)
+        m.local_get(PA)
+            .i64_const(sys.ram_base as i64)
+            .op(I64_SUB)
+            .op(I32_WRAP_I64)
+            .i32_const(sys.ram_off as i32)
+            .op(I32_ADD);
     }
 }
 
@@ -124,7 +277,8 @@ impl Ctx {
 /// instruction isn't translatable (caller interprets it instead).
 pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> Option<Block> {
     let c = Ctx { lay };
-    let mut m = WasmModule::new(2); // scratch i64 locals at SCR, SCR+1
+    // 4 i64 scratch locals (VA/PAGE/PA/VAL) + 1 i32 (IDXB).
+    let mut m = WasmModule::with_locals(N_I64_LOCALS, 1);
     let mut pc = start_pc;
     let mut n = 0u32;
 
@@ -303,9 +457,8 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     c.store_post(&mut m, d);
                 }
             }
-            // LOAD / STORE-FP-less loads: direct guest memory (user-mode only)
-            0x03 if lay.mem.is_some() => {
-                let (mem_base, size) = lay.mem.unwrap();
+            // LOAD (user-mode direct, or system inline-TLB)
+            0x03 if lay.mem.is_some() || lay.sys.is_some() => {
                 let f3 = funct3(insn);
                 let len = match f3 {
                     0 | 4 => 1,
@@ -314,11 +467,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     3 => 8,
                     _ => break,
                 };
-                c.push_reg(&mut m, s1);
-                m.i64_const(imm_i(insn)).op(I64_ADD);
-                c.guest_addr(&mut m, size, len); // i32 index on stack
-                                                 // value
-                m.op(match f3 {
+                let load_op = match f3 {
                     0 => I64_LOAD8_S,
                     1 => I64_LOAD16_S,
                     2 => I64_LOAD32_S,
@@ -326,50 +475,54 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     4 => I64_LOAD8_U,
                     5 => I64_LOAD16_U,
                     _ => I64_LOAD32_U,
-                });
-                // align hint + offset immediates
-                {
-                    let a = match len {
-                        1 => 0u64,
-                        2 => 1,
-                        4 => 2,
-                        _ => 3,
-                    };
-                    m.raw_uleb(a).raw_uleb(mem_base as u64);
-                }
-                if d == 0 {
-                    m.op(DROP); // load to x0: access happens, result discarded
+                };
+                // address (i64 va) on stack
+                c.push_reg(&mut m, s1);
+                m.i64_const(imm_i(insn)).op(I64_ADD);
+                let mem_off = if let Some((mem_base, size)) = lay.mem {
+                    c.guest_addr(&mut m, size, len); // i32 index, traps OOB
+                    mem_base as u64
                 } else {
-                    // stash value, then store to x[rd]
-                    m.local_set(SCR + 1);
-                    m.i32_const(0).local_get(SCR + 1);
+                    // system: probe TLB; leaves full linear index on stack
+                    c.tlb_index(&mut m, &lay.sys.unwrap(), len, false, pc, n);
+                    0
+                };
+                m.op(load_op).raw_uleb(len_align(len)).raw_uleb(mem_off);
+                if d == 0 {
+                    m.op(DROP);
+                } else {
+                    m.local_set(VAL);
+                    m.i32_const(0).local_get(VAL);
                     c.store_post(&mut m, d);
                 }
             }
-            0x23 if lay.mem.is_some() => {
-                let (mem_base, size) = lay.mem.unwrap();
+            // STORE (user-mode direct, or system inline-TLB)
+            0x23 if lay.mem.is_some() || lay.sys.is_some() => {
                 let f3 = funct3(insn);
                 if f3 > 3 {
                     break;
                 }
                 let len = 1u64 << f3;
-                c.push_reg(&mut m, s1);
-                m.i64_const(imm_s(insn)).op(I64_ADD);
-                c.guest_addr(&mut m, size, len); // i32 index
-                c.push_reg(&mut m, s2); // value i64
-                m.op(match f3 {
+                let store_op = match f3 {
                     0 => I64_STORE8,
                     1 => I64_STORE16,
                     2 => I64_STORE32,
                     _ => I64_STORE,
-                });
-                let a = match len {
-                    1 => 0u64,
-                    2 => 1,
-                    4 => 2,
-                    _ => 3,
                 };
-                m.raw_uleb(a).raw_uleb(mem_base as u64);
+                c.push_reg(&mut m, s1);
+                m.i64_const(imm_s(insn)).op(I64_ADD);
+                if let Some((mem_base, size)) = lay.mem {
+                    c.guest_addr(&mut m, size, len);
+                    c.push_reg(&mut m, s2);
+                    m.op(store_op).raw_uleb(len_align(len)).raw_uleb(mem_base as u64);
+                } else {
+                    // system: tlb_index consumes the va and leaves the RAM
+                    // index on the stack; push_reg(s2) reads x[] (not touched
+                    // by the probe), then store.
+                    c.tlb_index(&mut m, &lay.sys.unwrap(), len, true, pc, n);
+                    c.push_reg(&mut m, s2);
+                    m.op(store_op).raw_uleb(len_align(len)).raw_uleb(0);
+                }
             }
             // JAL: link; follow plain forward jumps (superblock chaining),
             // otherwise end the block with a constant pc.
@@ -386,6 +539,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     continue;
                 }
                 c.set_pc_const(&mut m, target);
+                c.set_retired(&mut m, n + 1);
                 return Some(Block {
                     wasm: m.finish(),
                     len: next_pc - start_pc,
@@ -406,6 +560,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     c.store_post(&mut m, d);
                 }
                 m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
+                c.set_retired(&mut m, n + 1);
                 return Some(Block {
                     wasm: m.finish(),
                     len: next_pc - start_pc,
@@ -432,14 +587,15 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 m.op(ELSE);
                 c.set_pc_const(&mut m, next_pc);
                 m.op(END);
+                c.set_retired(&mut m, n + 1);
                 return Some(Block {
                     wasm: m.finish(),
                     len: next_pc - start_pc,
                     n_insns: n + 1,
                 });
             }
-            // Anything else (loads/stores/AMO/FP/SYSTEM): end the block here;
-            // the interpreter takes over at this pc.
+            // Anything else (AMO/FP/SYSTEM, or memory ops with no memory
+            // layout): end the block here; the interpreter takes over.
             _ => break,
         }
 
@@ -451,6 +607,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
         return None;
     }
     c.set_pc_const(&mut m, pc);
+    c.set_retired(&mut m, n);
     Some(Block {
         wasm: m.finish(),
         len: pc - start_pc,

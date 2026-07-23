@@ -1,9 +1,16 @@
 # Performance baseline (pre perf-trilogy)
 
 Recorded 2026-07-22, commit after validation roadmap completion.
-Methodology: `nix develop -c node tests/bench.mjs` — best of 3 runs, fresh
-wasm instance per run (cold V8 per rep; consistent across measurements).
-Host: WSL2, Node 20 (nix flake).
+
+**All measurements run under WebAssembly (V8, via Node) — the browser
+target.** The JIT exists only in the wasm build (it emits wasm modules the
+JS host instantiates into the module's function table); the native build
+has no JIT. Optimization goal is wasm/V8 throughput, not native.
+
+Methodology: `nix develop -c node tests/bench.mjs` loads
+`target/wasm32-unknown-unknown/release/rv64_wasm.wasm` and runs it in V8 —
+best of 3 runs, fresh wasm instance per run. Host: WSL2, Node 20 (nix
+flake).
 
 | workload      |     ms | Minsn/s | jit% | dispatches | blocks |
 |---------------|--------|---------|------|------------|--------|
@@ -31,3 +38,35 @@ blocks; `blocks` = live compiled blocks at end of run.
 3. **Dispatch overhead**: 10.7M dispatches for the user workload — one
    HashMap lookup + call_indirect per ~9 retired instructions.
    → roadmap item 2: in-wasm chaining/dispatch.
+
+
+## Update — inline-TLB system memory ops (roadmap item 1)
+
+Implemented: full-system JIT blocks now do guest loads/stores via an inline
+TLB probe (hit → direct RAM access; miss/MMIO/page-cross/self-modifying →
+bail to interpreter). Plus per-page invalidation (drop only blocks on a
+written code page, not the whole cache).
+
+Correctness: 4 MB md5sum inside booted Linux hashes bit-identically to the
+host (b5cfa9d6…) — a strong load/store check; full suite (arch-tests
+193/193, lockstep 109/109) green.
+
+Throughput: **flat at slice=4096** (no regression), and a slice sweep
+(warm interpreter fallback 64→1024) showed every value that raises JIT
+coverage *lowers* throughput:
+
+| warm slice | boot Minsn/s | sys-md5 Minsn/s | boot jit% |
+|-----------:|-------------:|----------------:|----------:|
+| 4096 (base)|         69.2 |            70.5 |       1.2 |
+| 1024       |         62.3 |            66.0 |       3.3 |
+|  512       |         59.3 |            64.3 |       6.6 |
+|   64       |         39.5 |            45.6 |      44.7 |
+
+**Finding: dispatch cost is the bottleneck, not coverage.** Each block
+dispatch pays a HashMap lookup + a pa-verify TLB walk + a call_indirect
+into a JS-registered function + the retired-cell read — more per
+instruction than the tight Rust interpreter costs to just run it. So item
+1 is necessary infrastructure (longer blocks are now possible) but pays
+off only once dispatch is cheap. **Roadmap item 2 (in-wasm block chaining
+/ cheaper dispatch) is the real unlock** and is next; the slice is held at
+4096 until then.

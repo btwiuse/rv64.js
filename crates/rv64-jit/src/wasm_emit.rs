@@ -4,6 +4,7 @@
 pub struct WasmModule {
     code: Vec<u8>,
     n_locals_i64: u32,
+    n_locals_i32: u32,
 }
 
 // Opcodes we use.
@@ -46,6 +47,8 @@ pub const UNREACHABLE: u8 = 0x00;
 pub const DROP: u8 = 0x1a;
 pub const I64_EXTEND_I32_U: u8 = 0xad;
 pub const I32_ADD: u8 = 0x6a;
+pub const I32_AND: u8 = 0x71;
+pub const I32_SHL: u8 = 0x74;
 pub const BLOCK: u8 = 0x02;
 pub const LOOP: u8 = 0x03;
 pub const IF: u8 = 0x04;
@@ -83,10 +86,11 @@ fn sleb(out: &mut Vec<u8>, mut v: i64) {
 
 impl WasmModule {
     pub fn new(n_locals_i64: u32) -> WasmModule {
-        WasmModule {
-            code: Vec::new(),
-            n_locals_i64,
-        }
+        WasmModule { code: Vec::new(), n_locals_i64, n_locals_i32: 0 }
+    }
+
+    pub fn with_locals(n_locals_i64: u32, n_locals_i32: u32) -> WasmModule {
+        WasmModule { code: Vec::new(), n_locals_i64, n_locals_i32 }
     }
 
     // -- instruction stream helpers --
@@ -124,6 +128,21 @@ impl WasmModule {
         self.code.push(LOCAL_SET);
         uleb(&mut self.code, i as u64);
         self
+    }
+
+    // i32-typed local aliases (same opcodes; the type is per the local
+    // declaration, this is just intent-documenting sugar).
+    pub fn local_get_i32(&mut self, i: u32) -> &mut Self {
+        self.local_get(i)
+    }
+    pub fn local_set_i32(&mut self, i: u32) -> &mut Self {
+        self.local_set(i)
+    }
+
+    /// i64.load where the address is `<i32 index on stack> + base`, encoded
+    /// via the static memarg offset (base is a compile-time constant).
+    pub fn i64_load_at(&mut self, base: u64) -> &mut Self {
+        self.i64_load(base)
     }
 
     /// i64.load from linear memory (align 3, given constant offset).
@@ -186,14 +205,20 @@ impl WasmModule {
         sec.extend_from_slice(&[0x00, 0x00]);
         section(&mut m, 7, &sec);
 
-        // code section (param occupies local index 0; i64 locals follow)
+        // code section (param is local 0; i64 locals then i32 locals — the
+        // declaration order fixes local indices, see lib.rs VA/PAGE/.../IDXB)
         let mut body = Vec::new();
+        let mut groups: Vec<(u32, u8)> = Vec::new();
         if self.n_locals_i64 > 0 {
-            body.push(1); // one locals-decl group
-            uleb(&mut body, self.n_locals_i64 as u64);
-            body.push(0x7e); // i64
-        } else {
-            body.push(0);
+            groups.push((self.n_locals_i64, 0x7e)); // i64
+        }
+        if self.n_locals_i32 > 0 {
+            groups.push((self.n_locals_i32, 0x7f)); // i32
+        }
+        uleb(&mut body, groups.len() as u64);
+        for (count, ty) in groups {
+            uleb(&mut body, count as u64);
+            body.push(ty);
         }
         body.extend_from_slice(&self.code);
         body.push(END);

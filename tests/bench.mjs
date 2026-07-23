@@ -5,7 +5,7 @@
 //   user-int   bench guest, integer xorshift phase (JIT-friendly ALU)
 //   user-fp    bench guest, FP phase under RNE (native-FP fast path)
 //   boot       Linux boot to shell prompt (mixed system workload)
-//   sys-shell  in-guest busybox arithmetic loop (system-mode hot loop)
+//   sys-md5    in-guest md5sum compute kernel (system-mode hot loop)
 //
 // Reported per workload: wall ms, guest Minsn/s, JIT coverage (% of guest
 // insns retired inside JIT blocks), dispatches, compiled blocks.
@@ -89,24 +89,26 @@ if (existsSync(img("bbl64.bin"))) {
     if (!out.includes("~ #")) throw new Error("boot failed");
     bootRuns.push(stats(vm, t0, t1, vm.sysInsnCount() - insns0));
 
-    // in-guest hot loop: busybox sh arithmetic (system-mode JIT territory)
+    // in-guest compute kernel: md5sum over zeros — a tight C loop in
+    // busybox (regular control flow, memory-bound), the realistic
+    // system-mode JIT target.
     out = "";
     vm.consoleInput(
       new TextEncoder().encode(
-        "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; echo LOOP-EOF\n",
+        "dd if=/dev/zero bs=1k count=4096 2>/dev/null | md5sum; echo LOOP-EOF\n",
       ),
     );
     const t2 = performance.now();
     const insns2 = vm.sysInsnCount();
-    for (let i = 0; i < 40000 && !out.includes("LOOP-EOF"); i++) {
+    for (let i = 0; i < 60000 && !out.includes("LOOP-EOF"); i++) {
       vm.runSystem(5_000_000n);
     }
     const t3 = performance.now();
-    if (!out.includes("LOOP-EOF")) throw new Error("shell loop failed");
+    if (!out.includes("LOOP-EOF")) throw new Error("compute kernel failed");
     shellRuns.push(stats(vm, t2, t3, vm.sysInsnCount() - insns2));
   }
   results["boot"] = best(bootRuns);
-  results["sys-shell"] = best(shellRuns);
+  results["sys-md5"] = best(shellRuns);
 } else {
   console.error("(web/images missing — system workloads skipped)");
 }

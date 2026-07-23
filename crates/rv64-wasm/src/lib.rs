@@ -239,6 +239,17 @@ impl JitState {
 static mut USER_JIT: Option<JitState> = None;
 static mut SYS_JIT: Option<JitState> = None;
 
+// Cell every compiled block writes with the number of guest instructions
+// it actually retired before returning (sys blocks with inline memory ops
+// can bail mid-block, so the count is dynamic — the dispatcher reads this
+// rather than assuming full block length).
+static mut RETIRED_CELL: u64 = 0;
+
+#[allow(static_mut_refs)]
+fn retired_addr() -> u32 {
+    unsafe { &RETIRED_CELL as *const u64 as u32 }
+}
+
 // Perf instrumentation: guest instructions retired inside JIT blocks vs
 // total, and dispatch counts (block calls). Exposed via jit_stat().
 static mut JIT_RETIRED: u64 = 0;
@@ -318,6 +329,8 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     x_base: m.cpu.x.as_ptr() as u32,
                     pc_addr: &m.cpu.pc as *const u64 as u32,
                     mem: Some((m.mem.as_ptr() as u32, m.mem.len() as u64)),
+                    sys: None,
+                    retired_addr: retired_addr(),
                 };
                 let end = (pc as usize + 1024).min(m.mem.len());
                 let entry = rv64_jit::translate_block(&m.mem[pc as usize..end], pc, pc, lay)
@@ -468,14 +481,21 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
     let mut remaining = max_insns;
 
     while remaining > 0 && !m.power_off {
+        // Per-page invalidation: drop only blocks whose physical code page
+        // was written (self-modifying code / recycled pages), not the whole
+        // cache. jit_dirty_pages is populated by SystemBus store tracking.
+        if !m.bus.jit_dirty_pages.is_empty() {
+            let dirty = m.bus.jit_take_dirty();
+            for &ppage in &dirty {
+                jit.cache.retain(|_, blk| {
+                    blk.map_or(true, |b| (b.pa - rv64_system::RAM_BASE) >> 12 != ppage)
+                });
+                m.bus.jit_unmark_page(ppage);
+            }
+        }
         // --- JIT fast path ---
         let mut chained = 0u32;
         while chained < JIT_CHAIN_CAP {
-            if m.bus.jit_dirty {
-                jit.clear();
-                m.bus.jit_clear_pages();
-                break;
-            }
             let Some(Some(b)) = jit.cache.get(&m.cpu.pc) else {
                 break;
             };
@@ -486,12 +506,15 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 _ => break,
             }
             call_block(b.idx, m as *mut _ as *mut u8);
-            m.cpu.insn_count += b.n as u64;
+            // Sys blocks with inline memory ops may bail mid-block; read the
+            // count they actually retired (pc is set by the block either way).
+            let retired = unsafe { RETIRED_CELL };
+            m.cpu.insn_count += retired;
             unsafe {
-                JIT_RETIRED += b.n as u64;
+                JIT_RETIRED += retired;
                 JIT_DISPATCHES += 1;
             }
-            remaining = remaining.saturating_sub(b.n as u64);
+            remaining = remaining.saturating_sub(retired);
             chained += 1;
         }
 
@@ -509,10 +532,24 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                     // Cap the window at the page end: blocks must not span
                     // pages (pa continuity isn't guaranteed across them).
                     let end = ((off + 1024).min(off | 0xfff) + 1).min(m.bus.ram.len());
+                    let (lt, ld, st, sd) = m.cpu.jit_tlb_ptrs();
+                    let sysmem = rv64_jit::SysMem {
+                        tlb_load_tag: lt as u32,
+                        tlb_load_diff: ld as u32,
+                        tlb_store_tag: st as u32,
+                        tlb_store_diff: sd as u32,
+                        tlb_mask: (rv64_core::Cpu::jit_tlb_size() - 1) as u32,
+                        ram_off: m.bus.ram.as_ptr() as u32,
+                        ram_base: rv64_system::RAM_BASE,
+                        ram_size: m.bus.ram.len() as u64,
+                        jit_pages_off: m.bus.jit_pages.as_ptr() as u32,
+                    };
                     let lay = rv64_jit::JitLayout {
                         x_base: m.cpu.x.as_ptr() as u32,
                         pc_addr: &m.cpu.pc as *const u64 as u32,
-                        mem: None, // memory ops fall back to the MMU interpreter
+                        mem: None,
+                        sys: Some(sysmem),
+                        retired_addr: retired_addr(),
                     };
                     let blk = rv64_jit::translate_block(&m.bus.ram[off..end], pc, pc, lay)?;
                     unsafe { JIT_OUT = blk.wasm };
@@ -535,6 +572,14 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         }
 
         // --- interpreter + devices ---
+        // Interpreter fallback slice. A shorter slice returns to the JIT
+        // dispatcher sooner (higher coverage), but the baseline sweep
+        // (tests/BASELINE.md) showed every slice < 4096 is net-negative at
+        // the current per-dispatch cost: HashMap lookup + pa-verify TLB walk
+        // + call_indirect into a JS-registered function exceeds interpreter
+        // savings on these short blocks. Held at 4096 until in-wasm chaining
+        // (roadmap item 2) makes dispatch cheap; then lowering this converts
+        // coverage into throughput.
         let ran = m.run_slice(remaining.min(4096));
         remaining = remaining.saturating_sub(ran.max(1));
     }

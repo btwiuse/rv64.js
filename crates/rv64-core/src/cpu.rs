@@ -106,6 +106,28 @@ impl Cpu {
         self.translate(bus, va, Access::Fetch).ok()
     }
 
+    /// Addresses of the Load/Store TLB rows (tag then pa-va diff, each
+    /// TLB_SIZE u64 entries), for JIT blocks that probe the TLB inline.
+    /// Layout contract: tag[i] == va>>12 means hit; pa = va + diff[i];
+    /// index = (va>>12) & (jit_tlb_size()-1). Entries are only ever filled
+    /// by successful translations (permissions + A/D already applied) and
+    /// are flushed on satp/mstatus/priv changes — so a hit is always safe
+    /// to use directly.
+    pub fn jit_tlb_ptrs(&self) -> (usize, usize, usize, usize) {
+        let l = Access::Load as usize;
+        let s = Access::Store as usize;
+        (
+            self.tlb_tag[l].as_ptr() as usize,
+            self.tlb_diff[l].as_ptr() as usize,
+            self.tlb_tag[s].as_ptr() as usize,
+            self.tlb_diff[s].as_ptr() as usize,
+        )
+    }
+
+    pub fn jit_tlb_size() -> usize {
+        TLB_SIZE
+    }
+
     #[inline]
     fn wr(&mut self, rd: usize, val: u64) {
         if rd != 0 {
