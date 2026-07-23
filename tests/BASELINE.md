@@ -134,3 +134,39 @@ interpreter tax amortizes away.
 Methodology note: absolute Minsn/s drifts with sustained host thermal load
 across a long session; compare within a single bench run, and re-baseline
 on a cold host before quoting deltas.
+
+## CORRECTION (2026-07-23): system-mode JIT IS a large win on real workloads
+
+The earlier "system-mode JIT gives no advantage" conclusion was WRONG, on
+two counts:
+
+1. **Unrepresentative benchmarks.** md5 is memory-*extreme* (pathological
+   for the JIT), boot is one-shot (no amortization), the busybox shell
+   arithmetic loop is a tree-walking interpreter (indirect-heavy). None is
+   the long-running compute-with-hot-code-reuse a JIT is for.
+2. **A terminal-echo harness bug.** The guest tty echoes input, so waiting
+   for a shell word-mark (`echo DONE`) matched the *echoed command text*
+   immediately — those A/Bs measured echo latency, i.e. nothing. (md5 and
+   boot waited for real output/prompt, so they stayed valid; the shell and
+   the first syscompute runs did not.)
+
+Correct measurement — a compute binary (guests/syscompute) run inside
+booted Linux, echo disabled, waiting for the real checksum
+(tests/bench-sys.mjs), JIT on vs off, checksums verified identical:
+
+| workload | jit-off | jit-on | speedup |
+|----------|--------:|-------:|--------:|
+| alu (register-only)        | ~5700ms | ~2020ms | **2.8x** |
+| mix (256 KiB array x-form) | ~1880ms |  ~583ms | **3.2x** |
+
+The memory-heavier "mix" workload benefits *more*, not less — refuting the
+"memory ops kill the system JIT" theory. md5 sits at ~1.0x because it is an
+outlier in memory density, not because the JIT is useless.
+
+Shipped config: **slice=256, JIT_ON_THRESHOLD=64.** The threshold keeps
+one-shot boot code interpreted (boot only ~5% slower) while compute loops,
+dispatched millions of times, tier up. Full suite green at this config
+(arch-tests 193, lockstep 109, riscv-tests 134, wasm smoke).
+
+Methodology lesson (for future benchmarks): disable guest echo and wait for
+real program output, never a shell word-mark; verify a checksum every run.

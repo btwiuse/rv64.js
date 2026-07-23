@@ -89,22 +89,25 @@ if (existsSync(img("bbl64.bin"))) {
     if (!out.includes("~ #")) throw new Error("boot failed");
     bootRuns.push(stats(vm, t0, t1, vm.sysInsnCount() - insns0));
 
-    // in-guest compute kernel: md5sum over zeros — a tight C loop in
-    // busybox (regular control flow, memory-bound), the realistic
-    // system-mode JIT target.
+    // in-guest md5sum over 4 MiB of zeros. NOTE: memory-*bound* — a
+    // pathological case for the JIT; kept as a data point, not the headline.
+    // We wait for the 32-hex digest (real output), never a shell word-mark:
+    // the tty echoes input, so waiting for "echo X" would match the echo
+    // and measure nothing. For the representative compute benchmark (where
+    // the system JIT is 2.8-3.4x) see tests/bench-sys.mjs.
     out = "";
     vm.consoleInput(
       new TextEncoder().encode(
-        "dd if=/dev/zero bs=1k count=4096 2>/dev/null | md5sum; echo LOOP-EOF\n",
+        "dd if=/dev/zero bs=1k count=4096 2>/dev/null | md5sum\n",
       ),
     );
     const t2 = performance.now();
     const insns2 = vm.sysInsnCount();
-    for (let i = 0; i < 60000 && !out.includes("LOOP-EOF"); i++) {
+    for (let i = 0; i < 60000 && !/[0-9a-f]{32}/.test(out); i++) {
       vm.runSystem(5_000_000n);
     }
     const t3 = performance.now();
-    if (!out.includes("LOOP-EOF")) throw new Error("compute kernel failed");
+    if (!/[0-9a-f]{32}/.test(out)) throw new Error("md5 kernel failed");
     shellRuns.push(stats(vm, t2, t3, vm.sysInsnCount() - insns2));
   }
   results["boot"] = best(bootRuns);

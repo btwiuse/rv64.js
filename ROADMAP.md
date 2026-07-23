@@ -8,14 +8,15 @@ priority order. Check items off as they land.
 
 ## Performance (the JIT's next tiers)
 
-- [ ] **1. Inline-TLB memory ops in full-system JIT blocks** — the biggest
-  remaining perf lever. System blocks are ALU/branch-only today; every guest
-  load/store ends a block and drops to the MMU interpreter, which fragments
-  kernel/userland code badly. Plan: emit an inline TLB probe in the block
-  (tag-match against a flattened TLB array in linear memory → direct RAM
-  access on hit; bail to interpreter with pc set on miss). Invalidation
-  already works (satp pa-verify + compiled-page store tracking). Large
-  effort, transforms system-mode throughput.
+- [x] **1. Inline-TLB memory ops in full-system JIT blocks** *(done; the
+  system-mode win)* — system JIT blocks translate guest loads/stores inline
+  (TLB probe → direct RAM on hit, bail to interpreter on miss/MMIO/page-
+  cross/store-to-compiled-page), with per-page invalidation. Combined with
+  item 2's cheap dispatch and slice=256/threshold=64, this delivers
+  **2.8-3.2x on real in-guest compute** (tests/bench-sys.mjs). It looked
+  neutral for a while only because the benchmarks were unrepresentative and
+  the harness had an echo bug — see the item-2b CORRECTION and
+  tests/BASELINE.md.
 
 - [x] **2. Cheap dispatch** *(done 2026-07-22)* — direct-mapped dispatch
   array (replaces HashMap+SipHash per block) + `cpu.jit_flush_gen`
@@ -46,18 +47,20 @@ priority order. Check items off as they land.
     boot code exceeds savings), and a benchmark reported an intermittent
     md5 mismatch (not reproduced in a cleaner 12-run test, so likely a
     harness artifact — but the perf regression alone made it non-viable).
-  - **Conclusion after two attempts: the system-mode JIT does not net
-    positive on real booted-Linux workloads with this architecture.** The
-    system interpreter (tight Rust→wasm) is fast; boot is one-shot (compile
-    cost unamortized), and memory-bound (md5) / indirect-heavy (shell)
-    loops don't benefit. Only a sustained pure-compute loop in a stable
-    address space would, and typical workloads aren't that. A real
-    system-mode win likely needs a different class of JIT (register
-    allocation + true block chaining that emits genuinely faster-than-
-    interpreter code), not incremental TLB tweaks — a large undertaking.
-    Meanwhile the system JIT is left dormant-neutral (slice 4096); consider
-    disabling it by default to shed complexity. **User-mode JIT (1.56×) is
-    the shipped, proven win.**
+  - **CORRECTION (2026-07-23): the above conclusion was WRONG.** It came
+    from unrepresentative benchmarks (md5 memory-extreme, boot one-shot,
+    shell a tree-walker) plus a terminal-echo harness bug that made the
+    shell/compute A/Bs measure nothing. A correct measurement — a compute
+    binary run inside booted Linux, echo disabled, waiting for its real
+    checksum (tests/bench-sys.mjs) — shows the item-2 system-mode JIT is a
+    large win: 2.8x (register-heavy) to 3.2x (memory+ALU mix), the
+    memory-heavier workload benefiting MORE. md5 (~1.0x) is a memory-density
+    outlier. Shipped config: slice=256, JIT_ON_THRESHOLD=64 (boot only ~5%
+    slower; compute 2.8-3.2x). The 2b JTLB work is NOT required for a
+    system-mode win: item 1's inline-TLB memory ops already deliver it. 2b
+    remains a possible further optimization but is no longer the gate.
+    Both user-mode (1.56x) and system-mode (2.8-3.2x) JIT are now proven,
+    shipped wins.
 
 - [ ] **3. FP ops inside JIT blocks** — FP instructions currently end
   blocks. Reuse the interpreter's sticky-NX/RNE eligibility guard (see

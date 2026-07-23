@@ -315,15 +315,19 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
 
 // JIT tier-up threshold. Settable at runtime (jit_set_enabled) so
 // benchmarks can compare against the pure wasm interpreter.
-static mut JIT_THRESHOLD: u32 = 16;
+/// Compile a block after it is dispatched this many times. High enough
+/// that one-shot boot code stays interpreted; low enough that compute
+/// loops (dispatched millions of times) tier up quickly.
+const JIT_ON_THRESHOLD: u32 = 64;
+static mut JIT_THRESHOLD: u32 = 64;
 /// Interpreter fallback slice once JIT blocks exist (tuned below).
-const SYS_WARM_SLICE: u64 = 4096;
+const SYS_WARM_SLICE: u64 = 256;
 
 /// Enable/disable JIT tier-up (1/0). Disabling sets the threshold beyond
 /// any counter so blocks are never compiled — pure interpreter baseline.
 #[no_mangle]
 pub extern "C" fn jit_set_enabled(on: u32) {
-    unsafe { JIT_THRESHOLD = if on == 0 { u32::MAX } else { 16 } }
+    unsafe { JIT_THRESHOLD = if on == 0 { u32::MAX } else { JIT_ON_THRESHOLD } }
 }
 /// Max chained block dispatches before returning to the interpreter (keeps
 /// interrupt/budget latency bounded in fully-jitted loops).
