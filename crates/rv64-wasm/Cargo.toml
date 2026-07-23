@@ -10,3 +10,4 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rv64-core = { path = "../rv64-core" }
+rv64-linux = { path = "../rv64-linux" }

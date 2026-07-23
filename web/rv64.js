@@ -8,21 +8,85 @@ export const Stop = Object.freeze({
   ECALL: 1,
   BREAK: 2,
   TRAP: 3,
+  EXITED: 4,
 });
 
 export class RV64 {
   /** @param {WebAssembly.Instance} instance */
   constructor(instance) {
     this.ex = instance.exports;
+    /** Override to capture guest console output: (fd, Uint8Array) => void */
+    this.onWrite = (fd, bytes) => {
+      const text = new TextDecoder().decode(bytes);
+      (fd === 2 ? console.error : console.log)(text);
+    };
   }
 
   /** Instantiate from wasm bytes (ArrayBuffer/TypedArray/Response). */
   static async create(wasmSource) {
+    let vm;
+    const imports = {
+      env: {
+        host_write: (fd, ptr, len) => {
+          // Copy out: the view dies if wasm memory grows.
+          const bytes = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
+          vm.onWrite(fd, bytes);
+        },
+        host_now_ms: () =>
+          typeof performance !== "undefined" ? performance.now() : Date.now(),
+        host_random: (ptr, len) => {
+          const buf = new Uint8Array(vm.ex.memory.buffer, ptr, len);
+          if (globalThis.crypto?.getRandomValues && len <= 65536) {
+            crypto.getRandomValues(buf);
+          } else {
+            for (let i = 0; i < len; i++) buf[i] = (Math.random() * 256) | 0;
+          }
+        },
+      },
+    };
     const { instance } =
       wasmSource instanceof Response || wasmSource instanceof Promise
-        ? await WebAssembly.instantiateStreaming(wasmSource, {})
-        : await WebAssembly.instantiate(wasmSource, {});
-    return new RV64(instance);
+        ? await WebAssembly.instantiateStreaming(wasmSource, imports)
+        : await WebAssembly.instantiate(wasmSource, imports);
+    vm = new RV64(instance);
+    return vm;
+  }
+
+  // ---- user-mode Linux API ----
+
+  /** Copy bytes into the wasm staging buffer. */
+  #stage(bytes) {
+    const ptr = this.ex.staging_alloc(bytes.length);
+    new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
+  }
+
+  /**
+   * Load a static riscv64 Linux ELF (Uint8Array) with the given argv.
+   * @returns {boolean} success
+   */
+  loadElf(elfBytes, argv = ["guest"], memMB = 256) {
+    const enc = new TextEncoder();
+    for (const arg of argv) {
+      this.#stage(enc.encode(arg));
+      this.ex.user_arg_push();
+    }
+    this.#stage(elfBytes);
+    return this.ex.user_load(memMB << 20) === 0;
+  }
+
+  /** Run the loaded program; returns a Stop.* code (EXITED when done). */
+  runUser(budget = 10_000_000_000n) {
+    return this.ex.user_run(BigInt(budget));
+  }
+
+  userExitCode() {
+    return this.ex.user_exit_code();
+  }
+  userInsnCount() {
+    return this.ex.user_insn_count();
+  }
+  userPc() {
+    return this.ex.user_pc();
   }
 
   /** Allocate guest RAM at guest address `base` and reset the CPU (pc = base). */

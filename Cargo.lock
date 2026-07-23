@@ -26,4 +26,5 @@ name = "rv64-wasm"
 version = "0.1.0"
 dependencies = [
  "rv64-core",
+ "rv64-linux",
 ]
