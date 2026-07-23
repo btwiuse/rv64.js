@@ -86,11 +86,19 @@ fn sleb(out: &mut Vec<u8>, mut v: i64) {
 
 impl WasmModule {
     pub fn new(n_locals_i64: u32) -> WasmModule {
-        WasmModule { code: Vec::new(), n_locals_i64, n_locals_i32: 0 }
+        WasmModule {
+            code: Vec::new(),
+            n_locals_i64,
+            n_locals_i32: 0,
+        }
     }
 
     pub fn with_locals(n_locals_i64: u32, n_locals_i32: u32) -> WasmModule {
-        WasmModule { code: Vec::new(), n_locals_i64, n_locals_i32 }
+        WasmModule {
+            code: Vec::new(),
+            n_locals_i64,
+            n_locals_i32,
+        }
     }
 
     // -- instruction stream helpers --

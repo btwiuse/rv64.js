@@ -17,11 +17,19 @@ priority order. Check items off as they land.
   already works (satp pa-verify + compiled-page store tracking). Large
   effort, transforms system-mode throughput.
 
-- [ ] **2. In-wasm block chaining** — dispatch currently costs a HashMap
-  lookup + `call_indirect` per block (~1 dispatch per loop iteration on
-  small loops). Options: patch direct block→block calls for constant-target
-  ends (JAL/branches), or a wasm-side pc→funcindex dispatch table to keep
-  the loop inside wasm. Medium effort, multiplies hot-loop throughput.
+- [x] **2. Cheap dispatch** *(done 2026-07-22)* — direct-mapped dispatch
+  array (replaces HashMap+SipHash per block) + `cpu.jit_flush_gen`
+  (drops the per-dispatch pa-verify TLB walk; flush only on satp/SFENCE).
+  +6% on user-int+fp; the `jit_set_enabled` diagnostic shows user JIT is
+  1.56× over the wasm interpreter. Dispatch is no longer the bottleneck.
+
+- [ ] **2b. Fused JIT software-TLB (the system-mode unlock)** — the
+  diagnostic shows system JIT is 1.00× on memory-heavy code because inline
+  memory ops emit ~15 wasm instructions each. Replace with a dedicated
+  JIT-TLB whose present entries already encode RAM+writable+not-compiled,
+  so a load is tag-compare + offset-add + load (~4 ops). Filled on the
+  interpreter bail path; invalidated via the existing gen/page hooks.
+  This is what makes item 1's inline memory ops pay off in system mode.
 
 - [ ] **3. FP ops inside JIT blocks** — FP instructions currently end
   blocks. Reuse the interpreter's sticky-NX/RNE eligibility guard (see

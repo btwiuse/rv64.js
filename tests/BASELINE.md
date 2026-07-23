@@ -70,3 +70,39 @@ instruction than the tight Rust interpreter costs to just run it. So item
 off only once dispatch is cheap. **Roadmap item 2 (in-wasm block chaining
 / cheaper dispatch) is the real unlock** and is next; the slice is held at
 4096 until then.
+
+
+## Update — item 2: cheap dispatch (direct-mapped cache + gen flush)
+
+Two per-dispatch costs from the item-1 finding, removed:
+- HashMap+SipHash lookup → **direct-mapped dispatch array** (16384 lines,
+  one read + tag compare), backed by the HashMap for invalidation. Applied
+  to both user_run and sys_run.
+- pa-verify TLB walk every dispatch → **`cpu.jit_flush_gen`**: bumped only
+  on satp write / SFENCE.VMA (the real remap events), the dispatcher drops
+  the sys cache when it changes. No per-dispatch translate() call.
+
+Also added `jit_set_enabled(0/1)` to measure JIT vs the pure wasm
+interpreter directly.
+
+Results (wasm/V8, best of 3):
+
+| workload    | baseline | item 2 |     Δ | JIT vs interp |
+|-------------|---------:|-------:|------:|--------------:|
+| user-int+fp |    137.2 |    145 |  +6%  |       1.56×   |
+| boot        |     69.1 |   68.8 |  flat |          —    |
+| sys-md5     |     70.5 |   69.5 |  flat |       1.00×   |
+
+**The `jit_set_enabled` diagnostic is the headline finding:** in wasm the
+user-mode JIT is a real **1.56× over the interpreter**, but the system-mode
+JIT is **1.00× on memory-heavy code**. Root cause: the inline-TLB emits
+~15 wasm instructions per guest load/store (page-cross guard, TLB tag
+probe, MMIO range check, store-to-compiled-page check), which cancels the
+decode-elimination win on load/store-bound workloads like md5.
+
+**Next (the real system-mode unlock): a fused JIT software-TLB** — one
+array whose entry, when present, already encodes RAM-backed + writable +
+not-compiled, so a guest load becomes tag-compare + offset-add + load
+(~4 wasm ops instead of ~15). Filled on the interpreter bail path,
+invalidated with the existing gen/page mechanisms. That is what should
+push sys-md5 past 1.0×; dispatch is no longer the bottleneck.

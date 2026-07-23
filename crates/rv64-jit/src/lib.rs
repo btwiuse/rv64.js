@@ -171,7 +171,9 @@ impl Ctx {
 
     /// Write the retired-instruction count for this block exit.
     fn set_retired(&self, m: &mut WasmModule, n: u32) {
-        m.i32_const(0).i64_const(n as i64).i64_store(self.lay.retired_addr as u64);
+        m.i32_const(0)
+            .i64_const(n as i64)
+            .i64_store(self.lay.retired_addr as u64);
     }
 
     /// Bail out of the block at instruction index `n` (retired so far),
@@ -246,7 +248,7 @@ impl Ctx {
                 .i64_const(12)
                 .op(I64_SHR_U)
                 .local_set(PAGE); // PAGE now = ppage
-            // word address = jit_pages_off + (ppage >> 6) * 8
+                                  // word address = jit_pages_off + (ppage >> 6) * 8
             m.local_get(PAGE)
                 .i64_const(6)
                 .op(I64_SHR_U)
@@ -514,7 +516,9 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 if let Some((mem_base, size)) = lay.mem {
                     c.guest_addr(&mut m, size, len);
                     c.push_reg(&mut m, s2);
-                    m.op(store_op).raw_uleb(len_align(len)).raw_uleb(mem_base as u64);
+                    m.op(store_op)
+                        .raw_uleb(len_align(len))
+                        .raw_uleb(mem_base as u64);
                 } else {
                     // system: tlb_index consumes the va and leaves the RAM
                     // index on the stack; push_reg(s2) reads x[] (not touched

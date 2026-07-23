@@ -52,6 +52,12 @@ pub struct Cpu {
     /// Diagnostics: exception counts by cause, interrupt counts by cause.
     pub exc_counts: [u64; 16],
     pub irq_counts: [u64; 16],
+    /// Bumped whenever the va→pa code mapping may have changed (satp write,
+    /// SFENCE.VMA). A JIT host keyed on virtual pc flushes its cache when
+    /// this changes, which removes the need to re-verify pa on every block
+    /// dispatch. Privilege changes do NOT bump it (they flush the data TLB
+    /// but leave va→pa identity for a given satp intact).
+    pub jit_flush_gen: u64,
     // Direct-mapped TLBs (virtual page tag -> pa-va diff), one per access
     // type so permission bits never need re-checking on a hit.
     tlb_tag: [[u64; TLB_SIZE]; 3],
@@ -82,6 +88,7 @@ impl Cpu {
             sys: None,
             exc_counts: [0; 16],
             irq_counts: [0; 16],
+            jit_flush_gen: 0,
             tlb_tag: [[TLB_INVALID; TLB_SIZE]; 3],
             tlb_diff: [[0; TLB_SIZE]; 3],
         }
@@ -993,7 +1000,8 @@ impl Cpu {
                             return Err(Exception::IllegalInstruction { insn });
                         }
                     }
-                    self.flush_tlb()
+                    self.flush_tlb();
+                    self.jit_flush_gen += 1; // code mapping may have changed
                 }
                 // Zicsr
                 (_, f3 @ 1..=3) | (_, f3 @ 5..=7) => {
@@ -1508,8 +1516,12 @@ impl Cpu {
                 // Accept bare/sv39/sv48; ignore others (WARL).
                 let mode = v >> 60;
                 if mode == 0 || mode == 8 || mode == 9 {
+                    let changed = sys.satp != v;
                     sys.satp = v;
                     self.flush_tlb();
+                    if changed {
+                        self.jit_flush_gen += 1; // address space switched
+                    }
                 }
             }
             // Debug trigger CSRs: writes ignored (no triggers implemented).

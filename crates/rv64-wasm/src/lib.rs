@@ -217,10 +217,29 @@ struct JitBlock {
     pa: u64,
 }
 
+/// Direct-mapped dispatch line: `pc` is the full key, `blk` its block.
+/// A slot with `pc == NO_PC` is empty. Indexed by low pc bits — a single
+/// array read + compare replaces the HashMap+SipHash lookup on the hot path.
+#[derive(Clone, Copy)]
+struct DispatchLine {
+    pc: u64,
+    blk: JitBlock,
+}
+
+const NO_PC: u64 = u64::MAX;
+const DISPATCH_BITS: u32 = 14; // 16384 lines
+const DISPATCH_SIZE: usize = 1 << DISPATCH_BITS;
+
 struct JitState {
     /// pc -> compiled block; None = tried and not translatable (blacklist).
+    /// Authoritative store (iterated for per-page invalidation).
     cache: std::collections::HashMap<u64, Option<JitBlock>>,
     hot: std::collections::HashMap<u64, u32>,
+    /// Fast dispatch cache: direct-mapped, populated lazily from `cache`.
+    dispatch: Vec<DispatchLine>,
+    /// Last observed cpu.jit_flush_gen; a change means the va→pa code
+    /// mapping was invalidated (satp/SFENCE) — drop everything.
+    flush_gen: u64,
 }
 
 impl JitState {
@@ -228,11 +247,34 @@ impl JitState {
         JitState {
             cache: Default::default(),
             hot: Default::default(),
+            dispatch: vec![
+                DispatchLine {
+                    pc: NO_PC,
+                    blk: JitBlock {
+                        idx: 0,
+                        n: 0,
+                        pa: 0
+                    }
+                };
+                DISPATCH_SIZE
+            ],
+            flush_gen: 0,
         }
     }
     fn clear(&mut self) {
         self.cache.clear();
         self.hot.clear();
+        self.clear_dispatch();
+    }
+    #[inline]
+    fn clear_dispatch(&mut self) {
+        for l in self.dispatch.iter_mut() {
+            l.pc = NO_PC;
+        }
+    }
+    #[inline]
+    fn dslot(pc: u64) -> usize {
+        ((pc >> 1) as usize) & (DISPATCH_SIZE - 1)
     }
 }
 
@@ -271,7 +313,18 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
     }
 }
 
-const JIT_THRESHOLD: u32 = 16;
+// JIT tier-up threshold. Settable at runtime (jit_set_enabled) so
+// benchmarks can compare against the pure wasm interpreter.
+static mut JIT_THRESHOLD: u32 = 16;
+/// Interpreter fallback slice once JIT blocks exist (tuned below).
+const SYS_WARM_SLICE: u64 = 4096;
+
+/// Enable/disable JIT tier-up (1/0). Disabling sets the threshold beyond
+/// any counter so blocks are never compiled — pure interpreter baseline.
+#[no_mangle]
+pub extern "C" fn jit_set_enabled(on: u32) {
+    unsafe { JIT_THRESHOLD = if on == 0 { u32::MAX } else { 16 } }
+}
 /// Max chained block dispatches before returning to the interpreter (keeps
 /// interrupt/budget latency bounded in fully-jitted loops).
 const JIT_CHAIN_CAP: u32 = 64;
@@ -299,13 +352,23 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
     let mut remaining = budget;
 
     loop {
-        // --- JIT fast path: chain compiled blocks ---
+        // --- JIT fast path: direct-mapped dispatch, chain blocks ---
         let mut chained = 0u32;
         while chained < JIT_CHAIN_CAP {
-            let Some(Some(b)) = jit.cache.get(&m.cpu.pc) else {
-                break;
+            let pc = m.cpu.pc;
+            let line = jit.dispatch[JitState::dslot(pc)];
+            let b = if line.pc == pc {
+                line.blk
+            } else {
+                match jit.cache.get(&pc) {
+                    Some(Some(b)) => {
+                        let b = *b;
+                        jit.dispatch[JitState::dslot(pc)] = DispatchLine { pc, blk: b };
+                        b
+                    }
+                    _ => break,
+                }
             };
-            let b = *b;
             call_block(b.idx, m as *mut _ as *mut u8);
             m.cpu.insn_count += b.n as u64;
             unsafe {
@@ -324,7 +387,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
         if !jit.cache.contains_key(&pc) {
             let c = jit.hot.entry(pc).or_insert(0);
             *c += 1;
-            if *c >= JIT_THRESHOLD {
+            if *c >= unsafe { JIT_THRESHOLD } {
                 let lay = rv64_jit::JitLayout {
                     x_base: m.cpu.x.as_ptr() as u32,
                     pc_addr: &m.cpu.pc as *const u64 as u32,
@@ -467,12 +530,13 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
 /// Run a slice with JIT tier-up; streams console output through
 /// host_write(1, ...). Returns 1 if the guest powered off, else 0.
 ///
-/// Full-system blocks are ALU/branch-only (guest memory ops go through the
-/// MMU, so they end blocks) and are keyed by virtual pc with the physical
-/// address re-verified on every dispatch — an satp/mapping change simply
-/// misses. Stores to compiled code pages set jit_dirty (SystemBus tracks a
-/// page bitset) and drop all blocks; FENCE.I/SFENCE need no extra hook
-/// because staleness is caught by those two mechanisms.
+/// Full-system blocks are keyed by virtual pc. Correctness of the va→pa
+/// code mapping is guarded cheaply: the whole cache is dropped when
+/// `cpu.jit_flush_gen` changes (bumped only on satp write / SFENCE.VMA —
+/// the actual remap events), so no per-dispatch pa re-verification is
+/// needed. Self-modifying code and recycled pages are caught by per-page
+/// store tracking (SystemBus.jit_dirty_pages). The hot path is a
+/// direct-mapped dispatch array (one read + compare), not a HashMap.
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn sys_run(max_insns: u64) -> i32 {
@@ -481,9 +545,14 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
     let mut remaining = max_insns;
 
     while remaining > 0 && !m.power_off {
+        // Mapping-change flush (satp/SFENCE): drop the whole cache.
+        if m.cpu.jit_flush_gen != jit.flush_gen {
+            jit.flush_gen = m.cpu.jit_flush_gen;
+            jit.clear();
+            m.bus.jit_take_dirty();
+        }
         // Per-page invalidation: drop only blocks whose physical code page
-        // was written (self-modifying code / recycled pages), not the whole
-        // cache. jit_dirty_pages is populated by SystemBus store tracking.
+        // was written (self-modifying code / recycled pages).
         if !m.bus.jit_dirty_pages.is_empty() {
             let dirty = m.bus.jit_take_dirty();
             for &ppage in &dirty {
@@ -492,19 +561,26 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 });
                 m.bus.jit_unmark_page(ppage);
             }
+            jit.clear_dispatch(); // stale lines may point at dropped blocks
         }
-        // --- JIT fast path ---
+        // --- JIT fast path: direct-mapped dispatch, no pa-verify ---
         let mut chained = 0u32;
         while chained < JIT_CHAIN_CAP {
-            let Some(Some(b)) = jit.cache.get(&m.cpu.pc) else {
-                break;
+            let pc = m.cpu.pc;
+            let line = jit.dispatch[JitState::dslot(pc)];
+            let b = if line.pc == pc {
+                line.blk
+            } else {
+                // dispatch miss: consult the authoritative cache, fill line
+                match jit.cache.get(&pc) {
+                    Some(Some(b)) => {
+                        let b = *b;
+                        jit.dispatch[JitState::dslot(pc)] = DispatchLine { pc, blk: b };
+                        b
+                    }
+                    _ => break, // uncompiled or blacklisted
+                }
             };
-            let b = *b;
-            // Verify the va still maps to the same code.
-            match m.cpu.jit_probe_fetch(&mut m.bus, m.cpu.pc) {
-                Some(pa) if pa == b.pa => {}
-                _ => break,
-            }
             call_block(b.idx, m as *mut _ as *mut u8);
             // Sys blocks with inline memory ops may bail mid-block; read the
             // count they actually retired (pc is set by the block either way).
@@ -523,7 +599,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         if !jit.cache.contains_key(&pc) {
             let c = jit.hot.entry(pc).or_insert(0);
             *c += 1;
-            if *c >= JIT_THRESHOLD {
+            if *c >= unsafe { JIT_THRESHOLD } {
                 let entry = m.cpu.jit_probe_fetch(&mut m.bus, pc).and_then(|pa| {
                     if pa < rv64_system::RAM_BASE {
                         return None;
@@ -572,15 +648,15 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         }
 
         // --- interpreter + devices ---
-        // Interpreter fallback slice. A shorter slice returns to the JIT
-        // dispatcher sooner (higher coverage), but the baseline sweep
-        // (tests/BASELINE.md) showed every slice < 4096 is net-negative at
-        // the current per-dispatch cost: HashMap lookup + pa-verify TLB walk
-        // + call_indirect into a JS-registered function exceeds interpreter
-        // savings on these short blocks. Held at 4096 until in-wasm chaining
-        // (roadmap item 2) makes dispatch cheap; then lowering this converts
-        // coverage into throughput.
-        let ran = m.run_slice(remaining.min(4096));
+        // With cheap dispatch (item 2), a short warm slice returns us to the
+        // JIT quickly and converts coverage into throughput; a large cold
+        // slice avoids dispatch churn before any block exists.
+        let slice = if jit.cache.is_empty() {
+            4096
+        } else {
+            SYS_WARM_SLICE
+        };
+        let ran = m.run_slice(remaining.min(slice));
         remaining = remaining.saturating_sub(ran.max(1));
     }
 
