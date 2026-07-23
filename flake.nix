@@ -44,15 +44,10 @@
         # reproducibly without hard-coded store paths.
         virtKernel = pkgs.pkgsCross.riscv64.linux_latest;
         virtOpensbi = pkgs.pkgsCross.riscv64.opensbi;
-        # riscv64 Linux C cross-compiler for the smoke-test guest init. Built
-        # on demand by the harness (not part of the devShell, to keep
-        # `nix develop` fast).
-        virtCc = pkgs.pkgsCross.riscv64-musl.buildPackages.gcc;
       in
       {
         packages.virt-kernel = virtKernel;
         packages.virt-opensbi = virtOpensbi;
-        packages.virt-cc = virtCc;
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [

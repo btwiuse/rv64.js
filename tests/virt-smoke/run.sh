@@ -23,24 +23,28 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 cd "$root"
 
-echo "[virt-smoke] resolving flake inputs (first run builds kernel+toolchain)…"
-# --print-out-paths can emit several outputs (e.g. gcc's out/man/info); search
-# all of them for the file we need.
+echo "[virt-smoke] resolving flake inputs (first run builds the kernel)…"
+# --print-out-paths can emit several outputs; search all of them for the file.
 image="$(nix build --no-link --print-out-paths .#virt-kernel \
     | xargs -I{} find {} -maxdepth 2 -name Image 2>/dev/null | head -1)"
 fw="$(nix build --no-link --print-out-paths .#virt-opensbi \
     | xargs -I{} find {} -name fw_dynamic.bin 2>/dev/null | grep -E 'generic' | head -1)"
-cc="$(nix build --no-link --print-out-paths .#virt-cc \
-    | xargs -I{} find {}/bin -name '*-linux-*-gcc' 2>/dev/null | head -1)"
+# The init is freestanding, so the bare-metal cross-gcc already in the dev
+# shell (RISCV_PREFIX, set by flake.nix) suffices — no libc, no extra build.
+cc="${RISCV_PREFIX:-riscv64-none-elf-}gcc"
 
-[ -n "$image" ] && [ -n "$fw" ] && [ -n "$cc" ] || {
+[ -n "$image" ] && [ -n "$fw" ] && command -v "$cc" >/dev/null || {
   echo "[virt-smoke] FAIL: could not resolve image=$image fw=$fw cc=$cc"; exit 2; }
 
 echo "[virt-smoke] building rv64-vboot…"
 cargo build --release --bin rv64-vboot >/dev/null 2>&1
 
 echo "[virt-smoke] building guest init + initramfs…"
-"$cc" -static -Os -o "$work/init" "$here/init.c"
+# Freestanding (no libc): a static, non-PIE riscv64 ELF Linux can load and run
+# directly. Works with any riscv64 gcc (bare-metal or linux cross).
+"$cc" -nostdlib -ffreestanding -static -no-pie \
+    -march=rv64gc -mabi=lp64d -Os \
+    -Wl,-Ttext-segment=0x10000 -o "$work/init" "$here/init.c"
 mkdir -p "$work/irfs"
 cp "$work/init" "$work/irfs/init"
 ( cd "$work/irfs" && find . | cpio -o -H newc 2>/dev/null | gzip ) > "$work/initramfs.cpio.gz"
