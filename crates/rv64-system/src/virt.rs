@@ -176,11 +176,15 @@ struct Uart {
     scr: u8,
     rx: std::collections::VecDeque<u8>,
     tx_out: Vec<u8>,
+    /// THR-empty interrupt pending (transmit is instant, so this tracks the
+    /// 8250 THRE interrupt: armed when TX ints are enabled or a byte is sent,
+    /// cleared when the guest reads IIR).
+    thre_ip: bool,
 }
 
 impl Uart {
     fn new() -> Uart {
-        Uart { ier: 0, lcr: 0, mcr: 0, scr: 0, rx: Default::default(), tx_out: Vec::new() }
+        Uart { ier: 0, lcr: 0, mcr: 0, scr: 0, rx: Default::default(), tx_out: Vec::new(), thre_ip: false }
     }
     // Register offsets (byte): 0 RBR/THR/DLL, 1 IER/DLM, 2 IIR/FCR, 3 LCR,
     // 4 MCR, 5 LSR, 6 MSR, 7 SCR. DLAB (LCR bit7) selects divisor latches.
@@ -192,9 +196,17 @@ impl Uart {
             1 if !dlab => self.ier,
             1 => 0, // DLM
             2 => {
-                // IIR: report RX-available if enabled and data present,
-                // else "no interrupt pending" (0x1) with FIFO bits.
-                if self.ier & 1 != 0 && !self.rx.is_empty() { 0xc4 } else { 0xc1 }
+                // IIR, highest-priority pending source first (FIFO bits 0xc0):
+                // RX data available (0x04) outranks THR-empty (0x02). Reading
+                // IIR acknowledges (clears) a pending THRE interrupt.
+                if self.ier & 1 != 0 && !self.rx.is_empty() {
+                    0xc4
+                } else if self.thre_ip {
+                    self.thre_ip = false;
+                    0xc2
+                } else {
+                    0xc1
+                }
             }
             3 => self.lcr,
             4 => self.mcr,
@@ -214,17 +226,34 @@ impl Uart {
     fn write(&mut self, off: u64, val: u8) {
         let dlab = self.lcr & 0x80 != 0;
         match off {
-            0 if !dlab => self.tx_out.push(val), // THR
-            1 if !dlab => self.ier = val,
+            0 if !dlab => {
+                self.tx_out.push(val); // THR — transmitted instantly
+                // THR is now empty again: re-arm the THR-empty interrupt so
+                // interrupt-driven TX keeps flowing.
+                if self.ier & 2 != 0 {
+                    self.thre_ip = true;
+                }
+            }
+            1 if !dlab => {
+                let was = self.ier;
+                self.ier = val;
+                // Enabling the THR-empty interrupt raises it immediately (our
+                // THR is always empty). Without this, the 8250 driver's
+                // interrupt-driven TX / tty drain (e.g. bash's tcsetattr on the
+                // console) blocks forever waiting for a THRE IRQ.
+                if val & 2 != 0 && was & 2 == 0 {
+                    self.thre_ip = true;
+                }
+            }
             3 => self.lcr = val,
             4 => self.mcr = val,
             7 => self.scr = val,
             _ => {}
         }
     }
-    /// UART interrupt line (RX data available and RX interrupts enabled).
+    /// UART interrupt line: RX-data (if enabled) or THR-empty (if enabled).
     fn irq(&self) -> bool {
-        self.ier & 1 != 0 && !self.rx.is_empty()
+        (self.ier & 1 != 0 && !self.rx.is_empty()) || self.thre_ip
     }
 }
 
@@ -583,7 +612,22 @@ impl VirtMachine {
         self.bus.mtime = self.cpu.insn_count / self.insns_per_tick + self.idle_ticks;
         if let Some(sys) = self.cpu.sys.as_mut() {
             sys.mtime = self.bus.mtime;
+            // Let rdtime advance every instruction (not just per slice) so
+            // busy-wait loops reading `time` make progress: same clock as the
+            // CLINT, derived live from insn_count.
+            sys.time_scale = self.insns_per_tick;
+            sys.time_offset = self.idle_ticks;
         }
+    }
+
+    /// Read a u16 from guest RAM (little-endian), for ring inspection.
+    fn ram_u16(&self, pa: u64) -> u16 {
+        let off = (pa - RAM_BASE) as usize;
+        self.bus
+            .ram
+            .get(off..off + 2)
+            .map(|s| u16::from_le_bytes([s[0], s[1]]))
+            .unwrap_or(0)
     }
 
     /// One-line dump of interrupt-delivery state, for diagnosing idle hangs.
@@ -594,7 +638,18 @@ impl VirtMachine {
             .virtio
             .iter()
             .enumerate()
-            .map(|(i, d)| format!("v{i}.irq={}", d.irq_pending()))
+            .map(|(i, d)| {
+                // For queue 0: avail.idx (guest submitted), my last_avail
+                // (serviced), used.idx (device published), all so we can see
+                // whether there's outstanding I/O the guest is blocked on.
+                let ring = d.queue_debug(0).map(|(_r, _n, avail, used, last_avail)| {
+                    let avail_idx = self.ram_u16(avail + 2);
+                    let used_idx = self.ram_u16(used + 2);
+                    format!(" q0[avail.idx={avail_idx} serviced={last_avail} used.idx={used_idx} outstanding={}]",
+                        avail_idx.wrapping_sub(last_avail))
+                }).unwrap_or_default();
+                format!("v{i}.irq={}{ring}", d.irq_pending())
+            })
             .collect();
         let (mip, mie) = self
             .cpu

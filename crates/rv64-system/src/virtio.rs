@@ -71,6 +71,14 @@ impl VirtioDev {
         self.int_status != 0
     }
 
+    /// (ready, num, avail_addr, used_addr, my last_avail_idx) for queue `qi`.
+    pub fn queue_debug(&self, qi: usize) -> Option<(u32, u32, u64, u64, u16)> {
+        self.queues
+            .get(qi)
+            .filter(|q| q.ready != 0)
+            .map(|q| (q.ready, q.num, q.avail, q.used, q.last_avail_idx))
+    }
+
     /// Queue console input; delivered to the guest via the RX virtqueue on
     /// the next `process` call.
     pub fn console_input(&mut self, bytes: &[u8]) {

@@ -131,6 +131,13 @@ pub struct SysCsrs {
     pub mhartid: u64,
     /// mtime mirror, updated by the machine (CLINT owns the real one).
     pub mtime: u64,
+    /// Live `time` CSR derivation. When `time_scale != 0`, rdtime returns
+    /// `insn_count / time_scale + time_offset`, so it advances every
+    /// instruction (matching the CLINT clock but at instruction granularity)
+    /// instead of only at slice boundaries — needed by busy-wait loops like
+    /// the kernel's __delay that read rdtime tightly. 0 = use `mtime` mirror.
+    pub time_scale: u64,
+    pub time_offset: u64,
     /// PMP storage (no enforcement — single-guest machine, like TinyEMU).
     pub pmpcfg: [u64; 8],
     pub pmpaddr: [u64; 64],
@@ -160,6 +167,8 @@ impl SysCsrs {
             mepc: 0,
             mcause: 0,
             mtval: 0,
+            time_scale: 0,
+            time_offset: 0,
             stvec: 0,
             scounteren: 0,
             sscratch: 0,

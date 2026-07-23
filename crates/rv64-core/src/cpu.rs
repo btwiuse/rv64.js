@@ -43,6 +43,10 @@ pub struct Cpu {
     pub insn_count: u64,
     /// LR/SC reservation address (A extension); None = no reservation.
     pub reservation: Option<u64>,
+    /// Debug ring buffer of the last user ecalls: (a7 syscall nr, satp).
+    /// Written on every U-mode ecall; dumped by the host to diagnose hangs.
+    pub syscall_log: [(u64, u64); 64],
+    pub syscall_log_pos: usize,
     /// f0..f31 (F/D extensions). f32 values are NaN-boxed in the low bits.
     pub f: [u64; 32],
     /// fcsr: fflags[4:0] | frm[7:5].
@@ -82,6 +86,8 @@ impl Cpu {
             x: [0; 32],
             pc: 0,
             insn_count: 0,
+            syscall_log: [(u64::MAX, 0); 64],
+            syscall_log_pos: 0,
             reservation: None,
             f: [0; 32],
             fcsr: 0,
@@ -349,6 +355,18 @@ impl Cpu {
 
     /// Enter the trap handler for an exception or interrupt.
     pub fn take_trap(&mut self, cause: u64, tval: u64, is_interrupt: bool) {
+        // A trap between an LR and its SC must invalidate the reservation, so
+        // the SC fails and the guest's LR/SC loop retries. Linux's atomics rely
+        // on this: without it, an interrupt handler that updates the same word
+        // via LR/SC lets the interrupted SC still succeed, silently losing the
+        // handler's update — an intermittent source of lost wakeups.
+        self.reservation = None;
+        // Record user syscalls (ecall from U-mode = cause 8) in a ring buffer.
+        if !is_interrupt && cause == 8 {
+            let satp = self.sys.as_ref().map_or(0, |s| s.satp);
+            self.syscall_log[self.syscall_log_pos] = (self.x[17], satp);
+            self.syscall_log_pos = (self.syscall_log_pos + 1) % self.syscall_log.len();
+        }
         let c = (cause & 15) as usize;
         if is_interrupt {
             self.irq_counts[c] += 1;
@@ -1355,7 +1373,13 @@ impl Cpu {
                 self.insn_count
                     .wrapping_add(self.sys.as_ref().map_or(0, |s| s.minstret_off)),
             ),
-            TIME => self.sys.as_ref().map(|s| s.mtime).or(Some(self.insn_count)),
+            TIME => Some(self.sys.as_ref().map_or(self.insn_count, |s| {
+                if s.time_scale != 0 {
+                    (self.insn_count / s.time_scale).wrapping_add(s.time_offset)
+                } else {
+                    s.mtime
+                }
+            })),
             // PMP: storage only, no enforcement (single-guest machine).
             0x3a0..=0x3af if csr & 1 == 0 => self
                 .sys

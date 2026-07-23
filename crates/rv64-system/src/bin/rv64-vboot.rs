@@ -74,6 +74,7 @@ fn main() {
                 eprintln!("\r[hb] t={:.0}s insns={} {:.0} MIPS pc={:#x} mode={} {}",
                     t0.elapsed().as_secs_f64(), now_insns, mips, m.cpu.pc, mode,
                     m.debug_irq_state());
+                eprintln!("[hb] last syscalls (a7@satp): {}", fmt_syscalls(&m.cpu));
                 hb_last = std::time::Instant::now();
                 hb_insns = now_insns;
             }
@@ -119,6 +120,46 @@ fn main() {
             }
         }
     }
+}
+
+/// Format the last ~20 user syscalls from the CPU ring buffer, decoding
+/// common riscv64 syscall numbers, tagging the address space by satp.
+fn fmt_syscalls(cpu: &rv64_core::Cpu) -> String {
+    fn name(n: u64) -> String {
+        match n {
+            17 => "getcwd".into(), 23 => "dup".into(), 25 => "fcntl".into(),
+            29 => "ioctl".into(), 48 => "faccessat".into(), 56 => "openat".into(),
+            57 => "close".into(), 61 => "getdents".into(), 62 => "lseek".into(),
+            63 => "read".into(), 64 => "write".into(), 66 => "writev".into(),
+            72 => "pselect6".into(), 73 => "ppoll".into(), 78 => "readlinkat".into(),
+            79 => "newfstatat".into(), 80 => "fstat".into(), 93 => "exit".into(),
+            94 => "exit_group".into(), 96 => "set_tid_address".into(),
+            98 => "futex".into(), 99 => "set_robust_list".into(),
+            101 => "nanosleep".into(), 113 => "clock_gettime".into(),
+            124 => "sched_yield".into(), 129 => "kill".into(), 134 => "sigaction".into(),
+            135 => "sigprocmask".into(), 172 => "getpid".into(), 173 => "getppid".into(),
+            174 => "getuid".into(), 178 => "gettid".into(), 214 => "brk".into(),
+            215 => "munmap".into(), 220 => "clone".into(), 221 => "execve".into(),
+            222 => "mmap".into(), 226 => "mprotect".into(), 233 => "madvise".into(),
+            260 => "wait4".into(), 261 => "prlimit64".into(), 278 => "getrandom".into(),
+            435 => "clone3".into(),
+            u64::MAX => "-".into(),
+            other => format!("sys{other}"),
+        }
+    }
+    let log = &cpu.syscall_log;
+    let n = log.len();
+    let mut out = String::new();
+    for i in 0..20.min(n) {
+        let idx = (cpu.syscall_log_pos + n - 1 - i) % n;
+        let (a7, satp) = log[idx];
+        if a7 == u64::MAX {
+            break;
+        }
+        // last 5 hex of satp identifies the address space (process)
+        out = format!("{}({}@{:x}) ", out, name(a7), satp & 0xfffff);
+    }
+    out
 }
 
 struct RawTerm {
