@@ -29,8 +29,21 @@ pub const I64_EQ: u8 = 0x51;
 pub const I64_NE: u8 = 0x52;
 pub const I64_LT_S: u8 = 0x53;
 pub const I64_LT_U: u8 = 0x54;
-pub const I64_GE_S: u8 = 0x58;
-pub const I64_GE_U: u8 = 0x59;
+pub const I64_GT_U: u8 = 0x56;
+pub const I64_GE_S: u8 = 0x59; // (0x58 is le_u — was wrong before)
+pub const I64_GE_U: u8 = 0x5a;
+// typed i64 memory ops
+pub const I64_LOAD8_S: u8 = 0x30;
+pub const I64_LOAD8_U: u8 = 0x31;
+pub const I64_LOAD16_S: u8 = 0x32;
+pub const I64_LOAD16_U: u8 = 0x33;
+pub const I64_LOAD32_S: u8 = 0x34;
+pub const I64_LOAD32_U: u8 = 0x35;
+pub const I64_STORE8: u8 = 0x3c;
+pub const I64_STORE16: u8 = 0x3d;
+pub const I64_STORE32: u8 = 0x3e;
+pub const UNREACHABLE: u8 = 0x00;
+pub const DROP: u8 = 0x1a;
 pub const I64_EXTEND_I32_U: u8 = 0xad;
 pub const I32_ADD: u8 = 0x6a;
 pub const BLOCK: u8 = 0x02;
@@ -80,6 +93,12 @@ impl WasmModule {
 
     pub fn op(&mut self, opcode: u8) -> &mut Self {
         self.code.push(opcode);
+        self
+    }
+
+    /// Append a raw ULEB128 immediate (memarg align/offset fields).
+    pub fn raw_uleb(&mut self, v: u64) -> &mut Self {
+        uleb(&mut self.code, v);
         self
     }
 
@@ -140,9 +159,12 @@ impl WasmModule {
     pub fn finish(self) -> Vec<u8> {
         let mut m = vec![0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0]; // magic + version
 
-        // type section: one type: [] -> []
+        // type section: one type: (i32) -> [].
+        // The parameter is the emulator-state pointer: the host passes it so
+        // the pointer visibly escapes into the generated code, which stops
+        // LLVM from caching CPU state in registers across block calls.
         let mut sec = vec![1u8]; // count
-        sec.extend_from_slice(&[0x60, 0, 0]);
+        sec.extend_from_slice(&[0x60, 1, 0x7f, 0]);
         section(&mut m, 1, &sec);
 
         // import section: env.memory, min 1 page
@@ -164,7 +186,7 @@ impl WasmModule {
         sec.extend_from_slice(&[0x00, 0x00]);
         section(&mut m, 7, &sec);
 
-        // code section
+        // code section (param occupies local index 0; i64 locals follow)
         let mut body = Vec::new();
         if self.n_locals_i64 > 0 {
             body.push(1); // one locals-decl group

@@ -126,7 +126,11 @@ pub fn handle(m: &mut Machine, host: &mut dyn Host) -> Option<i32> {
                 m.mmap_top as i64
             }
         }
-        SYS_MUNMAP | SYS_MPROTECT | SYS_MADVISE | SYS_RISCV_FLUSH_ICACHE => 0,
+        SYS_RISCV_FLUSH_ICACHE => {
+            m.icache_flush_pending = true; // JIT hosts drop compiled blocks
+            0
+        }
+        SYS_MUNMAP | SYS_MPROTECT | SYS_MADVISE => 0,
         SYS_MREMAP => ENOMEM,
 
         SYS_CLOCK_GETTIME => {

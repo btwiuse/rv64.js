@@ -1,0 +1,4 @@
+[target.wasm32-unknown-unknown]
+# Export + allow growing the function table so the JS host can register
+# JIT-compiled block functions for call_indirect dispatch (v86-style).
+rustflags = ["-C", "link-arg=--export-table", "-C", "link-arg=--growable-table"]

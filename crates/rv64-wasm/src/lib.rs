@@ -14,7 +14,7 @@
 //! Single-instance (v86's model): one emulator per wasm instantiation.
 
 use rv64_core::{Cpu, FlatMemory, StopReason};
-use rv64_linux::{Host, Machine, RunResult};
+use rv64_linux::{Host, Machine};
 
 // ---- host imports (provided by web/rv64.js) -----------------------------
 
@@ -26,6 +26,10 @@ extern "C" {
     fn host_now_ms() -> f64;
     /// Fill with entropy (crypto.getRandomValues).
     fn host_random(ptr: *mut u8, len: usize);
+    /// JIT: instantiate the wasm module currently in JIT_OUT (see
+    /// jit_out_ptr/jit_out_len), append its `run` function to this module's
+    /// exported function table, and return the table index (-1 on failure).
+    fn host_jit_register() -> i32;
 }
 
 struct JsHost;
@@ -188,6 +192,10 @@ pub extern "C" fn user_load(mem_size: u32) -> i32 {
                     machine,
                     exit_code: 0,
                 });
+                // New address space: any compiled blocks are stale.
+                if let Some(j) = USER_JIT.as_mut() {
+                    j.clear();
+                }
                 STAGING.clear();
                 USER_ARGS.clear();
                 0
@@ -197,22 +205,137 @@ pub extern "C" fn user_load(mem_size: u32) -> i32 {
     }
 }
 
-/// Run the loaded program. STOP_EXITED on exit, STOP_BUDGET if out of fuel,
-/// STOP_TRAP on unhandled trap.
+// ---- JIT dispatch state ---------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct JitBlock {
+    /// Function-table index of the compiled block.
+    idx: i32,
+    /// Guest instructions it retires.
+    n: u32,
+    /// Physical address of the code (full-system: verified per dispatch).
+    pa: u64,
+}
+
+struct JitState {
+    /// pc -> compiled block; None = tried and not translatable (blacklist).
+    cache: std::collections::HashMap<u64, Option<JitBlock>>,
+    hot: std::collections::HashMap<u64, u32>,
+}
+
+impl JitState {
+    fn new() -> JitState {
+        JitState { cache: Default::default(), hot: Default::default() }
+    }
+    fn clear(&mut self) {
+        self.cache.clear();
+        self.hot.clear();
+    }
+}
+
+static mut USER_JIT: Option<JitState> = None;
+static mut SYS_JIT: Option<JitState> = None;
+
+const JIT_THRESHOLD: u32 = 16;
+/// Max chained block dispatches before returning to the interpreter (keeps
+/// interrupt/budget latency bounded in fully-jitted loops).
+const JIT_CHAIN_CAP: u32 = 64;
+
+/// Call a compiled block. The state pointer parameter deliberately escapes
+/// the emulator state into the opaque call so the compiler reloads CPU
+/// fields afterwards instead of caching them in locals.
+#[inline]
+fn call_block(idx: i32, state_ptr: *mut u8) {
+    unsafe {
+        let f: extern "C" fn(i32) = core::mem::transmute(idx as usize);
+        f(state_ptr as i32);
+    }
+}
+
+/// Run the loaded program with JIT tier-up. STOP_EXITED on exit,
+/// STOP_BUDGET if out of fuel, STOP_TRAP on unhandled trap.
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn user_run(budget: u64) -> i32 {
     let e = unsafe { USER.as_mut().expect("call user_load() first") };
+    let jit = unsafe { USER_JIT.get_or_insert_with(JitState::new) };
     let mut host = JsHost;
-    match e.machine.run(&mut host, budget) {
-        RunResult::Exited(code) => {
-            e.exit_code = code;
-            STOP_EXITED
+    let m = &mut e.machine;
+    let mut remaining = budget;
+
+    loop {
+        // --- JIT fast path: chain compiled blocks ---
+        let mut chained = 0u32;
+        while chained < JIT_CHAIN_CAP {
+            let Some(Some(b)) = jit.cache.get(&m.cpu.pc) else { break };
+            let b = *b;
+            call_block(b.idx, m as *mut _ as *mut u8);
+            m.cpu.insn_count += b.n as u64;
+            remaining = remaining.saturating_sub(b.n as u64);
+            chained += 1;
+            if remaining == 0 {
+                return STOP_BUDGET;
+            }
         }
-        RunResult::Budget => STOP_BUDGET,
-        RunResult::Trap(exc) => {
-            unsafe { LAST_TRAP = exc.cause() as i32 };
-            STOP_TRAP
+
+        // --- hot counting + compile ---
+        let pc = m.cpu.pc;
+        if !jit.cache.contains_key(&pc) {
+            let c = jit.hot.entry(pc).or_insert(0);
+            *c += 1;
+            if *c >= JIT_THRESHOLD {
+                let lay = rv64_jit::JitLayout {
+                    x_base: m.cpu.x.as_ptr() as u32,
+                    pc_addr: &m.cpu.pc as *const u64 as u32,
+                    mem: Some((m.mem.as_ptr() as u32, m.mem.len() as u64)),
+                };
+                let end = (pc as usize + 1024).min(m.mem.len());
+                let entry = rv64_jit::translate_block(&m.mem[pc as usize..end], pc, pc, lay)
+                    .and_then(|blk| {
+                        unsafe { JIT_OUT = blk.wasm };
+                        let idx = unsafe { host_jit_register() };
+                        (idx >= 0).then_some(JitBlock { idx, n: blk.n_insns, pa: pc })
+                    });
+                jit.cache.insert(pc, entry);
+                if entry.is_some() {
+                    continue; // dispatch it immediately
+                }
+            }
+        }
+
+        // --- interpreter slice ---
+        let slice = remaining.min(512);
+        let stop = {
+            let mut bus = FlatMemory::new(0, &mut m.mem);
+            m.cpu.run(&mut bus, slice)
+        };
+        match stop {
+            StopReason::Budget => {
+                remaining = remaining.saturating_sub(slice);
+                if remaining == 0 {
+                    return STOP_BUDGET;
+                }
+            }
+            StopReason::Ecall => {
+                if let Some(code) = rv64_linux::syscall::handle(m, &mut host) {
+                    m.exit_code = Some(code);
+                    e.exit_code = code;
+                    return STOP_EXITED;
+                }
+                if m.icache_flush_pending {
+                    m.icache_flush_pending = false;
+                    jit.clear(); // architectural code-change signal
+                }
+            }
+            StopReason::Break => {
+                e.exit_code = 133;
+                return STOP_EXITED;
+            }
+            StopReason::Trap(exc) => {
+                unsafe { LAST_TRAP = exc.cause() as i32 };
+                return STOP_TRAP;
+            }
+            StopReason::Wfi => unreachable!(),
         }
     }
 }
@@ -294,13 +417,84 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
     }
 }
 
-/// Run a slice; streams console output through host_write(1, ...).
-/// Returns 1 if the guest powered off, else 0.
+/// Run a slice with JIT tier-up; streams console output through
+/// host_write(1, ...). Returns 1 if the guest powered off, else 0.
+///
+/// Full-system blocks are ALU/branch-only (guest memory ops go through the
+/// MMU, so they end blocks) and are keyed by virtual pc with the physical
+/// address re-verified on every dispatch — an satp/mapping change simply
+/// misses. Stores to compiled code pages set jit_dirty (SystemBus tracks a
+/// page bitset) and drop all blocks; FENCE.I/SFENCE need no extra hook
+/// because staleness is caught by those two mechanisms.
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn sys_run(max_insns: u64) -> i32 {
     let m = unsafe { SYS.as_mut().expect("call sys_boot() first") };
-    m.run_slice(max_insns);
+    let jit = unsafe { SYS_JIT.get_or_insert_with(JitState::new) };
+    let mut remaining = max_insns;
+
+    while remaining > 0 && !m.power_off {
+        // --- JIT fast path ---
+        let mut chained = 0u32;
+        while chained < JIT_CHAIN_CAP {
+            if m.bus.jit_dirty {
+                jit.clear();
+                m.bus.jit_clear_pages();
+                break;
+            }
+            let Some(Some(b)) = jit.cache.get(&m.cpu.pc) else { break };
+            let b = *b;
+            // Verify the va still maps to the same code.
+            match m.cpu.jit_probe_fetch(&mut m.bus, m.cpu.pc) {
+                Some(pa) if pa == b.pa => {}
+                _ => break,
+            }
+            call_block(b.idx, m as *mut _ as *mut u8);
+            m.cpu.insn_count += b.n as u64;
+            remaining = remaining.saturating_sub(b.n as u64);
+            chained += 1;
+        }
+
+        // --- hot counting + compile (from physical code bytes) ---
+        let pc = m.cpu.pc;
+        if !jit.cache.contains_key(&pc) {
+            let c = jit.hot.entry(pc).or_insert(0);
+            *c += 1;
+            if *c >= JIT_THRESHOLD {
+                let entry = m.cpu.jit_probe_fetch(&mut m.bus, pc).and_then(|pa| {
+                    if pa < rv64_system::RAM_BASE {
+                        return None;
+                    }
+                    let off = (pa - rv64_system::RAM_BASE) as usize;
+                    // Cap the window at the page end: blocks must not span
+                    // pages (pa continuity isn't guaranteed across them).
+                    let end = ((off + 1024).min(off | 0xfff) + 1).min(m.bus.ram.len());
+                    let lay = rv64_jit::JitLayout {
+                        x_base: m.cpu.x.as_ptr() as u32,
+                        pc_addr: &m.cpu.pc as *const u64 as u32,
+                        mem: None, // memory ops fall back to the MMU interpreter
+                    };
+                    let blk = rv64_jit::translate_block(&m.bus.ram[off..end], pc, pc, lay)?;
+                    unsafe { JIT_OUT = blk.wasm };
+                    let idx = unsafe { host_jit_register() };
+                    if idx < 0 {
+                        return None;
+                    }
+                    m.bus.jit_mark_page(pa);
+                    Some(JitBlock { idx, n: blk.n_insns, pa })
+                });
+                jit.cache.insert(pc, entry);
+                if entry.is_some() {
+                    continue;
+                }
+            }
+        }
+
+        // --- interpreter + devices ---
+        let ran = m.run_slice(remaining.min(4096));
+        remaining = remaining.saturating_sub(ran.max(1));
+    }
+
     let out = m.console_output();
     if !out.is_empty() {
         unsafe { host_write(1, out.as_ptr(), out.len()) }
@@ -336,7 +530,7 @@ static mut JIT_OUT: Vec<u8> = Vec::new();
 #[allow(static_mut_refs)]
 pub extern "C" fn jit_translate(base: u64, pc: u64) -> u32 {
     unsafe {
-        match rv64_jit::translate_block(&STAGING, base, pc) {
+        match rv64_jit::translate_block(&STAGING, base, pc, rv64_jit::JitLayout::bare()) {
             Some(b) => {
                 JIT_OUT = b.wasm;
                 b.n_insns

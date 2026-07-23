@@ -31,6 +31,9 @@ pub struct Machine {
     /// Bump allocator for anonymous mmap (top-down from below the stack).
     pub mmap_top: u64,
     pub exit_code: Option<i32>,
+    /// Set when the guest calls riscv_flush_icache — the architectural
+    /// signal that code changed. JIT hosts must drop compiled blocks.
+    pub icache_flush_pending: bool,
 }
 
 /// Guest virtual address space size (flat, starts at 0).
@@ -71,6 +74,7 @@ impl Machine {
             brk_start: loaded.brk_start,
             mmap_top: stack_bottom,
             exit_code: None,
+            icache_flush_pending: false,
         };
         m.setup_stack(stack_top, argv, envp, &loaded, host);
         Ok(m)

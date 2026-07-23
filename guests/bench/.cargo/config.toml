@@ -1,0 +1,11 @@
+[build]
+target = "riscv64gc-unknown-linux-musl"
+
+[target.riscv64gc-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=--no-dynamic-linker",
+    # we provide our own _start; drop musl's crt1/crti/crtn
+    "-C", "link-self-contained=no",
+]

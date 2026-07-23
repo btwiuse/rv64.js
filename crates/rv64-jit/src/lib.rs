@@ -23,8 +23,31 @@ use rv64_core::compressed::expand;
 use rv64_core::decode::*;
 use wasm_emit::*;
 
-const PC_OFF: u64 = 256;
 const MAX_BLOCK: usize = 128;
+/// First scratch local (local 0 is the state-pointer parameter).
+const SCR: u32 = 1;
+
+/// Where the emitted code finds emulator state in linear memory, and
+/// (optionally) guest RAM for direct load/store translation.
+#[derive(Clone, Copy)]
+pub struct JitLayout {
+    /// Linear-memory offset of x[0] (x1.. follow at 8-byte stride).
+    pub x_base: u32,
+    /// Linear-memory offset of the pc slot.
+    pub pc_addr: u32,
+    /// Guest RAM window for direct memory ops: (linear offset of guest
+    /// address 0, guest size in bytes). None => loads/stores end the block
+    /// (interpreter fallback) — used for full-system blocks where accesses
+    /// must go through the MMU.
+    pub mem: Option<(u32, u64)>,
+}
+
+impl JitLayout {
+    /// Layout used by the standalone tests: x at 0, pc at 256, no memory.
+    pub fn bare() -> JitLayout {
+        JitLayout { x_base: 0, pc_addr: 256, mem: None }
+    }
+}
 
 /// Result of translating one block.
 pub struct Block {
@@ -47,40 +70,54 @@ fn fetch(code: &[u8], base: u64, pc: u64) -> Option<(u32, u64)> {
     }
 }
 
-/// Emit `push x[r]` (reads the register slot; x0 is constant 0).
-fn push_reg(m: &mut WasmModule, r: usize) {
-    if r == 0 {
-        m.i64_const(0);
-    } else {
-        m.i32_const(0).i64_load(r as u64 * 8);
+struct Ctx {
+    lay: JitLayout,
+}
+
+impl Ctx {
+    /// Emit `push x[r]` (reads the register slot; x0 is constant 0).
+    fn push_reg(&self, m: &mut WasmModule, r: usize) {
+        if r == 0 {
+            m.i64_const(0);
+        } else {
+            m.i32_const(0).i64_load(self.lay.x_base as u64 + r as u64 * 8);
+        }
     }
-}
 
-/// Emit `x[rd] = <top of stack>`. The value must be on the stack *after*
-/// the address operand — so callers emit `i32_const(0)` first via this
-/// helper pair: `store_reg_pre` ... value ... `store_reg_post`.
-fn store_pre(m: &mut WasmModule, rd: usize) -> bool {
-    if rd == 0 {
-        return false; // caller must still balance the stack (skip entirely)
+    fn store_pre(&self, m: &mut WasmModule, rd: usize) -> bool {
+        if rd == 0 {
+            return false;
+        }
+        m.i32_const(0);
+        true
     }
-    m.i32_const(0);
-    true
-}
 
-fn store_post(m: &mut WasmModule, rd: usize) {
-    m.i64_store(rd as u64 * 8);
-}
+    fn store_post(&self, m: &mut WasmModule, rd: usize) {
+        m.i64_store(self.lay.x_base as u64 + rd as u64 * 8);
+    }
 
-/// Store the (constant) next pc and return.
-fn set_pc_const(m: &mut WasmModule, pc: u64) {
-    m.i32_const(0).i64_const(pc as i64).i64_store(PC_OFF);
+    /// Store the (constant) next pc.
+    fn set_pc_const(&self, m: &mut WasmModule, pc: u64) {
+        m.i32_const(0).i64_const(pc as i64).i64_store(self.lay.pc_addr as u64);
+    }
+
+    /// Guest address (i64) is on the stack. Bounds-check it against guest
+    /// RAM and leave the wrapped i32 index on the stack. Traps (wasm
+    /// `unreachable`) on out-of-range — a fatal guest fault in user mode.
+    fn guest_addr(&self, m: &mut WasmModule, size: u64, len: u64) {
+        m.local_set(SCR);
+        m.local_get(SCR).i64_const((size - len) as i64).op(I64_GT_U);
+        m.op(IF).op(VOID).op(UNREACHABLE).op(END);
+        m.local_get(SCR).op(I32_WRAP_I64);
+    }
 }
 
 /// Translate one basic block starting at `pc`. `code` is the guest code
 /// bytes and `base` its guest address. Returns None if the very first
 /// instruction isn't translatable (caller interprets it instead).
-pub fn translate_block(code: &[u8], base: u64, start_pc: u64) -> Option<Block> {
-    let mut m = WasmModule::new(2); // locals: 0 = scratch a, 1 = scratch b
+pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> Option<Block> {
+    let c = Ctx { lay };
+    let mut m = WasmModule::new(2); // scratch i64 locals at SCR, SCR+1
     let mut pc = start_pc;
     let mut n = 0u32;
 
@@ -95,22 +132,22 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64) -> Option<Block> {
         match op {
             // LUI / AUIPC: constants at translation time.
             0x37 | 0x17 => {
-                if store_pre(&mut m, d) {
+                if c.store_pre(&mut m, d) {
                     let v = if op == 0x37 {
                         imm_u(insn) as u64
                     } else {
                         pc.wrapping_add(imm_u(insn) as u64)
                     };
                     m.i64_const(v as i64);
-                    store_post(&mut m, d);
+                    c.store_post(&mut m, d);
                 }
             }
             // OP-IMM
             0x13 => {
                 let imm = imm_i(insn);
                 let f3 = funct3(insn);
-                if store_pre(&mut m, d) {
-                    push_reg(&mut m, s1);
+                if c.store_pre(&mut m, d) {
+                    c.push_reg(&mut m, s1);
                     match f3 {
                         0 => {
                             m.i64_const(imm).op(I64_ADD);
@@ -141,7 +178,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64) -> Option<Block> {
                             m.i64_const(imm).op(I64_AND);
                         }
                     }
-                    store_post(&mut m, d);
+                    c.store_post(&mut m, d);
                 }
             }
             // OP (I and M-mul only; div falls back)
@@ -152,56 +189,56 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64) -> Option<Block> {
                 if !supported {
                     break;
                 }
-                if store_pre(&mut m, d) {
-                    push_reg(&mut m, s1);
+                if c.store_pre(&mut m, d) {
+                    c.push_reg(&mut m, s1);
                     match (f7, f3) {
                         (0x00, 0) => {
-                            push_reg(&mut m, s2);
+                            c.push_reg(&mut m, s2);
                             m.op(I64_ADD);
                         }
                         (0x20, 0) => {
-                            push_reg(&mut m, s2);
+                            c.push_reg(&mut m, s2);
                             m.op(I64_SUB);
                         }
                         (0x01, 0) => {
-                            push_reg(&mut m, s2);
+                            c.push_reg(&mut m, s2);
                             m.op(I64_MUL);
                         }
                         (0x00, 1) => {
-                            push_reg(&mut m, s2);
+                            c.push_reg(&mut m, s2);
                             m.i64_const(0x3f).op(I64_AND).op(I64_SHL);
                         }
                         (0x00, 2) => {
-                            push_reg(&mut m, s2);
+                            c.push_reg(&mut m, s2);
                             m.op(I64_LT_S).op(I64_EXTEND_I32_U);
                         }
                         (0x00, 3) => {
-                            push_reg(&mut m, s2);
+                            c.push_reg(&mut m, s2);
                             m.op(I64_LT_U).op(I64_EXTEND_I32_U);
                         }
                         (0x00, 4) => {
-                            push_reg(&mut m, s2);
+                            c.push_reg(&mut m, s2);
                             m.op(I64_XOR);
                         }
                         (0x00, 5) => {
-                            push_reg(&mut m, s2);
+                            c.push_reg(&mut m, s2);
                             m.i64_const(0x3f).op(I64_AND).op(I64_SHR_U);
                         }
                         (0x20, 5) => {
-                            push_reg(&mut m, s2);
+                            c.push_reg(&mut m, s2);
                             m.i64_const(0x3f).op(I64_AND).op(I64_SHR_S);
                         }
                         (0x00, 6) => {
-                            push_reg(&mut m, s2);
+                            c.push_reg(&mut m, s2);
                             m.op(I64_OR);
                         }
                         (0x00, 7) => {
-                            push_reg(&mut m, s2);
+                            c.push_reg(&mut m, s2);
                             m.op(I64_AND);
                         }
                         _ => unreachable!(),
                     }
-                    store_post(&mut m, d);
+                    c.store_post(&mut m, d);
                 }
             }
             // OP-IMM-32 (ADDIW/SLLIW/SRLIW/SRAIW): compute in 64, wrap+extend.
@@ -211,8 +248,8 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64) -> Option<Block> {
                 if !matches!(f3, 0 | 1 | 5) {
                     break;
                 }
-                if store_pre(&mut m, d) {
-                    push_reg(&mut m, s1);
+                if c.store_pre(&mut m, d) {
+                    c.push_reg(&mut m, s1);
                     match f3 {
                         0 => {
                             m.i64_const(imm).op(I64_ADD);
@@ -238,7 +275,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64) -> Option<Block> {
                     }
                     // sign-extend low 32 bits
                     m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S);
-                    store_post(&mut m, d);
+                    c.store_post(&mut m, d);
                 }
             }
             // OP-32 (ADDW/SUBW/MULW)
@@ -247,25 +284,93 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64) -> Option<Block> {
                 if !matches!((f7, f3), (0x00, 0) | (0x20, 0) | (0x01, 0)) {
                     break;
                 }
-                if store_pre(&mut m, d) {
-                    push_reg(&mut m, s1);
-                    push_reg(&mut m, s2);
+                if c.store_pre(&mut m, d) {
+                    c.push_reg(&mut m, s1);
+                    c.push_reg(&mut m, s2);
                     m.op(match (f7, f3) {
                         (0x00, 0) => I64_ADD,
                         (0x20, 0) => I64_SUB,
                         _ => I64_MUL,
                     });
                     m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S);
-                    store_post(&mut m, d);
+                    c.store_post(&mut m, d);
                 }
             }
-            // JAL: link + constant jump; block ends.
-            0x6f => {
-                if store_pre(&mut m, d) {
-                    m.i64_const(next_pc as i64);
-                    store_post(&mut m, d);
+            // LOAD / STORE-FP-less loads: direct guest memory (user-mode only)
+            0x03 if lay.mem.is_some() => {
+                let (mem_base, size) = lay.mem.unwrap();
+                let f3 = funct3(insn);
+                let len = match f3 {
+                    0 | 4 => 1,
+                    1 | 5 => 2,
+                    2 | 6 => 4,
+                    3 => 8,
+                    _ => break,
+                };
+                c.push_reg(&mut m, s1);
+                m.i64_const(imm_i(insn)).op(I64_ADD);
+                c.guest_addr(&mut m, size, len); // i32 index on stack
+                // value
+                m.op(match f3 {
+                    0 => I64_LOAD8_S,
+                    1 => I64_LOAD16_S,
+                    2 => I64_LOAD32_S,
+                    3 => I64_LOAD,
+                    4 => I64_LOAD8_U,
+                    5 => I64_LOAD16_U,
+                    _ => I64_LOAD32_U,
+                });
+                // align hint + offset immediates
+                {
+                    let a = match len { 1 => 0u64, 2 => 1, 4 => 2, _ => 3 };
+                    m.raw_uleb(a).raw_uleb(mem_base as u64);
                 }
-                set_pc_const(&mut m, pc.wrapping_add(imm_j(insn) as u64));
+                if d == 0 {
+                    m.op(DROP); // load to x0: access happens, result discarded
+                } else {
+                    // stash value, then store to x[rd]
+                    m.local_set(SCR + 1);
+                    m.i32_const(0).local_get(SCR + 1);
+                    c.store_post(&mut m, d);
+                }
+            }
+            0x23 if lay.mem.is_some() => {
+                let (mem_base, size) = lay.mem.unwrap();
+                let f3 = funct3(insn);
+                if f3 > 3 {
+                    break;
+                }
+                let len = 1u64 << f3;
+                c.push_reg(&mut m, s1);
+                m.i64_const(imm_s(insn)).op(I64_ADD);
+                c.guest_addr(&mut m, size, len); // i32 index
+                c.push_reg(&mut m, s2); // value i64
+                m.op(match f3 {
+                    0 => I64_STORE8,
+                    1 => I64_STORE16,
+                    2 => I64_STORE32,
+                    _ => I64_STORE,
+                });
+                let a = match len { 1 => 0u64, 2 => 1, 4 => 2, _ => 3 };
+                m.raw_uleb(a).raw_uleb(mem_base as u64);
+            }
+            // JAL: link; follow plain forward jumps (superblock chaining),
+            // otherwise end the block with a constant pc.
+            0x6f => {
+                let target = pc.wrapping_add(imm_j(insn) as u64);
+                if c.store_pre(&mut m, d) {
+                    m.i64_const(next_pc as i64);
+                    c.store_post(&mut m, d);
+                }
+                let in_window = target > pc
+                    && target >= base
+                    && target < base + code.len() as u64;
+                if d == 0 && in_window {
+                    pc = target;
+                    n += 1;
+                    continue;
+                }
+                c.set_pc_const(&mut m, target);
                 return Some(Block {
                     wasm: m.finish(),
                     len: next_pc - start_pc,
@@ -275,17 +380,17 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64) -> Option<Block> {
             // JALR: dynamic target; block ends.
             0x67 => {
                 // scratch = (x[rs1] + imm) & ~1  (compute before link write!)
-                push_reg(&mut m, s1);
+                c.push_reg(&mut m, s1);
                 m.i64_const(imm_i(insn))
                     .op(I64_ADD)
                     .i64_const(!1)
                     .op(I64_AND)
-                    .local_set(0);
-                if store_pre(&mut m, d) {
+                    .local_set(SCR);
+                if c.store_pre(&mut m, d) {
                     m.i64_const(next_pc as i64);
-                    store_post(&mut m, d);
+                    c.store_post(&mut m, d);
                 }
-                m.i32_const(0).local_get(0).i64_store(PC_OFF);
+                m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
                 return Some(Block {
                     wasm: m.finish(),
                     len: next_pc - start_pc,
@@ -304,13 +409,13 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64) -> Option<Block> {
                     7 => I64_GE_U,
                     _ => break, // before any stack pushes — stream stays balanced
                 };
-                push_reg(&mut m, s1);
-                push_reg(&mut m, s2);
+                c.push_reg(&mut m, s1);
+                c.push_reg(&mut m, s2);
                 m.op(cmp);
                 m.op(IF).op(VOID);
-                set_pc_const(&mut m, target);
+                c.set_pc_const(&mut m, target);
                 m.op(ELSE);
-                set_pc_const(&mut m, next_pc);
+                c.set_pc_const(&mut m, next_pc);
                 m.op(END);
                 return Some(Block {
                     wasm: m.finish(),
@@ -330,7 +435,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64) -> Option<Block> {
     if n == 0 {
         return None;
     }
-    set_pc_const(&mut m, pc);
+    c.set_pc_const(&mut m, pc);
     Some(Block {
         wasm: m.finish(),
         len: pc - start_pc,
@@ -355,20 +460,20 @@ mod tests {
     fn translates_leading_block() {
         // Block 1: three addis then falls into the loop body... the block
         // actually extends through the branch (bne terminates it).
-        let b = translate_block(&code_bytes(), 0x1000, 0x1000).unwrap();
+        let b = translate_block(&code_bytes(), 0x1000, 0x1000, JitLayout::bare()).unwrap();
         assert_eq!(b.n_insns, 6); // addi,addi,addi,add,addi,bne
         assert!(b.wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d])); // \0asm
     }
 
     #[test]
     fn loop_body_block() {
-        let b = translate_block(&code_bytes(), 0x1000, 0x100c).unwrap();
+        let b = translate_block(&code_bytes(), 0x1000, 0x100c, JitLayout::bare()).unwrap();
         assert_eq!(b.n_insns, 3); // add, addi, bne
     }
 
     #[test]
     fn ecall_not_translatable() {
-        assert!(translate_block(&code_bytes(), 0x1000, 0x1018).is_none());
+        assert!(translate_block(&code_bytes(), 0x1000, 0x1018, JitLayout::bare()).is_none());
     }
 
     #[test]
@@ -379,7 +484,7 @@ mod tests {
             code.extend_from_slice(&h.to_le_bytes());
         }
         code.extend_from_slice(&0x0000_0073u32.to_le_bytes());
-        let b = translate_block(&code, 0, 0).unwrap();
+        let b = translate_block(&code, 0, 0, JitLayout::bare()).unwrap();
         assert_eq!(b.n_insns, 3);
         assert_eq!(b.len, 6);
     }

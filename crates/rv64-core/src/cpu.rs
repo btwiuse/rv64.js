@@ -133,6 +133,13 @@ impl Cpu {
         self.tlb_tag = [[TLB_INVALID; TLB_SIZE]; 3];
     }
 
+    /// Translate a fetch address without raising a fault (JIT support:
+    /// verify that a va-keyed compiled block still maps to the same
+    /// physical code before dispatching to it).
+    pub fn jit_probe_fetch<B: Bus>(&mut self, bus: &mut B, va: u64) -> Option<u64> {
+        self.translate(bus, va, Access::Fetch).ok()
+    }
+
     #[inline]
     fn wr(&mut self, rd: usize, val: u64) {
         if rd != 0 {

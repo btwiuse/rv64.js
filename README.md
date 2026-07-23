@@ -8,7 +8,7 @@ compiled to WebAssembly, plain-JS device/browser layer.
 privileged arch with sv39/sv48 MMU) boots TinyEMU's stock Linux 4.15 +
 buildroot image to an interactive busybox shell — natively (~50 Minsn/s)
 and in the browser. User-mode emulation (qemu-user style) runs static
-riscv64 musl binaries. JIT-to-wasm pipeline is proven end-to-end (v1).
+riscv64 musl binaries. The JIT is live in both run loops: hot blocks compile to wasm modules dispatched via call_indirect (~3x on hot code, with safe invalidation).
 See [DESIGN.md](DESIGN.md) for architecture and remaining work.
 
 ```sh

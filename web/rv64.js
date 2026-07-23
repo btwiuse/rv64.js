@@ -42,6 +42,30 @@ export class RV64 {
             for (let i = 0; i < len; i++) buf[i] = (Math.random() * 256) | 0;
           }
         },
+        // JIT: instantiate the module the core just emitted (JIT_OUT),
+        // register its `run` function in the core's function table, and
+        // return the table index for call_indirect dispatch.
+        host_jit_register: () => {
+          try {
+            const bytes = new Uint8Array(
+              vm.ex.memory.buffer,
+              vm.ex.jit_out_ptr(),
+              vm.ex.jit_out_len(),
+            ).slice();
+            const mod = new WebAssembly.Module(bytes);
+            const inst = new WebAssembly.Instance(mod, {
+              env: { memory: vm.ex.memory },
+            });
+            const table = vm.ex.__indirect_function_table;
+            const idx = table.grow(1);
+            table.set(idx, inst.exports.run);
+            vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
+            return idx;
+          } catch (e) {
+            console.warn("jit register failed:", e);
+            return -1;
+          }
+        },
       },
     };
     const { instance } =

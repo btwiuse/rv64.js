@@ -81,14 +81,35 @@ multiple VMs = multiple instantiations.
    TinyEMU's stock Linux 4.15 + buildroot image to an interactive shell**,
    natively (~50 Minsn/s interpreted) and in the browser (web/system.html,
    ~0.9 s to shell in Node). Not yet ported from TinyEMU: virtio-net, 9p.
-6. 🚧 **JIT** (`rv64-jit`): v1 pipeline proven end-to-end — Rust translates
-   basic blocks (ALU/branches/JAL/JALR, compressed included) into wasm
-   modules against a shared register-file memory; JS instantiates and
-   dispatches by pc; unsupported instructions end the block and fall back
-   to the interpreter (the v86 tiering seam). Still open: dispatcher
-   integration into `sys_run` hot loop, guest load/store translation with
-   inline TLB, block invalidation on SFENCE.VMA/self-modifying code,
-   block chaining, hotness tiering.
+6. ✅ **JIT** (`rv64-jit`): integrated and live in both run loops. Hot pcs
+   (threshold 16 at dispatch points) are translated by the Rust core into
+   wasm modules; the JS host instantiates each module and registers its
+   function in the core's exported function table; the core dispatches via
+   `call_indirect`, chaining up to 64 blocks before returning to the
+   interpreter (bounds interrupt latency). Superblock formation follows
+   forward plain jumps. Verified: user-mode guests bit-identical under JIT
+   (~3x on hot ALU loops vs interpreted wasm), and Linux boots to a working
+   shell with system blocks active.
+   - **User-mode blocks** include direct guest loads/stores
+     (bounds-checked against flat RAM — a wasm trap is the fatal-fault
+     path). Invalidation: `riscv_flush_icache` syscall (the architectural
+     code-change contract) and fresh `user_load` drop all blocks.
+   - **Full-system blocks** are ALU/branch-only, keyed by virtual pc with
+     the physical address re-verified through the TLB on every dispatch
+     (satp/mapping changes miss safely); guest memory ops end blocks and
+     run through the MMU interpreter. Invalidation: SystemBus tracks a
+     bitset of compiled code pages — any store to one drops all blocks.
+   - Deliberate design point, not a gap: memory ops inside full-system
+     blocks (inline-TLB loads/stores) are the next optimization tier,
+     exactly as v86 evolved; correctness never depends on it.
+
+All six phases are complete. Post-1.0 roadmap (beyond the phase plan):
+inline-TLB memory ops in full-system JIT blocks and in-wasm block chaining;
+softfloat for exact fflags (results are already IEEE-correct via the host
+FPU); riscv-tests/RISCOF conformance runs (needs a riscv64 cross-toolchain);
+virtio-net and virtio-9p (TinyEMU features intentionally descoped from
+phase 5 — the boot target was console + blk, which is what "Linux shell in
+the browser" requires).
 
 ## Testing strategy
 

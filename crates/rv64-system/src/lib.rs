@@ -48,6 +48,11 @@ pub struct SystemBus {
     pub htif_fromhost: u64,
     pub htif_console: Vec<u8>,
     pub power_off: bool,
+    // JIT support: bitset of RAM pages holding compiled code. A store to a
+    // marked page sets jit_dirty; the JIT host then drops all blocks
+    // (self-modifying code / page reuse).
+    pub jit_pages: Vec<u64>,
+    pub jit_dirty: bool,
 }
 
 impl SystemBus {
@@ -185,6 +190,33 @@ impl SystemBus {
         self.plic_pending & !self.plic_served != 0
     }
 
+    /// Mark a RAM page as containing JIT-compiled code.
+    pub fn jit_mark_page(&mut self, pa: u64) {
+        if pa >= RAM_BASE {
+            let page = ((pa - RAM_BASE) >> 12) as usize;
+            if let Some(w) = self.jit_pages.get_mut(page / 64) {
+                *w |= 1 << (page % 64);
+            }
+        }
+    }
+
+    pub fn jit_clear_pages(&mut self) {
+        self.jit_pages.iter_mut().for_each(|w| *w = 0);
+        self.jit_dirty = false;
+    }
+
+    #[inline]
+    fn jit_check_store(&mut self, addr: u64) {
+        if addr >= RAM_BASE {
+            let page = ((addr - RAM_BASE) >> 12) as usize;
+            if let Some(w) = self.jit_pages.get(page / 64) {
+                if w & (1 << (page % 64)) != 0 {
+                    self.jit_dirty = true;
+                }
+            }
+        }
+    }
+
     #[inline]
     fn ram_slice(&mut self, addr: u64, len: usize) -> Option<&mut [u8]> {
         if addr >= RAM_BASE {
@@ -222,6 +254,7 @@ macro_rules! sys_rw {
             Err(Exception::LoadAccessFault { addr })
         }
         fn $wr(&mut self, addr: u64, val: $ty) -> Result<(), Exception> {
+            self.jit_check_store(addr);
             if let Some(s) = self.ram_slice(addr, $n) {
                 s.copy_from_slice(&val.to_le_bytes());
                 return Ok(());
@@ -349,6 +382,8 @@ impl Machine {
                 htif_fromhost: 0,
                 htif_console: Vec::new(),
                 power_off: false,
+                jit_pages: vec![0u64; (ram_size >> 12).div_ceil(64)],
+                jit_dirty: false,
             },
             insns_per_tick: 10, // pretend 100 Minsn/s against the 10 MHz clock
             power_off: false,
