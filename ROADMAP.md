@@ -97,8 +97,8 @@ priority order. Check items off as they land.
   `tests/virt-smoke/run.sh` boots the virt machine with a ~10 KB initramfs
   whose init exercises the paths that were broken (8250 THRE TX interrupt,
   LR/SC-across-trap, live rdtime) and checks for `SMOKE_OK` vs a hang. Inputs
-  come from the flake (`.#virt-kernel`, `.#virt-opensbi`, `.#virt-cc`) so it's
-  reproducible. **Coverage is layered** because not all bugs are catchable by
+  come from the flake (`.#virt-kernel`, `.#virt-opensbi`; the freestanding init
+  is built by the dev-shell cross-gcc) so it's reproducible. **Coverage is layered** because not all bugs are catchable by
   an integration test: the THRE hang is deterministic and caught by the smoke
   test, but the LR/SC reservation and rdtime bugs are probabilistic/latent —
   a simple boot passes even with them reverted — so they are pinned by

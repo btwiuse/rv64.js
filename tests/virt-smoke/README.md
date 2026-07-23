@@ -10,9 +10,10 @@ the harness time out and fail.
 nix develop -c tests/virt-smoke/run.sh
 ```
 
-First run builds the kernel and cross-toolchain from the flake
-(`.#virt-kernel`, `.#virt-opensbi`, `.#virt-cc`); both are cached afterwards, so
-later runs take a few seconds.
+First run builds the kernel from the flake (`.#virt-kernel`, plus
+`.#virt-opensbi`); the freestanding init is built by the bare-metal cross-gcc
+already in the dev shell. The kernel is cached afterwards, so later runs take a
+few seconds.
 
 ## What it exercises, and why it's layered
 
