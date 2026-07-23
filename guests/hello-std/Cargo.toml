@@ -1,0 +1,10 @@
+[package]
+name = "hello-std"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone (not part of the host workspace — different target).
+[workspace]
+
+[profile.release]
+opt-level = "s"

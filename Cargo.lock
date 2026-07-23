@@ -7,6 +7,21 @@ name = "rv64-core"
 version = "0.1.0"
 
 [[package]]
+name = "rv64-linux"
+version = "0.1.0"
+dependencies = [
+ "rv64-core",
+]
+
+[[package]]
+name = "rv64-run"
+version = "0.1.0"
+dependencies = [
+ "rv64-core",
+ "rv64-linux",
+]
+
+[[package]]
 name = "rv64-wasm"
 version = "0.1.0"
 dependencies = [

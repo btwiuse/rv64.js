@@ -1,0 +1,9 @@
+[package]
+name = "rv64-linux"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "User-mode Linux emulation for rv64.js: ELF loader + syscall shim"
+
+[dependencies]
+rv64-core = { path = "../rv64-core" }

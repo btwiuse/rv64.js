@@ -1,0 +1,14 @@
+[package]
+name = "rv64-run"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native user-mode runner (qemu-user style) for rv64.js development"
+
+[[bin]]
+name = "rv64-run"
+path = "src/main.rs"
+
+[dependencies]
+rv64-core = { path = "../rv64-core" }
+rv64-linux = { path = "../rv64-linux" }
