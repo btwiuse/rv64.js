@@ -567,7 +567,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             }
             jit.clear_dispatch(); // stale lines may point at dropped blocks
         }
-        // --- JIT fast path: direct-mapped dispatch, no pa-verify ---
+        // --- JIT fast path: direct-mapped dispatch + cheap pa-verify ---
         let mut chained = 0u32;
         while chained < JIT_CHAIN_CAP {
             let pc = m.cpu.pc;
@@ -585,6 +585,19 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                     _ => break, // uncompiled or blacklisted
                 }
             };
+            // Verify the block's virtual pc still maps to the same physical
+            // code. This catches stale code mappings (satp/remap) cheaply —
+            // a fetch-TLB probe, not a full flush — so the cache survives the
+            // frequent data-page SFENCEs of malloc-heavy processes. If the
+            // mapping changed, drop the block and fall to the interpreter.
+            match m.cpu.jit_probe_fetch(&mut m.bus, pc) {
+                Some(pa) if pa == b.pa => {}
+                _ => {
+                    jit.cache.remove(&pc);
+                    jit.dispatch[JitState::dslot(pc)].pc = NO_PC;
+                    break;
+                }
+            }
             call_block(b.idx, m as *mut _ as *mut u8);
             // Sys blocks with inline memory ops may bail mid-block; read the
             // count they actually retired (pc is set by the block either way).

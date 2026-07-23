@@ -1001,7 +1001,13 @@ impl Cpu {
                         }
                     }
                     self.flush_tlb();
-                    self.jit_flush_gen += 1; // code mapping may have changed
+                    // NOTE: do NOT bump jit_flush_gen here. SFENCE.VMA is
+                    // issued on every page-table change — including the
+                    // frequent data mmaps of a malloc-heavy process (a
+                    // compiler!) — which would flush the whole JIT block
+                    // cache and keep coverage at ~0% on realistic workloads.
+                    // Stale *code* mappings are instead caught cheaply by
+                    // the dispatcher's per-block pa re-verification.
                 }
                 // Zicsr
                 (_, f3 @ 1..=3) | (_, f3 @ 5..=7) => {

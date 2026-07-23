@@ -170,3 +170,38 @@ dispatched millions of times, tier up. Full suite green at this config
 
 Methodology lesson (for future benchmarks): disable guest echo and wait for
 real program output, never a shell word-mark; verify a checksum every run.
+
+## Three-way compilation benchmark (2026-07-23): native / interp / JIT
+
+A real riscv64 tinycc compiling real C translation units inside booted
+Linux (tests/compile-bench/). Object md5 identical JIT-on vs JIT-off every
+run (the JIT compiles correctly). Native = host x86 tcc.
+
+| tier   | native | interp   | JIT      | JIT vs interp | interp vs native |
+|--------|-------:|---------:|---------:|--------------:|-----------------:|
+| quick  |  13 ms |   800 ms |   799 ms |    1.00x      |   62x slower     |
+| medium |  51 ms |  4749 ms |  4504 ms |    1.05x      |   93x slower     |
+| soak   | 238 ms | 28146 ms | 21761 ms |  **1.29x**    |  118x slower     |
+
+Two honest findings:
+
+1. **A real bug fixed.** The JIT was retiring 0% of instructions during a
+   tcc compile — because item 2 flushed the *entire* block cache on every
+   SFENCE.VMA, and a malloc-heavy process (a compiler!) issues an SFENCE on
+   every heap-growing mmap. Removed the SFENCE flush; restored a cheap
+   per-dispatch pa re-verification (a fetch-TLB probe) to catch genuinely
+   stale code mappings. Coverage went 0% -> 27% (medium). Syscompute tight
+   loops stayed at 2.8-3.2x; md5 3/3 correct; full suite green.
+
+2. **Our JIT helps real compilation modestly (up to 1.29x), far less than
+   tight loops (2.8-3.2x).** Compiler code is branchy and pointer-heavy;
+   our naive JIT (no register allocation — every operand round-trips
+   through linear memory, small blocks, scattered memory access) produces
+   blocks barely faster than the tight Rust interpreter. The benefit grows
+   with compile length (amortization: quick 1.00x -> soak 1.29x). Closing
+   the gap to native (~90x) on realistic code needs a real optimizing JIT
+   (register allocation + block linking) — v86-class engineering, a large
+   undertaking, not incremental tweaks.
+
+Run: `tests/compile-bench/bench.sh {quick|medium|soak}` (riscv64 tcc built
+manually — the nixpkgs cross build is broken; see the script).
