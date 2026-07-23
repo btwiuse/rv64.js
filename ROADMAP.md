@@ -25,11 +25,27 @@ priority order. Check items off as they land.
 
 - [ ] **2b. Fused JIT software-TLB (the system-mode unlock)** — the
   diagnostic shows system JIT is 1.00× on memory-heavy code because inline
-  memory ops emit ~15 wasm instructions each. Replace with a dedicated
-  JIT-TLB whose present entries already encode RAM+writable+not-compiled,
-  so a load is tag-compare + offset-add + load (~4 ops). Filled on the
-  interpreter bail path; invalidated via the existing gen/page hooks.
-  This is what makes item 1's inline memory ops pay off in system mode.
+  memory ops emit ~15 wasm instructions each. A dedicated JIT-TLB whose
+  present entries encode RAM+writable+not-compiled makes a load tag-compare
+  + offset-add + load (~4 ops).
+  - **First attempt (2026-07-22) — reverted, regressed.** Built the fused
+    JIT-TLB (Cpu.jtlb arrays, Bus::jit_ram_offset, emitter probe, wasm
+    wiring). Correct (md5 bit-identical) but a **net loss**: sys-md5
+    69→38, boot 69→38 Minsn/s. Root cause: the JTLB was *filled* inside the
+    interpreter's `translate()` (the ~89%-hot path), and `flush_tlb()` wipes
+    it on **every privilege-change trap** (each timer interrupt). So the
+    expensive `bus.jit_ram_offset` fill ran on nearly every interpreter
+    memory op → the interpreter itself slowed ~45%. The probe was cheap; the
+    fill placement + flush frequency was fatal.
+  - **The fix (identified, not yet built): privilege-tagged JTLB decoupled
+    from the priv-change flush.** Encode the effective privilege in the
+    entry tag (fold mode into the low 12 bits of `va & ~0xfff`, which are
+    free). Then `flush_tlb()` stops touching the JTLB; the JTLB is flushed
+    only at true mapping/permission-model changes (satp write, SFENCE.VMA,
+    SUM/MXR writes) — all rare, none per-interrupt. The JTLB stays warm
+    across timer interrupts, so fills are rare and the interpreter tax
+    amortizes away, while probes gain one cheap tag compare. Validate with
+    the full gate (md5 + arch-tests 193 + lockstep 109) before keeping.
 
 - [ ] **3. FP ops inside JIT blocks** — FP instructions currently end
   blocks. Reuse the interpreter's sticky-NX/RNE eligibility guard (see

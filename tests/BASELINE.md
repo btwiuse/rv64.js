@@ -106,3 +106,31 @@ not-compiled, so a guest load becomes tag-compare + offset-add + load
 (~4 wasm ops instead of ~15). Filled on the interpreter bail path,
 invalidated with the existing gen/page mechanisms. That is what should
 push sys-md5 past 1.0×; dispatch is no longer the bottleneck.
+
+## Update — item 2b attempt (fused JIT-TLB): reverted, regressed
+
+Built the fused JIT software-TLB (roadmap 2b) to cut system memory ops
+from ~15 to ~4 wasm instructions. **Correct** (md5 bit-identical) but a
+**net regression** — reverted:
+
+| workload | item 2 | 2b attempt |
+|----------|-------:|-----------:|
+| boot     |   68.8 |       37.7 |
+| sys-md5  |   69.5 |       37.9 |
+
+Root cause: the JTLB was filled inside the interpreter's `translate()`,
+and `flush_tlb()` wipes it on every privilege-change trap (each timer
+interrupt). So `bus.jit_ram_offset` (the fill query) ran on nearly every
+interpreter memory op — the interpreter, which is ~89% of system
+execution, slowed ~45%. The emitted probe was cheap as designed; the fill
+placement + flush frequency killed it.
+
+Fix identified (ROADMAP 2b): privilege-tagged JTLB entries (fold mode into
+the free low 12 bits of the page tag) so the JTLB no longer flushes on
+privilege changes — only on satp/SFENCE/SUM-MXR (rare, not per-interrupt).
+The JTLB then stays warm across interrupts, fills become rare, and the
+interpreter tax amortizes away.
+
+Methodology note: absolute Minsn/s drifts with sustained host thermal load
+across a long session; compare within a single bench run, and re-baseline
+on a cold host before quoting deltas.
