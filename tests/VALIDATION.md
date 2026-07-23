@@ -1,6 +1,8 @@
 # Validation status
 
-Last full run: 2026-07-22.
+Last full run: 2026-07-22. Reproduce everything with `tests/run-all.sh`
+(all tools provided by `nix develop`; stages skip gracefully if a tool is
+missing).
 
 ## Official riscv-tests (ISA suites, p-variants, 134 tests)
 
@@ -38,6 +40,15 @@ Runner: `tests/run-isa-tests.sh` (needs gcc-riscv64-unknown-elf).
   input) are structurally valid wasm.
 - Interpreter-vs-JIT: guests produce bit-identical results with the JIT
   enabled; Linux boots to an interactive shell with system blocks live.
+
+## FP fast path
+
+FADD/FSUB/FMUL/FDIV use native FP (wasm f32/f64 instructions in the
+browser build) when rm=RNE and NX is already set — conditions under which
+no new flag information is possible. Verified by a 600k-iteration
+differential fuzz against softfp (bit-identical values; softfp confirmed
+to set nothing beyond NX in every eligible case) — see
+`fp_fastpath_tests` in cpu.rs. riscv-tests remain 134/134.
 
 ## Bugs found by this validation (all fixed)
 

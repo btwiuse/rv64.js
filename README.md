@@ -28,18 +28,26 @@ cargo run --release -p rv64-run -- <static-elf> [args...]
 ## Build & test
 
 ```sh
-# core unit tests
-cargo test -p rv64-core
+# reproducible dev environment (rust + cross targets, node, qemu, spike,
+# riscv cross-gcc, wabt/binaryen, dtc — everything validation needs)
+nix develop
 
-# wasm module
+# the full automated suite: cargo tests, guest builds, qemu differential,
+# official riscv-tests (134/134), wasm build + Node smoke (user-mode, JIT,
+# Linux boot). Stages skip gracefully when a tool is missing.
+tests/run-all.sh
+
+# individual pieces
+cargo test --workspace                  # unit + integration tests
+tests/run-isa-tests.sh                  # official ISA suite only
 cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
-
-# browser demo (needs the wasm build above)
-python3 -m http.server -d . 8000   # then open http://localhost:8000/web/
+python3 -m http.server -d . 8000        # then open /web/system.html
 
 # native TinyEMU oracle (differential testing)
 make -C reference/tinyemu CONFIG_FS_NET= CONFIG_SDL= CONFIG_X86EMU= CONFIG_SLIRP=
 ```
+
+Validation status lives in [tests/VALIDATION.md](tests/VALIDATION.md).
 
 ## Layout
 
