@@ -1,0 +1,12 @@
+[package]
+name = "rv64-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "wasm32 export surface for rv64.js — plain extern \"C\" ABI, v86-style (no wasm-bindgen)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rv64-core = { path = "../rv64-core" }

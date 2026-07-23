@@ -1,0 +1,8 @@
+[package]
+name = "rv64-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Portable RV64 CPU core (no_std-friendly, no I/O) for rv64.js"
+
+[dependencies]

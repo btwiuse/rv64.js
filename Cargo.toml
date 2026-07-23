@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/rv64-core", "crates/rv64-wasm"]
+
+[profile.release]
+lto = true
+opt-level = 3

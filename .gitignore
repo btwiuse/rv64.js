@@ -1,0 +1,7 @@
+/target
+# TinyEMU native build artifacts (source stays vendored)
+reference/tinyemu/*.o
+reference/tinyemu/*.d
+reference/tinyemu/temu
+reference/tinyemu/slirp/*.o
+reference/tinyemu/slirp/*.d
