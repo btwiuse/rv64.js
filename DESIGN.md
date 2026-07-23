@@ -63,24 +63,32 @@ multiple VMs = multiple instantiations.
 
 ## Phases
 
-1. **rv64i interpreter** *(done — this scaffold)*: decoder, ALU, branches,
-   loads/stores, ecall/ebreak; unit tests; wasm + JS demo run end-to-end.
-2. **User-mode Linux**: ELF loader, stack/auxv, `SVC→syscall` shim
-   (write/exit/brk/mmap/…) in JS or Rust-native harness → run static
-   hello-world, then busybox. Add **riscv-tests** (official ISA suite) and a
-   differential harness against the native `reference/tinyemu/temu` build
-   and/or QEMU.
-3. **Extensions**: M (mul/div), A (atomics), F/D (reuse ideas from TinyEMU's
-   softfp), C (compressed — implemented as a 16→32-bit expander in front of
-   the one decoder, not a second execute path), Zicsr/Zifencei.
-4. **Privileged architecture**: M/S/U modes, CSRs, sv39 (then sv48) MMU with
-   TLB behind a `SystemBus`, CLINT (timer/IPI), PLIC (external interrupts).
-   Map scope directly from `reference/tinyemu/riscv_machine.c`.
-5. **Devices + boot**: virtio-mmio (console, blk, net, 9p — TinyEMU's set,
-   `virtio.c`), device tree generation, boot the same kernel/rootfs images
-   TinyEMU ships → Linux shell in the browser.
-6. **JIT** (v86's endgame): translate hot basic blocks to wasm modules at
-   runtime. RISC-V's decode makes this the cleanest possible version of it.
+1. ✅ **rv64i interpreter**: decoder, ALU, branches, loads/stores,
+   ecall/ebreak; unit tests; wasm + JS demo run end-to-end.
+2. ✅ **User-mode Linux** (`rv64-linux`, `rv64-run`): ELF loader (ET_EXEC +
+   static-pie), Linux ABI stack/auxv, ~45-syscall shim. Runs no_std and
+   full-Rust-std musl static binaries, native and in the browser.
+3. ✅ **Extensions**: M, A (LR/SC + AMOs), F/D (host-float; fflags
+   approximated — softfloat pass still open, TinyEMU's softfp.c is the
+   model), C (16→32 expander in front of the one decoder), Zicsr.
+4. ✅ **Privileged architecture**: M/S/U, full CSR file, trap delegation,
+   MRET/SRET/WFI/SFENCE.VMA, sv39/sv48 MMU with per-access TLBs, hardware
+   A/D, SUM/MXR/MPRV. Interrupt lines are sampled live from the bus each
+   step (`Bus::irq_lines`) — level-triggered like real hardware, which is
+   what makes timer reprogramming race-free.
+5. ✅ **Devices + boot** (`rv64-system`): CLINT, TinyEMU-minimal PLIC, HTIF,
+   virtio-mmio v2 (console + blk), DTB builder, BBL trampoline. **Boots
+   TinyEMU's stock Linux 4.15 + buildroot image to an interactive shell**,
+   natively (~50 Minsn/s interpreted) and in the browser (web/system.html,
+   ~0.9 s to shell in Node). Not yet ported from TinyEMU: virtio-net, 9p.
+6. 🚧 **JIT** (`rv64-jit`): v1 pipeline proven end-to-end — Rust translates
+   basic blocks (ALU/branches/JAL/JALR, compressed included) into wasm
+   modules against a shared register-file memory; JS instantiates and
+   dispatches by pc; unsupported instructions end the block and fall back
+   to the interpreter (the v86 tiering seam). Still open: dispatcher
+   integration into `sys_run` hot loop, guest load/store translation with
+   inline TLB, block invalidation on SFENCE.VMA/self-modifying code,
+   block chaining, hotness tiering.
 
 ## Testing strategy
 

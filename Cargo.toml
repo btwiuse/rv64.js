@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rv64-core", "crates/rv64-linux", "crates/rv64-run", "crates/rv64-system", "crates/rv64-wasm"]
+members = ["crates/rv64-core", "crates/rv64-jit", "crates/rv64-linux", "crates/rv64-run", "crates/rv64-system", "crates/rv64-wasm"]
 
 [profile.release]
 lto = true

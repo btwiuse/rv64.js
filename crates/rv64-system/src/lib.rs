@@ -117,9 +117,7 @@ impl SystemBus {
                 match addr - CLINT_BASE {
                     0x0 => self.msip = val & 1 != 0,
                     0x4000 => self.mtimecmp = (self.mtimecmp & !0xffff_ffff) | val as u64,
-                    0x4004 => {
-                        self.mtimecmp = (self.mtimecmp & 0xffff_ffff) | ((val as u64) << 32)
-                    }
+                    0x4004 => self.mtimecmp = (self.mtimecmp & 0xffff_ffff) | ((val as u64) << 32),
                     _ => {}
                 }
                 true
@@ -141,8 +139,7 @@ impl SystemBus {
                         // command fires on the high-word write (TinyEMU-compatible)
                     }
                     4 => {
-                        self.htif_tohost =
-                            (self.htif_tohost & 0xffff_ffff) | ((val as u64) << 32);
+                        self.htif_tohost = (self.htif_tohost & 0xffff_ffff) | ((val as u64) << 32);
                         self.htif_handle_cmd();
                     }
                     8 => self.htif_fromhost = (self.htif_fromhost & !0xffff_ffff) | val as u64,
@@ -218,9 +215,7 @@ macro_rules! sys_rw {
             }
             if $n == 8 {
                 // allow 64-bit mtime reads
-                if let (Some(lo), Some(hi)) =
-                    (self.mmio_read32(addr), self.mmio_read32(addr + 4))
-                {
+                if let (Some(lo), Some(hi)) = (self.mmio_read32(addr), self.mmio_read32(addr + 4)) {
                     return Ok((((hi as u64) << 32) | lo as u64) as $ty);
                 }
             }
@@ -415,7 +410,13 @@ impl Machine {
     }
 }
 
-fn build_fdt(ram_size: u64, kernel_start: u64, kernel_len: u64, cmdline: &str, ndevs: usize) -> Vec<u8> {
+fn build_fdt(
+    ram_size: u64,
+    kernel_start: u64,
+    kernel_len: u64,
+    cmdline: &str,
+    ndevs: usize,
+) -> Vec<u8> {
     let mut f = dtb::Fdt::new();
     let intc_phandle = 1u32;
     let plic_phandle = 2u32;
@@ -492,7 +493,10 @@ fn build_fdt(ram_size: u64, kernel_start: u64, kernel_len: u64, cmdline: &str, n
     f.prop_str("bootargs", cmdline);
     if kernel_len > 0 {
         f.prop("riscv,kernel-start", &kernel_start.to_be_bytes());
-        f.prop("riscv,kernel-end", &(kernel_start + kernel_len).to_be_bytes());
+        f.prop(
+            "riscv,kernel-end",
+            &(kernel_start + kernel_len).to_be_bytes(),
+        );
     }
     f.end_node();
 

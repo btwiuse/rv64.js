@@ -4,8 +4,26 @@ A RISC-V (RV64) emulator for the browser — [TinyEMU](https://bellard.org/tinye
 scope with [copy/v86](https://github.com/copy/v86)'s architecture: Rust CPU core
 compiled to WebAssembly, plain-JS device/browser layer.
 
-**Status: phase 1 — RV64I interpreter running end-to-end (Rust → wasm → JS).**
-See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
+**Status: boots Linux.** rv64gc interpreter (I/M/A/F/D/C + Zicsr + full
+privileged arch with sv39/sv48 MMU) boots TinyEMU's stock Linux 4.15 +
+buildroot image to an interactive busybox shell — natively (~50 Minsn/s)
+and in the browser. User-mode emulation (qemu-user style) runs static
+riscv64 musl binaries. JIT-to-wasm pipeline is proven end-to-end (v1).
+See [DESIGN.md](DESIGN.md) for architecture and remaining work.
+
+```sh
+# boot Linux in the browser
+web/get-images.sh
+cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
+python3 -m http.server -d . 8000    # open http://localhost:8000/web/system.html
+
+# boot Linux natively
+cargo build --release -p rv64-system
+target/release/rv64-boot web/images/bbl64.bin web/images/kernel-riscv64.bin web/images/root-riscv64.bin
+
+# run a static riscv64 Linux binary (qemu-user style)
+cargo run --release -p rv64-run -- <static-elf> [args...]
+```
 
 ## Build & test
 

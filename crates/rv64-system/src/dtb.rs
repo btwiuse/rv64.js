@@ -15,7 +15,11 @@ const FDT_END: u32 = 9;
 
 impl Fdt {
     pub fn new() -> Fdt {
-        Fdt { struct_: Vec::new(), strings: Vec::new(), names: Vec::new() }
+        Fdt {
+            struct_: Vec::new(),
+            strings: Vec::new(),
+            names: Vec::new(),
+        }
     }
 
     fn u32(&mut self, v: u32) {
@@ -105,10 +109,10 @@ impl Fdt {
             total as u32,
             off_struct as u32,
             off_strings as u32,
-            header_len as u32,     // off_mem_rsvmap
-            17,                    // version
-            16,                    // last_comp_version
-            0,                     // boot_cpuid
+            header_len as u32, // off_mem_rsvmap
+            17,                // version
+            16,                // last_comp_version
+            0,                 // boot_cpuid
             self.strings.len() as u32,
             self.struct_.len() as u32,
         ] {

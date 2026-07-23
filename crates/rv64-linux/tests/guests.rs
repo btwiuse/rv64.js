@@ -32,8 +32,7 @@ fn run_guest(rel_path: &str, argv: &[&str]) -> Option<(i32, String)> {
     }
 }
 
-const NOSTD: &str =
-    "guests/hello-nostd/target/riscv64gc-unknown-linux-musl/release/hello-nostd";
+const NOSTD: &str = "guests/hello-nostd/target/riscv64gc-unknown-linux-musl/release/hello-nostd";
 const STD: &str = "guests/hello-std/target/riscv64gc-unknown-linux-musl/release/hello-std";
 const FPU: &str = "guests/fpu-test/target/riscv64gc-unknown-linux-musl/release/fpu-test";
 

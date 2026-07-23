@@ -198,8 +198,8 @@ impl Cpu {
             return Ok(va);
         }
         let levels: i32 = match vm {
-            8 => 3,  // sv39
-            9 => 4,  // sv48
+            8 => 3, // sv39
+            9 => 4, // sv48
             _ => return Err(Self::fault(access, va)),
         };
         // Canonical check: high bits must equal bit (9*levels + 12 - 1).
@@ -262,7 +262,8 @@ impl Cpu {
                 new_pte |= 1 << 7; // D
             }
             if new_pte != pte {
-                bus.write64(pte_addr, new_pte).map_err(|_| Self::fault(access, va))?;
+                bus.write64(pte_addr, new_pte)
+                    .map_err(|_| Self::fault(access, va))?;
             }
             // Physical address: superpage low VPN bits come from va.
             let mask = (1u64 << (12 + 9 * level as u32)) - 1;
@@ -334,11 +335,19 @@ impl Cpu {
             self.exc_counts[c] += 1;
         }
         let sys = self.sys.as_mut().unwrap();
-        let deleg = if is_interrupt { sys.mideleg } else { sys.medeleg };
+        let deleg = if is_interrupt {
+            sys.mideleg
+        } else {
+            sys.medeleg
+        };
         let bit = 1u64 << (cause & 63);
         let to_s = sys.mode != Mode::Machine && (deleg & bit) != 0;
 
-        let cause_val = if is_interrupt { (1 << 63) | cause } else { cause };
+        let cause_val = if is_interrupt {
+            (1 << 63) | cause
+        } else {
+            cause
+        };
         if to_s {
             sys.scause = cause_val;
             sys.stval = tval;
@@ -347,7 +356,11 @@ impl Cpu {
             let sie = (sys.mstatus >> 1) & 1;
             sys.mstatus = (sys.mstatus & !(MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SIE))
                 | (sie << 5)
-                | (if sys.mode == Mode::Supervisor { MSTATUS_SPP } else { 0 });
+                | (if sys.mode == Mode::Supervisor {
+                    MSTATUS_SPP
+                } else {
+                    0
+                });
             sys.mode = Mode::Supervisor;
             let base = sys.stvec & !3;
             self.pc = if sys.stvec & 3 == 1 && is_interrupt {
@@ -398,7 +411,9 @@ impl Cpu {
     /// Returns true if a trap was taken. Hardware lines (timer/external)
     /// come live from the bus; only software bits live in sys.mip.
     pub fn check_interrupts<B: Bus>(&mut self, bus: &mut B) -> bool {
-        let Some(sys) = self.sys.as_mut() else { return false };
+        let Some(sys) = self.sys.as_mut() else {
+            return false;
+        };
         const HW: u64 = IRQ_MTIP | IRQ_MSIP | IRQ_MEIP | IRQ_SEIP;
         sys.mip = (sys.mip & !HW) | (bus.irq_lines() & HW);
         let sys = self.sys.as_ref().unwrap();
@@ -848,7 +863,10 @@ impl Cpu {
                 }
                 // MRET
                 (0x3020_0073, _) => {
-                    let sys = self.sys.as_mut().ok_or(Exception::IllegalInstruction { insn })?;
+                    let sys = self
+                        .sys
+                        .as_mut()
+                        .ok_or(Exception::IllegalInstruction { insn })?;
                     if sys.mode != Mode::Machine {
                         return Err(Exception::IllegalInstruction { insn });
                     }
@@ -866,7 +884,10 @@ impl Cpu {
                 }
                 // SRET
                 (0x1020_0073, _) => {
-                    let sys = self.sys.as_mut().ok_or(Exception::IllegalInstruction { insn })?;
+                    let sys = self
+                        .sys
+                        .as_mut()
+                        .ok_or(Exception::IllegalInstruction { insn })?;
                     if sys.mode == Mode::User {
                         return Err(Exception::IllegalInstruction { insn });
                     }
@@ -1231,49 +1252,73 @@ impl Cpu {
             FCSR => self.fcsr = v as u32 & 0xff,
             MCYCLE | MINSTRET => {} // writable counters: ignore
             SSTATUS => {
-                const W: u64 =
-                    MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_FS | MSTATUS_SUM | MSTATUS_MXR;
-                let Some(sys) = self.sys.as_mut() else { return false };
+                const W: u64 = MSTATUS_SIE
+                    | MSTATUS_SPIE
+                    | MSTATUS_SPP
+                    | MSTATUS_FS
+                    | MSTATUS_SUM
+                    | MSTATUS_MXR;
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.mstatus = (sys.mstatus & !W) | (v & W);
                 self.flush_tlb(); // SUM/MXR affect translation
             }
             SIE => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 let mask = sys.mideleg;
                 sys.mie = (sys.mie & !mask) | (v & mask);
             }
             STVEC => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.stvec = v & !2;
             }
             SCOUNTEREN => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.scounteren = v & 7;
             }
             SSCRATCH => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.sscratch = v;
             }
             SEPC => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.sepc = v & !1;
             }
             SCAUSE => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.scause = v;
             }
             STVAL => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.stval = v;
             }
             SIP => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 // Only SSIP is directly writable by S-mode.
                 let mask = IRQ_SSIP & sys.mideleg;
                 sys.mip = (sys.mip & !mask) | (v & mask);
             }
             SATP => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 // Accept bare/sv39/sv48; ignore others (WARL).
                 let mode = v >> 60;
                 if mode == 0 || mode == 8 || mode == 9 {
@@ -1292,49 +1337,71 @@ impl Cpu {
                     | MSTATUS_MPRV
                     | MSTATUS_SUM
                     | MSTATUS_MXR;
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.mstatus = (sys.mstatus & !W) | (v & W);
                 self.flush_tlb();
             }
             MISA => {}
             MEDELEG => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.medeleg = v;
             }
             MIDELEG => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.mideleg = v & (IRQ_SSIP | IRQ_STIP | IRQ_SEIP);
             }
             MIE => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.mie = v;
             }
             MTVEC => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.mtvec = v & !2;
             }
             MCOUNTEREN => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.mcounteren = v & 7;
             }
             MSCRATCH => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.mscratch = v;
             }
             MEPC => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.mepc = v & !1;
             }
             MCAUSE => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.mcause = v;
             }
             MTVAL => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 sys.mtval = v;
             }
             MIP => {
-                let Some(sys) = self.sys.as_mut() else { return false };
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
                 // MSIP/MTIP are set by the CLINT; software may write others.
                 const W: u64 = IRQ_SSIP | IRQ_STIP | IRQ_SEIP;
                 sys.mip = (sys.mip & !W) | (v & W);

@@ -107,7 +107,13 @@ fn dump_kernel_log(m: &Machine) {
             let end = (i + 32768).min(ram.len());
             let chunk: String = ram[i..end]
                 .iter()
-                .map(|&b| if (32..127).contains(&b) || b == b'\n' { b as char } else { '.' })
+                .map(|&b| {
+                    if (32..127).contains(&b) || b == b'\n' {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
                 .collect();
             eprintln!("--- log candidate at ram+{i:#x}:\n{chunk}\n---");
         }

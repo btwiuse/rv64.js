@@ -275,9 +275,17 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
             ram_mb as usize,
             rv64_system::BootImages {
                 bios: &SYS_BIOS,
-                kernel: if SYS_KERNEL.is_empty() { None } else { Some(&SYS_KERNEL) },
+                kernel: if SYS_KERNEL.is_empty() {
+                    None
+                } else {
+                    Some(&SYS_KERNEL)
+                },
                 cmdline,
-                disk: if SYS_DISK.is_empty() { None } else { Some(core::mem::take(&mut SYS_DISK)) },
+                disk: if SYS_DISK.is_empty() {
+                    None
+                } else {
+                    Some(core::mem::take(&mut SYS_DISK))
+                },
             },
         );
         SYS_BIOS = Vec::new();
@@ -315,4 +323,40 @@ pub extern "C" fn sys_console_input() {
 #[allow(static_mut_refs)]
 pub extern "C" fn sys_insn_count() -> u64 {
     unsafe { SYS.as_ref().map(|m| m.cpu.insn_count).unwrap_or(0) }
+}
+
+// ---- JIT API (phase 6, v1) -------------------------------------------------
+
+static mut JIT_OUT: Vec<u8> = Vec::new();
+
+/// Translate a basic block: guest code bytes staged via staging_alloc,
+/// `base` = guest address of the staged bytes, `pc` = block entry.
+/// Returns number of guest instructions translated (0 = not translatable).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn jit_translate(base: u64, pc: u64) -> u32 {
+    unsafe {
+        match rv64_jit::translate_block(&STAGING, base, pc) {
+            Some(b) => {
+                JIT_OUT = b.wasm;
+                b.n_insns
+            }
+            None => {
+                JIT_OUT.clear();
+                0
+            }
+        }
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn jit_out_ptr() -> *const u8 {
+    unsafe { JIT_OUT.as_ptr() }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn jit_out_len() -> u32 {
+    unsafe { JIT_OUT.len() as u32 }
 }
