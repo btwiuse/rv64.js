@@ -225,7 +225,10 @@ struct JitState {
 
 impl JitState {
     fn new() -> JitState {
-        JitState { cache: Default::default(), hot: Default::default() }
+        JitState {
+            cache: Default::default(),
+            hot: Default::default(),
+        }
     }
     fn clear(&mut self) {
         self.cache.clear();
@@ -267,7 +270,9 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
         // --- JIT fast path: chain compiled blocks ---
         let mut chained = 0u32;
         while chained < JIT_CHAIN_CAP {
-            let Some(Some(b)) = jit.cache.get(&m.cpu.pc) else { break };
+            let Some(Some(b)) = jit.cache.get(&m.cpu.pc) else {
+                break;
+            };
             let b = *b;
             call_block(b.idx, m as *mut _ as *mut u8);
             m.cpu.insn_count += b.n as u64;
@@ -294,7 +299,11 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     .and_then(|blk| {
                         unsafe { JIT_OUT = blk.wasm };
                         let idx = unsafe { host_jit_register() };
-                        (idx >= 0).then_some(JitBlock { idx, n: blk.n_insns, pa: pc })
+                        (idx >= 0).then_some(JitBlock {
+                            idx,
+                            n: blk.n_insns,
+                            pa: pc,
+                        })
                     });
                 jit.cache.insert(pc, entry);
                 if entry.is_some() {
@@ -442,7 +451,9 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 m.bus.jit_clear_pages();
                 break;
             }
-            let Some(Some(b)) = jit.cache.get(&m.cpu.pc) else { break };
+            let Some(Some(b)) = jit.cache.get(&m.cpu.pc) else {
+                break;
+            };
             let b = *b;
             // Verify the va still maps to the same code.
             match m.cpu.jit_probe_fetch(&mut m.bus, m.cpu.pc) {
@@ -481,7 +492,11 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         return None;
                     }
                     m.bus.jit_mark_page(pa);
-                    Some(JitBlock { idx, n: blk.n_insns, pa })
+                    Some(JitBlock {
+                        idx,
+                        n: blk.n_insns,
+                        pa,
+                    })
                 });
                 jit.cache.insert(pc, entry);
                 if entry.is_some() {

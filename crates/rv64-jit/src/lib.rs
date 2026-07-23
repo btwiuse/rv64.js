@@ -45,7 +45,11 @@ pub struct JitLayout {
 impl JitLayout {
     /// Layout used by the standalone tests: x at 0, pc at 256, no memory.
     pub fn bare() -> JitLayout {
-        JitLayout { x_base: 0, pc_addr: 256, mem: None }
+        JitLayout {
+            x_base: 0,
+            pc_addr: 256,
+            mem: None,
+        }
     }
 }
 
@@ -80,7 +84,8 @@ impl Ctx {
         if r == 0 {
             m.i64_const(0);
         } else {
-            m.i32_const(0).i64_load(self.lay.x_base as u64 + r as u64 * 8);
+            m.i32_const(0)
+                .i64_load(self.lay.x_base as u64 + r as u64 * 8);
         }
     }
 
@@ -98,7 +103,9 @@ impl Ctx {
 
     /// Store the (constant) next pc.
     fn set_pc_const(&self, m: &mut WasmModule, pc: u64) {
-        m.i32_const(0).i64_const(pc as i64).i64_store(self.lay.pc_addr as u64);
+        m.i32_const(0)
+            .i64_const(pc as i64)
+            .i64_store(self.lay.pc_addr as u64);
     }
 
     /// Guest address (i64) is on the stack. Bounds-check it against guest
@@ -310,7 +317,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 c.push_reg(&mut m, s1);
                 m.i64_const(imm_i(insn)).op(I64_ADD);
                 c.guest_addr(&mut m, size, len); // i32 index on stack
-                // value
+                                                 // value
                 m.op(match f3 {
                     0 => I64_LOAD8_S,
                     1 => I64_LOAD16_S,
@@ -322,7 +329,12 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 });
                 // align hint + offset immediates
                 {
-                    let a = match len { 1 => 0u64, 2 => 1, 4 => 2, _ => 3 };
+                    let a = match len {
+                        1 => 0u64,
+                        2 => 1,
+                        4 => 2,
+                        _ => 3,
+                    };
                     m.raw_uleb(a).raw_uleb(mem_base as u64);
                 }
                 if d == 0 {
@@ -351,7 +363,12 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     2 => I64_STORE32,
                     _ => I64_STORE,
                 });
-                let a = match len { 1 => 0u64, 2 => 1, 4 => 2, _ => 3 };
+                let a = match len {
+                    1 => 0u64,
+                    2 => 1,
+                    4 => 2,
+                    _ => 3,
+                };
                 m.raw_uleb(a).raw_uleb(mem_base as u64);
             }
             // JAL: link; follow plain forward jumps (superblock chaining),
@@ -362,9 +379,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     m.i64_const(next_pc as i64);
                     c.store_post(&mut m, d);
                 }
-                let in_window = target > pc
-                    && target >= base
-                    && target < base + code.len() as u64;
+                let in_window = target > pc && target >= base && target < base + code.len() as u64;
                 if d == 0 && in_window {
                     pc = target;
                     n += 1;

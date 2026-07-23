@@ -147,6 +147,25 @@ impl Cpu {
         }
     }
 
+    /// FP instructions are illegal while mstatus.FS = Off (system mode).
+    #[inline]
+    fn fp_check(&self, insn: u32) -> Result<(), Exception> {
+        if let Some(sys) = &self.sys {
+            if sys.mstatus & MSTATUS_FS == 0 {
+                return Err(Exception::IllegalInstruction { insn });
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark FP state dirty (mstatus.FS = 11) after FP execution.
+    #[inline]
+    fn fp_dirty(&mut self) {
+        if let Some(sys) = &mut self.sys {
+            sys.mstatus |= MSTATUS_FS;
+        }
+    }
+
     // ---- address translation --------------------------------------------
 
     #[inline]
@@ -759,6 +778,18 @@ impl Cpu {
                     }
                     _ => {
                         let old = aload!();
+                        // 32-bit AMOs compare/compute on the low 32 bits
+                        // only (the register's high bits are ignored).
+                        let (co, cs) = if is64 {
+                            (old, src)
+                        } else {
+                            (old as u32 as u64, src as u32 as u64)
+                        };
+                        let signed_lt = if is64 {
+                            (co as i64) < (cs as i64)
+                        } else {
+                            (co as u32 as i32) < (cs as u32 as i32)
+                        };
                         let new = match funct5 {
                             0x01 => src,                   // AMOSWAP
                             0x00 => old.wrapping_add(src), // AMOADD
@@ -766,22 +797,33 @@ impl Cpu {
                             0x0c => old & src,             // AMOAND
                             0x08 => old | src,             // AMOOR
                             0x10 => {
-                                // AMOMIN (signed)
-                                if (old as i64) < (src as i64) {
+                                if signed_lt {
                                     old
                                 } else {
                                     src
                                 }
-                            }
+                            } // AMOMIN
                             0x14 => {
-                                if (old as i64) > (src as i64) {
+                                if !signed_lt && co != cs {
                                     old
                                 } else {
                                     src
-                                } // AMOMAX
-                            }
-                            0x18 => old.min(src), // AMOMINU
-                            0x1c => old.max(src), // AMOMAXU
+                                }
+                            } // AMOMAX
+                            0x18 => {
+                                if co < cs {
+                                    old
+                                } else {
+                                    src
+                                }
+                            } // AMOMINU
+                            0x1c => {
+                                if co > cs {
+                                    old
+                                } else {
+                                    src
+                                }
+                            } // AMOMAXU
                             _ => return Err(Exception::IllegalInstruction { insn }),
                         };
                         // 32-bit AMOs operate on the sign-extended old value
@@ -793,6 +835,8 @@ impl Cpu {
             }
             // LOAD-FP (FLW/FLD)
             0x07 => {
+                self.fp_check(insn)?;
+                self.fp_dirty();
                 let addr = self.x[rs1(insn)].wrapping_add(imm_i(insn) as u64);
                 self.f[rd(insn)] = match funct3(insn) {
                     2 => box32(f32::from_bits(self.ld::<B, 4>(bus, addr)? as u32)),
@@ -802,6 +846,7 @@ impl Cpu {
             }
             // STORE-FP (FSW/FSD)
             0x27 => {
+                self.fp_check(insn)?;
                 let addr = self.x[rs1(insn)].wrapping_add(imm_s(insn) as u64);
                 let v = self.f[rs2(insn)];
                 match funct3(insn) {
@@ -812,6 +857,8 @@ impl Cpu {
             }
             // FMADD/FMSUB/FNMSUB/FNMADD
             0x43 | 0x47 | 0x4b | 0x4f => {
+                self.fp_check(insn)?;
+                self.fp_dirty();
                 let rs3 = (insn >> 27) as usize;
                 let neg_prod = opcode(insn) == 0x4b || opcode(insn) == 0x4f;
                 let neg_c = opcode(insn) == 0x47 || opcode(insn) == 0x4f;
@@ -844,7 +891,11 @@ impl Cpu {
                 }
             }
             // OP-FP
-            0x53 => self.op_fp(insn)?,
+            0x53 => {
+                self.fp_check(insn)?;
+                self.fp_dirty();
+                self.op_fp(insn)?
+            }
             // MISC-MEM: FENCE/FENCE.I — no-ops for a single in-order hart
             0x0f => {}
             // SYSTEM
@@ -895,7 +946,9 @@ impl Cpu {
                         .sys
                         .as_mut()
                         .ok_or(Exception::IllegalInstruction { insn })?;
-                    if sys.mode == Mode::User {
+                    if sys.mode == Mode::User
+                        || (sys.mode == Mode::Supervisor && sys.mstatus & MSTATUS_TSR != 0)
+                    {
                         return Err(Exception::IllegalInstruction { insn });
                     }
                     let spp = if sys.mstatus & MSTATUS_SPP != 0 {
@@ -917,16 +970,37 @@ impl Cpu {
                 // WFI: report to host if nothing pending (host may idle).
                 (0x1050_0073, _) => {
                     if let Some(sys) = self.sys.as_ref() {
+                        // U-mode WFI is illegal; S-mode WFI traps when TW=1.
+                        if sys.mode == Mode::User
+                            || (sys.mode == Mode::Supervisor && sys.mstatus & MSTATUS_TW != 0)
+                        {
+                            return Err(Exception::IllegalInstruction { insn });
+                        }
                         if sys.mip & sys.mie == 0 {
                             stop = Some(StopReason::Wfi);
                         }
                     }
                 }
                 // SFENCE.VMA (funct7 = 0x09, f3 = 0)
-                _ if funct7(insn) == 0x09 && funct3(insn) == 0 => self.flush_tlb(),
+                _ if funct7(insn) == 0x09 && funct3(insn) == 0 => {
+                    if let Some(sys) = self.sys.as_ref() {
+                        // U-mode always traps; S-mode traps when TVM=1.
+                        if sys.mode == Mode::User
+                            || (sys.mode == Mode::Supervisor && sys.mstatus & MSTATUS_TVM != 0)
+                        {
+                            return Err(Exception::IllegalInstruction { insn });
+                        }
+                    }
+                    self.flush_tlb()
+                }
                 // Zicsr
                 (_, f3 @ 1..=3) | (_, f3 @ 5..=7) => {
                     let csr = insn >> 20;
+                    if csr <= 3 {
+                        // fflags/frm/fcsr are FP state
+                        self.fp_check(insn)?;
+                        self.fp_dirty();
+                    }
                     let src = if f3 >= 5 {
                         rs1(insn) as u64 // immediate form: uimm5
                     } else {
@@ -1206,12 +1280,25 @@ impl Cpu {
             FFLAGS => Some((self.fcsr & 0x1f) as u64),
             FRM => Some(((self.fcsr >> 5) & 7) as u64),
             FCSR => Some(self.fcsr as u64),
-            CYCLE | INSTRET | MCYCLE | MINSTRET => Some(self.insn_count),
+            CYCLE | INSTRET | MCYCLE | MINSTRET => Some(
+                self.insn_count
+                    .wrapping_add(self.sys.as_ref().map_or(0, |s| s.minstret_off)),
+            ),
             TIME => self.sys.as_ref().map(|s| s.mtime).or(Some(self.insn_count)),
+            // PMP: storage only, no enforcement (single-guest machine).
+            0x3a0..=0x3af if csr & 1 == 0 => self
+                .sys
+                .as_ref()
+                .map(|s| s.pmpcfg[((csr - 0x3a0) / 2) as usize]),
+            0x3b0..=0x3ef => self.sys.as_ref().map(|s| s.pmpaddr[(csr - 0x3b0) as usize]),
             _ => {
                 let sys = self.sys.as_ref()?;
-                // mstatus.FS held at dirty (+SD): we always save FP state.
-                let mstatus = sys.mstatus | MSTATUS_FS | MSTATUS_SD;
+                // SD summarizes FS: set when FP state is dirty.
+                let mstatus = if sys.mstatus & MSTATUS_FS == MSTATUS_FS {
+                    sys.mstatus | MSTATUS_SD
+                } else {
+                    sys.mstatus
+                };
                 Some(match csr {
                     SSTATUS => mstatus & SSTATUS_MASK,
                     SIE => sys.mie & sys.mideleg,
@@ -1222,7 +1309,18 @@ impl Cpu {
                     SCAUSE => sys.scause,
                     STVAL => sys.stval,
                     SIP => sys.mip & sys.mideleg,
-                    SATP => sys.satp,
+                    SATP => {
+                        // S-mode satp access traps when mstatus.TVM = 1.
+                        if sys.mode == Mode::Supervisor && sys.mstatus & MSTATUS_TVM != 0 {
+                            return None;
+                        }
+                        sys.satp
+                    }
+                    // Debug triggers: none implemented. tselect reads back
+                    // nonzero after writing 0 — the architected "hardwired"
+                    // signal riscv-tests uses to skip trigger tests.
+                    0x7a0 => 1,
+                    0x7a1..=0x7a3 | 0x7a5 => 0,
                     MSTATUS => mstatus,
                     MISA => MISA_VALUE,
                     MEDELEG => sys.medeleg,
@@ -1257,7 +1355,28 @@ impl Cpu {
             FFLAGS => self.fcsr = (self.fcsr & !0x1f) | (v as u32 & 0x1f),
             FRM => self.fcsr = (self.fcsr & !0xe0) | ((v as u32 & 7) << 5),
             FCSR => self.fcsr = v as u32 & 0xff,
-            MCYCLE | MINSTRET => {} // writable counters: ignore
+            MCYCLE | MINSTRET => {
+                // Writable counters. The writing csrw itself retires after
+                // the write takes effect, so bias by insn_count+1: a
+                // csrw 0 / csrr pair reads back exactly 0.
+                let ic = self.insn_count.wrapping_add(1);
+                if let Some(sys) = self.sys.as_mut() {
+                    sys.minstret_off = v.wrapping_sub(ic);
+                }
+            }
+            0x3a0..=0x3af if csr & 1 == 0 => {
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
+                sys.pmpcfg[((csr - 0x3a0) / 2) as usize] = v;
+            }
+            0x3b0..=0x3ef => {
+                let Some(sys) = self.sys.as_mut() else {
+                    return false;
+                };
+                // WARL: address bits [53:0]
+                sys.pmpaddr[(csr - 0x3b0) as usize] = v & 0x003f_ffff_ffff_ffff;
+            }
             SSTATUS => {
                 const W: u64 = MSTATUS_SIE
                     | MSTATUS_SPIE
@@ -1326,6 +1445,9 @@ impl Cpu {
                 let Some(sys) = self.sys.as_mut() else {
                     return false;
                 };
+                if sys.mode == Mode::Supervisor && sys.mstatus & MSTATUS_TVM != 0 {
+                    return false; // traps as illegal under TVM
+                }
                 // Accept bare/sv39/sv48; ignore others (WARL).
                 let mode = v >> 60;
                 if mode == 0 || mode == 8 || mode == 9 {
@@ -1333,6 +1455,8 @@ impl Cpu {
                     self.flush_tlb();
                 }
             }
+            // Debug trigger CSRs: writes ignored (no triggers implemented).
+            0x7a0..=0x7a3 | 0x7a5 => {}
             MSTATUS => {
                 const W: u64 = MSTATUS_SIE
                     | MSTATUS_MIE
@@ -1343,7 +1467,10 @@ impl Cpu {
                     | MSTATUS_FS
                     | MSTATUS_MPRV
                     | MSTATUS_SUM
-                    | MSTATUS_MXR;
+                    | MSTATUS_MXR
+                    | MSTATUS_TVM
+                    | MSTATUS_TW
+                    | MSTATUS_TSR;
                 let Some(sys) = self.sys.as_mut() else {
                     return false;
                 };

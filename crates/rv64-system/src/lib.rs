@@ -43,11 +43,15 @@ pub struct SystemBus {
     pub plic_served: u32,
     // virtio devices (irq = index + 1)
     pub virtio: Vec<VirtioDev>,
-    // HTIF (BBL early console + power off)
+    // HTIF (BBL early console + power off; riscv-tests result channel)
+    pub htif_base: u64,
     pub htif_tohost: u64,
     pub htif_fromhost: u64,
     pub htif_console: Vec<u8>,
     pub power_off: bool,
+    /// Set when the guest writes an odd value to tohost: value >> 1
+    /// (riscv-tests: 0 = pass, n = failing test case number).
+    pub htif_exit: Option<u64>,
     // JIT support: bitset of RAM pages holding compiled code. A store to a
     // marked page sets jit_dirty; the JIT host then drops all blocks
     // (self-modifying code / page reuse).
@@ -84,13 +88,15 @@ impl SystemBus {
                     _ => 0,
                 })
             }
-            _ if (HTIF_BASE..HTIF_BASE + 16).contains(&addr) => Some(match addr - HTIF_BASE {
-                0 => self.htif_tohost as u32,
-                4 => (self.htif_tohost >> 32) as u32,
-                8 => self.htif_fromhost as u32,
-                12 => (self.htif_fromhost >> 32) as u32,
-                _ => 0,
-            }),
+            _ if (self.htif_base..self.htif_base + 16).contains(&addr) => {
+                Some(match addr - self.htif_base {
+                    0 => self.htif_tohost as u32,
+                    4 => (self.htif_tohost >> 32) as u32,
+                    8 => self.htif_fromhost as u32,
+                    12 => (self.htif_fromhost >> 32) as u32,
+                    _ => 0,
+                })
+            }
             _ if (VIRTIO_BASE..VIRTIO_BASE + 8 * VIRTIO_SIZE).contains(&addr) => {
                 let i = ((addr - VIRTIO_BASE) / VIRTIO_SIZE) as usize;
                 let off = (addr - VIRTIO_BASE) % VIRTIO_SIZE;
@@ -103,7 +109,10 @@ impl SystemBus {
     fn htif_handle_cmd(&mut self) {
         let device = self.htif_tohost >> 56;
         let cmd = (self.htif_tohost >> 48) & 0xff;
-        if self.htif_tohost == 1 {
+        if self.htif_tohost & 1 == 1 && device == 0 {
+            // Test/shutdown exit: 1 = clean poweroff (exit 0); odd value
+            // (n<<1)|1 = riscv-tests failure in case n.
+            self.htif_exit = Some(self.htif_tohost >> 1);
             self.power_off = true;
         } else if device == 1 && cmd == 1 {
             self.htif_console.push(self.htif_tohost as u8);
@@ -137,8 +146,8 @@ impl SystemBus {
                 }
                 true
             }
-            _ if (HTIF_BASE..HTIF_BASE + 16).contains(&addr) => {
-                match addr - HTIF_BASE {
+            _ if (self.htif_base..self.htif_base + 16).contains(&addr) => {
+                match addr - self.htif_base {
                     0 => {
                         self.htif_tohost = (self.htif_tohost & !0xffff_ffff) | val as u64;
                         // command fires on the high-word write (TinyEMU-compatible)
@@ -232,12 +241,23 @@ impl SystemBus {
     }
 }
 
+impl SystemBus {
+    /// riscv-tests link `tohost` inside RAM; the HTIF window must win over
+    /// plain memory dispatch.
+    #[inline]
+    fn htif_hit(&self, addr: u64) -> bool {
+        addr.wrapping_sub(self.htif_base) < 16
+    }
+}
+
 macro_rules! sys_rw {
     ($rd:ident, $wr:ident, $ty:ty, $n:expr) => {
         fn $rd(&mut self, addr: u64) -> Result<$ty, Exception> {
-            if let Some(s) = self.ram_slice(addr, $n) {
-                let b: [u8; $n] = (&*s).try_into().unwrap();
-                return Ok(<$ty>::from_le_bytes(b));
+            if !self.htif_hit(addr) {
+                if let Some(s) = self.ram_slice(addr, $n) {
+                    let b: [u8; $n] = (&*s).try_into().unwrap();
+                    return Ok(<$ty>::from_le_bytes(b));
+                }
             }
             // MMIO: only aligned 32-bit accesses are meaningful.
             if $n == 4 {
@@ -255,9 +275,11 @@ macro_rules! sys_rw {
         }
         fn $wr(&mut self, addr: u64, val: $ty) -> Result<(), Exception> {
             self.jit_check_store(addr);
-            if let Some(s) = self.ram_slice(addr, $n) {
-                s.copy_from_slice(&val.to_le_bytes());
-                return Ok(());
+            if !self.htif_hit(addr) {
+                if let Some(s) = self.ram_slice(addr, $n) {
+                    s.copy_from_slice(&val.to_le_bytes());
+                    return Ok(());
+                }
             }
             if $n == 4 && self.mmio_write32(addr, val as u32) {
                 return Ok(());
@@ -378,10 +400,12 @@ impl Machine {
                 plic_pending: 0,
                 plic_served: 0,
                 virtio,
+                htif_base: HTIF_BASE,
                 htif_tohost: 0,
                 htif_fromhost: 0,
                 htif_console: Vec::new(),
                 power_off: false,
+                htif_exit: None,
                 jit_pages: vec![0u64; (ram_size >> 12).div_ceil(64)],
                 jit_dirty: false,
             },

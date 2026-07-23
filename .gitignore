@@ -7,3 +7,4 @@ reference/tinyemu/slirp/*.o
 reference/tinyemu/slirp/*.d
 web/images/
 guests/*/target/
+tests/riscv-tests/

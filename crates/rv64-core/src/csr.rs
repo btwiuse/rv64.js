@@ -70,6 +70,9 @@ pub const MSTATUS_FS: u64 = 3 << 13;
 pub const MSTATUS_MPRV: u64 = 1 << 17;
 pub const MSTATUS_SUM: u64 = 1 << 18;
 pub const MSTATUS_MXR: u64 = 1 << 19;
+pub const MSTATUS_TVM: u64 = 1 << 20;
+pub const MSTATUS_TW: u64 = 1 << 21;
+pub const MSTATUS_TSR: u64 = 1 << 22;
 pub const MSTATUS_UXL: u64 = 3 << 32;
 pub const MSTATUS_SXL: u64 = 3 << 34;
 pub const MSTATUS_SD: u64 = 1 << 63;
@@ -128,6 +131,11 @@ pub struct SysCsrs {
     pub mhartid: u64,
     /// mtime mirror, updated by the machine (CLINT owns the real one).
     pub mtime: u64,
+    /// PMP storage (no enforcement — single-guest machine, like TinyEMU).
+    pub pmpcfg: [u64; 8],
+    pub pmpaddr: [u64; 64],
+    /// minstret/mcycle are writable: offset relative to insn_count.
+    pub minstret_off: u64,
 }
 
 impl Default for SysCsrs {
@@ -140,8 +148,8 @@ impl SysCsrs {
     pub fn new() -> Self {
         SysCsrs {
             mode: Mode::Machine,
-            // UXL/SXL fixed at 64-bit; FS=initial (0b01) so S-mode may use FP
-            mstatus: MSTATUS_UXL & (2 << 32) | MSTATUS_SXL & (2 << 34) | (1 << 13),
+            // UXL/SXL fixed at 64-bit; FS starts Off (firmware enables it)
+            mstatus: MSTATUS_UXL & (2 << 32) | MSTATUS_SXL & (2 << 34),
             medeleg: 0,
             mideleg: 0,
             mie: 0,
@@ -161,6 +169,9 @@ impl SysCsrs {
             satp: 0,
             mhartid: 0,
             mtime: 0,
+            pmpcfg: [0; 8],
+            pmpaddr: [0; 64],
+            minstret_off: 0,
         }
     }
 }
