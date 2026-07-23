@@ -62,6 +62,8 @@ const OPIMM: u32 = 0x13;
 const OPIMM32: u32 = 0x1b;
 const LOAD: u32 = 0x03;
 const STORE: u32 = 0x23;
+const LOADFP: u32 = 0x07;
+const STOREFP: u32 = 0x27;
 const LUI: u32 = 0x37;
 const JAL: u32 = 0x6f;
 const JALR: u32 = 0x67;
@@ -93,7 +95,8 @@ pub fn expand(c: u16) -> Option<u32> {
                 }
                 0b010 => {
                     // C.LW: lw rd', uimm(rs1')
-                    let imm = (((c >> 10) & 7) << 3) | (((c >> 6) & 1) << 2) | (((c >> 5) & 1) << 6);
+                    let imm =
+                        (((c >> 10) & 7) << 3) | (((c >> 6) & 1) << 2) | (((c >> 5) & 1) << 6);
                     Some(enc_i(LOAD, rd, 2, rs1, imm as i32))
                 }
                 0b011 => {
@@ -103,7 +106,8 @@ pub fn expand(c: u16) -> Option<u32> {
                 }
                 0b110 => {
                     // C.SW
-                    let imm = (((c >> 10) & 7) << 3) | (((c >> 6) & 1) << 2) | (((c >> 5) & 1) << 6);
+                    let imm =
+                        (((c >> 10) & 7) << 3) | (((c >> 6) & 1) << 2) | (((c >> 5) & 1) << 6);
                     Some(enc_s(STORE, 2, rs1, rd, imm as i32))
                 }
                 0b111 => {
@@ -111,7 +115,16 @@ pub fn expand(c: u16) -> Option<u32> {
                     let imm = (((c >> 10) & 7) << 3) | (((c >> 5) & 3) << 6);
                     Some(enc_s(STORE, 3, rs1, rd, imm as i32))
                 }
-                // 001/101 = C.FLD/C.FSD — arrive with the D extension
+                0b001 => {
+                    // C.FLD
+                    let imm = (((c >> 10) & 7) << 3) | (((c >> 5) & 3) << 6);
+                    Some(enc_i(LOADFP, rd, 3, rs1, imm as i32))
+                }
+                0b101 => {
+                    // C.FSD
+                    let imm = (((c >> 10) & 7) << 3) | (((c >> 5) & 3) << 6);
+                    Some(enc_s(STOREFP, 3, rs1, rd, imm as i32))
+                }
                 _ => None,
             }
         }
@@ -261,7 +274,17 @@ pub fn expand(c: u16) -> Option<u32> {
                     let imm = (((c >> 10) & 7) << 3) | (((c >> 7) & 7) << 6);
                     Some(enc_s(STORE, 3, 2, rs2, imm as i32))
                 }
-                // 001/101 = C.FLDSP/C.FSDSP — arrive with the D extension
+                0b001 => {
+                    // C.FLDSP
+                    let imm =
+                        (((c >> 12) & 1) << 5) | (((c >> 5) & 3) << 3) | (((c >> 2) & 7) << 6);
+                    Some(enc_i(LOADFP, rd, 3, 2, imm as i32))
+                }
+                0b101 => {
+                    // C.FSDSP
+                    let imm = (((c >> 10) & 7) << 3) | (((c >> 7) & 7) << 6);
+                    Some(enc_s(STOREFP, 3, 2, rs2, imm as i32))
+                }
                 _ => None,
             }
         }

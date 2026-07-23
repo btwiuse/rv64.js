@@ -85,7 +85,13 @@ fn raw() -> &'static mut RawEmu {
 pub extern "C" fn init(base: u64, size: u32) {
     let mut cpu = Cpu::new();
     cpu.pc = base;
-    unsafe { RAW = Some(RawEmu { cpu, ram: vec![0; size as usize], ram_base: base }) }
+    unsafe {
+        RAW = Some(RawEmu {
+            cpu,
+            ram: vec![0; size as usize],
+            ram_base: base,
+        })
+    }
 }
 
 #[no_mangle]
@@ -177,7 +183,10 @@ pub extern "C" fn user_load(mem_size: u32) -> i32 {
         let envp = ["PATH=/bin", "HOME=/", "TERM=dumb"];
         match Machine::load(&STAGING, argv, &envp, mem_size as usize, &mut host) {
             Ok(machine) => {
-                USER = Some(UserEmu { machine, exit_code: 0 });
+                USER = Some(UserEmu {
+                    machine,
+                    exit_code: 0,
+                });
                 STAGING.clear();
                 USER_ARGS.clear();
                 0

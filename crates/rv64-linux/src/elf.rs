@@ -85,9 +85,15 @@ pub fn load(elf: &[u8], mem: &mut [u8]) -> Result<LoadedElf, ElfError> {
         }
         let end = p_vaddr
             .checked_add(p_memsz)
-            .ok_or(ElfError::SegmentOutOfRange { vaddr: p_vaddr, size: p_memsz })?;
+            .ok_or(ElfError::SegmentOutOfRange {
+                vaddr: p_vaddr,
+                size: p_memsz,
+            })?;
         if end > mem.len() as u64 {
-            return Err(ElfError::SegmentOutOfRange { vaddr: p_vaddr, size: p_memsz });
+            return Err(ElfError::SegmentOutOfRange {
+                vaddr: p_vaddr,
+                size: p_memsz,
+            });
         }
         let src = p_offset as usize..(p_offset + p_filesz) as usize;
         if src.end > elf.len() {

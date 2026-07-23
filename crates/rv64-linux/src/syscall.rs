@@ -66,7 +66,14 @@ const PAGE: u64 = 4096;
 /// when the program terminated.
 pub fn handle(m: &mut Machine, host: &mut dyn Host) -> Option<i32> {
     let nr = m.cpu.x[17];
-    let a = [m.cpu.x[10], m.cpu.x[11], m.cpu.x[12], m.cpu.x[13], m.cpu.x[14], m.cpu.x[15]];
+    let a = [
+        m.cpu.x[10],
+        m.cpu.x[11],
+        m.cpu.x[12],
+        m.cpu.x[13],
+        m.cpu.x[14],
+        m.cpu.x[15],
+    ];
 
     let ret: i64 = match nr {
         SYS_EXIT | SYS_EXIT_GROUP => return Some(a[0] as i32),
@@ -175,10 +182,10 @@ pub fn handle(m: &mut Machine, host: &mut dyn Host) -> Option<i32> {
             m.mem[base..base + 128].fill(0);
             // offsetof(st_mode) = 16 in riscv64 struct stat
             let mode: u32 = 0o020620; // S_IFCHR | 0620
-        m.mem[base + 16..base + 20].copy_from_slice(&mode.to_le_bytes());
+            m.mem[base + 16..base + 20].copy_from_slice(&mode.to_le_bytes());
             0
         }
-        SYS_IOCTL => 0,   // pretend TIOCGWINSZ etc. succeed
+        SYS_IOCTL => 0, // pretend TIOCGWINSZ etc. succeed
         SYS_FCNTL => 0,
         SYS_OPENAT | SYS_FACCESSAT | SYS_UNLINKAT | SYS_READLINKAT => ENOENT, // no fs yet
         SYS_CLOSE | SYS_LSEEK => {

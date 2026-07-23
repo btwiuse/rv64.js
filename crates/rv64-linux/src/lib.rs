@@ -94,10 +94,14 @@ impl Machine {
             *pos
         };
 
-        let argv_ptrs: Vec<u64> =
-            argv.iter().map(|s| push_bytes(&mut self.mem, &mut pos, s.as_bytes())).collect();
-        let envp_ptrs: Vec<u64> =
-            envp.iter().map(|s| push_bytes(&mut self.mem, &mut pos, s.as_bytes())).collect();
+        let argv_ptrs: Vec<u64> = argv
+            .iter()
+            .map(|s| push_bytes(&mut self.mem, &mut pos, s.as_bytes()))
+            .collect();
+        let envp_ptrs: Vec<u64> = envp
+            .iter()
+            .map(|s| push_bytes(&mut self.mem, &mut pos, s.as_bytes()))
+            .collect();
 
         // AT_RANDOM: 16 bytes of entropy
         let mut rnd = [0u8; 16];
