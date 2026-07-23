@@ -1,0 +1,52 @@
+# Validation status
+
+Last full run: 2026-07-22.
+
+## Official riscv-tests (ISA suites, p-variants, 134 tests)
+
+| | rv64.js | Spike 1.1.1-dev (golden model) |
+|---|---|---|
+| pass | **121/134** | 132/134 |
+
+Cross-check verdict: **zero unexpected disagreements.**
+
+- The **13 rv64.js failures** (rv64uf/ud: fadd, fcmp, fcvt, fcvt_w, fdiv,
+  fmadd, fmin) all pass on Spike and are all `fflags` assertions — the
+  documented host-float deviation: computed values are IEEE-correct
+  (bit-identical to QEMU), exception flags are approximated. Fix: softfloat
+  port (TinyEMU's softfp.c is the model).
+- The **2 Spike failures** are Spike-configuration artifacts, not rv64.js
+  bugs:
+  - `rv64mi-p-zicntr`: passes on Spike with `--isa=rv64gc_zicntr`
+    (counters not in its default ISA string); rv64.js implements Zicntr.
+  - `rv64ui-p-ma_data`: rv64.js supports misaligned data accesses in
+    hardware (a spec-legal choice, same as TinyEMU); default Spike traps.
+
+Runner: `tests/run-isa-tests.sh` (needs gcc-riscv64-unknown-elf).
+
+## Differential testing
+
+- **qemu-riscv64 (user-mode)**: all three guests (hello-std, fpu-test,
+  bench) produce bit-identical stdout and exit codes.
+- **TinyEMU (`temu`, native)**: boots the same guest images; used as the
+  machine-model reference during bring-up.
+- **Spike**: built from riscv-isa-sim source; available as golden-model
+  oracle for future lockstep/state-diff work.
+
+## JIT
+
+- `wasm-validate` (wabt): 231/231 modules emitted by `translate_block`
+  from every halfword offset of a real guest binary (i.e. mostly garbage
+  input) are structurally valid wasm.
+- Interpreter-vs-JIT: guests produce bit-identical results with the JIT
+  enabled; Linux boots to an interactive shell with system blocks live.
+
+## Bugs found by this validation (all fixed)
+
+1. 32-bit AMO min/max compared full 64-bit registers (rv64ua-p-amomin*_w).
+2. `mstatus.FS` forced dirty; FP ops didn't trap when FS=Off (rv64mi-p-csr).
+3. `minstret`/`mcycle` not writable (rv64mi-p-instret_overflow).
+4. JIT emitter had wrong opcodes for I64_GE_S/GE_U — BGE/BGEU blocks
+   miscompiled (found by review during integration).
+5. Missing: PMP CSRs, mstatus.TVM/TW/TSR enforcement, U-mode WFI/SFENCE
+   traps, trigger CSR stubs (rv64mi-p-pmpaddr/illegal/breakpoint).
