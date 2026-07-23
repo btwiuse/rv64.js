@@ -68,8 +68,7 @@ macro_rules! softfp {
                 let rnd_bits: $u;
                 if exp <= 0 {
                     // Underflow flag: rounded result subnormal and inexact.
-                    let is_subnormal =
-                        exp < 0 || mant.wrapping_add(addend) < (1 << (F_SIZE - 1));
+                    let is_subnormal = exp < 0 || mant.wrapping_add(addend) < (1 << (F_SIZE - 1));
                     mant = rshift_rnd(mant, 1 - exp);
                     rnd_bits = mant & ((1 << RND_SIZE) - 1);
                     if is_subnormal && rnd_bits != 0 {
@@ -110,7 +109,14 @@ macro_rules! softfp {
             }
 
             /// Double-word mantissa variant (hi has at most F_SIZE-1 bits).
-            fn normalize2(sign: u32, exp: i32, mut hi: $u, mut lo: $u, rm: u32, fl: &mut u32) -> $u {
+            fn normalize2(
+                sign: u32,
+                exp: i32,
+                mut hi: $u,
+                mut lo: $u,
+                rm: u32,
+                fl: &mut u32,
+            ) -> $u {
                 let l = if hi == 0 {
                     F_SIZE as i32 + lo.leading_zeros() as i32
                 } else {

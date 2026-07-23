@@ -836,7 +836,11 @@ impl Cpu {
                 match (insn >> 25) & 3 {
                     0 => {
                         let ub = |r: u64| -> u32 {
-                            if r >> 32 == 0xffff_ffff { r as u32 } else { 0x7fc0_0000 }
+                            if r >> 32 == 0xffff_ffff {
+                                r as u32
+                            } else {
+                                0x7fc0_0000
+                            }
                         };
                         let mut a = ub(self.f[rs1(insn)]);
                         let b = ub(self.f[rs2(insn)]);
@@ -1021,6 +1025,75 @@ impl Cpu {
         (rm <= 4).then_some(rm)
     }
 
+    /// Native-FP fast path for FADD/FSUB/FMUL/FDIV, valid only when no new
+    /// fflags information is possible. Preconditions checked by the caller:
+    /// rm == RNE and NX already set (flags are sticky, so once NX is set,
+    /// an op whose only possible flag is NX changes nothing architectural).
+    /// This function then excludes every operand/result shape that could
+    /// raise NV/DZ/OF/UF:
+    /// - operands must be finite (no NaN/inf -> no NV; nonzero divisor -> no DZ)
+    /// - result must not be inf (no OF)
+    /// - UF: add/sub of finite values never underflows inexactly (a
+    ///   subnormal sum is exact — classic IEEE result), so any non-inf
+    ///   result is fine; mul/div require a *normal* result, or an exactly
+    ///   zero result forced by a zero operand.
+    /// Under those conditions the host op (native FPU, or wasm f32/f64
+    /// instructions in the wasm build) is bit-exact IEEE RNE, and no flag
+    /// computation is needed at all. Everything else falls to softfp.
+    #[inline]
+    fn fp_fast64(op: u32, a: u64, b: u64) -> Option<u64> {
+        let ea = (a >> 52) & 0x7ff;
+        let eb = (b >> 52) & 0x7ff;
+        if ea == 0x7ff || eb == 0x7ff {
+            return None; // NaN/inf operands
+        }
+        if op == 3 && b << 1 == 0 {
+            return None; // divide by zero
+        }
+        let (fa, fb) = (f64::from_bits(a), f64::from_bits(b));
+        let r = match op {
+            0 => fa + fb,
+            1 => fa - fb,
+            2 => fa * fb,
+            _ => fa / fb,
+        };
+        let rb = r.to_bits();
+        let er = (rb >> 52) & 0x7ff;
+        let ok = match op {
+            0 | 1 => er != 0x7ff,
+            2 => (1..=0x7fe).contains(&er) || (rb << 1 == 0 && (a << 1 == 0 || b << 1 == 0)),
+            _ => (1..=0x7fe).contains(&er) || (rb << 1 == 0 && a << 1 == 0),
+        };
+        ok.then_some(rb)
+    }
+
+    #[inline]
+    fn fp_fast32(op: u32, a: u32, b: u32) -> Option<u32> {
+        let ea = (a >> 23) & 0xff;
+        let eb = (b >> 23) & 0xff;
+        if ea == 0xff || eb == 0xff {
+            return None;
+        }
+        if op == 3 && b << 1 == 0 {
+            return None;
+        }
+        let (fa, fb) = (f32::from_bits(a), f32::from_bits(b));
+        let r = match op {
+            0 => fa + fb,
+            1 => fa - fb,
+            2 => fa * fb,
+            _ => fa / fb,
+        };
+        let rb = r.to_bits();
+        let er = (rb >> 23) & 0xff;
+        let ok = match op {
+            0 | 1 => er != 0xff,
+            2 => (1..=0xfe).contains(&er) || (rb << 1 == 0 && (a << 1 == 0 || b << 1 == 0)),
+            _ => (1..=0xfe).contains(&er) || (rb << 1 == 0 && a << 1 == 0),
+        };
+        ok.then_some(rb)
+    }
+
     /// OP-FP (opcode 0x53), softfloat implementation (exact fflags).
     /// Ported from TinyEMU's softfp (see softfp.rs).
     fn op_fp(&mut self, insn: u32) -> Result<(), Exception> {
@@ -1053,6 +1126,13 @@ impl Cpu {
             (0x00..=0x03, 0) => {
                 let rm = self.get_rm(f3).ok_or(ill)?;
                 let (a, b) = (ub32(self.f[s1]), ub32(self.f[s2]));
+                // Fast path: see fp_fast32 — exact, no flag math needed.
+                if rm == sfp::RM_RNE && self.fcsr & sfp::FFLAG_INEXACT != 0 {
+                    if let Some(r) = Self::fp_fast32(op, a, b) {
+                        self.f[d] = bx32(r);
+                        return Ok(());
+                    }
+                }
                 let r = match op {
                     0 => sf32::add(a, b, rm, &mut fl),
                     1 => sf32::sub(a, b, rm, &mut fl),
@@ -1064,6 +1144,12 @@ impl Cpu {
             (0x00..=0x03, 1) => {
                 let rm = self.get_rm(f3).ok_or(ill)?;
                 let (a, b) = (self.f[s1], self.f[s2]);
+                if rm == sfp::RM_RNE && self.fcsr & sfp::FFLAG_INEXACT != 0 {
+                    if let Some(r) = Self::fp_fast64(op, a, b) {
+                        self.f[d] = r;
+                        return Ok(());
+                    }
+                }
                 self.f[d] = match op {
                     0 => sf64::add(a, b, rm, &mut fl),
                     1 => sf64::sub(a, b, rm, &mut fl),
@@ -1660,5 +1746,88 @@ mod tests {
             StopReason::Trap(Exception::IllegalInstruction { .. }) => {}
             other => panic!("expected illegal instruction, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod fp_fastpath_tests {
+    use super::Cpu;
+    use crate::softfp::{sf32, sf64, FFLAG_INEXACT, RM_RNE};
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// The fast path must be bit-identical to softfp, and softfp must set
+    /// no flag beyond NX whenever the fast path considered itself eligible
+    /// (that's the entire correctness argument for skipping flag math).
+    #[test]
+    fn fast64_matches_softfp() {
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        let mut hits = 0u32;
+        for i in 0..300_000 {
+            let (mut a, mut b) = (rng.next(), rng.next());
+            if i % 3 == 0 {
+                // bias exponents toward mid-range so most samples are
+                // eligible normals, not NaN/inf/subnormal rejects
+                a = (a & !(0x7ff << 52)) | (((a >> 52) % 0x600 + 0x100) << 52);
+                b = (b & !(0x7ff << 52)) | (((b >> 52) % 0x600 + 0x100) << 52);
+            }
+            let op = (rng.next() % 4) as u32;
+            if let Some(fast) = Cpu::fp_fast64(op, a, b) {
+                hits += 1;
+                let mut fl = 0u32;
+                let soft = match op {
+                    0 => sf64::add(a, b, RM_RNE, &mut fl),
+                    1 => sf64::sub(a, b, RM_RNE, &mut fl),
+                    2 => sf64::mul(a, b, RM_RNE, &mut fl),
+                    _ => sf64::div(a, b, RM_RNE, &mut fl),
+                };
+                assert_eq!(fast, soft, "op {op} a={a:#x} b={b:#x}");
+                assert_eq!(
+                    fl & !FFLAG_INEXACT,
+                    0,
+                    "op {op} a={a:#x} b={b:#x} flags {fl:#x}"
+                );
+            }
+        }
+        assert!(hits > 50_000, "fast path rarely eligible: {hits}");
+    }
+
+    #[test]
+    fn fast32_matches_softfp() {
+        let mut rng = Rng(0xDEADBEEFCAFED00D);
+        let mut hits = 0u32;
+        for i in 0..300_000 {
+            let (mut a, mut b) = (rng.next() as u32, rng.next() as u32);
+            if i % 3 == 0 {
+                a = (a & !(0xff << 23)) | ((((a >> 23) % 0xc0) + 0x20) << 23);
+                b = (b & !(0xff << 23)) | ((((b >> 23) % 0xc0) + 0x20) << 23);
+            }
+            let op = (rng.next() % 4) as u32;
+            if let Some(fast) = Cpu::fp_fast32(op, a, b) {
+                hits += 1;
+                let mut fl = 0u32;
+                let soft = match op {
+                    0 => sf32::add(a, b, RM_RNE, &mut fl),
+                    1 => sf32::sub(a, b, RM_RNE, &mut fl),
+                    2 => sf32::mul(a, b, RM_RNE, &mut fl),
+                    _ => sf32::div(a, b, RM_RNE, &mut fl),
+                };
+                assert_eq!(fast, soft, "op {op} a={a:#x} b={b:#x}");
+                assert_eq!(
+                    fl & !FFLAG_INEXACT,
+                    0,
+                    "op {op} a={a:#x} b={b:#x} flags {fl:#x}"
+                );
+            }
+        }
+        assert!(hits > 50_000, "fast path rarely eligible: {hits}");
     }
 }

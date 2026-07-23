@@ -9,8 +9,43 @@ fn sys(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     ret
 }
 
+fn set_frm(frm: u64) {
+    unsafe { asm!("csrw frm, {0}", in(reg) frm) }
+}
+
 #[no_mangle]
-extern "C" fn rust_main(_sp: *const u64) -> ! {
+extern "C" fn rust_main(sp: *const u64) -> ! {
+    // argv[1] == "soft" forces frm=RDN: the interpreter's native-FP fast
+    // path requires RNE, so this benchmarks the softfp fallback instead.
+    let argc = unsafe { *sp } as usize;
+    let mut soft = false;
+    if argc > 1 {
+        let p = unsafe { *sp.add(2) } as *const u8;
+        soft = unsafe { *p == b's' };
+    }
+    set_frm(if soft { 2 } else { 0 }); // RDN vs RNE
+
+    // FP phase: mul/add/div mix on normal values
+    let mut y: f64 = 1.5;
+    let mut facc: f64 = 0.0;
+    let mut i: u64 = 0;
+    while i < 5_000_000 {
+        y = y * 1.0000001 + 0.0625;
+        facc += y / 3.0;
+        if y > 1e300 {
+            y = 1.5;
+        }
+        i += 1;
+    }
+    let fb = facc.to_bits();
+    let mut fbuf = [0u8; 17];
+    for j in 0..16 {
+        let dd = ((fb >> (60 - j * 4)) & 0xf) as u8;
+        fbuf[j] = if dd < 10 { b'0' + dd } else { b'a' + dd - 10 };
+    }
+    fbuf[16] = b'\n';
+    sys(64, 1, fbuf.as_ptr() as u64, 17);
+
     // xorshift + accumulate: pure ALU/branch, JIT-friendly
     let mut x: u64 = 0x2545F4914F6CDD1D;
     let mut acc: u64 = 0;
