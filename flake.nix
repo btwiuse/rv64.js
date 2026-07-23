@@ -37,8 +37,23 @@
         spike = pkgs.spike.overrideAttrs (old: {
           configureFlags = (old.configureFlags or [ ]) ++ [ "--enable-commitlog" ];
         });
+
+        # Modern-system smoke test (tests/virt-smoke): a stock riscv64 kernel
+        # with virtio-blk/ext4 built in, and OpenSBI fw_dynamic, both booted by
+        # the virt machine. Exposed as packages so the harness resolves them
+        # reproducibly without hard-coded store paths.
+        virtKernel = pkgs.pkgsCross.riscv64.linux_latest;
+        virtOpensbi = pkgs.pkgsCross.riscv64.opensbi;
+        # riscv64 Linux C cross-compiler for the smoke-test guest init. Built
+        # on demand by the harness (not part of the devShell, to keep
+        # `nix develop` fast).
+        virtCc = pkgs.pkgsCross.riscv64-musl.buildPackages.gcc;
       in
       {
+        packages.virt-kernel = virtKernel;
+        packages.virt-opensbi = virtOpensbi;
+        packages.virt-cc = virtCc;
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rust

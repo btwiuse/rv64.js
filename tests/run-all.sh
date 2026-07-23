@@ -11,6 +11,7 @@
 #   5. spike lockstep     per-instruction register-writeback diff vs Spike
 #   6. riscv-arch-test    official architecture tests, signatures vs Spike
 #   7. wasm build + smoke user-mode/JIT/Linux-boot through Node
+#   8. virt-smoke        modern-system (Debian-class) boot regression test
 #
 # Under the nix dev shell (flake.nix) all tools are present.
 set -u
@@ -69,12 +70,21 @@ else
     echo "SKIP (spike or ${PREFIX}gcc not found)"
 fi
 
-note "7/7 wasm build + smoke"
+note "7/8 wasm build + smoke"
 if command -v node >/dev/null 2>&1; then
     cargo build --release -q -p rv64-wasm --target wasm32-unknown-unknown || FAILED=1
     node tests/wasm-smoke.mjs || FAILED=1
 else
     echo "SKIP (node not found)"
+fi
+
+note "8/8 virt-smoke (modern-system boot)"
+# Only run when the kernel is already realized in the store; building it is a
+# ~15 min one-off. `nix path-info` checks presence without triggering a build.
+if command -v nix >/dev/null 2>&1 && nix path-info .#virt-kernel >/dev/null 2>&1; then
+    tests/virt-smoke/run.sh || FAILED=1
+else
+    echo "SKIP (virt-kernel not built; run tests/virt-smoke/run.sh once to build+cache it)"
 fi
 
 printf '\n'

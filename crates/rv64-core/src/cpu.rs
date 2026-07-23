@@ -1783,6 +1783,52 @@ mod tests {
     }
 
     #[test]
+    fn trap_invalidates_lr_reservation() {
+        // A trap taken between an LR and its SC must clear the reservation, so
+        // the SC fails and the guest's LR/SC loop retries. Without this, an
+        // interrupt handler updating the same word via LR/SC lets the
+        // interrupted SC still succeed and silently lose the handler's update
+        // (an intermittent lost-wakeup source under Linux). Deterministic guard
+        // for a bug the full-system smoke test only trips probabilistically.
+        let mut cpu = Cpu::new();
+        cpu.enable_system(0);
+        cpu.reservation = Some(0x8000_0000);
+        cpu.take_trap(7, 0, true); // e.g. a timer interrupt
+        assert_eq!(cpu.reservation, None, "trap must invalidate LR reservation");
+
+        // Any exception must too (page fault, ecall, ...).
+        cpu.reservation = Some(0x8000_1000);
+        cpu.take_trap(8, 0, false); // ecall from U-mode
+        assert_eq!(cpu.reservation, None, "exception must invalidate LR reservation");
+    }
+
+    #[test]
+    fn rdtime_derives_live_from_insn_count() {
+        // In full-system mode the machine sets time_scale/time_offset so rdtime
+        // advances every instruction (matching the CLINT clock at instruction
+        // granularity) instead of only at slice boundaries — kernel busy-wait
+        // loops like __delay read rdtime tightly and must see it move.
+        let mut cpu = Cpu::new();
+        cpu.enable_system(0);
+        {
+            let sys = cpu.sys.as_mut().unwrap();
+            sys.time_scale = 10;
+            sys.time_offset = 5;
+        }
+        cpu.insn_count = 0;
+        assert_eq!(cpu.csr_read(TIME), Some(5)); // 0/10 + 5
+        cpu.insn_count = 100;
+        assert_eq!(cpu.csr_read(TIME), Some(15)); // 100/10 + 5
+        // time_scale == 0 falls back to the mirrored mtime (legacy machine).
+        {
+            let sys = cpu.sys.as_mut().unwrap();
+            sys.time_scale = 0;
+            sys.mtime = 42;
+        }
+        assert_eq!(cpu.csr_read(TIME), Some(42));
+    }
+
+    #[test]
     fn compressed_instructions_execute() {
         // c.li a0, 21 (0x4555); c.mv a1, a0 (0x85aa); c.add a0, a1 (0x952e); ecall
         let mut mem = vec![0u8; 0x10000];

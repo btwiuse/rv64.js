@@ -93,6 +93,19 @@ priority order. Check items off as they land.
   lockstep-identical (~24k writebacks; ma_data skipped as the documented
   spec-legal misaligned-access divergence).
 
+- [x] **6b. Modern-system smoke / regression harness** *(done 2026-07-23)* —
+  `tests/virt-smoke/run.sh` boots the virt machine with a ~10 KB initramfs
+  whose init exercises the paths that were broken (8250 THRE TX interrupt,
+  LR/SC-across-trap, live rdtime) and checks for `SMOKE_OK` vs a hang. Inputs
+  come from the flake (`.#virt-kernel`, `.#virt-opensbi`, `.#virt-cc`) so it's
+  reproducible. **Coverage is layered** because not all bugs are catchable by
+  an integration test: the THRE hang is deterministic and caught by the smoke
+  test, but the LR/SC reservation and rdtime bugs are probabilistic/latent —
+  a simple boot passes even with them reverted — so they are pinned by
+  deterministic unit tests (`cpu::tests::trap_invalidates_lr_reservation`,
+  `rdtime_derives_live_from_insn_count`). Each guard was validated by
+  reverting its fix and confirming it fails. See `tests/virt-smoke/README.md`.
+
 ## Features (TinyEMU parity and beyond)
 
 - [ ] **7. virtio-9p** — host filesystem sharing into the guest (TinyEMU's
@@ -104,10 +117,17 @@ priority order. Check items off as they land.
   relay (v86's approach); native can use a tun/tap or slirp port. Large
   effort, needs infrastructure.
 
-- [ ] **9. Modern guest images** — current images are TinyEMU's 2018
-  Linux 4.15 + buildroot. Build a current kernel + rootfs (toolchain is in
-  the nix shell) to validate modern virtio drivers and get a nicer
-  userland. Also replaces BBL with OpenSBI.
+- [x] **9. Modern guest images** *(done 2026-07-23)* — a new **virt**-class
+  machine (`crates/rv64-system/src/virt.rs`, runner `bin/rv64-vboot`) boots a
+  stock **Debian riscv64 6.18 kernel** via **OpenSBI fw_dynamic** (not BBL),
+  with a full PLIC, ns16550 UART, sifive-test, CLINT and virtio-mmio, plus a
+  modern DTB (incl. `/chosen/rng-seed`). With a virtio-blk/ext4-builtin kernel
+  it mounts a real Debian rootfs and runs Debian userland; a debootstrap-built
+  rootfs with build-essential **compiles the Linux kernel in-guest** (gcc-14 +
+  make; ~100× slower than native under the interpreter — a full build is a
+  days-long soak, not for CI). Getting here fixed several real full-system
+  bugs — the 8250 THRE transmit interrupt, LR/SC reservation-on-trap, and
+  live rdtime; see the smoke harness below and `tests/virt-smoke/README.md`.
 
 - [ ] **10. Snapshot save/restore** — serialize machine state (CPU + RAM +
   devices are all plain data) for v86-style instant-boot-from-snapshot in
