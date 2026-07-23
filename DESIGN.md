@@ -111,16 +111,11 @@ fflags.NX is already sticky-set — conditions under which no new flag
 information is possible — falling back to softfp otherwise. ~2x on
 FP-heavy code in wasm, verified by 600k-iteration differential fuzz.
 
-Post-1.0 roadmap (rough priority order):
-1. Inline-TLB memory ops in full-system JIT blocks (biggest perf lever —
-   system blocks are currently ALU/branch-only).
-2. In-wasm block chaining (drop the HashMap + call_indirect per block).
-3. FP ops inside JIT blocks (same sticky-NX/RNE guard, inline wasm FP).
-4. RISCOF formal compliance runs (Spike + toolchain already set up).
-5. virtio-9p host filesystem sharing; then virtio-net (WebSocket relay);
-   modern kernel/rootfs images; snapshot save/restore.
-virtio-net/9p were intentionally descoped from phase 5 — the boot target
-was console + blk, which is what "Linux shell in the browser" requires.
+The post-1.0 roadmap lives in [ROADMAP.md](../ROADMAP.md) (perf: inline-TLB
+JIT memory ops, block chaining, FP-in-blocks; validation: RISCOF, Spike
+lockstep; features: virtio-9p/net, modern images, snapshots). virtio-net/9p
+were intentionally descoped from phase 5 — the boot target was console +
+blk, which is what "Linux shell in the browser" requires.
 
 ## Testing strategy
 
