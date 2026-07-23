@@ -31,6 +31,15 @@ pub trait Bus {
         self.read16(addr)
             .map_err(|_| Exception::InstructionAccessFault { addr })
     }
+
+    /// Hardware interrupt lines (MTIP/MSIP/MEIP/SEIP bit positions), sampled
+    /// by the CPU before each instruction in full-system mode. Level-
+    /// triggered: the device recomputes from its own state, so a cleared
+    /// condition (e.g. mtimecmp rewritten) drops the line immediately —
+    /// no stale-mip interrupt storms.
+    fn irq_lines(&mut self) -> u64 {
+        0
+    }
 }
 
 /// Flat guest memory starting at `base` — the user-mode Bus.

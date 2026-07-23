@@ -1,0 +1,9 @@
+[package]
+name = "rv64-system"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Full-system riscv64 machine for rv64.js: RAM, CLINT, PLIC, virtio-mmio, DTB (TinyEMU-compatible layout)"
+
+[dependencies]
+rv64-core = { path = "../rv64-core" }

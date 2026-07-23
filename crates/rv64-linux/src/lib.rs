@@ -201,6 +201,8 @@ impl Machine {
                     return RunResult::Exited(133);
                 }
                 StopReason::Trap(e) => return RunResult::Trap(e),
+                // Full-system only; unreachable in user-mode emulation.
+                StopReason::Wfi => unreachable!("WFI stop without system mode"),
             }
         }
     }

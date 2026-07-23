@@ -31,6 +31,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rv64-system"
+version = "0.1.0"
+dependencies = [
+ "rv64-core",
+]
+
+[[package]]
 name = "rv64-wasm"
 version = "0.1.0"
 dependencies = [

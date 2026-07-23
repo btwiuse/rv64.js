@@ -1,4 +1,5 @@
 use crate::bus::Bus;
+use crate::csr::*;
 use crate::decode::*;
 use crate::exception::Exception;
 
@@ -7,14 +8,28 @@ use crate::exception::Exception;
 pub enum StopReason {
     /// Instruction budget exhausted; just call run() again.
     Budget,
-    /// ECALL executed. User-mode: the host services a syscall and resumes.
-    /// Full-system (later): routed to the trap vector instead of returned.
+    /// ECALL executed (user-mode emulation only: the host services a
+    /// syscall and resumes; full-system routes ecall to the guest kernel).
     Ecall,
-    /// EBREAK executed.
+    /// EBREAK executed (user-mode emulation only).
     Break,
-    /// An exception with no handler configured (phase 1: all of them).
+    /// An exception with no handler configured (user-mode emulation only).
     Trap(Exception),
+    /// WFI with no pending interrupt (full-system only): host may idle.
+    Wfi,
 }
+
+/// Memory access type, for translation and fault selection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Fetch,
+    Load,
+    Store,
+}
+
+const TLB_BITS: u32 = 8;
+const TLB_SIZE: usize = 1 << TLB_BITS;
+const TLB_INVALID: u64 = !0;
 
 /// RV64I hart state + interpreter.
 ///
@@ -32,6 +47,15 @@ pub struct Cpu {
     pub f: [u64; 32],
     /// fcsr: fflags[4:0] | frm[7:5].
     pub fcsr: u32,
+    /// Privileged state; None = pure user-mode emulation (no MMU/traps).
+    pub sys: Option<SysCsrs>,
+    /// Diagnostics: exception counts by cause, interrupt counts by cause.
+    pub exc_counts: [u64; 16],
+    pub irq_counts: [u64; 16],
+    // Direct-mapped TLBs (virtual page tag -> pa-va diff), one per access
+    // type so permission bits never need re-checking on a hit.
+    tlb_tag: [[u64; TLB_SIZE]; 3],
+    tlb_diff: [[u64; TLB_SIZE]; 3],
 }
 
 /// NaN-box an f32 into a 64-bit F register (high 32 bits all-ones).
@@ -89,7 +113,24 @@ impl Cpu {
             reservation: None,
             f: [0; 32],
             fcsr: 0,
+            sys: None,
+            exc_counts: [0; 16],
+            irq_counts: [0; 16],
+            tlb_tag: [[TLB_INVALID; TLB_SIZE]; 3],
+            tlb_diff: [[0; TLB_SIZE]; 3],
         }
+    }
+
+    /// Enable full-system mode: M/S/U privileges, MMU, traps. The hart
+    /// resets to M-mode at `pc` with a0=hartid, a1=dtb (set by caller).
+    pub fn enable_system(&mut self, hartid: u64) {
+        let mut sys = SysCsrs::new();
+        sys.mhartid = hartid;
+        self.sys = Some(sys);
+    }
+
+    pub fn flush_tlb(&mut self) {
+        self.tlb_tag = [[TLB_INVALID; TLB_SIZE]; 3];
     }
 
     #[inline]
@@ -99,13 +140,316 @@ impl Cpu {
         }
     }
 
+    // ---- address translation --------------------------------------------
+
+    #[inline]
+    fn fault(access: Access, addr: u64) -> Exception {
+        match access {
+            Access::Fetch => Exception::InstructionPageFault { addr },
+            Access::Load => Exception::LoadPageFault { addr },
+            Access::Store => Exception::StorePageFault { addr },
+        }
+    }
+
+    /// Effective privilege for data accesses (MPRV) or fetch.
+    fn eff_mode(&self, access: Access) -> Mode {
+        let sys = self.sys.as_ref().unwrap();
+        if access != Access::Fetch && sys.mstatus & MSTATUS_MPRV != 0 {
+            Mode::from_bits((sys.mstatus & MSTATUS_MPP) >> 11)
+        } else {
+            sys.mode
+        }
+    }
+
+    /// Translate a virtual address (full-system mode). Hot path: TLB hit.
+    #[inline]
+    fn translate<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        va: u64,
+        access: Access,
+    ) -> Result<u64, Exception> {
+        if self.sys.is_none() {
+            return Ok(va);
+        }
+        let idx = ((va >> 12) as usize) & (TLB_SIZE - 1);
+        let tag = va >> 12;
+        let a = access as usize;
+        if self.tlb_tag[a][idx] == tag {
+            return Ok(va.wrapping_add(self.tlb_diff[a][idx]));
+        }
+        self.translate_slow(bus, va, access)
+    }
+
+    /// Page-table walk (sv39/sv48), permission checks, A/D update, TLB fill.
+    fn translate_slow<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        va: u64,
+        access: Access,
+    ) -> Result<u64, Exception> {
+        let sys = self.sys.as_ref().unwrap();
+        let mode = self.eff_mode(access);
+        let satp = sys.satp;
+        let vm = satp >> 60;
+
+        // Bare, or M-mode without MPRV redirection: identity.
+        if vm == 0 || mode == Mode::Machine {
+            return Ok(va);
+        }
+        let levels: i32 = match vm {
+            8 => 3,  // sv39
+            9 => 4,  // sv48
+            _ => return Err(Self::fault(access, va)),
+        };
+        // Canonical check: high bits must equal bit (9*levels + 12 - 1).
+        let va_bits = 9 * levels as u32 + 12;
+        let ext = (va as i64) >> (va_bits - 1);
+        if ext != 0 && ext != -1 {
+            return Err(Self::fault(access, va));
+        }
+
+        let sum = sys.mstatus & MSTATUS_SUM != 0;
+        let mxr = sys.mstatus & MSTATUS_MXR != 0;
+
+        let mut table = (satp & 0xfff_ffff_ffff) << 12; // PPN
+        let mut level = levels - 1;
+        loop {
+            let vpn = (va >> (12 + 9 * level as u32)) & 0x1ff;
+            let pte_addr = table + vpn * 8;
+            let pte = bus.read64(pte_addr).map_err(|_| Self::fault(access, va))?;
+            let v = pte & 1;
+            let r = pte >> 1 & 1;
+            let w = pte >> 2 & 1;
+            let x = pte >> 3 & 1;
+            if v == 0 || (r == 0 && w == 1) {
+                return Err(Self::fault(access, va));
+            }
+            if r == 0 && x == 0 {
+                // pointer to next level
+                if level == 0 {
+                    return Err(Self::fault(access, va));
+                }
+                table = (pte >> 10) << 12;
+                level -= 1;
+                continue;
+            }
+            // Leaf. Check alignment of superpages.
+            let ppn = pte >> 10;
+            if level > 0 && (ppn & ((1 << (9 * level as u32)) - 1)) != 0 {
+                return Err(Self::fault(access, va));
+            }
+            // Permission checks.
+            let u = pte >> 4 & 1 != 0;
+            match mode {
+                Mode::User if !u => return Err(Self::fault(access, va)),
+                Mode::Supervisor if u && !(sum && access != Access::Fetch) => {
+                    return Err(Self::fault(access, va))
+                }
+                _ => {}
+            }
+            let ok = match access {
+                Access::Fetch => x == 1,
+                Access::Load => r == 1 || (mxr && x == 1),
+                Access::Store => w == 1,
+            };
+            if !ok {
+                return Err(Self::fault(access, va));
+            }
+            // A/D update (hardware-managed, like TinyEMU).
+            let mut new_pte = pte | 1 << 6; // A
+            if access == Access::Store {
+                new_pte |= 1 << 7; // D
+            }
+            if new_pte != pte {
+                bus.write64(pte_addr, new_pte).map_err(|_| Self::fault(access, va))?;
+            }
+            // Physical address: superpage low VPN bits come from va.
+            let mask = (1u64 << (12 + 9 * level as u32)) - 1;
+            let pa = ((ppn << 12) & !mask) | (va & mask);
+
+            // Fill TLB (only 4K granularity; superpages fill one entry).
+            // Don't cache Load entries whose D bit isn't set for stores etc.
+            let idx = ((va >> 12) as usize) & (TLB_SIZE - 1);
+            let a = access as usize;
+            self.tlb_tag[a][idx] = va >> 12;
+            self.tlb_diff[a][idx] = pa.wrapping_sub(va);
+            return Ok(pa);
+        }
+    }
+
+    // ---- memory accessors (virtual in full-system, direct otherwise) -----
+
+    #[inline]
+    fn ld<B: Bus, const N: u32>(&mut self, bus: &mut B, va: u64) -> Result<u64, Exception> {
+        // Split accesses that cross a page boundary (two translations).
+        if self.sys.is_some() && (va & 0xfff) + N as u64 > 0x1000 {
+            let mut v: u64 = 0;
+            for i in 0..N as u64 {
+                let pa = self.translate(bus, va + i, Access::Load)?;
+                v |= (bus.read8(pa)? as u64) << (8 * i);
+            }
+            return Ok(v);
+        }
+        let pa = self.translate(bus, va, Access::Load)?;
+        match N {
+            1 => bus.read8(pa).map(|v| v as u64),
+            2 => bus.read16(pa).map(|v| v as u64),
+            4 => bus.read32(pa).map(|v| v as u64),
+            _ => bus.read64(pa),
+        }
+    }
+
+    #[inline]
+    fn st<B: Bus, const N: u32>(
+        &mut self,
+        bus: &mut B,
+        va: u64,
+        val: u64,
+    ) -> Result<(), Exception> {
+        if self.sys.is_some() && (va & 0xfff) + N as u64 > 0x1000 {
+            for i in 0..N as u64 {
+                let pa = self.translate(bus, va + i, Access::Store)?;
+                bus.write8(pa, (val >> (8 * i)) as u8)?;
+            }
+            return Ok(());
+        }
+        let pa = self.translate(bus, va, Access::Store)?;
+        match N {
+            1 => bus.write8(pa, val as u8),
+            2 => bus.write16(pa, val as u16),
+            4 => bus.write32(pa, val as u32),
+            _ => bus.write64(pa, val),
+        }
+    }
+
+    // ---- traps ------------------------------------------------------------
+
+    /// Enter the trap handler for an exception or interrupt.
+    pub fn take_trap(&mut self, cause: u64, tval: u64, is_interrupt: bool) {
+        let c = (cause & 15) as usize;
+        if is_interrupt {
+            self.irq_counts[c] += 1;
+        } else {
+            self.exc_counts[c] += 1;
+        }
+        let sys = self.sys.as_mut().unwrap();
+        let deleg = if is_interrupt { sys.mideleg } else { sys.medeleg };
+        let bit = 1u64 << (cause & 63);
+        let to_s = sys.mode != Mode::Machine && (deleg & bit) != 0;
+
+        let cause_val = if is_interrupt { (1 << 63) | cause } else { cause };
+        if to_s {
+            sys.scause = cause_val;
+            sys.stval = tval;
+            sys.sepc = self.pc;
+            // SPIE = SIE; SIE = 0; SPP = prev
+            let sie = (sys.mstatus >> 1) & 1;
+            sys.mstatus = (sys.mstatus & !(MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SIE))
+                | (sie << 5)
+                | (if sys.mode == Mode::Supervisor { MSTATUS_SPP } else { 0 });
+            sys.mode = Mode::Supervisor;
+            let base = sys.stvec & !3;
+            self.pc = if sys.stvec & 3 == 1 && is_interrupt {
+                base + 4 * cause
+            } else {
+                base
+            };
+        } else {
+            sys.mcause = cause_val;
+            sys.mtval = tval;
+            sys.mepc = self.pc;
+            let mie = (sys.mstatus >> 3) & 1;
+            sys.mstatus = (sys.mstatus & !(MSTATUS_MPIE | MSTATUS_MPP | MSTATUS_MIE))
+                | (mie << 7)
+                | ((sys.mode as u64) << 11);
+            sys.mode = Mode::Machine;
+            let base = sys.mtvec & !3;
+            self.pc = if sys.mtvec & 3 == 1 && is_interrupt {
+                base + 4 * cause
+            } else {
+                base
+            };
+        }
+        self.flush_tlb(); // privilege changed
+    }
+
+    fn exception_to_trap(&mut self, e: Exception) {
+        let (cause, tval) = match e {
+            Exception::InstructionAddressMisaligned { addr } => (0, addr),
+            Exception::InstructionAccessFault { addr } => (1, addr),
+            Exception::IllegalInstruction { insn } => (2, insn as u64),
+            Exception::Breakpoint => (3, self.pc),
+            Exception::LoadAddressMisaligned { addr } => (4, addr),
+            Exception::LoadAccessFault { addr } => (5, addr),
+            Exception::StoreAddressMisaligned { addr } => (6, addr),
+            Exception::StoreAccessFault { addr } => (7, addr),
+            Exception::EnvironmentCallFromUMode => (8, 0),
+            Exception::EnvironmentCallFromSMode => (9, 0),
+            Exception::EnvironmentCallFromMMode => (11, 0),
+            Exception::InstructionPageFault { addr } => (12, addr),
+            Exception::LoadPageFault { addr } => (13, addr),
+            Exception::StorePageFault { addr } => (15, addr),
+        };
+        self.take_trap(cause, tval, false);
+    }
+
+    /// Check for a deliverable interrupt; take the highest-priority one.
+    /// Returns true if a trap was taken. Hardware lines (timer/external)
+    /// come live from the bus; only software bits live in sys.mip.
+    pub fn check_interrupts<B: Bus>(&mut self, bus: &mut B) -> bool {
+        let Some(sys) = self.sys.as_mut() else { return false };
+        const HW: u64 = IRQ_MTIP | IRQ_MSIP | IRQ_MEIP | IRQ_SEIP;
+        sys.mip = (sys.mip & !HW) | (bus.irq_lines() & HW);
+        let sys = self.sys.as_ref().unwrap();
+        let pending = sys.mip & sys.mie;
+        if pending == 0 {
+            return false;
+        }
+        let mideleg = sys.mideleg;
+        let m_enabled = sys.mode != Mode::Machine || (sys.mstatus & MSTATUS_MIE) != 0;
+        let s_enabled = sys.mode == Mode::User
+            || (sys.mode == Mode::Supervisor && (sys.mstatus & MSTATUS_SIE) != 0);
+
+        // Priority: MEI, MSI, MTI, SEI, SSI, STI.
+        for &irq in &[11u64, 3, 7, 9, 1, 5] {
+            let bit = 1u64 << irq;
+            if pending & bit == 0 {
+                continue;
+            }
+            let target_s = mideleg & bit != 0;
+            let deliverable = if target_s {
+                // S-target: fires when we're below S, or in S with SIE.
+                sys.mode == Mode::User || (sys.mode == Mode::Supervisor && s_enabled)
+            } else {
+                // M-target: fires when below M, or in M with MIE.
+                sys.mode != Mode::Machine || m_enabled
+            };
+            if deliverable {
+                self.take_trap(irq, 0, true);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Run up to `budget` instructions; returns why we stopped.
     pub fn run<B: Bus>(&mut self, bus: &mut B, budget: u64) -> StopReason {
+        let system = self.sys.is_some();
         for _ in 0..budget {
+            if system {
+                self.check_interrupts(bus);
+            }
             match self.step(bus) {
                 Ok(None) => {}
                 Ok(Some(stop)) => return stop,
-                Err(e) => return StopReason::Trap(e),
+                Err(e) => {
+                    if system {
+                        self.exception_to_trap(e);
+                    } else {
+                        return StopReason::Trap(e);
+                    }
+                }
             }
         }
         StopReason::Budget
@@ -117,9 +461,16 @@ impl Cpu {
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> Result<Option<StopReason>, Exception> {
         // Fetch 16 bits first: a compressed instruction may sit on the last
         // halfword of a page/region, where a blind 32-bit fetch would fault.
-        let lo = bus.fetch16(self.pc)? as u32;
+        let pa = self.translate(bus, self.pc, Access::Fetch)?;
+        let lo = bus.fetch16(pa)? as u32;
         let (insn, ilen) = if lo & 3 == 3 {
-            let hi = bus.fetch16(self.pc.wrapping_add(2))? as u32;
+            let pc2 = self.pc.wrapping_add(2);
+            let pa2 = if pc2 & 0xfff == 0 {
+                self.translate(bus, pc2, Access::Fetch)?
+            } else {
+                pa + 2
+            };
+            let hi = bus.fetch16(pa2)? as u32;
             (lo | (hi << 16), 4)
         } else {
             let exp = crate::compressed::expand(lo as u16)
@@ -165,13 +516,13 @@ impl Cpu {
             0x03 => {
                 let addr = self.x[rs1(insn)].wrapping_add(imm_i(insn) as u64);
                 let val = match funct3(insn) {
-                    0 => bus.read8(addr)? as i8 as i64 as u64,   // LB
-                    1 => bus.read16(addr)? as i16 as i64 as u64, // LH
-                    2 => bus.read32(addr)? as i32 as i64 as u64, // LW
-                    3 => bus.read64(addr)?,                      // LD
-                    4 => bus.read8(addr)? as u64,                // LBU
-                    5 => bus.read16(addr)? as u64,               // LHU
-                    6 => bus.read32(addr)? as u64,               // LWU
+                    0 => self.ld::<B, 1>(bus, addr)? as i8 as i64 as u64, // LB
+                    1 => self.ld::<B, 2>(bus, addr)? as i16 as i64 as u64, // LH
+                    2 => self.ld::<B, 4>(bus, addr)? as i32 as i64 as u64, // LW
+                    3 => self.ld::<B, 8>(bus, addr)?,                     // LD
+                    4 => self.ld::<B, 1>(bus, addr)?,                     // LBU
+                    5 => self.ld::<B, 2>(bus, addr)?,                     // LHU
+                    6 => self.ld::<B, 4>(bus, addr)?,                     // LWU
                     _ => return Err(Exception::IllegalInstruction { insn }),
                 };
                 self.wr(rd(insn), val);
@@ -181,10 +532,10 @@ impl Cpu {
                 let addr = self.x[rs1(insn)].wrapping_add(imm_s(insn) as u64);
                 let val = self.x[rs2(insn)];
                 match funct3(insn) {
-                    0 => bus.write8(addr, val as u8)?,   // SB
-                    1 => bus.write16(addr, val as u16)?, // SH
-                    2 => bus.write32(addr, val as u32)?, // SW
-                    3 => bus.write64(addr, val)?,        // SD
+                    0 => self.st::<B, 1>(bus, addr, val)?, // SB
+                    1 => self.st::<B, 2>(bus, addr, val)?, // SH
+                    2 => self.st::<B, 4>(bus, addr, val)?, // SW
+                    3 => self.st::<B, 8>(bus, addr, val)?, // SD
                     _ => return Err(Exception::IllegalInstruction { insn }),
                 }
             }
@@ -349,31 +700,35 @@ impl Cpu {
                     3 => true,
                     _ => return Err(Exception::IllegalInstruction { insn }),
                 };
-                let load = |bus: &mut B, addr: u64| -> Result<u64, Exception> {
-                    if is64 {
-                        bus.read64(addr)
-                    } else {
-                        Ok(bus.read32(addr)? as i32 as i64 as u64)
-                    }
-                };
-                let store = |bus: &mut B, addr: u64, v: u64| -> Result<(), Exception> {
-                    if is64 {
-                        bus.write64(addr, v)
-                    } else {
-                        bus.write32(addr, v as u32)
-                    }
-                };
+                macro_rules! aload {
+                    () => {
+                        if is64 {
+                            self.ld::<B, 8>(bus, addr)?
+                        } else {
+                            self.ld::<B, 4>(bus, addr)? as i32 as i64 as u64
+                        }
+                    };
+                }
+                macro_rules! astore {
+                    ($v:expr) => {
+                        if is64 {
+                            self.st::<B, 8>(bus, addr, $v)?
+                        } else {
+                            self.st::<B, 4>(bus, addr, $v)?
+                        }
+                    };
+                }
                 match funct5 {
                     0x02 => {
                         // LR
-                        let v = load(bus, addr)?;
+                        let v = aload!();
                         self.reservation = Some(addr);
                         self.wr(rd(insn), v);
                     }
                     0x03 => {
                         // SC
                         if self.reservation == Some(addr) {
-                            store(bus, addr, src)?;
+                            astore!(src);
                             self.wr(rd(insn), 0);
                         } else {
                             self.wr(rd(insn), 1);
@@ -381,7 +736,7 @@ impl Cpu {
                         self.reservation = None;
                     }
                     _ => {
-                        let old = load(bus, addr)?;
+                        let old = aload!();
                         let new = match funct5 {
                             0x01 => src,                   // AMOSWAP
                             0x00 => old.wrapping_add(src), // AMOADD
@@ -409,7 +764,7 @@ impl Cpu {
                         };
                         // 32-bit AMOs operate on the sign-extended old value
                         // but store only the low 32 bits.
-                        store(bus, addr, new)?;
+                        astore!(new);
                         self.wr(rd(insn), old);
                     }
                 }
@@ -418,8 +773,8 @@ impl Cpu {
             0x07 => {
                 let addr = self.x[rs1(insn)].wrapping_add(imm_i(insn) as u64);
                 self.f[rd(insn)] = match funct3(insn) {
-                    2 => box32(f32::from_bits(bus.read32(addr)?)),
-                    3 => bus.read64(addr)?,
+                    2 => box32(f32::from_bits(self.ld::<B, 4>(bus, addr)? as u32)),
+                    3 => self.ld::<B, 8>(bus, addr)?,
                     _ => return Err(Exception::IllegalInstruction { insn }),
                 };
             }
@@ -428,8 +783,8 @@ impl Cpu {
                 let addr = self.x[rs1(insn)].wrapping_add(imm_s(insn) as u64);
                 let v = self.f[rs2(insn)];
                 match funct3(insn) {
-                    2 => bus.write32(addr, v as u32)?,
-                    3 => bus.write64(addr, v)?,
+                    2 => self.st::<B, 4>(bus, addr, v)?,
+                    3 => self.st::<B, 8>(bus, addr, v)?,
                     _ => return Err(Exception::IllegalInstruction { insn }),
                 }
             }
@@ -472,8 +827,75 @@ impl Cpu {
             0x0f => {}
             // SYSTEM
             0x73 => match (insn, funct3(insn)) {
-                (0x0000_0073, _) => stop = Some(StopReason::Ecall),
-                (0x0010_0073, _) => stop = Some(StopReason::Break),
+                (0x0000_0073, _) => {
+                    if let Some(sys) = self.sys.as_ref() {
+                        let cause = match sys.mode {
+                            Mode::User => 8,
+                            Mode::Supervisor => 9,
+                            Mode::Machine => 11,
+                        };
+                        self.take_trap(cause, 0, false);
+                        self.insn_count += 1;
+                        return Ok(None); // pc set by take_trap
+                    }
+                    stop = Some(StopReason::Ecall);
+                }
+                (0x0010_0073, _) => {
+                    if self.sys.is_some() {
+                        return Err(Exception::Breakpoint); // routed to trap
+                    }
+                    stop = Some(StopReason::Break);
+                }
+                // MRET
+                (0x3020_0073, _) => {
+                    let sys = self.sys.as_mut().ok_or(Exception::IllegalInstruction { insn })?;
+                    if sys.mode != Mode::Machine {
+                        return Err(Exception::IllegalInstruction { insn });
+                    }
+                    let mpp = Mode::from_bits((sys.mstatus & MSTATUS_MPP) >> 11);
+                    let mpie = (sys.mstatus >> 7) & 1;
+                    sys.mstatus = (sys.mstatus & !(MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP))
+                        | (mpie << 3)
+                        | MSTATUS_MPIE;
+                    if mpp != Mode::Machine {
+                        sys.mstatus &= !MSTATUS_MPRV;
+                    }
+                    sys.mode = mpp;
+                    next_pc = sys.mepc;
+                    self.flush_tlb();
+                }
+                // SRET
+                (0x1020_0073, _) => {
+                    let sys = self.sys.as_mut().ok_or(Exception::IllegalInstruction { insn })?;
+                    if sys.mode == Mode::User {
+                        return Err(Exception::IllegalInstruction { insn });
+                    }
+                    let spp = if sys.mstatus & MSTATUS_SPP != 0 {
+                        Mode::Supervisor
+                    } else {
+                        Mode::User
+                    };
+                    let spie = (sys.mstatus >> 5) & 1;
+                    sys.mstatus = (sys.mstatus & !(MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP))
+                        | (spie << 1)
+                        | MSTATUS_SPIE;
+                    if spp != Mode::Machine {
+                        sys.mstatus &= !MSTATUS_MPRV;
+                    }
+                    sys.mode = spp;
+                    next_pc = sys.sepc;
+                    self.flush_tlb();
+                }
+                // WFI: report to host if nothing pending (host may idle).
+                (0x1050_0073, _) => {
+                    if let Some(sys) = self.sys.as_ref() {
+                        if sys.mip & sys.mie == 0 {
+                            stop = Some(StopReason::Wfi);
+                        }
+                    }
+                }
+                // SFENCE.VMA (funct7 = 0x09, f3 = 0)
+                _ if funct7(insn) == 0x09 && funct3(insn) == 0 => self.flush_tlb(),
                 // Zicsr
                 (_, f3 @ 1..=3) | (_, f3 @ 5..=7) => {
                     let csr = insn >> 20;
@@ -746,22 +1168,177 @@ impl Cpu {
 
     /// Read a CSR; None = unimplemented (traps as illegal instruction).
     fn csr_read(&self, csr: u32) -> Option<u64> {
+        // Privilege check: bits [9:8] of the address encode the minimum mode.
+        if let Some(sys) = self.sys.as_ref() {
+            if ((csr >> 8) & 3) as u64 > sys.mode as u64 {
+                return None;
+            }
+        }
         match csr {
-            0x001 => Some((self.fcsr & 0x1f) as u64),     // fflags
-            0x002 => Some(((self.fcsr >> 5) & 7) as u64), // frm
-            0x003 => Some(self.fcsr as u64),              // fcsr
-            0xc00 | 0xc02 => Some(self.insn_count),       // cycle, instret
-            0xc01 => Some(self.insn_count),               // time (placeholder)
-            _ => None,
+            FFLAGS => Some((self.fcsr & 0x1f) as u64),
+            FRM => Some(((self.fcsr >> 5) & 7) as u64),
+            FCSR => Some(self.fcsr as u64),
+            CYCLE | INSTRET | MCYCLE | MINSTRET => Some(self.insn_count),
+            TIME => self.sys.as_ref().map(|s| s.mtime).or(Some(self.insn_count)),
+            _ => {
+                let sys = self.sys.as_ref()?;
+                // mstatus.FS held at dirty (+SD): we always save FP state.
+                let mstatus = sys.mstatus | MSTATUS_FS | MSTATUS_SD;
+                Some(match csr {
+                    SSTATUS => mstatus & SSTATUS_MASK,
+                    SIE => sys.mie & sys.mideleg,
+                    STVEC => sys.stvec,
+                    SCOUNTEREN => sys.scounteren,
+                    SSCRATCH => sys.sscratch,
+                    SEPC => sys.sepc,
+                    SCAUSE => sys.scause,
+                    STVAL => sys.stval,
+                    SIP => sys.mip & sys.mideleg,
+                    SATP => sys.satp,
+                    MSTATUS => mstatus,
+                    MISA => MISA_VALUE,
+                    MEDELEG => sys.medeleg,
+                    MIDELEG => sys.mideleg,
+                    MIE => sys.mie,
+                    MTVEC => sys.mtvec,
+                    MCOUNTEREN => sys.mcounteren,
+                    MSCRATCH => sys.mscratch,
+                    MEPC => sys.mepc,
+                    MCAUSE => sys.mcause,
+                    MTVAL => sys.mtval,
+                    MIP => sys.mip,
+                    MVENDORID | MARCHID | MIMPID => 0,
+                    MHARTID => sys.mhartid,
+                    _ => return None,
+                })
+            }
         }
     }
 
     /// Write a CSR; false = unimplemented/read-only.
     fn csr_write(&mut self, csr: u32, v: u64) -> bool {
+        if csr >> 10 == 3 {
+            return false; // read-only region
+        }
+        if let Some(sys) = self.sys.as_ref() {
+            if ((csr >> 8) & 3) as u64 > sys.mode as u64 {
+                return false;
+            }
+        }
         match csr {
-            0x001 => self.fcsr = (self.fcsr & !0x1f) | (v as u32 & 0x1f),
-            0x002 => self.fcsr = (self.fcsr & !0xe0) | ((v as u32 & 7) << 5),
-            0x003 => self.fcsr = v as u32 & 0xff,
+            FFLAGS => self.fcsr = (self.fcsr & !0x1f) | (v as u32 & 0x1f),
+            FRM => self.fcsr = (self.fcsr & !0xe0) | ((v as u32 & 7) << 5),
+            FCSR => self.fcsr = v as u32 & 0xff,
+            MCYCLE | MINSTRET => {} // writable counters: ignore
+            SSTATUS => {
+                const W: u64 =
+                    MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_FS | MSTATUS_SUM | MSTATUS_MXR;
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.mstatus = (sys.mstatus & !W) | (v & W);
+                self.flush_tlb(); // SUM/MXR affect translation
+            }
+            SIE => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                let mask = sys.mideleg;
+                sys.mie = (sys.mie & !mask) | (v & mask);
+            }
+            STVEC => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.stvec = v & !2;
+            }
+            SCOUNTEREN => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.scounteren = v & 7;
+            }
+            SSCRATCH => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.sscratch = v;
+            }
+            SEPC => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.sepc = v & !1;
+            }
+            SCAUSE => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.scause = v;
+            }
+            STVAL => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.stval = v;
+            }
+            SIP => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                // Only SSIP is directly writable by S-mode.
+                let mask = IRQ_SSIP & sys.mideleg;
+                sys.mip = (sys.mip & !mask) | (v & mask);
+            }
+            SATP => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                // Accept bare/sv39/sv48; ignore others (WARL).
+                let mode = v >> 60;
+                if mode == 0 || mode == 8 || mode == 9 {
+                    sys.satp = v;
+                    self.flush_tlb();
+                }
+            }
+            MSTATUS => {
+                const W: u64 = MSTATUS_SIE
+                    | MSTATUS_MIE
+                    | MSTATUS_SPIE
+                    | MSTATUS_MPIE
+                    | MSTATUS_SPP
+                    | MSTATUS_MPP
+                    | MSTATUS_FS
+                    | MSTATUS_MPRV
+                    | MSTATUS_SUM
+                    | MSTATUS_MXR;
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.mstatus = (sys.mstatus & !W) | (v & W);
+                self.flush_tlb();
+            }
+            MISA => {}
+            MEDELEG => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.medeleg = v;
+            }
+            MIDELEG => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.mideleg = v & (IRQ_SSIP | IRQ_STIP | IRQ_SEIP);
+            }
+            MIE => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.mie = v;
+            }
+            MTVEC => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.mtvec = v & !2;
+            }
+            MCOUNTEREN => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.mcounteren = v & 7;
+            }
+            MSCRATCH => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.mscratch = v;
+            }
+            MEPC => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.mepc = v & !1;
+            }
+            MCAUSE => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.mcause = v;
+            }
+            MTVAL => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                sys.mtval = v;
+            }
+            MIP => {
+                let Some(sys) = self.sys.as_mut() else { return false };
+                // MSIP/MTIP are set by the CLINT; software may write others.
+                const W: u64 = IRQ_SSIP | IRQ_STIP | IRQ_SEIP;
+                sys.mip = (sys.mip & !W) | (v & W);
+            }
             _ => return false,
         }
         true

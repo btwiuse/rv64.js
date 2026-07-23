@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod bus;
+pub mod csr;
 pub mod compressed;
 pub mod cpu;
 pub mod decode;
