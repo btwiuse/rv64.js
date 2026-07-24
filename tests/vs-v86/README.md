@@ -156,6 +156,39 @@ debugfs -w -R 'sif /nbench mode 0100755' root-nbench.bin
 SC=. ROOT_NBENCH=root-nbench.bin node tests/vs-v86/nbench.mjs
 ```
 
+## Debian riscv64 userland (real python, glibc) — arch-python
+
+To run v86's arch-python (`time python fib(30)`) and anything else needing a
+real userland, we assemble a minimal **Debian riscv64** rootfs — no building
+from scratch, just prebuilt `.debs` — that boots under our JIT-capable machine
+(bbl64 + kernel-riscv64). `mk-debian-rootfs.sh` does it with no root and no
+binfmt: `fakeroot debootstrap --foreign` (host-side download + first-stage
+unpack), then `dpkg-deb -x` the `--include=python3` packages (a bare interpreter
+needs no maintainer-script configuration), then `mke2fs -d` into a ~300 MB ext4
+image. The virtio-blk disk is read on demand, so it fits under wasm's 4 GB
+(image + 512 MB RAM). Boot with `init=/binit.sh` (mounts proc/dev/sys → shell).
+
+```sh
+nix develop -c tests/vs-v86/mk-debian-rootfs.sh <outdir>   # -> deb-rootfs.ext4
+SC=<outdir> nix develop -c node tests/vs-v86/deb-python.mjs
+```
+
+**arch-python — fib(30) on riscv64** (Debian python 3.13, correct result 832040):
+
+| | full (`python3 fib.py`) | fib compute only |
+|---|---:|---:|
+| rv64 interp | 26.0 s | 24.8 s |
+| **rv64 JIT** | **16.8 s** | **15.4 s** |
+
+JIT is ~1.55× over our interpreter — modest because CPython's eval loop is
+branchy and indirect-call-heavy (v86's JIT gets a similar factor on python).
+The v86-side head-to-head needs python in v86's guest too — a symmetric Debian
+**i386** rootfs booted in v86 would do it (not yet wired up).
+
+This Debian rootfs is also a glibc environment, so a glibc-built nbench there
+*can* read a `-cCMD` command file (unlike the newlib build above, since riscv64
+Linux has no `open`, only `openat`, which newlib doesn't wire).
+
 ## Clock: instruction-counted (default) vs wall-clock (opt-in)
 
 Our CLINT `mtime` is derived from `insn_count` — deterministic "virtual time"
