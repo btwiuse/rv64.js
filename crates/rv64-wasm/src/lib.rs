@@ -730,17 +730,13 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             if hot >= unsafe { JIT_THRESHOLD } {
                 if let Some(pa) = m.cpu.jit_probe_fetch(&mut m.bus, pc) {
                     if pa >= rv64_system::RAM_BASE {
-                        let (lt, ld, st, sd) = m.cpu.jit_tlb_ptrs();
+                        let (lt, lo, st, so) = m.cpu.jit_ftlb_ptrs();
                         let sysmem = rv64_jit::SysMem {
-                            tlb_load_tag: lt as u32,
-                            tlb_load_diff: ld as u32,
-                            tlb_store_tag: st as u32,
-                            tlb_store_diff: sd as u32,
+                            ftlb_load_tag: lt as u32,
+                            ftlb_load_off: lo as u32,
+                            ftlb_store_tag: st as u32,
+                            ftlb_store_off: so as u32,
                             tlb_mask: (rv64_core::Cpu::jit_tlb_size() - 1) as u32,
-                            ram_off: m.bus.ram.as_ptr() as u32,
-                            ram_base: rv64_system::RAM_BASE,
-                            ram_size: m.bus.ram.len() as u64,
-                            jit_pages_off: m.bus.jit_pages.as_ptr() as u32,
                         };
                         let lay = rv64_jit::JitLayout {
                             x_base: m.cpu.x.as_ptr() as u32,
@@ -791,6 +787,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                 let idx = unsafe { host_jit_register() };
                                 if idx >= 0 {
                                     m.bus.jit_mark_page(pa);
+                                    m.cpu.clear_store_jtlb(); // this page may now hold code
                                     for &e in &entries {
                                         let epa = pa_page + (e - vpage);
                                         let jb = JitBlock { idx, n: 0, pa: epa };
@@ -812,6 +809,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                 return None;
                             }
                             m.bus.jit_mark_page(pa);
+                            m.cpu.clear_store_jtlb(); // this page may now hold code
                             Some(JitBlock { idx, n: blk.n_insns, pa })
                         });
                         jit.cache.insert(pc, entry);

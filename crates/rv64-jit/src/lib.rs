@@ -50,21 +50,14 @@ const N_I64_LOCALS: u32 = 6;
 /// (which walks the page table, fills the TLB, and handles MMIO/faults).
 #[derive(Clone, Copy)]
 pub struct SysMem {
-    /// TLB rows (tag then pa-va diff), Cpu::jit_tlb_ptrs() order.
-    pub tlb_load_tag: u32,
-    pub tlb_load_diff: u32,
-    pub tlb_store_tag: u32,
-    pub tlb_store_diff: u32,
-    /// Index mask: jit_tlb_size() - 1.
+    /// Fused JIT-TLB rows (tag then linear-offset), Cpu::jit_ftlb_ptrs() order.
+    /// A hit means the page is directly accessible and `linear = va + off`.
+    pub ftlb_load_tag: u32,
+    pub ftlb_load_off: u32,
+    pub ftlb_store_tag: u32,
+    pub ftlb_store_off: u32,
+    /// Index mask: jit_ftlb_size() - 1.
     pub tlb_mask: u32,
-    /// Guest RAM: linear offset of ram[0], guest-physical base, byte size.
-    pub ram_off: u32,
-    pub ram_base: u64,
-    pub ram_size: u64,
-    /// Compiled-code page bitset (u64 words, bit set = page holds JIT
-    /// code): stores into such pages bail so the interpreter records the
-    /// dirty page for invalidation.
-    pub jit_pages_off: u32,
 }
 
 /// Where the emitted code finds emulator state in linear memory, and
@@ -376,21 +369,21 @@ impl Ctx {
         m.op(RETURN);
     }
 
-    /// Emit an inline-TLB probe. `addr` (i64 va) must be on the stack.
-    /// On a hit that lands in guest RAM, leaves the i32 linear-memory index
-    /// on the stack and continues. On a miss (or MMIO / RAM-crossing), sets
-    /// VA-side state and jumps to `bail` — i.e. emits `if miss { bail }`.
-    /// `store` selects the store TLB and adds the compiled-code-page check.
+    /// Emit a fused JIT-TLB probe. `addr` (i64 va) must be on the stack. On a
+    /// hit, leaves the i32 linear-memory index on the stack and continues; on a
+    /// miss (or page-crossing access) sets VA and jumps to `bail`. The fused TLB
+    /// entry is pre-filtered (RAM, and for stores writable + not-compiled) and
+    /// stores a ready linear offset, so the whole probe is a tag match plus one
+    /// add — no RAM range-check or compiled-page check (they moved to the fill).
     fn tlb_index(&self, m: &mut WasmModule, sys: &SysMem, len: u64, store: bool, pc: u64, n: u32) {
-        let (tag_base, diff_base) = if store {
-            (sys.tlb_store_tag, sys.tlb_store_diff)
+        let (tag_base, off_base) = if store {
+            (sys.ftlb_store_tag, sys.ftlb_store_off)
         } else {
-            (sys.tlb_load_tag, sys.tlb_load_diff)
+            (sys.ftlb_load_tag, sys.ftlb_load_off)
         };
         m.local_set(VA);
-        // page-crossing guard: if (va & 0xfff) > 0x1000 - len, the access
-        // spans two pages whose physical mappings need not be contiguous —
-        // bail so the interpreter splits it.
+        // page-crossing guard: an access spanning two pages can't use a single
+        // fused entry, so bail and let the interpreter split it.
         if len > 1 {
             m.local_get(VA)
                 .i64_const(0xfff)
@@ -411,58 +404,16 @@ impl Ctx {
             .i32_const(3)
             .op(I32_SHL)
             .local_set_i32(self.idxb);
-        // miss if tlb_tag[idx] != page  -> bail
+        // miss if ftlb_tag[idx] != page -> bail
         m.local_get_i32(self.idxb).i64_load_at(tag_base as u64);
         m.local_get(PAGE).op(I64_NE);
         m.op(IF).op(VOID);
         self.bail(m, pc, n);
         m.op(END);
-        // PA = va + diff
+        // linear index = (va + ftlb_off[idx]) as i32
         m.local_get(VA);
-        m.local_get_i32(self.idxb).i64_load_at(diff_base as u64);
-        m.op(I64_ADD).local_set(PA);
-        // range check: (pa - ram_base) >u ram_size - len  -> bail (MMIO/cross)
-        m.local_get(PA)
-            .i64_const(sys.ram_base as i64)
-            .op(I64_SUB)
-            .i64_const((sys.ram_size - len) as i64)
-            .op(I64_GT_U);
-        m.op(IF).op(VOID);
-        self.bail(m, pc, n);
-        m.op(END);
-        if store {
-            // bail if the target physical page holds compiled code:
-            // ppage = (pa - ram_base) >> 12; word = jit_pages[ppage>>6];
-            // if (word >> (ppage & 63)) & 1 -> bail
-            m.local_get(PA)
-                .i64_const(sys.ram_base as i64)
-                .op(I64_SUB)
-                .i64_const(12)
-                .op(I64_SHR_U)
-                .local_set(PAGE); // PAGE now = ppage
-                                  // word address = jit_pages_off + (ppage >> 6) * 8
-            m.local_get(PAGE)
-                .i64_const(6)
-                .op(I64_SHR_U)
-                .op(I32_WRAP_I64)
-                .i32_const(3)
-                .op(I32_SHL)
-                .i64_load_at(sys.jit_pages_off as u64);
-            // >> (ppage & 63)
-            m.local_get(PAGE).i64_const(63).op(I64_AND).op(I64_SHR_U);
-            m.i64_const(1).op(I64_AND);
-            m.i64_const(0).op(I64_NE);
-            m.op(IF).op(VOID);
-            self.bail(m, pc, n);
-            m.op(END);
-        }
-        // linear index = ram_off + (pa - ram_base)   (i32)
-        m.local_get(PA)
-            .i64_const(sys.ram_base as i64)
-            .op(I64_SUB)
-            .op(I32_WRAP_I64)
-            .i32_const(sys.ram_off as i32)
-            .op(I32_ADD);
+        m.local_get_i32(self.idxb).i64_load_at(off_base as u64);
+        m.op(I64_ADD).op(I32_WRAP_I64);
     }
 }
 

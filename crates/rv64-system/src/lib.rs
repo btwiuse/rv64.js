@@ -327,6 +327,25 @@ impl Bus for SystemBus {
         }
         lines
     }
+
+    fn jit_fast_off(&self, va: u64, pa: u64, store: bool) -> Option<i64> {
+        // The whole 4K page must lie in guest RAM (not MMIO / device space).
+        if pa < RAM_BASE || (pa | 0xfff) >= RAM_BASE + self.ram.len() as u64 {
+            return None;
+        }
+        if store {
+            // A store to a page holding compiled code must bail so the block is
+            // invalidated — so don't fast-path such pages.
+            let ppage = ((pa - RAM_BASE) >> 12) as usize;
+            if let Some(w) = self.jit_pages.get(ppage / 64) {
+                if (w >> (ppage & 63)) & 1 != 0 {
+                    return None;
+                }
+            }
+        }
+        // linear_index = ram.as_ptr() + (pa - RAM_BASE); store off = linear - va.
+        Some(self.ram.as_ptr() as i64 + (pa as i64 - RAM_BASE as i64) - va as i64)
+    }
 }
 
 /// The assembled machine: hart + bus + boot state.

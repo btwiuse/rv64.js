@@ -66,6 +66,15 @@ pub struct Cpu {
     // type so permission bits never need re-checking on a hit.
     tlb_tag: [[u64; TLB_SIZE]; 3],
     tlb_diff: [[u64; TLB_SIZE]; 3],
+    // Fused JIT-TLB ([0]=load, [1]=store): stores a *linear memory offset*
+    // (`linear_index = va + off`) instead of a pa-va diff, and is filled ONLY
+    // for pages the JIT can access directly — in guest RAM (and, for stores,
+    // writable and not holding compiled code). So a hit lets a JIT block skip
+    // the RAM range-check and store-to-compiled-page check entirely; the whole
+    // inline memory op becomes tag-match + one add. Filled lazily by the
+    // interpreter's own loads/stores (i.e. on JIT bail); flushed with the TLB.
+    jtlb_tag: [[u64; TLB_SIZE]; 2],
+    jtlb_off: [[i64; TLB_SIZE]; 2],
 }
 
 /// NaN-box an f32 into a 64-bit F register (high 32 bits all-ones).
@@ -97,6 +106,8 @@ impl Cpu {
             jit_flush_gen: 0,
             tlb_tag: [[TLB_INVALID; TLB_SIZE]; 3],
             tlb_diff: [[0; TLB_SIZE]; 3],
+            jtlb_tag: [[TLB_INVALID; TLB_SIZE]; 2],
+            jtlb_off: [[0; TLB_SIZE]; 2],
         }
     }
 
@@ -110,6 +121,37 @@ impl Cpu {
 
     pub fn flush_tlb(&mut self) {
         self.tlb_tag = [[TLB_INVALID; TLB_SIZE]; 3];
+        self.jtlb_tag = [[TLB_INVALID; TLB_SIZE]; 2];
+    }
+
+    /// Drop all fused store-TLB entries — called when a new block is compiled
+    /// (a page may now hold code, so stores to it must bail to invalidate).
+    pub fn clear_store_jtlb(&mut self) {
+        self.jtlb_tag[1] = [TLB_INVALID; TLB_SIZE];
+    }
+
+    /// Fused JIT-TLB rows (load tag, load off, store tag, store off), for JIT
+    /// blocks that probe it inline: `tag[(va>>12)&(size-1)] == va>>12` means hit
+    /// and `linear_index = va + off[idx]` (no range or compiled-page check).
+    pub fn jit_ftlb_ptrs(&self) -> (usize, usize, usize, usize) {
+        (
+            self.jtlb_tag[0].as_ptr() as usize,
+            self.jtlb_off[0].as_ptr() as usize,
+            self.jtlb_tag[1].as_ptr() as usize,
+            self.jtlb_off[1].as_ptr() as usize,
+        )
+    }
+
+    /// Populate a fused JIT-TLB entry if `bus` says the page is directly
+    /// accessible. Called from the interpreter's own load/store path, so the
+    /// entry is warm the next time a JIT block reaches it.
+    #[inline]
+    fn fill_jtlb<B: Bus>(&mut self, bus: &B, va: u64, pa: u64, store: bool) {
+        if let Some(off) = bus.jit_fast_off(va, pa, store) {
+            let idx = ((va >> 12) as usize) & (TLB_SIZE - 1);
+            self.jtlb_tag[store as usize][idx] = va >> 12;
+            self.jtlb_off[store as usize][idx] = off;
+        }
     }
 
     /// Translate a fetch address without raising a fault (JIT support:
@@ -320,6 +362,7 @@ impl Cpu {
             return Ok(v);
         }
         let pa = self.translate(bus, va, Access::Load)?;
+        self.fill_jtlb(bus, va, pa, false);
         match N {
             1 => bus.read8(pa).map(|v| v as u64),
             2 => bus.read16(pa).map(|v| v as u64),
@@ -343,6 +386,7 @@ impl Cpu {
             return Ok(());
         }
         let pa = self.translate(bus, va, Access::Store)?;
+        self.fill_jtlb(bus, va, pa, true);
         match N {
             1 => bus.write8(pa, val as u8),
             2 => bus.write16(pa, val as u16),

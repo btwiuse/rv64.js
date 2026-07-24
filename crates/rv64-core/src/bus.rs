@@ -18,6 +18,15 @@ pub trait Bus {
     fn write32(&mut self, addr: u64, val: u32) -> Result<(), Exception>;
     fn write64(&mut self, addr: u64, val: u64) -> Result<(), Exception>;
 
+    /// Fused JIT-TLB support: if the page holding physical address `pa` (which
+    /// `va` translates to) is directly JIT-accessible — in guest RAM, and for a
+    /// store also writable and not holding compiled code — return the linear
+    /// offset such that `linear_index = va + off`; else `None`. Lets a JIT block
+    /// access memory with just a tag match and one add. Default: not accessible.
+    fn jit_fast_off(&self, _va: u64, _pa: u64, _store: bool) -> Option<i64> {
+        None
+    }
+
     /// Instruction fetch. Separate from data reads so full-system mode can
     /// apply execute permissions and take InstructionPageFault distinctly.
     fn fetch32(&mut self, addr: u64) -> Result<u32, Exception> {
