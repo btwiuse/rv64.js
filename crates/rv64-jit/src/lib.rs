@@ -563,6 +563,19 @@ fn detect_structured_loop(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout
                     return None;
                 }
             }
+            // User-mode loads/stores are inline and only TRAP (never bail) on
+            // OOB, so they're safe inside a compiled loop. (System-mode memory
+            // ops can bail mid-loop, so loop-opt stays user-mode only anyway.)
+            0x03 if lay.mem.is_some() => {
+                if funct3(insn) == 7 {
+                    return None;
+                }
+            }
+            0x23 if lay.mem.is_some() => {
+                if funct3(insn) > 3 {
+                    return None;
+                }
+            }
             0x63 => {
                 if !matches!(funct3(insn), 0 | 1 | 4 | 5 | 6 | 7) {
                     return None;
