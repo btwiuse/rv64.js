@@ -83,6 +83,10 @@ pub struct JitLayout {
     /// ops can bail mid-block (TLB miss / MMIO), so the dispatcher must read
     /// this rather than assume the full block length.
     pub retired_addr: u32,
+    /// Linear-memory offset of f[0] (FP register file; f1.. at 8-byte stride)
+    /// and of the fcsr slot. Both 0 disables FP-in-block translation.
+    pub f_base: u32,
+    pub fcsr_addr: u32,
 }
 
 impl JitLayout {
@@ -94,6 +98,8 @@ impl JitLayout {
             mem: None,
             sys: None,
             retired_addr: 264,
+            f_base: 0,
+            fcsr_addr: 0,
         }
     }
 }
@@ -190,6 +196,62 @@ impl Ctx {
                     .i64_store(self.lay.x_base as u64 + r as u64 * 8);
             }
         }
+    }
+
+    /// Emit a double-precision FP arithmetic op (FADD/FSUB/FMUL/FDIV.D) as an
+    /// inline wasm f64 op, guarded to stay bit-exact: the interpreter's fast
+    /// path applies only when rm==RNE and the inexact flag (NX) is already
+    /// sticky-set, and the result is a normal number (any inf/nan/subnormal/
+    /// zero result could raise OF/UF/NV/DZ, so we bail to the interpreter for
+    /// exact flags). FP registers stay in memory (f_base); GPR locals are
+    /// flushed by bail. `op`: 0=add 1=sub 2=mul 3=div. `dyn_rm`: rm field is
+    /// 0b111 (dynamic) so we must also check frm==RNE at runtime.
+    fn fp_arith_d(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, d: usize, dyn_rm: bool, pc: u64, n: u32) {
+        let f = self.lay.f_base as u64;
+        let fcsr = self.lay.fcsr_addr as u64;
+        // Eligibility: bail if NX not set (fcsr&1==0) — or, for dynamic rm,
+        // if frm != RNE ((fcsr>>5)&7 != 0).
+        m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
+        if dyn_rm {
+            m.i32_const(0)
+                .i64_load(fcsr)
+                .i64_const(5)
+                .op(I64_SHR_U)
+                .i64_const(7)
+                .op(I64_AND)
+                .op(I64_EQZ) // frm==0 ?
+                .op(I32_EQZ) // -> frm!=0
+                .op(I32_OR);
+        }
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+        // r = f[s1] <op> f[s2]  (as f64), reinterpreted back to i64 bits.
+        m.i32_const(0).i64_load(f + s1 as u64 * 8).op(F64_REINTERPRET_I64);
+        m.i32_const(0).i64_load(f + s2 as u64 * 8).op(F64_REINTERPRET_I64);
+        m.op(match op {
+            0 => F64_ADD,
+            1 => F64_SUB,
+            2 => F64_MUL,
+            _ => F64_DIV,
+        });
+        m.op(I64_REINTERPRET_F64).local_set(VAL);
+        // Bail unless the result is a normal number: exp in [1, 0x7fe], i.e.
+        // (exp - 1) <=u 0x7fd. Catches inf/nan (0x7ff) and subnormal/zero (0).
+        m.local_get(VAL)
+            .i64_const(52)
+            .op(I64_SHR_U)
+            .i64_const(0x7ff)
+            .op(I64_AND)
+            .i64_const(1)
+            .op(I64_SUB)
+            .i64_const(0x7fd)
+            .op(I64_GT_U);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+        // f[d] = r
+        m.i32_const(0).local_get(VAL).i64_store(f + d as u64 * 8);
     }
 
     /// Store the (constant) next pc.
@@ -401,6 +463,17 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 mark(&mut read, s1);
                 mark(&mut read, s2);
                 break;
+            }
+            // OP-FP (mirror translate_block): FP arith touches no GPRs;
+            // FMV.D.X reads a GPR, FMV.X.D writes one; others end the block.
+            0x53 if lay.f_base != 0 => {
+                let f7 = funct7(insn);
+                match (f7 >> 2, f7 & 3, funct3(insn)) {
+                    (0..=3, 1, 0 | 7) => {}
+                    (0x1e, 1, 0) => mark(&mut read, s1),
+                    (0x1c, 1, 0) => mark(&mut write, d),
+                    _ => break,
+                }
             }
             _ => break,
         }
@@ -867,6 +940,32 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     len: next_pc - start_pc,
                     n_insns: n + 1,
                 });
+            }
+            // OP-FP: double-precision add/sub/mul/div + FMV.D.X/FMV.X.D inline
+            // (Phase 2). Other FP ops (single, sqrt, fmadd, compare, convert,
+            // sign-inject, and FP load/store) still end the block.
+            0x53 if lay.f_base != 0 => {
+                let f7 = funct7(insn);
+                let (fmt, fpop, f3) = (f7 & 3, f7 >> 2, funct3(insn));
+                let fb = lay.f_base as u64;
+                match (fpop, fmt, f3) {
+                    // FADD/FSUB/FMUL/FDIV.D (static RNE or dynamic rounding)
+                    (0..=3, 1, 0 | 7) => c.fp_arith_d(&mut m, fpop, s1, s2, d, f3 == 7, pc, n),
+                    // FMV.D.X: f[d] = x[s1] (raw 64-bit copy)
+                    (0x1e, 1, 0) => {
+                        m.i32_const(0);
+                        c.push_reg(&mut m, s1);
+                        m.i64_store(fb + d as u64 * 8);
+                    }
+                    // FMV.X.D: x[d] = f[s1] (raw 64-bit copy)
+                    (0x1c, 1, 0) => {
+                        if c.store_pre(&mut m, d) {
+                            m.i32_const(0).i64_load(fb + s1 as u64 * 8);
+                            c.store_post(&mut m, d);
+                        }
+                    }
+                    _ => break,
+                }
             }
             // Anything else (AMO/FP/SYSTEM, or memory ops with no memory
             // layout): end the block here; the interpreter takes over.

@@ -402,6 +402,8 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     mem: Some((m.mem.as_ptr() as u32, m.mem.len() as u64)),
                     sys: None,
                     retired_addr: retired_addr(),
+                    f_base: m.cpu.f.as_ptr() as u32,
+                    fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
                 };
                 let end = (pc as usize + 1024).min(m.mem.len());
                 let entry = rv64_jit::translate_block(&m.mem[pc as usize..end], pc, pc, lay)
@@ -647,6 +649,9 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         mem: None,
                         sys: Some(sysmem),
                         retired_addr: retired_addr(),
+                        // FP-in-block is user-mode-tested only for now.
+                        f_base: 0,
+                        fcsr_addr: 0,
                     };
                     let blk = rv64_jit::translate_block(&m.bus.ram[off..end], pc, pc, lay)?;
                     unsafe { JIT_OUT = blk.wasm };

@@ -43,6 +43,16 @@ pub const I64_LOAD32_U: u8 = 0x35;
 pub const I64_STORE8: u8 = 0x3c;
 pub const I64_STORE16: u8 = 0x3d;
 pub const I64_STORE32: u8 = 0x3e;
+pub const I64_EQZ: u8 = 0x50;
+pub const I32_OR: u8 = 0x72;
+pub const I32_EQZ: u8 = 0x45;
+// f64 arithmetic + reinterpret casts (Phase 2 FP-in-blocks).
+pub const F64_ADD: u8 = 0xa0;
+pub const F64_SUB: u8 = 0xa1;
+pub const F64_MUL: u8 = 0xa2;
+pub const F64_DIV: u8 = 0xa3;
+pub const F64_REINTERPRET_I64: u8 = 0xbf;
+pub const I64_REINTERPRET_F64: u8 = 0xbd;
 pub const UNREACHABLE: u8 = 0x00;
 pub const DROP: u8 = 0x1a;
 pub const I64_EXTEND_I32_U: u8 = 0xad;
