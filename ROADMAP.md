@@ -93,24 +93,22 @@ with `tests/vs-v86` (baseline vs v86: ALU 50.5s vs 2.9s; mixed 17.1s vs 1.5s).
   JIT. This closes the v86 performance gap that motivated items 3a–3e —
   **in user mode**. See 3f.
 
-- [ ] **3f. Port the 3a–3e JIT wins to SYSTEM mode** *(the real v86 gap — v86
-  has no user mode, so this is the only apples-to-apples comparison)* —
-  everything in 3a–3e is gated to user-mode (`lay.mem` / `f_base != 0`):
-  structured/nested-loop compilation (`loop_region`/`translate_loop`),
-  FP arith/compare in blocks, FP-in-locals, FLD/FSD. In system mode the JIT is
-  still the old ALU-inline + inline-TLB one with **per-iteration loop dispatch
-  and no FP compilation**. Measured with `tests/vs-v86/compare-sys.mjs` (both
-  emulators boot full Linux, run the same kernel in-guest, host-wall-clock):
-  **system-mode v86 JIT is ~10-12× FASTER than ours** (ALU 27.0s vs 2.76s;
-  mixed 18.0s vs 1.55s), and our system JIT gains only 2.7×/1.1× over its own
-  interpreter. Work: (1) allow `loop_region`/`translate_loop` in system blocks
-  — the blocker is that inline-TLB memory ops can *bail* mid-loop (miss/MMIO/
-  store-to-compiled-page), so a compiled loop needs a clean mid-iteration bail
-  path (flush locals, set pc, return) rather than the user-mode "only traps"
-  assumption; (2) enable FP-in-blocks for system mode (set `f_base`/`fcsr_addr`
-  to the live CPU FP file + honor its softfloat fast-path guard). This is the
-  largest remaining perf lever and the one that decides the v86 comparison that
-  counts.
+- [x] **3f. Port the 3a–3e JIT wins to SYSTEM mode** *(done 2026-07-23 — the
+  real v86 gap: v86 has no user mode, so this is the only apples-to-apples
+  comparison)* — **3f-1** enabled `loop_region`/`translate_loop` for system
+  blocks. The one subtlety vs user mode: inline-TLB memory ops can *bail*
+  mid-iteration (miss/MMIO/store-to-compiled-page), and a loop running millions
+  of iterations must report its true retired count on bail or the kernel's
+  insn_count-derived clock stalls — added `Ctx::retired_local` so a loop's bail
+  stores the live `ITER` accumulator (basic blocks keep the static constant).
+  **3f-2** set the system layout's `f_base`/`fcsr_addr` to the live CPU FP file
+  (was 0 = disabled), so FP arith/compare/FMV and FLD/FSD (via the bailing
+  inline-TLB path) compile in system blocks under the same softfloat fast-path
+  guard. **Result — both benchmarks now BEAT v86 in system mode**
+  (`tests/vs-v86/compare-sys.mjs`): ALU 27.0s→1.35s (9.8× slower → **2.2×
+  faster** than v86); mixed 18.0s→0.70s (11.7× slower → **2.3× faster**). Linux
+  still boots under JIT (wasm-smoke ALL PASS); 25/25 cargo tests; jit==interp
+  checksums identical. rv64.js now leads v86 in *both* modes.
 
 - [ ] **4. (Optional) residual-based flag recovery** — extend the FP fast
   path to work before NX is set, via error-free transformations (TwoSum
