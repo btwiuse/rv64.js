@@ -516,33 +516,50 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
     (read, write)
 }
 
-/// If the block at `start_pc` is a simple self-loop — a straight-line run of
-/// ALU/LUI ops (no memory, no jumps, no FP/system) ending in a conditional
-/// branch back to `start_pc` — return the instruction count per iteration.
-/// Such a loop can be compiled into one wasm `loop` (Phase 3) so the register
-/// locals stay live across iterations instead of being flushed per dispatch.
-fn detect_self_loop(code: &[u8], base: u64, start_pc: u64) -> Option<u32> {
+/// Is `f7`/`f3` a FP op the JIT emits inline (arith / compare / FMV)?
+fn fp_handled(f7: u32, f3: u32) -> bool {
+    matches!(
+        (f7 >> 2, f7 & 3, f3),
+        (0..=3, 1, 0 | 7) | (0x14, 1, 0..=2) | (0x1e, 1, 0) | (0x1c, 1, 0)
+    )
+}
+
+/// Is `f7`/`f3` a supported OP / OP-32 / OP-IMM-32 encoding?
+fn alu_handled(op: u32, f7: u32, f3: u32) -> bool {
+    match op {
+        0x37 | 0x17 | 0x13 => true,
+        0x33 => matches!((f7, f3), (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0)),
+        0x1b => matches!(f3, 0 | 1 | 5),
+        0x3b => matches!((f7, f3), (0x00, 0) | (0x20, 0) | (0x01, 0)),
+        _ => false,
+    }
+}
+
+/// If the block at `start_pc` is a *structured* self-loop — a body of handled
+/// ALU/FP ops plus properly-nested forward conditional branches (if-then, no
+/// else, no other backward branches or jumps), ending in a conditional branch
+/// back to `start_pc` — return the body's instruction count. Such a loop is
+/// compiled into a single wasm `loop` with nested `if` blocks (Phase 3 / 3d-2)
+/// so registers stay in locals across iterations and there is no per-iteration
+/// dispatch. Anything unstructured returns None (compiled as basic blocks).
+fn detect_structured_loop(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option<u32> {
     let mut pc = start_pc;
     let mut n = 0u32;
+    let mut if_stack: Vec<u64> = Vec::new(); // pending forward-if end targets
     while n < MAX_BLOCK as u32 {
+        while if_stack.last() == Some(&pc) {
+            if_stack.pop();
+        }
         let (insn, ilen) = fetch(code, base, pc)?;
-        match opcode(insn) {
-            0x37 | 0x17 | 0x13 => {}
-            0x33 => {
-                if !matches!(
-                    (funct7(insn), funct3(insn)),
-                    (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0)
-                ) {
+        let op = opcode(insn);
+        match op {
+            0x37 | 0x17 | 0x13 | 0x33 | 0x1b | 0x3b => {
+                if !alu_handled(op, funct7(insn), funct3(insn)) {
                     return None;
                 }
             }
-            0x1b => {
-                if !matches!(funct3(insn), 0 | 1 | 5) {
-                    return None;
-                }
-            }
-            0x3b => {
-                if !matches!((funct7(insn), funct3(insn)), (0x00, 0) | (0x20, 0) | (0x01, 0)) {
+            0x53 if lay.f_base != 0 => {
+                if !fp_handled(funct7(insn), funct3(insn)) {
                     return None;
                 }
             }
@@ -551,11 +568,25 @@ fn detect_self_loop(code: &[u8], base: u64, start_pc: u64) -> Option<u32> {
                     return None;
                 }
                 let target = pc.wrapping_add(imm_b(insn) as u64);
-                return if target == start_pc && n > 0 {
-                    Some(n + 1) // body instructions + the branch
+                if target == start_pc {
+                    // loop back-edge: only valid at the outermost level, and it
+                    // is the last instruction of the loop body.
+                    return if if_stack.is_empty() && n > 0 {
+                        Some(n + 1)
+                    } else {
+                        None
+                    };
+                } else if target > pc {
+                    // forward if-then; must nest within the enclosing if.
+                    if let Some(&top) = if_stack.last() {
+                        if target > top {
+                            return None;
+                        }
+                    }
+                    if_stack.push(target);
                 } else {
-                    None
-                };
+                    return None; // backward branch not to start = unstructured
+                }
             }
             _ => return None,
         }
@@ -603,14 +634,18 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
             .local_set(reg_local[r]);
     }
 
-    // Phase 3: user-mode self-loop → wrap the body in one wasm `loop` so the
-    // register locals persist across iterations (no per-iteration dispatch,
-    // prologue, or epilogue). The terminating branch becomes the loop back-edge.
+    // Phase 3 / 3d-2: user-mode structured self-loop → wrap the body in one
+    // wasm `loop` (forward if-then branches become nested wasm `if`) so the
+    // register locals persist across iterations with no per-iteration dispatch.
     let self_loop = if lay.mem.is_some() {
-        detect_self_loop(code, base, start_pc)
+        detect_structured_loop(code, base, start_pc, &lay)
     } else {
         None
     };
+    // Pending forward-if end targets (loop path): a wasm `if` is closed when
+    // pc reaches its target. `retired = ITER * body_n` slightly over-counts
+    // skipped if-bodies — insn_count only, never the computation.
+    let mut pending_ifs: Vec<u64> = Vec::new();
     if let Some(body_n) = self_loop {
         m.i64_const(0).local_set(ITER);
         m.op(LOOP).op(VOID); // $L (branch depth 0)
@@ -632,6 +667,11 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     let mut n = 0u32;
 
     while n < MAX_BLOCK as u32 {
+        // Close any forward-if wasm blocks whose target we've now reached.
+        while pending_ifs.last() == Some(&pc) {
+            m.op(END);
+            pending_ifs.pop();
+        }
         let Some((insn, ilen)) = fetch(code, base, pc) else {
             break;
         };
@@ -933,8 +973,10 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     7 => I64_GE_U,
                     _ => break, // before any stack pushes — stream stays balanced
                 };
-                // Phase 3: the back-branch of a compiled self-loop becomes the
-                // wasm loop back-edge (br_if $L), keeping registers in locals.
+                // Phase 3 / 3d-2: inside a compiled loop, a branch back to start
+                // is the loop back-edge; a forward branch is a structured
+                // if-then (nested wasm `if`). Outside a loop, the branch ends
+                // the block with a conditional pc select.
                 if let Some(body_n) = self_loop {
                     if target == start_pc {
                         // count this iteration, then loop back if the branch is taken
@@ -957,22 +999,39 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                             n_insns: body_n,
                         });
                     }
+                    // forward if-then: run [next_pc, target) under the NEGATED
+                    // condition (the guest branch skips that range when taken).
+                    let neg = match funct3(insn) {
+                        0 => I64_NE,
+                        1 => I64_EQ,
+                        4 => I64_GE_S,
+                        5 => I64_LT_S,
+                        6 => I64_GE_U,
+                        _ => I64_LT_U,
+                    };
+                    c.push_reg(&mut m, s1);
+                    c.push_reg(&mut m, s2);
+                    m.op(neg);
+                    m.op(IF).op(VOID);
+                    pending_ifs.push(target);
+                    // fall through: keep translating the loop body.
+                } else {
+                    c.push_reg(&mut m, s1);
+                    c.push_reg(&mut m, s2);
+                    m.op(cmp);
+                    m.op(IF).op(VOID);
+                    c.set_pc_const(&mut m, target);
+                    m.op(ELSE);
+                    c.set_pc_const(&mut m, next_pc);
+                    m.op(END);
+                    c.flush_writes(&mut m);
+                    c.set_retired(&mut m, n + 1);
+                    return Some(Block {
+                        wasm: m.finish(),
+                        len: next_pc - start_pc,
+                        n_insns: n + 1,
+                    });
                 }
-                c.push_reg(&mut m, s1);
-                c.push_reg(&mut m, s2);
-                m.op(cmp);
-                m.op(IF).op(VOID);
-                c.set_pc_const(&mut m, target);
-                m.op(ELSE);
-                c.set_pc_const(&mut m, next_pc);
-                m.op(END);
-                c.flush_writes(&mut m);
-                c.set_retired(&mut m, n + 1);
-                return Some(Block {
-                    wasm: m.finish(),
-                    len: next_pc - start_pc,
-                    n_insns: n + 1,
-                });
             }
             // OP-FP: double-precision add/sub/mul/div + FMV.D.X/FMV.X.D inline
             // (Phase 2). Other FP ops (single, sqrt, fmadd, compare, convert,
