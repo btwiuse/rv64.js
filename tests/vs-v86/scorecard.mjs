@@ -6,12 +6,16 @@
 //
 //   ARTIFACTS=<artifacts> nix develop -c node tests/vs-v86/scorecard.mjs
 //   FULL=1     include interpreter columns + JIT-over-interp (slow)
-//   NBENCH=1   include the BYTEmark suite (rv64 only, ~8 min)
+//   NBENCH=1   include the BYTEmark suite, rv64 vs v86 (~8 min)
 //   SKIP_V86=1 rv64 only
 //
-// Artifacts (build once with setup.sh; DEBIAN=1 for python): $ARTIFACTS/xbench/*,
-// $ARTIFACTS/root-nbench.bin, $ARTIFACTS/deb-riscv64.ext4, $ARTIFACTS/deb-i386.cpio.gz +
-// $ARTIFACTS/vmlinuz-i386, and a built copy/v86 checkout at $ARTIFACTS/v86.
+// Rows: ALU / Mixed / Boot / python fib(30) / compile (tcc -c), all rv64-JIT vs
+// v86-JIT; plus the NBENCH=1 BYTEmark table. compile + nbench run the SAME source
+// on both sides (w.c through tcc@d9d02c5; nbench-byte-2.2.3), one build per ISA.
+// Artifacts (build once with setup.sh; DEBIAN=1 for python + v86 compile/nbench):
+// $ARTIFACTS/xbench/*, root-nbench.bin, cc-bench.img, deb-riscv64.ext4,
+// vmlinuz-i386, deb-i386.cpio.gz, deb-i386-bench.cpio.gz, and a built copy/v86
+// checkout at $ARTIFACTS/v86.
 import { readFile, writeFile, copyFile, access } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -96,6 +100,25 @@ async function rvNbench(jit) {
   for (const m of out.matchAll(/^([A-Z][A-Z ]+?)\s+:\s+([\d.e+]+)\s+:/gm)) rows[m[1].trim()] = +m[2];
   return rows;
 }
+// compile benchmark: boot the buildroot image with our riscv64 tcc + w.c, time
+// `tcc -c /w.c` (the SAME source + tcc commit as the v86 side). Wall-clock ms.
+async function rvCompile(jit) {
+  const disk = new Uint8Array(await readFile(join(ARTIFACTS, "cc-bench.img")));
+  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0);
+  let out = ""; vm.onWrite = (fd, b) => (out += new TextDecoder().decode(b));
+  vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice() });
+  for (let i = 0; i < 40000 && !out.includes("~ #"); i++) vm.runSystem(5_000_000n);
+  if (!out.includes("~ #")) return null;
+  vm.consoleInput(enc.encode("stty -echo 2>/dev/null\n")); step(vm, 3000);
+  out = ""; vm.consoleInput(enc.encode("/tcc -c /w.c -o /w.o 2>/tmp/e; echo RC=$?; md5sum /w.o\n"));
+  const t = performance.now(); let done = false;
+  for (let i = 0; i < 2_000_000 && !done; i++) {
+    vm.runSystem(5_000_000n);
+    if (/RC=/.test(out) && (/[0-9a-f]{32}/.test(out) || /RC=[1-9]/.test(out))) done = true;
+    if (performance.now() - t > 300000) break;
+  }
+  return /RC=0/.test(out) ? performance.now() - t : null;
+}
 
 // ---------- v86: spawn its runners in the checkout, parse RESULT ----------
 function v86Spawn(script, env) {
@@ -108,11 +131,24 @@ function v86Spawn(script, env) {
 const v86Compute = (bin, jit) => v86Spawn("v86-compute.mjs", { BIN: bin, DISABLE_JIT: jit ? "0" : "1" });
 const v86Boot = (jit) => v86Spawn("v86-boottime.mjs", { DISABLE_JIT: jit ? "0" : "1" });
 const v86Python = (jit) => v86Spawn("deb-v86.mjs", { DISABLE_JIT: jit ? "0" : "1" });
+const v86Compile = (jit) => v86Spawn("v86-compile.mjs", { DISABLE_JIT: jit ? "0" : "1" });
+// v86 nbench: parse its self-timed per-kernel iterations/sec from the raw output.
+function v86Nbench() {
+  return new Promise((resolve) => {
+    const p = spawn("node", ["--max-old-space-size=4096", "v86-nbench.mjs"], { cwd: V86DIR, env: { ...process.env, ARTIFACTS } });
+    let buf = ""; p.stdout.on("data", (d) => (buf += d));
+    p.on("close", () => {
+      const rows = {};
+      for (const m of buf.matchAll(/^([A-Z][A-Z ]+?)\s+:\s+([\d.e+]+)\s+:/gm)) rows[m[1].trim()] = +m[2];
+      resolve(rows);
+    });
+  });
+}
 
 // copy v86 runners into the checkout (relative ./src, ./bios resolve there)
 let haveV86 = WANT_V86;
 if (haveV86 && (await has(join(V86DIR, "src/main.js")))) {
-  for (const f of ["v86-compute.mjs", "v86-boottime.mjs", "deb-v86.mjs"])
+  for (const f of ["v86-compute.mjs", "v86-boottime.mjs", "deb-v86.mjs", "v86-compile.mjs", "v86-nbench.mjs"])
     if (await has(join(root, "tests/vs-v86", f))) await copyFile(join(root, "tests/vs-v86", f), join(V86DIR, f));
 } else haveV86 = false;
 
@@ -136,6 +172,8 @@ for (const jit of FULL ? [false, true] : [true]) {
 for (const jit of FULL ? [false, true] : [true]) { log(`[rv64 boot jit=${+jit}]…`); (R.Boot ??= {})[jit ? "rvj" : "rvi"] = await rvBootTime(jit); log(" ok\n"); }
 // python (needs the debian image)
 if (await has(join(ARTIFACTS, "deb-riscv64.ext4"))) for (const jit of FULL ? [false, true] : [true]) { log(`[rv64 python jit=${+jit}]…`); (R["python fib(30)"] ??= {})[jit ? "rvj" : "rvi"] = await rvPython(jit); log(" ok\n"); }
+// compile (needs the cc-bench image; same w.c + tcc commit as v86)
+if (await has(join(ARTIFACTS, "cc-bench.img"))) for (const jit of FULL ? [false, true] : [true]) { log(`[rv64 compile jit=${+jit}]…`); (R["compile (tcc -c)"] ??= {})[jit ? "rvj" : "rvi"] = await rvCompile(jit); log(" ok\n"); }
 
 // v86 side
 if (haveV86) {
@@ -144,14 +182,19 @@ if (haveV86) {
     log(" mixed"); (R.Mixed ??= {})[jit ? "v8j" : "v8i"] = await v86Compute("rvbench_fs.i386", jit);
     log(" boot"); (R.Boot ??= {})[jit ? "v8j" : "v8i"] = await v86Boot(jit);
     if (await has(join(ARTIFACTS, "vmlinuz-i386"))) { log(" python"); (R["python fib(30)"] ??= {})[jit ? "v8j" : "v8i"] = await v86Python(jit); }
+    if (await has(join(ARTIFACTS, "deb-i386-bench.cpio.gz"))) { log(" compile"); (R["compile (tcc -c)"] ??= {})[jit ? "v8j" : "v8i"] = await v86Compile(jit); }
     log("\n");
   }
 }
-// nbench (rv64 only, slow)
+// nbench (BYTEmark) — rv64 JIT vs v86 JIT, both self-timed; gated (slow, ~8 min)
 let nb = null;
 if (WANT_NBENCH && (await has(join(ARTIFACTS, "root-nbench.bin")))) {
-  log("[rv64 nbench jit]…"); const nj = await rvNbench(true); log(" interp…"); const ni = await rvNbench(false); log(" ok\n");
-  nb = { jit: nj, int: ni };
+  log("[rv64 nbench jit]…"); const nj = await rvNbench(true);
+  let ni = null; if (FULL) { log(" interp…"); ni = await rvNbench(false); }
+  let v8 = null;
+  if (haveV86 && (await has(join(ARTIFACTS, "deb-i386-bench.cpio.gz")))) { log(" v86…"); v8 = await v86Nbench(); }
+  log(" ok\n");
+  nb = { jit: nj, int: ni, v8 };
 }
 
 // ---------- render ----------
@@ -159,13 +202,19 @@ const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 const ms = (x) => (x == null ? "—" : `${Math.round(x)}ms`);
 const ratio = (r) => (r?.rvj && r?.v8j ? (r.rvj / r.v8j).toFixed(2) + "× " + (r.rvj < r.v8j ? "rv64" : "v86") : "—");
 const speedup = (r) => (r?.rvi && r?.rvj ? (r.rvi / r.rvj).toFixed(1) + "×" : "—");
-const order = ["ALU", "Mixed", "Boot", "python fib(30)"];
+const order = ["ALU", "Mixed", "Boot", "python fib(30)", "compile (tcc -c)"];
 let md = `# rv64.js vs v86 — performance scorecard\n\n_${ts}, system-mode, host wall-clock. Ratio = rv64 JIT vs v86 JIT (lower rv64 = rv64 faster)._\n\n`;
 md += `| Benchmark | rv64 interp | rv64 JIT | v86 interp | v86 JIT | rv64 JIT/interp | rv64 vs v86 JIT |\n|---|--:|--:|--:|--:|--:|--:|\n`;
 for (const k of order) { const r = R[k]; if (!r) continue; md += `| ${k} | ${ms(r.rvi)} | ${ms(r.rvj)} | ${ms(r.v8i)} | ${ms(r.v8j)} | ${speedup(r)} | ${ratio(r)} |\n`; }
 if (nb) {
-  md += `\n**nbench (BYTEmark, rv64 iterations/sec, higher=better; JIT vs our interp):**\n\n| Kernel | interp | JIT | speedup |\n|---|--:|--:|--:|\n`;
-  for (const k of Object.keys(nb.jit)) md += `| ${k} | ${nb.int[k] ?? "—"} | ${nb.jit[k] ?? "—"} | ${nb.int[k] && nb.jit[k] ? (nb.jit[k] / nb.int[k]).toFixed(1) + "×" : "—"} |\n`;
+  // BYTEmark self-times iterations/sec (higher = faster); compare rv64 vs v86.
+  const nr = (a, b) => (a && b ? (a / b).toFixed(2) + "× " + (a > b ? "rv64" : "v86") : "—");
+  md += `\n**nbench (BYTEmark, iterations/sec, higher=better; ratio = rv64 JIT vs v86 JIT):**\n\n`;
+  md += `| Kernel | rv64 JIT | v86 JIT | rv64 vs v86 |${nb.int ? " rv64 interp |" : ""}\n|---|--:|--:|--:|${nb.int ? "--:|" : ""}\n`;
+  for (const k of Object.keys(nb.jit)) {
+    const rj = nb.jit[k], vj = nb.v8?.[k];
+    md += `| ${k} | ${rj ?? "—"} | ${vj ?? "—"} | ${nr(rj, vj)} |${nb.int ? ` ${nb.int[k] ?? "—"} |` : ""}\n`;
+  }
 }
 console.log("\n" + md);
 await writeFile(join(ARTIFACTS, `scorecard-${ts}.md`), md);

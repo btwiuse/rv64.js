@@ -38,12 +38,21 @@ directly comparable. This is the entry point — use the individual harnesses
 below only for focused runs.
 
 ```sh
-nix develop -c tests/vs-v86/setup.sh target/bench           # build artifacts (DEBIAN=1 for python)
+nix develop -c tests/vs-v86/setup.sh target/bench           # build artifacts (DEBIAN=1 for python + v86 compile/nbench)
 ARTIFACTS=target/bench nix develop -c node tests/vs-v86/scorecard.mjs   # + FULL=1 (interp), NBENCH=1 (BYTEmark)
 ```
 
-It covers ALU, Mixed, Boot, python fib(30) (all with the v86 head-to-head) and
-optionally nbench (rv64 JIT-vs-interp). Needs a built `copy/v86` at `$SC/v86`.
+It covers ALU, Mixed, Boot, python fib(30), and **compile (tcc -c)** — all as
+rv64-JIT-vs-v86-JIT head-to-heads — plus the **nbench** BYTEmark table (rv64 vs
+v86) under `NBENCH=1`. Needs a built `copy/v86` at `$SC/v86`.
+
+The compile + nbench rows run the **same source on both sides**, one build per
+ISA: `w.c` (compile-bench/gen_c.py) through `tcc@d9d02c5`, and nbench-byte-2.2.3.
+The cross-ISA binaries come from `mk-bench-bins.sh`, which builds static musl
+`tcc.i386`/`tcc.rv64`/`nbench.i386` with `zig cc` — no 32-bit-glibc host
+toolchain needed (the old blocker; see below). `mk-v86-bench.sh` bakes tcc +
+nbench + `w.c` into one Debian-i386 v86 initramfs that dispatches on a `bench=`
+cmdline token (python | tcc | nbench); the rv64 compile side boots `cc-bench.img`.
 
 ## Automated setup (build everything once)
 
@@ -162,13 +171,13 @@ designed to expose:
 | IDEA | 142 | 353 | 2.5× |
 | HUFFMAN | 67 | 71 | 1.1× |
 
-**v86-side head-to-head is not yet wired up** — two environment blockers:
-building nbench for i386 needs 32-bit glibc (`gnu/stubs-32.h`), absent from this
-nix env (our freestanding kernels use `-nostdlib`, but nbench needs full libc);
-and v86's own arch-bytemark needs its Arch-Linux image + snapshot, not
-downloaded here. Options to close it: fetch v86's Arch image
-(`tests/benchmark/fetch-download.js`) and run its real arch-bytemark, or get a
-32-bit libc to build `nbench.i386` and inject it into v86's buildroot.
+**v86-side head-to-head is now wired up** (`scorecard.mjs` with `NBENCH=1`). The
+old blocker — nbench for i386 needs 32-bit glibc (`gnu/stubs-32.h`), absent from
+this nix env — is sidestepped by building a **static musl** `nbench.i386` with
+`zig cc -target x86-linux-musl` (see `mk-bench-bins.sh`); it runs in v86's
+Debian-i386 guest with no lib deps. rv64 stays the newlib buildroot build below;
+both are the same nbench-byte-2.2.3 source, self-timed, so the per-kernel
+iterations/sec compare directly (libc differs but nbench barely touches it).
 
 Build + bake (riscv64 side), for `nbench.mjs`:
 

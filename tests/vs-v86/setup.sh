@@ -20,8 +20,15 @@ echo "== 1/3 building rv64-wasm =="
 echo "== 2/3 benchmark kernels =="
 "$HERE/build-kernels.sh" "$OUT"
 
-echo "== 3/3 nbench rootfs =="
+echo "== 3/3 nbench rootfs (rv64 BYTEmark) =="
 "$HERE/mk-nbench-rootfs.sh" "$OUT"
+
+echo "== + cross-ISA benchmark binaries (compile + v86 nbench) =="
+"$HERE/mk-bench-bins.sh" "$OUT"                       # tcc.i386/tcc.rv64/nbench.i386
+python3 "$HERE/../compile-bench/gen_c.py" "${NFUNCS:-2000}" > "$OUT/w.c"
+echo "== + rv64 compile image (tcc + w.c) =="
+IMG_SIZE=192M "$HERE/../compile-bench/mkimage.sh" "$OUT/cc-bench.img" "$OUT/tcc.rv64" "$OUT/w.c:/w.c" >/dev/null
+echo "  $OUT/cc-bench.img"
 
 if [ "${DEBIAN:-0}" = 1 ]; then
     echo "== + Debian riscv64 rootfs (python, arch-python) =="
@@ -29,6 +36,8 @@ if [ "${DEBIAN:-0}" = 1 ]; then
     echo "== + Debian i386 rootfs + v86 kernel/initramfs (apples-to-apples python) =="
     ARCH=i386 "$HERE/mk-debian-rootfs.sh" "$OUT"
     "$HERE/mk-v86-debian.sh" "$OUT"
+    echo "== + v86 bench initramfs (python + compile + nbench, one image) =="
+    "$HERE/mk-v86-bench.sh" "$OUT"
 fi
 
 cat <<EOF
