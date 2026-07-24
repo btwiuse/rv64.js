@@ -127,13 +127,26 @@ fn fetch(code: &[u8], base: u64, pc: u64) -> Option<(u32, u64)> {
 
 struct Ctx {
     lay: JitLayout,
+    /// Per-guest-register wasm local index, or 0 (= not cached, use memory).
+    /// Registers a block touches live in i64 locals for the block's lifetime
+    /// (v86's register_locals), eliminating the per-instruction load/store to
+    /// the CPU state struct. Locals are loaded at the prologue and flushed to
+    /// state at every exit / mid-block bail.
+    reg_local: [u32; 32],
+    /// Registers written anywhere in the block (flushed to state on exit).
+    write_mask: u32,
+    /// Dynamic index of the i32 IDXB scratch local (shifts with n_reg locals).
+    idxb: u32,
 }
 
 impl Ctx {
-    /// Emit `push x[r]` (reads the register slot; x0 is constant 0).
+    /// Emit `push x[r]` (reads the register; x0 is constant 0). Reads the
+    /// cached local if the register has one, else falls back to memory.
     fn push_reg(&self, m: &mut WasmModule, r: usize) {
         if r == 0 {
             m.i64_const(0);
+        } else if self.reg_local[r] != 0 {
+            m.local_get(self.reg_local[r]);
         } else {
             m.i32_const(0)
                 .i64_load(self.lay.x_base as u64 + r as u64 * 8);
@@ -144,12 +157,35 @@ impl Ctx {
         if rd == 0 {
             return false;
         }
-        m.i32_const(0);
+        // Memory stores need the address base pushed first; local stores don't.
+        if self.reg_local[rd] == 0 {
+            m.i32_const(0);
+        }
         true
     }
 
     fn store_post(&self, m: &mut WasmModule, rd: usize) {
-        m.i64_store(self.lay.x_base as u64 + rd as u64 * 8);
+        if self.reg_local[rd] != 0 {
+            m.local_set(self.reg_local[rd]);
+        } else {
+            m.i64_store(self.lay.x_base as u64 + rd as u64 * 8);
+        }
+    }
+
+    /// Flush every block-written register local back to the CPU state struct.
+    /// Precedes every block exit and mid-block bail so the interpreter (which
+    /// reads registers from state) sees current values.
+    fn flush_writes(&self, m: &mut WasmModule) {
+        let mut w = self.write_mask;
+        while w != 0 {
+            let r = w.trailing_zeros() as usize;
+            w &= w - 1;
+            if self.reg_local[r] != 0 {
+                m.i32_const(0)
+                    .local_get(self.reg_local[r])
+                    .i64_store(self.lay.x_base as u64 + r as u64 * 8);
+            }
+        }
     }
 
     /// Store the (constant) next pc.
@@ -179,6 +215,7 @@ impl Ctx {
     /// Bail out of the block at instruction index `n` (retired so far),
     /// leaving pc at `pc` for the interpreter to resume.
     fn bail(&self, m: &mut WasmModule, pc: u64, n: u32) {
+        self.flush_writes(m);
         self.set_pc_const(m, pc);
         self.set_retired(m, n);
         m.op(RETURN);
@@ -218,16 +255,16 @@ impl Ctx {
             .op(I32_AND)
             .i32_const(3)
             .op(I32_SHL)
-            .local_set_i32(IDXB);
+            .local_set_i32(self.idxb);
         // miss if tlb_tag[idx] != page  -> bail
-        m.local_get_i32(IDXB).i64_load_at(tag_base as u64);
+        m.local_get_i32(self.idxb).i64_load_at(tag_base as u64);
         m.local_get(PAGE).op(I64_NE);
         m.op(IF).op(VOID);
         self.bail(m, pc, n);
         m.op(END);
         // PA = va + diff
         m.local_get(VA);
-        m.local_get_i32(IDXB).i64_load_at(diff_base as u64);
+        m.local_get_i32(self.idxb).i64_load_at(diff_base as u64);
         m.op(I64_ADD).local_set(PA);
         // range check: (pa - ram_base) >u ram_size - len  -> bail (MMIO/cross)
         m.local_get(PA)
@@ -274,13 +311,138 @@ impl Ctx {
     }
 }
 
+/// Pre-scan a block — walking and terminating exactly like `translate_block`
+/// — to collect which guest registers it reads and writes, as 32-bit bitmaps.
+/// Used to decide which registers to cache in wasm locals.
+fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u32) {
+    let (mut read, mut write) = (0u32, 0u32);
+    let mut pc = start_pc;
+    let mut n = 0u32;
+    let mark = |m: &mut u32, r: usize| {
+        if r != 0 {
+            *m |= 1 << r;
+        }
+    };
+    while n < MAX_BLOCK as u32 {
+        let Some((insn, ilen)) = fetch(code, base, pc) else {
+            break;
+        };
+        let next_pc = pc.wrapping_add(ilen);
+        let (d, s1, s2) = (rd(insn), rs1(insn), rs2(insn));
+        match opcode(insn) {
+            0x37 | 0x17 => mark(&mut write, d),
+            0x13 => {
+                mark(&mut read, s1);
+                mark(&mut write, d);
+            }
+            0x33 => {
+                if !matches!(
+                    (funct7(insn), funct3(insn)),
+                    (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0)
+                ) {
+                    break;
+                }
+                mark(&mut read, s1);
+                mark(&mut read, s2);
+                mark(&mut write, d);
+            }
+            0x1b => {
+                if !matches!(funct3(insn), 0 | 1 | 5) {
+                    break;
+                }
+                mark(&mut read, s1);
+                mark(&mut write, d);
+            }
+            0x3b => {
+                if !matches!((funct7(insn), funct3(insn)), (0x00, 0) | (0x20, 0) | (0x01, 0)) {
+                    break;
+                }
+                mark(&mut read, s1);
+                mark(&mut write, d);
+            }
+            0x03 if lay.mem.is_some() || lay.sys.is_some() => {
+                if funct3(insn) == 7 {
+                    break;
+                }
+                mark(&mut read, s1);
+                mark(&mut write, d);
+            }
+            0x23 if lay.mem.is_some() || lay.sys.is_some() => {
+                if funct3(insn) > 3 {
+                    break;
+                }
+                mark(&mut read, s1);
+                mark(&mut read, s2);
+            }
+            0x6f => {
+                mark(&mut write, d);
+                let target = pc.wrapping_add(imm_j(insn) as u64);
+                let in_window = target > pc && target >= base && target < base + code.len() as u64;
+                if d == 0 && in_window {
+                    pc = target;
+                    n += 1;
+                    continue;
+                }
+                break;
+            }
+            0x67 => {
+                mark(&mut read, s1);
+                mark(&mut write, d);
+                break;
+            }
+            0x63 => {
+                if !matches!(funct3(insn), 0 | 1 | 4 | 5 | 6 | 7) {
+                    break;
+                }
+                mark(&mut read, s1);
+                mark(&mut read, s2);
+                break;
+            }
+            _ => break,
+        }
+        pc = next_pc;
+        n += 1;
+    }
+    (read, write)
+}
+
 /// Translate one basic block starting at `pc`. `code` is the guest code
 /// bytes and `base` its guest address. Returns None if the very first
 /// instruction isn't translatable (caller interprets it instead).
 pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> Option<Block> {
-    let c = Ctx { lay };
-    // 4 i64 scratch locals (VA/PAGE/PA/VAL) + 1 i32 (IDXB).
-    let mut m = WasmModule::with_locals(N_I64_LOCALS, 1);
+    // Pass 1: find which guest registers the block reads/writes, so we can
+    // cache them in wasm locals (v86-style register allocation) instead of
+    // round-tripping every access through the CPU state struct in memory.
+    let (read_mask, write_mask) = scan_regs(code, base, start_pc, &lay);
+    let touched = read_mask | write_mask;
+    // Assign an i64 local (index 5, 6, ...) to each touched register.
+    let mut reg_local = [0u32; 32];
+    let mut n_reg = 0u32;
+    for r in 1..32 {
+        if touched & (1 << r) != 0 {
+            reg_local[r] = N_I64_LOCALS + 1 + n_reg;
+            n_reg += 1;
+        }
+    }
+    let c = Ctx {
+        lay,
+        reg_local,
+        write_mask,
+        idxb: N_I64_LOCALS + n_reg + 1, // i32 local sits after all i64 locals
+    };
+    // 4 i64 scratch (VA/PAGE/PA/VAL) + n_reg register locals + 1 i32 (IDXB).
+    let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg, 1);
+    // Prologue: load each touched register from the state struct into its
+    // local. (Write-only regs are loaded too, so a mid-block bail can safely
+    // flush the whole write-set.)
+    let mut t = touched;
+    while t != 0 {
+        let r = t.trailing_zeros() as usize;
+        t &= t - 1;
+        m.i32_const(0)
+            .i64_load(lay.x_base as u64 + r as u64 * 8)
+            .local_set(reg_local[r]);
+    }
     let mut pc = start_pc;
     let mut n = 0u32;
 
@@ -494,7 +656,8 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     m.op(DROP);
                 } else {
                     m.local_set(VAL);
-                    m.i32_const(0).local_get(VAL);
+                    c.store_pre(&mut m, d); // addr base for memory dest; nothing for a local
+                    m.local_get(VAL);
                     c.store_post(&mut m, d);
                 }
             }
@@ -542,6 +705,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     n += 1;
                     continue;
                 }
+                c.flush_writes(&mut m);
                 c.set_pc_const(&mut m, target);
                 c.set_retired(&mut m, n + 1);
                 return Some(Block {
@@ -564,6 +728,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     c.store_post(&mut m, d);
                 }
                 m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
+                c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
                 return Some(Block {
                     wasm: m.finish(),
@@ -591,6 +756,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 m.op(ELSE);
                 c.set_pc_const(&mut m, next_pc);
                 m.op(END);
+                c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
                 return Some(Block {
                     wasm: m.finish(),
@@ -610,6 +776,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     if n == 0 {
         return None;
     }
+    c.flush_writes(&mut m);
     c.set_pc_const(&mut m, pc);
     c.set_retired(&mut m, n);
     Some(Block {

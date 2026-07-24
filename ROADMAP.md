@@ -24,56 +24,57 @@ priority order. Check items off as they land.
   +6% on user-int+fp; the `jit_set_enabled` diagnostic shows user JIT is
   1.56× over the wasm interpreter. Dispatch is no longer the bottleneck.
 
-- [ ] **2b. Fused JIT software-TLB (the system-mode unlock)** — the
-  diagnostic shows system JIT is 1.00× on memory-heavy code because inline
-  memory ops emit ~15 wasm instructions each. A dedicated JIT-TLB whose
-  present entries encode RAM+writable+not-compiled makes a load tag-compare
-  + offset-add + load (~4 ops).
-  - **First attempt (2026-07-22) — reverted, regressed.** Built the fused
-    JIT-TLB (Cpu.jtlb arrays, Bus::jit_ram_offset, emitter probe, wasm
-    wiring). Correct (md5 bit-identical) but a **net loss**: sys-md5
-    69→38, boot 69→38 Minsn/s. Root cause: the JTLB was *filled* inside the
-    interpreter's `translate()` (the ~89%-hot path), and `flush_tlb()` wipes
-    it on **every privilege-change trap** (each timer interrupt). So the
-    expensive `bus.jit_ram_offset` fill ran on nearly every interpreter
-    memory op → the interpreter itself slowed ~45%. The probe was cheap; the
-    fill placement + flush frequency was fatal.
-  - **Second attempt (2026-07-23) — privilege-tagged JTLB. Also reverted.**
-    Built exactly the fix above: mode folded into the free low-12 tag bits,
-    `jit_active` gate so the interpreter pays nothing when JIT is off, JTLB
-    flushed only on satp/SFENCE/SUM-MXR (not per-trap). It *did* remove the
-    interpreter-tax problem — but with the JIT actually engaged (slice 256)
-    **boot regressed to 0.90×** (compile + dispatch overhead on one-shot
-    boot code exceeds savings), and a benchmark reported an intermittent
-    md5 mismatch (not reproduced in a cleaner 12-run test, so likely a
-    harness artifact — but the perf regression alone made it non-viable).
-  - **CORRECTION (2026-07-23): the above conclusion was WRONG.** It came
-    from unrepresentative benchmarks (md5 memory-extreme, boot one-shot,
-    shell a tree-walker) plus a terminal-echo harness bug that made the
-    shell/compute A/Bs measure nothing. A correct measurement — a compute
-    binary run inside booted Linux, echo disabled, waiting for its real
-    checksum (tests/bench-sys.mjs) — shows the item-2 system-mode JIT is a
-    large win: 2.8x (register-heavy) to 3.2x (memory+ALU mix), the
-    memory-heavier workload benefiting MORE. md5 (~1.0x) is a memory-density
-    outlier. Shipped config: slice=256, JIT_ON_THRESHOLD=64 (boot only ~5%
-    slower; compute 2.8-3.2x). The 2b JTLB work is NOT required for a
-    system-mode win: item 1's inline-TLB memory ops already deliver it. 2b
-    remains a possible further optimization but is no longer the gate.
-    Both user-mode (1.56x) and system-mode (2.8-3.2x) JIT are now proven,
-    shipped wins.
+- [ ] **2b. Fused JIT software-TLB** *(deferred)* — a dedicated JIT-TLB
+  encoding RAM+writable+not-compiled to shrink inline memory ops from ~15 to
+  ~4 wasm ops. Attempted twice and reverted (interpreter-fill tax, then
+  one-shot-boot dispatch overhead; full post-mortem in git history). Item 1's
+  inline TLB already delivers the system win; superseded in priority by the
+  register-locals work below.
 
-- [ ] **3. FP ops inside JIT blocks** — FP instructions currently end
-  blocks. Reuse the interpreter's sticky-NX/RNE eligibility guard (see
-  cpu.rs `fp_fast64`): emit a runtime guard on fcsr (JitLayout needs an
-  fcsr_addr) + inline wasm `f32/f64` ops with the same operand/result
-  shape checks; bail to interpreter otherwise. Medium effort; big win for
-  FP-heavy guest loops. Differentially fuzz blocks against softfp like the
-  interpreter fast path.
+### Closing the JIT gap to v86 (measured plan, 2026-07-23)
+
+`tests/vs-v86/` benchmarks us head-to-head against copy/v86 on the same
+machine. Result: **our interpreter is a peer to v86's, but our JIT is ~11×
+(mixed) to ~18× (pure ALU) slower than v86's.** Deep-dive into both codebases
+found the gap is 100% implementation maturity — and riscv64 is a *better* JIT
+target than x86 (no condition flags → we skip v86's largest subsystem, its
+lazy-EFLAGS machinery; fixed-width decode; clean IEEE F/D vs x87). v86 wins
+via three techniques; below is our phased plan to adopt them, each measured
+with `tests/vs-v86` (baseline vs v86: ALU 50.5s vs 2.9s; mixed 17.1s vs 1.5s).
+
+- [ ] **3a. Phase 1 — registers in wasm locals** *(the #1 ALU win)* — today
+  every guest-register access is a linear-memory load/store to the CPU state
+  struct (`rv64-jit` `push_reg`/`store_post`); the xorshift loop does ~8
+  memory ops/iteration where v86 does zero. Cache the GPRs a block touches in
+  `i64` wasm locals (v86's `register_locals`): prologue loads read-regs →
+  locals; `push_reg`→`local.get`, `store_post`→`local.set`; **every exit and
+  every mid-block bail** flushes dirty locals → state (the interpreter reads
+  state). Moderate effort, large ALU win.
+
+- [ ] **3b. Phase 2 — FP ops inside JIT blocks** — FP currently *ends* the
+  block, so FP-heavy code gets ~0% coverage (half the mixed workload). Emit
+  wasm `f32/f64` ops under the interpreter's sticky-NX/RNE eligibility guard
+  (`cpu.rs fp_fast64/32`; JitLayout needs `fcsr_addr` + `f_base`), cache FPRs
+  in `f64` locals, bail otherwise. Easier for us than for v86 (no x87).
+  Differentially fuzz blocks against softfp like the interpreter fast path.
+
+- [ ] **3c. Phase 3 — compile loops/regions as one wasm function** *(the
+  architectural leap, highest ceiling)* — today each basic block is its own
+  wasm function and a hot loop re-`call_indirect`s through the Rust dispatcher
+  every iteration, so V8 can't optimize across the back-edge and locals get
+  flushed/reloaded each time. Structure a hot region/loop into a single wasm
+  function with internal control flow (wasm `loop`/`br`), like v86's
+  `control_flow.rs` (SCC → Loop/Block/Dispatcher). Combined with Phase 1 this
+  keeps registers in locals across iterations → V8 JITs the loop near-native.
 
 - [ ] **4. (Optional) residual-based flag recovery** — extend the FP fast
   path to work before NX is set, via error-free transformations (TwoSum
   for add, Dekker splitting for mul — no FMA needed, so wasm-compatible).
   Low priority: sticky-NX already covers real workloads.
+
+The old **item 2b (fused JIT software-TLB)** stays deferred — item 1's inline
+TLB already delivers the system-mode win; register-locals (3a) is the bigger
+lever now. Its two reverted attempts are documented in git history.
 
 ## Validation
 
