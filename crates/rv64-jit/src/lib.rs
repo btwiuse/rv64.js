@@ -254,6 +254,38 @@ impl Ctx {
         m.i32_const(0).local_get(VAL).i64_store(f + d as u64 * 8);
     }
 
+    /// Emit a double-precision FP compare (FLE/FLT/FEQ.D) as an inline wasm
+    /// f64 compare into GPR x[d]. `f3`: 0=FLE 1=FLT 2=FEQ. Bails to the
+    /// interpreter if either operand is inf/nan (the exact-flag/NV cases);
+    /// finite operands compare exactly with no flag change.
+    fn fp_cmp_d(&self, m: &mut WasmModule, f3: u32, s1: usize, s2: usize, d: usize, pc: u64, n: u32) {
+        let f = self.lay.f_base as u64;
+        for &s in &[s1, s2] {
+            m.i32_const(0)
+                .i64_load(f + s as u64 * 8)
+                .i64_const(52)
+                .op(I64_SHR_U)
+                .i64_const(0x7ff)
+                .op(I64_AND)
+                .i64_const(0x7ff)
+                .op(I64_EQ);
+            m.op(IF).op(VOID);
+            self.bail(m, pc, n);
+            m.op(END);
+        }
+        if self.store_pre(m, d) {
+            m.i32_const(0).i64_load(f + s1 as u64 * 8).op(F64_REINTERPRET_I64);
+            m.i32_const(0).i64_load(f + s2 as u64 * 8).op(F64_REINTERPRET_I64);
+            m.op(match f3 {
+                0 => F64_LE,
+                1 => F64_LT,
+                _ => F64_EQ,
+            });
+            m.op(I64_EXTEND_I32_U);
+            self.store_post(m, d);
+        }
+    }
+
     /// Store the (constant) next pc.
     fn set_pc_const(&self, m: &mut WasmModule, pc: u64) {
         m.i32_const(0)
@@ -470,6 +502,7 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 let f7 = funct7(insn);
                 match (f7 >> 2, f7 & 3, funct3(insn)) {
                     (0..=3, 1, 0 | 7) => {}
+                    (0x14, 1, 0..=2) => mark(&mut write, d), // FLE/FLT/FEQ -> x[d]
                     (0x1e, 1, 0) => mark(&mut read, s1),
                     (0x1c, 1, 0) => mark(&mut write, d),
                     _ => break,
@@ -951,6 +984,8 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 match (fpop, fmt, f3) {
                     // FADD/FSUB/FMUL/FDIV.D (static RNE or dynamic rounding)
                     (0..=3, 1, 0 | 7) => c.fp_arith_d(&mut m, fpop, s1, s2, d, f3 == 7, pc, n),
+                    // FLE/FLT/FEQ.D -> x[d]
+                    (0x14, 1, 0..=2) => c.fp_cmp_d(&mut m, f3, s1, s2, d, pc, n),
                     // FMV.D.X: f[d] = x[s1] (raw 64-bit copy)
                     (0x1e, 1, 0) => {
                         m.i32_const(0);
