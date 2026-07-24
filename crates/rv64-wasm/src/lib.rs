@@ -266,6 +266,11 @@ struct JitState {
     /// exactly the affected entries instead of scanning the whole cache per
     /// page — the cache persists across context switches now, so it's large.
     page_blocks: std::collections::HashMap<u64, Vec<u64>>,
+    /// Virtual pages already compiled as a superblock — compile ONCE per page
+    /// (with whatever entries were hot then); later hot pcs in the page get
+    /// individual blocks. Recompiling the page's big br_table function on every
+    /// new entry was a 2x regression on short workloads (the recompile storm).
+    superblocked: std::collections::HashSet<u64>,
 }
 
 impl JitState {
@@ -285,12 +290,14 @@ impl JitState {
             page_entries: Default::default(),
             interp_hot: vec![0; DISPATCH_SIZE],
             page_blocks: Default::default(),
+            superblocked: Default::default(),
         }
     }
     fn clear(&mut self) {
         self.cache.clear();
         self.hot.clear();
         self.page_entries.clear();
+        self.superblocked.clear();
         for h in self.interp_hot.iter_mut() {
             *h = 0;
         }
@@ -702,6 +709,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         if m.cpu.jit_flush_gen != jit.flush_gen {
             jit.flush_gen = m.cpu.jit_flush_gen;
             jit.page_entries.clear();
+            jit.superblocked.clear();
         }
         // Per-page invalidation: drop only blocks whose physical code page
         // was written (self-modifying code / recycled pages), and clear only
@@ -721,6 +729,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 m.bus.jit_unmark_page(ppage);
             }
             jit.page_entries.clear(); // re-discover superblock entries
+            jit.superblocked.clear();
         }
         // --- JIT fast path: direct-mapped dispatch + cheap pa-verify ---
         // Per-dispatch bookkeeping accumulates in LOCALS and flushes once after
@@ -858,12 +867,25 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
 
                         if !is_loop
                             && n_entries >= SUPERBLOCK_THRESHOLD
+                            && !jit.superblocked.contains(&vpage)
                             && pa_page_off + 0x1000 <= m.bus.ram.len()
                         {
-                            // Compile / recompile the page superblock covering
-                            // every hot entry, and point them all at it.
-                            let entries = jit.page_entries[&vpage].clone();
+                            // Enough individually-hot pcs: compile the page as
+                            // ONE function — but over the FULL statically
+                            // discovered leader set (v86's page analysis), not
+                            // just the hot seeds. That keeps intra-page control
+                            // flow inside the function (any discovered target
+                            // hits its br_table slot) without recompiling per
+                            // newly-hot entry. Loop headers are EXCLUDED: their
+                            // br_table slots fall to the exit default, so the
+                            // tight individual loop-region blocks keep owning
+                            // them.
+                            let seeds = jit.page_entries[&vpage].clone();
                             let code = &m.bus.ram[pa_page_off..pa_page_off + 0x1000];
+                            let mut entries = rv64_jit::discover_page_leaders(
+                                code, vpage, vpage, 0x1000, &seeds, 384,
+                            );
+                            entries.retain(|&e| !rv64_jit::is_loop_at(code, vpage, e, lay));
                             let sb = rv64_jit::translate_superblock(
                                 code, vpage, vpage, 0x1000, &entries, lay,
                             );
@@ -873,6 +895,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                 if idx >= 0 {
                                     m.bus.jit_mark_page(pa);
                                     m.cpu.clear_store_jtlb(); // this page may now hold code
+                                    jit.superblocked.insert(vpage); // compile once
                                     for &e in &entries {
                                         let epa = pa_page + (e - vpage);
                                         let jb = JitBlock { idx, n: 0, pa: epa };
@@ -1008,6 +1031,13 @@ pub extern "C" fn sys_console_input() {
 
 #[no_mangle]
 #[allow(static_mut_refs)]
+/// Current guest pc (diagnostic: host-side pc sampling for guest profiling).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_pc() -> u64 {
+    unsafe { SYS.as_ref().map_or(0, |m| m.cpu.pc) }
+}
+
 pub extern "C" fn sys_insn_count() -> u64 {
     unsafe { SYS.as_ref().map(|m| m.cpu.insn_count).unwrap_or(0) }
 }

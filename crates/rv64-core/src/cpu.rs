@@ -27,7 +27,12 @@ enum Access {
     Store,
 }
 
-const TLB_BITS: u32 = 8;
+// 12 bits = 4096 entries/class. 256 was fine for small-working-set loops but
+// direct-mapped-thrashes on multi-MB working sets (a compiler's symbol tables
+// and mallocs): every conflict is a page walk in the interpreter and a block
+// BAIL in the JIT. v86 never capacity-misses (full 2^20-page index for 32-bit
+// guests); 4096 entries is the closest affordable equivalent for sv39.
+const TLB_BITS: u32 = 12;
 const TLB_SIZE: usize = 1 << TLB_BITS;
 const TLB_INVALID: u64 = !0;
 

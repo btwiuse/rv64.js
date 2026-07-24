@@ -1859,6 +1859,97 @@ pub fn is_loop_at(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> bool
     loop_region(code, base, start_pc, &lay).is_some()
 }
 
+/// Statically discover every basic-block leader in a code page reachable from
+/// `seeds` (v86's page-analysis pass). Walks each pending leader forward,
+/// adding in-page branch targets, fallthroughs, and post-call return sites as
+/// new leaders until fixpoint. A superblock compiled over the FULL leader set
+/// keeps intra-page control flow inside one wasm function — compiling only the
+/// handful of individually-hot pcs misses most of the page and forces a
+/// recompile storm (or, compiled once, a permanently sparse br_table).
+///
+/// `max_leaders` bounds pathological pages (jump-table-dense code). Returns a
+/// sorted, deduplicated list. Leaders may start with an instruction the block
+/// emitter can't handle — the superblock emitter turns those into exit stubs.
+pub fn discover_page_leaders(
+    code: &[u8],
+    base: u64,
+    page_base: u64,
+    page_span: u64,
+    seeds: &[u64],
+    max_leaders: usize,
+) -> Vec<u64> {
+    let page_end = page_base + page_span;
+    let in_page = |pc: u64| pc >= page_base && pc < page_end;
+    let mut leaders: std::collections::BTreeSet<u64> = seeds.iter().copied().collect();
+    let mut done: std::collections::BTreeSet<u64> = Default::default();
+    let mut pending: Vec<u64> = seeds.to_vec();
+    while let Some(start) = pending.pop() {
+        if !done.insert(start) {
+            continue;
+        }
+        let mut pc = start;
+        let mut n = 0u32;
+        while n < MAX_BLOCK as u32 && pc < page_end {
+            let Some((insn, ilen)) = fetch(code, base, pc) else {
+                break;
+            };
+            let next = pc.wrapping_add(ilen);
+            let mut add = |t: u64, leaders: &mut std::collections::BTreeSet<u64>,
+                           pending: &mut Vec<u64>| {
+                if in_page(t) && leaders.len() < max_leaders && leaders.insert(t) {
+                    pending.push(t);
+                }
+            };
+            match opcode(insn) {
+                // conditional branch: target + fallthrough are leaders; block ends
+                0x63 => {
+                    add(pc.wrapping_add(imm_b(insn) as u64), &mut leaders, &mut pending);
+                    add(next, &mut leaders, &mut pending);
+                    break;
+                }
+                // JAL: target is a leader if in page; a CALL (rd != 0) also makes
+                // the return site a leader (the callee's ret dispatches back there)
+                0x6f => {
+                    add(pc.wrapping_add(imm_j(insn) as u64), &mut leaders, &mut pending);
+                    if rd(insn) != 0 {
+                        add(next, &mut leaders, &mut pending);
+                    }
+                    break;
+                }
+                // JALR: dynamic target; if it links (call), the return site is a
+                // leader. Block ends either way.
+                0x67 => {
+                    if rd(insn) != 0 {
+                        add(next, &mut leaders, &mut pending);
+                    }
+                    break;
+                }
+                // Anything the emitter can't inline ends the block; execution
+                // resumes at the next insn after the interpreter steps it.
+                op => {
+                    let handled = match op {
+                        0x37 | 0x17 | 0x13 | 0x33 | 0x1b | 0x3b => {
+                            alu_handled(op, funct7(insn), funct3(insn))
+                        }
+                        0x03 => funct3(insn) != 7,
+                        0x23 => funct3(insn) <= 3,
+                        0x07 | 0x27 => funct3(insn) == 3,
+                        0x53 => fp_handled(funct7(insn), funct3(insn)),
+                        _ => false,
+                    };
+                    if !handled {
+                        add(next, &mut leaders, &mut pending);
+                        break;
+                    }
+                }
+            }
+            pc = next;
+            n += 1;
+        }
+    }
+    leaders.into_iter().collect()
+}
+
 /// Compile a whole page of basic blocks (v86's function-per-page) into one wasm
 /// function with an internal `br_table` dispatch loop and all touched registers
 /// cached in locals for the function's lifetime — so execution flows between
