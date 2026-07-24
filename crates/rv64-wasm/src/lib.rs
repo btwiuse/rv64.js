@@ -258,6 +258,11 @@ struct JitState {
     interp_hot: Vec<u16>,
     /// DIAGNOSTIC: histogram of run_slice_until entry pcs.
     slice_pcs: std::collections::HashMap<u64, u64>,
+    /// Physical page -> pcs of cache entries whose code lives there (blocks
+    /// AND pa-stamped blacklist sentinels). Lets dirty-page invalidation drop
+    /// exactly the affected entries instead of scanning the whole cache per
+    /// page — the cache persists across context switches now, so it's large.
+    page_blocks: std::collections::HashMap<u64, Vec<u64>>,
 }
 
 impl JitState {
@@ -281,6 +286,7 @@ impl JitState {
             page_entries: Default::default(),
             interp_hot: vec![0; DISPATCH_SIZE],
             slice_pcs: Default::default(),
+            page_blocks: Default::default(),
         }
     }
     fn clear(&mut self) {
@@ -291,6 +297,7 @@ impl JitState {
             *h = 0;
         }
         self.slice_pcs.clear();
+        self.page_blocks.clear();
         self.clear_dispatch();
     }
     #[inline]
@@ -377,6 +384,13 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
 /// loops (dispatched millions of times) tier up quickly.
 const JIT_ON_THRESHOLD: u32 = 64;
 static mut JIT_THRESHOLD: u32 = 64;
+/// Tier-up threshold for the per-EXECUTION interp-stretch counter. Deliberately
+/// much higher than JIT_THRESHOLD (which counts block-entry events): blocks and
+/// hot-counts persist across context switches now, so a low per-execution bar
+/// makes boot synchronously compile ~19k one-shot cold blocks (~0.1ms of
+/// WebAssembly.Module each = seconds of boot). Steady-state hot code executes
+/// millions of times and crosses 1024 in microseconds.
+const INTERP_HOT_THRESHOLD: u16 = 2048;
 /// Interpreter fallback slice once JIT blocks exist (tuned below).
 const SYS_WARM_SLICE: u64 = 256;
 
@@ -496,6 +510,9 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     _ => break,
                 }
             };
+            if b.idx < 0 {
+                break; // blacklisted (pa-verified for the current mapping)
+            }
             call_block(b.idx, m as *mut _ as *mut u8);
             // Read the dynamic retired count the block wrote: self-loop blocks
             // (Phase 3) run a runtime-variable number of iterations, so their
@@ -700,24 +717,38 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 unsafe { WALL_IDLE_ITERS += 1 };
             }
         }
-        // Mapping-change flush (satp/SFENCE): drop the whole cache.
+        // Address-space switch (satp write): compiled blocks SURVIVE — they're
+        // va-keyed and every dispatch lazily re-verifies its va→pa mapping when
+        // cpu.map_gen moved, so a block whose va now maps elsewhere (or nowhere)
+        // is dropped at dispatch, and kernel/global mappings keep their blocks
+        // across every context switch (recompiling the working set per switch
+        // was a large fraction of boot time). Only va-keyed state that could
+        // POISON a different address space at the same va must go: blacklist
+        // entries (a va untranslatable in space A may be hot compilable code in
+        // space B) and superblock page-entry lists (block starts from A are
+        // arbitrary byte offsets in B).
         if m.cpu.jit_flush_gen != jit.flush_gen {
             jit.flush_gen = m.cpu.jit_flush_gen;
-            jit.clear();
-            m.bus.jit_take_dirty();
+            jit.page_entries.clear();
         }
         // Per-page invalidation: drop only blocks whose physical code page
-        // was written (self-modifying code / recycled pages).
+        // was written (self-modifying code / recycled pages), and clear only
+        // their dispatch lines (a full dispatch memset is megabytes per event).
         if !m.bus.jit_dirty_pages.is_empty() {
             let dirty = m.bus.jit_take_dirty();
             for &ppage in &dirty {
-                jit.cache.retain(|_, blk| {
-                    blk.map_or(true, |b| (b.pa - rv64_system::RAM_BASE) >> 12 != ppage)
-                });
+                if let Some(pcs) = jit.page_blocks.remove(&ppage) {
+                    for pc in pcs {
+                        jit.cache.remove(&pc);
+                        let slot = JitState::dslot(pc);
+                        if jit.dispatch[slot].pc == pc {
+                            jit.dispatch[slot].pc = NO_PC;
+                        }
+                    }
+                }
                 m.bus.jit_unmark_page(ppage);
             }
             jit.page_entries.clear(); // re-discover superblock entries
-            jit.clear_dispatch(); // stale lines may point at dropped blocks
         }
         // --- JIT fast path: direct-mapped dispatch + cheap pa-verify ---
         let mut chained = 0u32;
@@ -766,6 +797,9 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                     _ => break, // uncompiled or blacklisted
                 }
             };
+            if b.idx < 0 {
+                break; // blacklisted (pa-verified for the current mapping)
+            }
             call_block(b.idx, m as *mut _ as *mut u8);
             // Sys blocks with inline memory ops may bail mid-block; read the
             // count they actually retired (pc is set by the block either way).
@@ -872,7 +906,12 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                     for &e in &entries {
                                         let epa = pa_page + (e - vpage);
                                         let jb = JitBlock { idx, n: 0, pa: epa };
-                                        jit.cache.insert(e, Some(jb));
+                                        if jit.cache.insert(e, Some(jb)).is_none() {
+                                            jit.page_blocks
+                                                .entry((epa - rv64_system::RAM_BASE) >> 12)
+                                                .or_default()
+                                                .push(e);
+                                        }
                                         jit.dispatch[JitState::dslot(e)] = DispatchLine {
                                             pc: e,
                                             blk: jb,
@@ -896,9 +935,34 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             m.cpu.clear_store_jtlb(); // this page may now hold code
                             Some(JitBlock { idx, n: blk.n_insns, pa })
                         });
-                        jit.cache.insert(pc, entry);
-                        if entry.is_some() {
-                            continue;
+                        match entry {
+                            Some(b) => {
+                                if jit.cache.insert(pc, Some(b)).is_none() {
+                                    jit.page_blocks
+                                        .entry((b.pa - rv64_system::RAM_BASE) >> 12)
+                                        .or_default()
+                                        .push(pc);
+                                }
+                                continue;
+                            }
+                            // Untranslatable at THESE code bytes: blacklist with
+                            // a pa-stamped sentinel (idx = -1). It's re-verified
+                            // like a real block (map_gen / dispatch probe) so it
+                            // survives context switches without poisoning a
+                            // different address space at the same va, and the
+                            // dirty-page tracker naturally drops it if the code
+                            // bytes are overwritten.
+                            None => {
+                                m.bus.jit_mark_page(pa);
+                                m.cpu.clear_store_jtlb();
+                                let jb = JitBlock { idx: -1, n: 0, pa };
+                                if jit.cache.insert(pc, Some(jb)).is_none() {
+                                    jit.page_blocks
+                                        .entry((pa - rv64_system::RAM_BASE) >> 12)
+                                        .or_default()
+                                        .push(pc);
+                                }
+                            }
                         }
                     }
                 }
@@ -931,7 +995,6 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             // run_slice_until would interpret the whole stretch forever without
             // any of its blocks ever tiering up — that residual is ~half of
             // fib's wall time).
-            let thr = unsafe { JIT_THRESHOLD }.min(u16::MAX as u32) as u16;
             let ran = m.run_slice_until(remaining.min(SYS_WARM_SLICE), |pc| {
                 if jit.dispatch[JitState::dslot(pc)].pc == pc {
                     return true;
@@ -939,7 +1002,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 let slot = JitState::dslot(pc);
                 let cnt = &mut jit.interp_hot[slot];
                 *cnt = cnt.saturating_add(1);
-                if *cnt < thr {
+                if *cnt < INTERP_HOT_THRESHOLD {
                     return false; // cold: cheap array bump only, no HashMap
                 }
                 // Hot stretch interior: force it onto the fast-path hot map so
