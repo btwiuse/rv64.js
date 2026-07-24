@@ -530,16 +530,16 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 mark(&mut read, s1);
                 mark(&mut read, s2);
             }
-            // FLD / FSD (double, funct3==3): raw 8-byte copy mem<->f[]. User-
-            // mode only (needs f_base for the FP file; loop-opt is user-mode).
-            0x07 if lay.mem.is_some() && lay.f_base != 0 => {
+            // FLD / FSD (double, funct3==3): raw 8-byte copy mem<->f[], user-mode
+            // direct or system inline-TLB (needs f_base for the FP file).
+            0x07 if (lay.mem.is_some() || lay.sys.is_some()) && lay.f_base != 0 => {
                 if funct3(insn) != 3 {
                     break;
                 }
                 mark(&mut read, s1);
                 fmark(&mut fwrite, d);
             }
-            0x27 if lay.mem.is_some() && lay.f_base != 0 => {
+            0x27 if (lay.mem.is_some() || lay.sys.is_some()) && lay.f_base != 0 => {
                 if funct3(insn) != 3 {
                     break;
                 }
@@ -1146,31 +1146,42 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
             }
         }
         // FLD: f[d] = mem[x[s1]+imm] (double). Raw 8-byte copy, bit-exact.
-        0x07 if lay.mem.is_some() && lay.f_base != 0 => {
+        // User-mode direct access or system inline-TLB.
+        0x07 if (lay.mem.is_some() || lay.sys.is_some()) && lay.f_base != 0 => {
             if funct3(insn) != 3 {
                 return false;
             }
-            let (mem_base, size) = lay.mem.unwrap();
             c.push_reg(m, s1);
             m.i64_const(imm_i(insn)).op(I64_ADD);
-            c.guest_addr(m, size, 8);
-            m.op(I64_LOAD).raw_uleb(len_align(8)).raw_uleb(mem_base as u64);
+            let off = if let Some((mem_base, size)) = lay.mem {
+                c.guest_addr(m, size, 8);
+                mem_base as u64
+            } else {
+                c.tlb_index(m, &lay.sys.unwrap(), 8, false, pc, n);
+                0
+            };
+            m.op(I64_LOAD).raw_uleb(len_align(8)).raw_uleb(off);
             m.local_set(VAL);
             c.store_freg_pre(m, d);
             m.local_get(VAL);
             c.store_freg_post(m, d);
         }
         // FSD: mem[x[s1]+imm] = f[s2] (double). Raw 8-byte copy.
-        0x27 if lay.mem.is_some() && lay.f_base != 0 => {
+        0x27 if (lay.mem.is_some() || lay.sys.is_some()) && lay.f_base != 0 => {
             if funct3(insn) != 3 {
                 return false;
             }
-            let (mem_base, size) = lay.mem.unwrap();
             c.push_reg(m, s1);
             m.i64_const(imm_s(insn)).op(I64_ADD);
-            c.guest_addr(m, size, 8);
-            c.push_freg(m, s2);
-            m.op(I64_STORE).raw_uleb(len_align(8)).raw_uleb(mem_base as u64);
+            if let Some((mem_base, size)) = lay.mem {
+                c.guest_addr(m, size, 8);
+                c.push_freg(m, s2);
+                m.op(I64_STORE).raw_uleb(len_align(8)).raw_uleb(mem_base as u64);
+            } else {
+                c.tlb_index(m, &lay.sys.unwrap(), 8, true, pc, n);
+                c.push_freg(m, s2);
+                m.op(I64_STORE).raw_uleb(len_align(8)).raw_uleb(0);
+            }
         }
         // OP-FP: double add/sub/mul/div + compares + FMV.D.X/FMV.X.D inline.
         0x53 if lay.f_base != 0 => {
