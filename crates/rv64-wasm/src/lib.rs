@@ -295,6 +295,8 @@ fn retired_addr() -> u32 {
 // Perf instrumentation: guest instructions retired inside JIT blocks vs
 // total, and dispatch counts (block calls). Exposed via jit_stat().
 static mut JIT_RETIRED: u64 = 0;
+static mut SLICE_CALLS: u64 = 0;
+static mut SLICE_INSNS: u64 = 0;
 static mut JIT_DISPATCHES: u64 = 0;
 
 /// jit_stat(0) = insns retired in JIT blocks, (1) = block dispatches,
@@ -308,6 +310,8 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             1 => JIT_DISPATCHES,
             2 => USER_JIT.as_ref().map_or(0, |j| j.cache.len() as u64),
             3 => SYS_JIT.as_ref().map_or(0, |j| j.cache.len() as u64),
+            4 => SLICE_CALLS,
+            5 => SLICE_INSNS,
             _ => 0,
         }
     }
@@ -629,6 +633,27 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             }
             remaining = remaining.saturating_sub(retired);
             chained += 1;
+            // A block that retired nothing bailed on its very first instruction
+            // (TLB miss / MMIO / FP fast-path). It makes no progress, so stop
+            // chaining and let the interpreter handle that instruction — never
+            // spin re-calling it.
+            if retired == 0 {
+                break;
+            }
+        }
+
+        // If we stopped only because we hit the chain cap (the next pc is still
+        // compiled and making progress), keep running in the JIT: advance the
+        // clock and service interrupts here — the interrupt/timer work the
+        // interpreter slice below used to do — instead of dropping to a wasteful
+        // ~256-insn interp slice. This is the difference between ~50% and ~95%
+        // JIT coverage on branchy, deeply-chained workloads (the CPython eval
+        // loop). (`chained == CAP` can only be reached when every block in the
+        // batch retired > 0, since a zero-retire block breaks above.)
+        if chained == JIT_CHAIN_CAP {
+            m.sync_devices();
+            m.cpu.check_interrupts(&mut m.bus);
+            continue;
         }
 
         // --- hot counting + compile (from physical code bytes) ---
@@ -691,16 +716,34 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         }
 
         // --- interpreter + devices ---
-        // With cheap dispatch (item 2), a short warm slice returns us to the
-        // JIT quickly and converts coverage into throughput; a large cold
-        // slice avoids dispatch churn before any block exists.
-        let slice = if jit.cache.is_empty() {
-            4096
+        if jit.cache.is_empty() {
+            // Cold: no compiled blocks to return to — one big slice avoids
+            // dispatch churn before any block exists.
+            let ran = m.run_slice(remaining.min(4096));
+            unsafe { SLICE_CALLS += 1; SLICE_INSNS += ran; }
+            remaining = remaining.saturating_sub(ran.max(1));
         } else {
-            SYS_WARM_SLICE
-        };
-        let ran = m.run_slice(remaining.min(slice));
-        remaining = remaining.saturating_sub(ran.max(1));
+            // Warm: interpret ONLY the uncompiled stretch — stop the moment pc
+            // reaches a compiled block again. A fixed warm slice overshoots into
+            // compiled code and runs it in the interpreter; on the CPython eval
+            // loop that overshoot was ~half of all instructions (2.8M slices ×
+            // 256 insns). Run in small chunks, checking the (cheap, direct-
+            // mapped) dispatch cache between them.
+            // Interpret only the uncompiled stretch, stopping the instant pc
+            // reaches a hot compiled block — a fixed slice would overshoot into
+            // compiled code and run it in the interpreter (on the CPython eval
+            // loop that overshoot was ~half of all instructions). The first
+            // instruction always runs (pc may be a block that just bailed here),
+            // so no spin.
+            let ran = m.run_slice_until(remaining.min(SYS_WARM_SLICE), |pc| {
+                jit.dispatch[JitState::dslot(pc)].pc == pc
+            });
+            unsafe {
+                SLICE_CALLS += 1;
+                SLICE_INSNS += ran;
+            }
+            remaining = remaining.saturating_sub(ran.max(1));
+        }
     }
 
     let out = m.console_output();

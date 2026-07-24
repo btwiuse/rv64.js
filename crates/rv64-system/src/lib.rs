@@ -479,6 +479,37 @@ impl Machine {
         self.cpu.insn_count - start
     }
 
+    /// Interpret up to `max_insns`, but stop as soon as `compiled(pc)` reports
+    /// the pc has reached a JIT-compiled block — so the interpreter never
+    /// overshoots into compiled code (which the JIT should run instead). Used by
+    /// the system JIT dispatcher's warm-interp fallback. Runs one instruction at
+    /// a time (interrupts/exceptions handled by `cpu.run`), refreshing the clock
+    /// only periodically so the per-instruction cost stays near the interpreter's.
+    pub fn run_slice_until(&mut self, max_insns: u64, mut compiled: impl FnMut(u64) -> bool) -> u64 {
+        let start = self.cpu.insn_count;
+        self.sync_devices();
+        let mut i = 0u64;
+        while i < max_insns {
+            if let StopReason::Wfi = self.cpu.run(&mut self.bus, 1) {
+                let next = self.bus.mtimecmp;
+                if next != u64::MAX && next > self.bus.mtime {
+                    self.cpu.insn_count += (next - self.bus.mtime) * self.insns_per_tick;
+                }
+                break;
+            }
+            i = self.cpu.insn_count - start;
+            if compiled(self.cpu.pc) {
+                break; // reached compiled code — hand back to the JIT
+            }
+            if i & 63 == 0 {
+                self.sync_devices();
+            }
+        }
+        self.sync_devices();
+        self.power_off = self.bus.power_off;
+        self.cpu.insn_count - start
+    }
+
     /// Advance the CLINT clock (interrupt lines are sampled live by the CPU
     /// via Bus::irq_lines; nothing else to propagate).
     pub fn sync_devices(&mut self) {
