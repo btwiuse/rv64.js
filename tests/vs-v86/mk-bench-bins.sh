@@ -77,4 +77,28 @@ i386cc -DLINUX -O2 -static -o "$OUT/nbench.i386" \
    nbench0.c nbench1.c sysspec.c misc.c emfloat.c hwstub.c
 echo "  $OUT/nbench.i386: $(file -b "$OUT/nbench.i386" | cut -d, -f1-2)"
 
-echo "done: tcc.i386 tcc.rv64 nbench.i386 in $OUT"
+# --- nbench riscv64 (musl, SAME libc family as the i386 side — the old newlib
+# build's generic byte-loop memmove made STRING SORT ~5x slower than the code
+# deserves; fastmem.c is the ISA-fair counterpart of musl's i386 asm strings) ---
+echo "== nbench.rv64 (musl + fastmem) =="
+cd "$NB"
+echo '#define LONG64' > pointer.h
+cat > sysinfo.c  <<'X'
+sprintf(buffer,"**System: riscv64 under rv64.js\n"); output_string(buffer);
+X
+cat > sysinfoc.c <<'X'
+sprintf(buffer,"C compiler          : zig cc (riscv64 musl)\n"); output_string(buffer);
+sprintf(buffer,"libc                : musl\n"); output_string(buffer);
+X
+cp "$HERE/nbench-extras/fastmem.c" fastmem.c
+rv64cc -DLINUX -O2 -static -fno-builtin-memmove -fno-builtin-memcpy -o "$OUT/nbench.rv64" \
+   nbench0.c nbench1.c sysspec.c misc.c emfloat.c hwstub.c fastmem.c
+echo "  $OUT/nbench.rv64: $(file -b "$OUT/nbench.rv64" | cut -d, -f1-2)"
+# bake into the buildroot rootfs image the nbench harness boots
+cp "$HERE/../../web/images/root-riscv64.bin" "$OUT/root-nbench.bin"
+debugfs -w -R "rm /nbench" "$OUT/root-nbench.bin" >/dev/null 2>&1 || true
+debugfs -w -R "write $OUT/nbench.rv64 nbench" "$OUT/root-nbench.bin" >/dev/null 2>&1
+debugfs -w -R "sif /nbench mode 0100755" "$OUT/root-nbench.bin" >/dev/null 2>&1
+echo "  baked $OUT/root-nbench.bin"
+
+echo "done: tcc.i386 tcc.rv64 nbench.i386 nbench.rv64 root-nbench.bin in $OUT"
