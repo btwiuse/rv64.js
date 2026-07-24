@@ -336,6 +336,13 @@ pub struct Machine {
     /// Instructions per mtime tick (insn rate / RTC_FREQ).
     pub insns_per_tick: u64,
     pub power_off: bool,
+    /// Opt-in wall-clock time source (host nanoseconds). `None` (default) =
+    /// deterministic instruction-counted time (mtime = insn_count/insns_per_tick),
+    /// which our lockstep/differential testing relies on. When `Some(ns)` the
+    /// CLINT tracks real host time instead, so guest `gettimeofday`/`clock` and
+    /// self-timing benchmarks (nbench) reflect real throughput — the host layer
+    /// refreshes it each slice. Monotonic-clamped so it never runs backward.
+    pub wall_ns: Option<u64>,
 }
 
 pub struct BootImages<'a> {
@@ -422,6 +429,7 @@ impl Machine {
             },
             insns_per_tick: 10, // pretend 100 Minsn/s against the 10 MHz clock
             power_off: false,
+            wall_ns: None, // deterministic instruction-counted time by default
         }
     }
 
@@ -474,7 +482,13 @@ impl Machine {
     /// Advance the CLINT clock (interrupt lines are sampled live by the CPU
     /// via Bus::irq_lines; nothing else to propagate).
     pub fn sync_devices(&mut self) {
-        self.bus.mtime = self.cpu.insn_count / self.insns_per_tick;
+        let next = match self.wall_ns {
+            // ns → 10 MHz ticks (1e9 / RTC_FREQ = 100 ns/tick).
+            Some(ns) => ns / (1_000_000_000 / RTC_FREQ),
+            None => self.cpu.insn_count / self.insns_per_tick,
+        };
+        // Never let the clock run backward (host wall-clock can be non-monotonic).
+        self.bus.mtime = next.max(self.bus.mtime);
         let sys = self.cpu.sys.as_mut().unwrap();
         sys.mtime = self.bus.mtime;
     }

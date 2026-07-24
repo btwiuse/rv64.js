@@ -329,6 +329,15 @@ const SYS_WARM_SLICE: u64 = 256;
 pub extern "C" fn jit_set_enabled(on: u32) {
     unsafe { JIT_THRESHOLD = if on == 0 { u32::MAX } else { JIT_ON_THRESHOLD } }
 }
+/// Opt-in: drive the guest CLINT from real host wall-clock instead of the
+/// default deterministic instruction-counted time. For benchmarks that self-
+/// time via the guest clock (nbench) and realistic `date`/timeouts. Off by
+/// default so lockstep/differential testing stays reproducible.
+static mut SYS_WALLCLOCK: bool = false;
+#[no_mangle]
+pub extern "C" fn sys_set_wallclock(on: u32) {
+    unsafe { SYS_WALLCLOCK = on != 0 }
+}
 /// Max chained block dispatches before returning to the interpreter (keeps
 /// interrupt/budget latency bounded in fully-jitted loops).
 const JIT_CHAIN_CAP: u32 = 64;
@@ -555,6 +564,11 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
     let mut remaining = max_insns;
 
     while remaining > 0 && !m.power_off {
+        // Refresh the wall-clock time source (opt-in) so the CLINT tracks real
+        // host time; per outer-loop iteration, not per instruction.
+        if unsafe { SYS_WALLCLOCK } {
+            m.wall_ns = Some(unsafe { host_now_ms() } as u64 * 1_000_000);
+        }
         // Mapping-change flush (satp/SFENCE): drop the whole cache.
         if m.cpu.jit_flush_gen != jit.flush_gen {
             jit.flush_gen = m.cpu.jit_flush_gen;
