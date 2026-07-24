@@ -613,23 +613,34 @@ fn alu_handled(op: u32, f7: u32, f3: u32) -> bool {
     }
 }
 
-/// If the block at `start_pc` is a *structured* self-loop — a body of handled
-/// ALU/FP ops plus properly-nested forward conditional branches (if-then, no
-/// else, no other backward branches or jumps), ending in a conditional branch
-/// back to `start_pc` — return the body's instruction count. Such a loop is
-/// compiled into a single wasm `loop` with nested `if` blocks (Phase 3 / 3d-2)
-/// so registers stay in locals across iterations and there is no per-iteration
-/// dispatch. Anything unstructured returns None (compiled as basic blocks).
-fn detect_structured_loop(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option<u32> {
+/// A compilable loop region: guest code `[start_pc, end_pc)` containing
+/// properly-nested natural loops plus forward if-then / loop-exit branches.
+/// `loops` is (header_pc, exit_pc) per loop; `start_pc` is the outermost
+/// loop's header. Compiled into nested wasm `block`+`loop` pairs (3e-2,
+/// generalising 3d-2's single straight-line self-loop) so every register local
+/// persists across all iterations of all levels with no per-iteration dispatch.
+struct LoopRegion {
+    end_pc: u64,
+    loops: Vec<(u64, u64)>,
+}
+
+/// Detect and fully validate a structured loop region at `start_pc` (which must
+/// be a natural-loop header — the target of a backward branch). User-mode only:
+/// inline memory ops here only TRAP on fault (never bail mid-loop), and the FP
+/// register file is present. Returns None for anything not provably structured
+/// (the caller then compiles a plain basic block).
+fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option<LoopRegion> {
+    lay.mem?; // user-mode direct memory only
+    // Pass A: linear walk to the back-edge that closes the outermost loop,
+    // collecting every conditional branch. Every instruction must be handled.
+    let mut branches: Vec<(u64, u64, u64)> = Vec::new(); // (pc, target, next)
+    let mut end_pc = None;
     let mut pc = start_pc;
     let mut n = 0u32;
-    let mut if_stack: Vec<u64> = Vec::new(); // pending forward-if end targets
     while n < MAX_BLOCK as u32 {
-        while if_stack.last() == Some(&pc) {
-            if_stack.pop();
-        }
         let (insn, ilen) = fetch(code, base, pc)?;
         let op = opcode(insn);
+        let next = pc.wrapping_add(ilen);
         match op {
             0x37 | 0x17 | 0x13 | 0x33 | 0x1b | 0x3b => {
                 if !alu_handled(op, funct7(insn), funct3(insn)) {
@@ -641,21 +652,17 @@ fn detect_structured_loop(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout
                     return None;
                 }
             }
-            // User-mode loads/stores are inline and only TRAP (never bail) on
-            // OOB, so they're safe inside a compiled loop. (System-mode memory
-            // ops can bail mid-loop, so loop-opt stays user-mode only anyway.)
-            0x03 if lay.mem.is_some() => {
+            0x03 => {
                 if funct3(insn) == 7 {
                     return None;
                 }
             }
-            0x23 if lay.mem.is_some() => {
+            0x23 => {
                 if funct3(insn) > 3 {
                     return None;
                 }
             }
-            // FLD / FSD (double) — inline in user-mode loops (see translate).
-            0x07 | 0x27 if lay.mem.is_some() && lay.f_base != 0 => {
+            0x07 | 0x27 if lay.f_base != 0 => {
                 if funct3(insn) != 3 {
                     return None;
                 }
@@ -664,47 +671,181 @@ fn detect_structured_loop(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout
                 if !matches!(funct3(insn), 0 | 1 | 4 | 5 | 6 | 7) {
                     return None;
                 }
-                let target = pc.wrapping_add(imm_b(insn) as u64);
-                if target == start_pc {
-                    // loop back-edge: only valid at the outermost level, and it
-                    // is the last instruction of the loop body.
-                    return if if_stack.is_empty() && n > 0 {
-                        Some(n + 1)
-                    } else {
-                        None
-                    };
-                } else if target > pc {
-                    // forward if-then; must nest within the enclosing if.
-                    if let Some(&top) = if_stack.last() {
-                        if target > top {
-                            return None;
-                        }
-                    }
-                    if_stack.push(target);
-                } else {
-                    return None; // backward branch not to start = unstructured
+                let t = pc.wrapping_add(imm_b(insn) as u64);
+                branches.push((pc, t, next));
+                if t == start_pc {
+                    end_pc = Some(next);
+                    break;
                 }
             }
-            _ => return None,
+            _ => return None, // calls / jumps / system / AMO / single-FP end it
         }
-        pc = pc.wrapping_add(ilen);
+        pc = next;
         n += 1;
     }
-    None
+    let end_pc = end_pc?;
+    // Pass B: derive loops from backward branches (target < pc); a header's
+    // exit is the instruction after the last back-edge that targets it.
+    let mut loops: Vec<(u64, u64)> = Vec::new();
+    for &(bpc, t, bnext) in &branches {
+        if t < bpc {
+            if let Some(e) = loops.iter_mut().find(|(h, _)| *h == t) {
+                if bnext > e.1 {
+                    e.1 = bnext;
+                }
+            } else {
+                loops.push((t, bnext));
+            }
+        }
+    }
+    loops.sort_by_key(|&(h, _)| h);
+    // Reject duplicate headers and improperly-overlapping loop ranges.
+    for i in 0..loops.len() {
+        let (hi, ei) = loops[i];
+        if hi < start_pc || ei > end_pc {
+            return None;
+        }
+        for j in (i + 1)..loops.len() {
+            let (hj, ej) = loops[j];
+            if hj == hi {
+                return None;
+            }
+            // sorted so hi < hj: allow proper nesting (ej<=ei) or disjoint (ei<=hj).
+            if !(ei <= hj || ej <= ei) {
+                return None;
+            }
+        }
+    }
+    // Validate every forward branch is a structured break or if-then.
+    for &(bpc, t, _) in &branches {
+        if t <= bpc {
+            continue; // back-edges validated above
+        }
+        if t > end_pc {
+            return None;
+        }
+        // break: target equals the exit of an enclosing loop.
+        if loops.iter().any(|&(h, e)| h <= bpc && bpc < e && e == t) {
+            continue;
+        }
+        // if-then: target within the innermost enclosing loop, and not jumping
+        // into the middle of a nested loop.
+        let bound = loops
+            .iter()
+            .filter(|&&(h, e)| h <= bpc && bpc < e)
+            .map(|&(_, e)| e)
+            .min()
+            .unwrap_or(end_pc);
+        if t > bound {
+            return None;
+        }
+        if loops.iter().any(|&(h, e)| bpc < h && h < t && t < e) {
+            return None;
+        }
+    }
+    if loops.is_empty() {
+        return None;
+    }
+    Some(LoopRegion { end_pc, loops })
 }
 
-/// Translate one basic block starting at `pc`. `code` is the guest code
-/// bytes and `base` its guest address. Returns None if the very first
-/// instruction isn't translatable (caller interprets it instead).
-pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> Option<Block> {
-    // Pass 1: find which guest registers the block reads/writes, so we can
-    // cache them in wasm locals (v86-style register allocation) instead of
-    // round-tripping every access through the CPU state struct in memory.
-    let (read_mask, write_mask, fp_read, fp_write) = scan_regs(code, base, start_pc, &lay);
+/// Register scan over a whole loop region `[start_pc, end_pc)` (linear; every
+/// instruction is already validated as handled). Returns the same four masks
+/// as `scan_regs`: (gpr_read, gpr_write, fp_read, fp_write).
+fn scan_regs_region(
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    end_pc: u64,
+    _lay: &JitLayout,
+) -> (u32, u32, u32, u32) {
+    let (mut read, mut write, mut fread, mut fwrite) = (0u32, 0u32, 0u32, 0u32);
+    let fmark = |m: &mut u32, r: usize| *m |= 1 << r;
+    let mark = |m: &mut u32, r: usize| {
+        if r != 0 {
+            *m |= 1 << r;
+        }
+    };
+    let mut pc = start_pc;
+    while pc < end_pc {
+        let Some((insn, ilen)) = fetch(code, base, pc) else {
+            break;
+        };
+        let (d, s1, s2) = (rd(insn), rs1(insn), rs2(insn));
+        match opcode(insn) {
+            0x37 | 0x17 => mark(&mut write, d),
+            0x13 | 0x1b => {
+                mark(&mut read, s1);
+                mark(&mut write, d);
+            }
+            0x33 | 0x3b => {
+                mark(&mut read, s1);
+                mark(&mut read, s2);
+                mark(&mut write, d);
+            }
+            0x03 => {
+                mark(&mut read, s1);
+                mark(&mut write, d);
+            }
+            0x23 => {
+                mark(&mut read, s1);
+                mark(&mut read, s2);
+            }
+            0x07 => {
+                mark(&mut read, s1);
+                fmark(&mut fwrite, d);
+            }
+            0x27 => {
+                mark(&mut read, s1);
+                fmark(&mut fread, s2);
+            }
+            0x53 => {
+                let f7 = funct7(insn);
+                match (f7 >> 2, f7 & 3, funct3(insn)) {
+                    (0..=3, 1, 0 | 7) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x14, 1, 0..=2) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        mark(&mut write, d);
+                    }
+                    (0x1e, 1, 0) => {
+                        mark(&mut read, s1);
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x1c, 1, 0) => {
+                        fmark(&mut fread, s1);
+                        mark(&mut write, d);
+                    }
+                    _ => {}
+                }
+            }
+            0x63 => {
+                mark(&mut read, s1);
+                mark(&mut read, s2);
+            }
+            _ => {}
+        }
+        pc = pc.wrapping_add(ilen);
+    }
+    (read, write, fread, fwrite)
+}
+
+/// Assign wasm locals for the touched GPR/FP registers, build the module, and
+/// emit the prologue that loads each touched register from state into its
+/// local. Shared by the basic-block and structured-loop compilers.
+fn build_ctx(
+    lay: JitLayout,
+    read_mask: u32,
+    write_mask: u32,
+    fp_read: u32,
+    fp_write: u32,
+) -> (Ctx, WasmModule) {
     let touched = read_mask | write_mask;
     let fp_touched = fp_read | fp_write;
-    // Assign i64 locals: GPRs first (index 6+), then FP registers, then the
-    // i32 IDXB. All follow the fixed scratch locals (VA/PAGE/PA/VAL/ITER).
     let mut reg_local = [0u32; 32];
     let mut n_reg = 0u32;
     for r in 1..32 {
@@ -730,8 +871,6 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
         fp_write_mask: fp_write,
     };
     let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp, 1);
-    // Prologue: load each touched GPR and FP register from state into its local
-    // (write-only regs too, so a mid-block bail can flush the whole write-set).
     let mut t = touched;
     while t != 0 {
         let r = t.trailing_zeros() as usize;
@@ -748,45 +887,325 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
             .i64_load(lay.f_base as u64 + r as u64 * 8)
             .local_set(fp_local[r]);
     }
+    (c, m)
+}
 
-    // Phase 3 / 3d-2: user-mode structured self-loop → wrap the body in one
-    // wasm `loop` (forward if-then branches become nested wasm `if`) so the
-    // register locals persist across iterations with no per-iteration dispatch.
-    let self_loop = if lay.mem.is_some() {
-        detect_structured_loop(code, base, start_pc, &lay)
-    } else {
-        None
-    };
-    // Pending forward-if end targets (loop path): a wasm `if` is closed when
-    // pc reaches its target. `retired = ITER * body_n` slightly over-counts
-    // skipped if-bodies — insn_count only, never the computation.
-    let mut pending_ifs: Vec<u64> = Vec::new();
-    if let Some(body_n) = self_loop {
-        m.i64_const(0).local_set(ITER);
-        m.op(LOOP).op(VOID); // $L (branch depth 0)
-        // Iteration cap → yield to the dispatcher, resuming at start_pc.
-        m.local_get(ITER).i64_const(LOOP_CAP as i64).op(I64_GE_U);
-        m.op(IF).op(VOID);
-        c.flush_writes(&mut m);
-        c.set_pc_const(&mut m, start_pc);
-        m.i32_const(0)
-            .local_get(ITER)
-            .i64_const(body_n as i64)
-            .op(I64_MUL)
-            .i64_store(lay.retired_addr as u64);
-        m.op(RETURN);
-        m.op(END); // close cap IF
+/// Emit one non-control-flow guest instruction (LUI/AUIPC, OP-IMM(-32),
+/// OP(-32), load/store, FLD/FSD, FP arith/compare/FMV). Returns false — before
+/// emitting anything — if `insn` is a branch/jump or an unsupported encoding;
+/// the caller then ends the block / loop region. `n` is the retired index used
+/// only for mid-block bail points (system TLB miss, FP fast-path bail).
+fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, n: u32) -> bool {
+    let op = opcode(insn);
+    let (d, s1, s2) = (rd(insn), rs1(insn), rs2(insn));
+    match op {
+        // LUI / AUIPC: constants at translation time.
+        0x37 | 0x17 => {
+            if c.store_pre(m, d) {
+                let v = if op == 0x37 {
+                    imm_u(insn) as u64
+                } else {
+                    pc.wrapping_add(imm_u(insn) as u64)
+                };
+                m.i64_const(v as i64);
+                c.store_post(m, d);
+            }
+        }
+        // OP-IMM
+        0x13 => {
+            let imm = imm_i(insn);
+            let f3 = funct3(insn);
+            if c.store_pre(m, d) {
+                c.push_reg(m, s1);
+                match f3 {
+                    0 => {
+                        m.i64_const(imm).op(I64_ADD);
+                    }
+                    1 => {
+                        m.i64_const(imm & 0x3f).op(I64_SHL);
+                    }
+                    2 => {
+                        m.i64_const(imm).op(I64_LT_S).op(I64_EXTEND_I32_U);
+                    }
+                    3 => {
+                        m.i64_const(imm).op(I64_LT_U).op(I64_EXTEND_I32_U);
+                    }
+                    4 => {
+                        m.i64_const(imm).op(I64_XOR);
+                    }
+                    5 => {
+                        if insn >> 26 == 0x10 {
+                            m.i64_const(imm & 0x3f).op(I64_SHR_S);
+                        } else {
+                            m.i64_const(imm & 0x3f).op(I64_SHR_U);
+                        }
+                    }
+                    6 => {
+                        m.i64_const(imm).op(I64_OR);
+                    }
+                    _ => {
+                        m.i64_const(imm).op(I64_AND);
+                    }
+                }
+                c.store_post(m, d);
+            }
+        }
+        // OP (I and M-mul only; div falls back)
+        0x33 => {
+            let f7 = funct7(insn);
+            let f3 = funct3(insn);
+            let supported = matches!((f7, f3), (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0));
+            if !supported {
+                return false;
+            }
+            if c.store_pre(m, d) {
+                c.push_reg(m, s1);
+                match (f7, f3) {
+                    (0x00, 0) => {
+                        c.push_reg(m, s2);
+                        m.op(I64_ADD);
+                    }
+                    (0x20, 0) => {
+                        c.push_reg(m, s2);
+                        m.op(I64_SUB);
+                    }
+                    (0x01, 0) => {
+                        c.push_reg(m, s2);
+                        m.op(I64_MUL);
+                    }
+                    (0x00, 1) => {
+                        c.push_reg(m, s2);
+                        m.i64_const(0x3f).op(I64_AND).op(I64_SHL);
+                    }
+                    (0x00, 2) => {
+                        c.push_reg(m, s2);
+                        m.op(I64_LT_S).op(I64_EXTEND_I32_U);
+                    }
+                    (0x00, 3) => {
+                        c.push_reg(m, s2);
+                        m.op(I64_LT_U).op(I64_EXTEND_I32_U);
+                    }
+                    (0x00, 4) => {
+                        c.push_reg(m, s2);
+                        m.op(I64_XOR);
+                    }
+                    (0x00, 5) => {
+                        c.push_reg(m, s2);
+                        m.i64_const(0x3f).op(I64_AND).op(I64_SHR_U);
+                    }
+                    (0x20, 5) => {
+                        c.push_reg(m, s2);
+                        m.i64_const(0x3f).op(I64_AND).op(I64_SHR_S);
+                    }
+                    (0x00, 6) => {
+                        c.push_reg(m, s2);
+                        m.op(I64_OR);
+                    }
+                    (0x00, 7) => {
+                        c.push_reg(m, s2);
+                        m.op(I64_AND);
+                    }
+                    _ => unreachable!(),
+                }
+                c.store_post(m, d);
+            }
+        }
+        // OP-IMM-32 (ADDIW/SLLIW/SRLIW/SRAIW): compute in 64, wrap+extend.
+        0x1b => {
+            let imm = imm_i(insn);
+            let f3 = funct3(insn);
+            if !matches!(f3, 0 | 1 | 5) {
+                return false;
+            }
+            if c.store_pre(m, d) {
+                c.push_reg(m, s1);
+                match f3 {
+                    0 => {
+                        m.i64_const(imm).op(I64_ADD);
+                    }
+                    1 => {
+                        m.i64_const(imm & 0x1f).op(I64_SHL);
+                    }
+                    _ => {
+                        m.op(I32_WRAP_I64).op(I64_EXTEND_I32_U);
+                        if funct7(insn) == 0x20 {
+                            m.op(I32_WRAP_I64)
+                                .op(I64_EXTEND_I32_S)
+                                .i64_const(imm & 0x1f)
+                                .op(I64_SHR_S);
+                        } else {
+                            m.i64_const(0xffff_ffff)
+                                .op(I64_AND)
+                                .i64_const(imm & 0x1f)
+                                .op(I64_SHR_U);
+                        }
+                    }
+                }
+                m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S);
+                c.store_post(m, d);
+            }
+        }
+        // OP-32 (ADDW/SUBW/MULW)
+        0x3b => {
+            let (f7, f3) = (funct7(insn), funct3(insn));
+            if !matches!((f7, f3), (0x00, 0) | (0x20, 0) | (0x01, 0)) {
+                return false;
+            }
+            if c.store_pre(m, d) {
+                c.push_reg(m, s1);
+                c.push_reg(m, s2);
+                m.op(match (f7, f3) {
+                    (0x00, 0) => I64_ADD,
+                    (0x20, 0) => I64_SUB,
+                    _ => I64_MUL,
+                });
+                m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S);
+                c.store_post(m, d);
+            }
+        }
+        // LOAD (user-mode direct, or system inline-TLB)
+        0x03 if lay.mem.is_some() || lay.sys.is_some() => {
+            let f3 = funct3(insn);
+            let len = match f3 {
+                0 | 4 => 1,
+                1 | 5 => 2,
+                2 | 6 => 4,
+                3 => 8,
+                _ => return false,
+            };
+            let load_op = match f3 {
+                0 => I64_LOAD8_S,
+                1 => I64_LOAD16_S,
+                2 => I64_LOAD32_S,
+                3 => I64_LOAD,
+                4 => I64_LOAD8_U,
+                5 => I64_LOAD16_U,
+                _ => I64_LOAD32_U,
+            };
+            c.push_reg(m, s1);
+            m.i64_const(imm_i(insn)).op(I64_ADD);
+            let mem_off = if let Some((mem_base, size)) = lay.mem {
+                c.guest_addr(m, size, len); // i32 index, traps OOB
+                mem_base as u64
+            } else {
+                c.tlb_index(m, &lay.sys.unwrap(), len, false, pc, n);
+                0
+            };
+            m.op(load_op).raw_uleb(len_align(len)).raw_uleb(mem_off);
+            if d == 0 {
+                m.op(DROP);
+            } else {
+                m.local_set(VAL);
+                c.store_pre(m, d);
+                m.local_get(VAL);
+                c.store_post(m, d);
+            }
+        }
+        // STORE (user-mode direct, or system inline-TLB)
+        0x23 if lay.mem.is_some() || lay.sys.is_some() => {
+            let f3 = funct3(insn);
+            if f3 > 3 {
+                return false;
+            }
+            let len = 1u64 << f3;
+            let store_op = match f3 {
+                0 => I64_STORE8,
+                1 => I64_STORE16,
+                2 => I64_STORE32,
+                _ => I64_STORE,
+            };
+            c.push_reg(m, s1);
+            m.i64_const(imm_s(insn)).op(I64_ADD);
+            if let Some((mem_base, size)) = lay.mem {
+                c.guest_addr(m, size, len);
+                c.push_reg(m, s2);
+                m.op(store_op)
+                    .raw_uleb(len_align(len))
+                    .raw_uleb(mem_base as u64);
+            } else {
+                c.tlb_index(m, &lay.sys.unwrap(), len, true, pc, n);
+                c.push_reg(m, s2);
+                m.op(store_op).raw_uleb(len_align(len)).raw_uleb(0);
+            }
+        }
+        // FLD: f[d] = mem[x[s1]+imm] (double). Raw 8-byte copy, bit-exact.
+        0x07 if lay.mem.is_some() && lay.f_base != 0 => {
+            if funct3(insn) != 3 {
+                return false;
+            }
+            let (mem_base, size) = lay.mem.unwrap();
+            c.push_reg(m, s1);
+            m.i64_const(imm_i(insn)).op(I64_ADD);
+            c.guest_addr(m, size, 8);
+            m.op(I64_LOAD).raw_uleb(len_align(8)).raw_uleb(mem_base as u64);
+            m.local_set(VAL);
+            c.store_freg_pre(m, d);
+            m.local_get(VAL);
+            c.store_freg_post(m, d);
+        }
+        // FSD: mem[x[s1]+imm] = f[s2] (double). Raw 8-byte copy.
+        0x27 if lay.mem.is_some() && lay.f_base != 0 => {
+            if funct3(insn) != 3 {
+                return false;
+            }
+            let (mem_base, size) = lay.mem.unwrap();
+            c.push_reg(m, s1);
+            m.i64_const(imm_s(insn)).op(I64_ADD);
+            c.guest_addr(m, size, 8);
+            c.push_freg(m, s2);
+            m.op(I64_STORE).raw_uleb(len_align(8)).raw_uleb(mem_base as u64);
+        }
+        // OP-FP: double add/sub/mul/div + compares + FMV.D.X/FMV.X.D inline.
+        0x53 if lay.f_base != 0 => {
+            let f7 = funct7(insn);
+            let (fmt, fpop, f3) = (f7 & 3, f7 >> 2, funct3(insn));
+            match (fpop, fmt, f3) {
+                (0..=3, 1, 0 | 7) => c.fp_arith_d(m, fpop, s1, s2, d, f3 == 7, pc, n),
+                (0x14, 1, 0..=2) => c.fp_cmp_d(m, f3, s1, s2, d, pc, n),
+                (0x1e, 1, 0) => {
+                    c.store_freg_pre(m, d);
+                    c.push_reg(m, s1);
+                    c.store_freg_post(m, d);
+                }
+                (0x1c, 1, 0) => {
+                    if c.store_pre(m, d) {
+                        c.push_freg(m, s1);
+                        c.store_post(m, d);
+                    }
+                }
+                _ => return false,
+            }
+        }
+        _ => return false,
     }
+    true
+}
+
+/// Translate a block starting at `start_pc`. `code` is the guest code bytes and
+/// `base` its guest address. Returns None if the first instruction isn't
+/// translatable (caller interprets it instead).
+pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> Option<Block> {
+    // Structured loop region (nested loops + forward if-then/break) → compile
+    // the whole thing as one wasm function so register locals persist across
+    // every iteration of every level (3e-2 / v86 control-flow structuring).
+    if lay.mem.is_some() {
+        if let Some(region) = loop_region(code, base, start_pc, &lay) {
+            let (rm, wm, fr, fw) = scan_regs_region(code, base, start_pc, region.end_pc, &lay);
+            let (c, m) = build_ctx(lay, rm, wm, fr, fw);
+            if let Some(b) = translate_loop(m, &c, code, base, start_pc, &region, &lay) {
+                return Some(b);
+            }
+        }
+    }
+
+    // Basic-block path: a straight-line run to the first branch/jump/unhandled
+    // op. Registers the block touches live in wasm locals for its lifetime.
+    let (read_mask, write_mask, fp_read, fp_write) = scan_regs(code, base, start_pc, &lay);
+    let (c, mut m) = build_ctx(lay, read_mask, write_mask, fp_read, fp_write);
 
     let mut pc = start_pc;
     let mut n = 0u32;
-
     while n < MAX_BLOCK as u32 {
-        // Close any forward-if wasm blocks whose target we've now reached.
-        while pending_ifs.last() == Some(&pc) {
-            m.op(END);
-            pending_ifs.pop();
-        }
         let Some((insn, ilen)) = fetch(code, base, pc) else {
             break;
         };
@@ -794,271 +1213,13 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
         let op = opcode(insn);
         let (d, s1, s2) = (rd(insn), rs1(insn), rs2(insn));
 
+        if emit_simple(&mut m, &c, lay, insn, pc, n) {
+            pc = next_pc;
+            n += 1;
+            continue;
+        }
+
         match op {
-            // LUI / AUIPC: constants at translation time.
-            0x37 | 0x17 => {
-                if c.store_pre(&mut m, d) {
-                    let v = if op == 0x37 {
-                        imm_u(insn) as u64
-                    } else {
-                        pc.wrapping_add(imm_u(insn) as u64)
-                    };
-                    m.i64_const(v as i64);
-                    c.store_post(&mut m, d);
-                }
-            }
-            // OP-IMM
-            0x13 => {
-                let imm = imm_i(insn);
-                let f3 = funct3(insn);
-                if c.store_pre(&mut m, d) {
-                    c.push_reg(&mut m, s1);
-                    match f3 {
-                        0 => {
-                            m.i64_const(imm).op(I64_ADD);
-                        }
-                        1 => {
-                            m.i64_const(imm & 0x3f).op(I64_SHL);
-                        }
-                        2 => {
-                            m.i64_const(imm).op(I64_LT_S).op(I64_EXTEND_I32_U);
-                        }
-                        3 => {
-                            m.i64_const(imm).op(I64_LT_U).op(I64_EXTEND_I32_U);
-                        }
-                        4 => {
-                            m.i64_const(imm).op(I64_XOR);
-                        }
-                        5 => {
-                            if insn >> 26 == 0x10 {
-                                m.i64_const(imm & 0x3f).op(I64_SHR_S);
-                            } else {
-                                m.i64_const(imm & 0x3f).op(I64_SHR_U);
-                            }
-                        }
-                        6 => {
-                            m.i64_const(imm).op(I64_OR);
-                        }
-                        _ => {
-                            m.i64_const(imm).op(I64_AND);
-                        }
-                    }
-                    c.store_post(&mut m, d);
-                }
-            }
-            // OP (I and M-mul only; div falls back)
-            0x33 => {
-                let f7 = funct7(insn);
-                let f3 = funct3(insn);
-                let supported = matches!((f7, f3), (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0));
-                if !supported {
-                    break;
-                }
-                if c.store_pre(&mut m, d) {
-                    c.push_reg(&mut m, s1);
-                    match (f7, f3) {
-                        (0x00, 0) => {
-                            c.push_reg(&mut m, s2);
-                            m.op(I64_ADD);
-                        }
-                        (0x20, 0) => {
-                            c.push_reg(&mut m, s2);
-                            m.op(I64_SUB);
-                        }
-                        (0x01, 0) => {
-                            c.push_reg(&mut m, s2);
-                            m.op(I64_MUL);
-                        }
-                        (0x00, 1) => {
-                            c.push_reg(&mut m, s2);
-                            m.i64_const(0x3f).op(I64_AND).op(I64_SHL);
-                        }
-                        (0x00, 2) => {
-                            c.push_reg(&mut m, s2);
-                            m.op(I64_LT_S).op(I64_EXTEND_I32_U);
-                        }
-                        (0x00, 3) => {
-                            c.push_reg(&mut m, s2);
-                            m.op(I64_LT_U).op(I64_EXTEND_I32_U);
-                        }
-                        (0x00, 4) => {
-                            c.push_reg(&mut m, s2);
-                            m.op(I64_XOR);
-                        }
-                        (0x00, 5) => {
-                            c.push_reg(&mut m, s2);
-                            m.i64_const(0x3f).op(I64_AND).op(I64_SHR_U);
-                        }
-                        (0x20, 5) => {
-                            c.push_reg(&mut m, s2);
-                            m.i64_const(0x3f).op(I64_AND).op(I64_SHR_S);
-                        }
-                        (0x00, 6) => {
-                            c.push_reg(&mut m, s2);
-                            m.op(I64_OR);
-                        }
-                        (0x00, 7) => {
-                            c.push_reg(&mut m, s2);
-                            m.op(I64_AND);
-                        }
-                        _ => unreachable!(),
-                    }
-                    c.store_post(&mut m, d);
-                }
-            }
-            // OP-IMM-32 (ADDIW/SLLIW/SRLIW/SRAIW): compute in 64, wrap+extend.
-            0x1b => {
-                let imm = imm_i(insn);
-                let f3 = funct3(insn);
-                if !matches!(f3, 0 | 1 | 5) {
-                    break;
-                }
-                if c.store_pre(&mut m, d) {
-                    c.push_reg(&mut m, s1);
-                    match f3 {
-                        0 => {
-                            m.i64_const(imm).op(I64_ADD);
-                        }
-                        1 => {
-                            m.i64_const(imm & 0x1f).op(I64_SHL);
-                        }
-                        _ => {
-                            // shift on the 32-bit value
-                            m.op(I32_WRAP_I64).op(I64_EXTEND_I32_U);
-                            if funct7(insn) == 0x20 {
-                                m.op(I32_WRAP_I64)
-                                    .op(I64_EXTEND_I32_S)
-                                    .i64_const(imm & 0x1f)
-                                    .op(I64_SHR_S);
-                            } else {
-                                m.i64_const(0xffff_ffff)
-                                    .op(I64_AND)
-                                    .i64_const(imm & 0x1f)
-                                    .op(I64_SHR_U);
-                            }
-                        }
-                    }
-                    // sign-extend low 32 bits
-                    m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S);
-                    c.store_post(&mut m, d);
-                }
-            }
-            // OP-32 (ADDW/SUBW/MULW)
-            0x3b => {
-                let (f7, f3) = (funct7(insn), funct3(insn));
-                if !matches!((f7, f3), (0x00, 0) | (0x20, 0) | (0x01, 0)) {
-                    break;
-                }
-                if c.store_pre(&mut m, d) {
-                    c.push_reg(&mut m, s1);
-                    c.push_reg(&mut m, s2);
-                    m.op(match (f7, f3) {
-                        (0x00, 0) => I64_ADD,
-                        (0x20, 0) => I64_SUB,
-                        _ => I64_MUL,
-                    });
-                    m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S);
-                    c.store_post(&mut m, d);
-                }
-            }
-            // LOAD (user-mode direct, or system inline-TLB)
-            0x03 if lay.mem.is_some() || lay.sys.is_some() => {
-                let f3 = funct3(insn);
-                let len = match f3 {
-                    0 | 4 => 1,
-                    1 | 5 => 2,
-                    2 | 6 => 4,
-                    3 => 8,
-                    _ => break,
-                };
-                let load_op = match f3 {
-                    0 => I64_LOAD8_S,
-                    1 => I64_LOAD16_S,
-                    2 => I64_LOAD32_S,
-                    3 => I64_LOAD,
-                    4 => I64_LOAD8_U,
-                    5 => I64_LOAD16_U,
-                    _ => I64_LOAD32_U,
-                };
-                // address (i64 va) on stack
-                c.push_reg(&mut m, s1);
-                m.i64_const(imm_i(insn)).op(I64_ADD);
-                let mem_off = if let Some((mem_base, size)) = lay.mem {
-                    c.guest_addr(&mut m, size, len); // i32 index, traps OOB
-                    mem_base as u64
-                } else {
-                    // system: probe TLB; leaves full linear index on stack
-                    c.tlb_index(&mut m, &lay.sys.unwrap(), len, false, pc, n);
-                    0
-                };
-                m.op(load_op).raw_uleb(len_align(len)).raw_uleb(mem_off);
-                if d == 0 {
-                    m.op(DROP);
-                } else {
-                    m.local_set(VAL);
-                    c.store_pre(&mut m, d); // addr base for memory dest; nothing for a local
-                    m.local_get(VAL);
-                    c.store_post(&mut m, d);
-                }
-            }
-            // STORE (user-mode direct, or system inline-TLB)
-            0x23 if lay.mem.is_some() || lay.sys.is_some() => {
-                let f3 = funct3(insn);
-                if f3 > 3 {
-                    break;
-                }
-                let len = 1u64 << f3;
-                let store_op = match f3 {
-                    0 => I64_STORE8,
-                    1 => I64_STORE16,
-                    2 => I64_STORE32,
-                    _ => I64_STORE,
-                };
-                c.push_reg(&mut m, s1);
-                m.i64_const(imm_s(insn)).op(I64_ADD);
-                if let Some((mem_base, size)) = lay.mem {
-                    c.guest_addr(&mut m, size, len);
-                    c.push_reg(&mut m, s2);
-                    m.op(store_op)
-                        .raw_uleb(len_align(len))
-                        .raw_uleb(mem_base as u64);
-                } else {
-                    // system: tlb_index consumes the va and leaves the RAM
-                    // index on the stack; push_reg(s2) reads x[] (not touched
-                    // by the probe), then store.
-                    c.tlb_index(&mut m, &lay.sys.unwrap(), len, true, pc, n);
-                    c.push_reg(&mut m, s2);
-                    m.op(store_op).raw_uleb(len_align(len)).raw_uleb(0);
-                }
-            }
-            // FLD: f[d] = mem[x[s1]+imm] (double). Raw 8-byte copy, bit-exact,
-            // no rounding/NaN concerns. User-mode direct access only.
-            0x07 if lay.mem.is_some() && lay.f_base != 0 => {
-                if funct3(insn) != 3 {
-                    break;
-                }
-                let (mem_base, size) = lay.mem.unwrap();
-                c.push_reg(&mut m, s1);
-                m.i64_const(imm_i(insn)).op(I64_ADD);
-                c.guest_addr(&mut m, size, 8); // i32 index, traps OOB
-                m.op(I64_LOAD).raw_uleb(len_align(8)).raw_uleb(mem_base as u64);
-                m.local_set(VAL);
-                c.store_freg_pre(&mut m, d);
-                m.local_get(VAL);
-                c.store_freg_post(&mut m, d);
-            }
-            // FSD: mem[x[s1]+imm] = f[s2] (double). Raw 8-byte copy.
-            0x27 if lay.mem.is_some() && lay.f_base != 0 => {
-                if funct3(insn) != 3 {
-                    break;
-                }
-                let (mem_base, size) = lay.mem.unwrap();
-                c.push_reg(&mut m, s1);
-                m.i64_const(imm_s(insn)).op(I64_ADD);
-                c.guest_addr(&mut m, size, 8); // i32 index
-                c.push_freg(&mut m, s2);
-                m.op(I64_STORE).raw_uleb(len_align(8)).raw_uleb(mem_base as u64);
-            }
             // JAL: link; follow plain forward jumps (superblock chaining),
             // otherwise end the block with a constant pc.
             0x6f => {
@@ -1084,7 +1245,6 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
             }
             // JALR: dynamic target; block ends.
             0x67 => {
-                // scratch = (x[rs1] + imm) & ~1  (compute before link write!)
                 c.push_reg(&mut m, s1);
                 m.i64_const(imm_i(insn))
                     .op(I64_ADD)
@@ -1114,102 +1274,27 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     5 => I64_GE_S,
                     6 => I64_LT_U,
                     7 => I64_GE_U,
-                    _ => break, // before any stack pushes — stream stays balanced
-                };
-                // Phase 3 / 3d-2: inside a compiled loop, a branch back to start
-                // is the loop back-edge; a forward branch is a structured
-                // if-then (nested wasm `if`). Outside a loop, the branch ends
-                // the block with a conditional pc select.
-                if let Some(body_n) = self_loop {
-                    if target == start_pc {
-                        // count this iteration, then loop back if the branch is taken
-                        m.local_get(ITER).i64_const(1).op(I64_ADD).local_set(ITER);
-                        c.push_reg(&mut m, s1);
-                        c.push_reg(&mut m, s2);
-                        m.op(cmp);
-                        m.br_if(0); // -> $L (loop top)
-                        m.op(END); // close loop $L (fall through = branch not taken = exit)
-                        c.flush_writes(&mut m);
-                        c.set_pc_const(&mut m, next_pc);
-                        m.i32_const(0)
-                            .local_get(ITER)
-                            .i64_const(body_n as i64)
-                            .op(I64_MUL)
-                            .i64_store(lay.retired_addr as u64);
-                        return Some(Block {
-                            wasm: m.finish(),
-                            len: next_pc - start_pc,
-                            n_insns: body_n,
-                        });
-                    }
-                    // forward if-then: run [next_pc, target) under the NEGATED
-                    // condition (the guest branch skips that range when taken).
-                    let neg = match funct3(insn) {
-                        0 => I64_NE,
-                        1 => I64_EQ,
-                        4 => I64_GE_S,
-                        5 => I64_LT_S,
-                        6 => I64_GE_U,
-                        _ => I64_LT_U,
-                    };
-                    c.push_reg(&mut m, s1);
-                    c.push_reg(&mut m, s2);
-                    m.op(neg);
-                    m.op(IF).op(VOID);
-                    pending_ifs.push(target);
-                    // fall through: keep translating the loop body.
-                } else {
-                    c.push_reg(&mut m, s1);
-                    c.push_reg(&mut m, s2);
-                    m.op(cmp);
-                    m.op(IF).op(VOID);
-                    c.set_pc_const(&mut m, target);
-                    m.op(ELSE);
-                    c.set_pc_const(&mut m, next_pc);
-                    m.op(END);
-                    c.flush_writes(&mut m);
-                    c.set_retired(&mut m, n + 1);
-                    return Some(Block {
-                        wasm: m.finish(),
-                        len: next_pc - start_pc,
-                        n_insns: n + 1,
-                    });
-                }
-            }
-            // OP-FP: double-precision add/sub/mul/div + FMV.D.X/FMV.X.D inline
-            // (Phase 2). Other FP ops (single, sqrt, fmadd, compare, convert,
-            // sign-inject, and FP load/store) still end the block.
-            0x53 if lay.f_base != 0 => {
-                let f7 = funct7(insn);
-                let (fmt, fpop, f3) = (f7 & 3, f7 >> 2, funct3(insn));
-                match (fpop, fmt, f3) {
-                    // FADD/FSUB/FMUL/FDIV.D (static RNE or dynamic rounding)
-                    (0..=3, 1, 0 | 7) => c.fp_arith_d(&mut m, fpop, s1, s2, d, f3 == 7, pc, n),
-                    // FLE/FLT/FEQ.D -> x[d]
-                    (0x14, 1, 0..=2) => c.fp_cmp_d(&mut m, f3, s1, s2, d, pc, n),
-                    // FMV.D.X: f[d] = x[s1] (raw 64-bit copy)
-                    (0x1e, 1, 0) => {
-                        c.store_freg_pre(&mut m, d);
-                        c.push_reg(&mut m, s1);
-                        c.store_freg_post(&mut m, d);
-                    }
-                    // FMV.X.D: x[d] = f[s1] (raw 64-bit copy)
-                    (0x1c, 1, 0) => {
-                        if c.store_pre(&mut m, d) {
-                            c.push_freg(&mut m, s1);
-                            c.store_post(&mut m, d);
-                        }
-                    }
                     _ => break,
-                }
+                };
+                c.push_reg(&mut m, s1);
+                c.push_reg(&mut m, s2);
+                m.op(cmp);
+                m.op(IF).op(VOID);
+                c.set_pc_const(&mut m, target);
+                m.op(ELSE);
+                c.set_pc_const(&mut m, next_pc);
+                m.op(END);
+                c.flush_writes(&mut m);
+                c.set_retired(&mut m, n + 1);
+                return Some(Block {
+                    wasm: m.finish(),
+                    len: next_pc - start_pc,
+                    n_insns: n + 1,
+                });
             }
-            // Anything else (AMO/FP/SYSTEM, or memory ops with no memory
-            // layout): end the block here; the interpreter takes over.
+            // AMO / SYSTEM / single-FP / memory with no layout: end the block.
             _ => break,
         }
-
-        pc = next_pc;
-        n += 1;
     }
 
     if n == 0 {
@@ -1222,6 +1307,161 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
         wasm: m.finish(),
         len: pc - start_pc,
         n_insns: n,
+    })
+}
+
+/// Compile a validated structured loop region into one wasm function. Nested
+/// natural loops become nested `block`+`loop` pairs; forward branches become
+/// wasm `if` (if-then) or `br` to an enclosing `block` (break). Register locals
+/// persist across every iteration of every level. Retired-instruction
+/// accounting is exact — each basic block adds its length to the accumulator
+/// once, conditionally inside an `if` body — so coverage/insn-count stay right.
+/// Local ITER doubles as that accumulator and the loop-cap guard.
+fn translate_loop(
+    mut m: WasmModule,
+    c: &Ctx,
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    region: &LoopRegion,
+    lay: &JitLayout,
+) -> Option<Block> {
+    m.i64_const(0).local_set(ITER); // ITER = retired-instruction accumulator
+    // Scope stack entry: (kind, close_pc, header). kind 0=block 1=loop 2=if.
+    let mut scopes: Vec<(u8, u64, u64)> = Vec::new();
+    let mut pc = start_pc;
+    let mut static_n = 0u32;
+    let mut seg = 0u64; // straight-line insns since the last retired flush
+    let mut guard = 0u32;
+    loop {
+        guard += 1;
+        if guard > 8192 {
+            return None;
+        }
+        // Close scopes ending here. An `if` first flushes its (conditional)
+        // body length into retired, still inside the `if`.
+        while let Some(&(kind, cp, _)) = scopes.last() {
+            if cp != pc {
+                break;
+            }
+            if kind == 2 && seg > 0 {
+                m.local_get(ITER)
+                    .i64_const(seg as i64)
+                    .op(I64_ADD)
+                    .local_set(ITER);
+                seg = 0;
+            }
+            m.op(END);
+            scopes.pop();
+        }
+        // Open a loop at a header: flush the unconditional straight-line run
+        // preceding it, then emit block+loop and the loop-top cap guard.
+        if let Some(&(h, e)) = region.loops.iter().find(|&&(h, _)| h == pc) {
+            if seg > 0 {
+                m.local_get(ITER)
+                    .i64_const(seg as i64)
+                    .op(I64_ADD)
+                    .local_set(ITER);
+                seg = 0;
+            }
+            m.op(BLOCK).op(VOID);
+            scopes.push((0, e, h));
+            m.op(LOOP).op(VOID);
+            scopes.push((1, e, h));
+            // Cap guard at the loop top — a safe yield point: resume at header
+            // with registers flushed (no partial iteration state to lose).
+            m.local_get(ITER).i64_const(LOOP_CAP as i64).op(I64_GE_U);
+            m.op(IF).op(VOID);
+            c.flush_writes(&mut m);
+            c.set_pc_const(&mut m, h);
+            m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
+            m.op(RETURN);
+            m.op(END);
+        }
+        if pc == region.end_pc {
+            break;
+        }
+        let (insn, ilen) = fetch(code, base, pc)?;
+        let next = pc.wrapping_add(ilen);
+        if opcode(insn) != 0x63 {
+            if !emit_simple(&mut m, c, *lay, insn, pc, static_n) {
+                return None;
+            }
+            seg += 1;
+            pc = next;
+            static_n += 1;
+            continue;
+        }
+        // Conditional branch: continue (back-edge) / break / if-then.
+        let (s1, s2) = (rs1(insn), rs2(insn));
+        let f3 = funct3(insn);
+        let target = pc.wrapping_add(imm_b(insn) as u64);
+        let cmp = match f3 {
+            0 => I64_EQ,
+            1 => I64_NE,
+            4 => I64_LT_S,
+            5 => I64_GE_S,
+            6 => I64_LT_U,
+            7 => I64_GE_U,
+            _ => return None,
+        };
+        // The branch always executes on reaching it: flush the straight-line
+        // segment plus this instruction into retired, unconditionally.
+        m.local_get(ITER)
+            .i64_const((seg + 1) as i64)
+            .op(I64_ADD)
+            .local_set(ITER);
+        seg = 0;
+        if target < pc {
+            // back-edge → continue the loop whose header == target.
+            let li = scopes.iter().rposition(|&(k, _, h)| k == 1 && h == target)?;
+            let depth = (scopes.len() - 1 - li) as u32;
+            c.push_reg(&mut m, s1);
+            c.push_reg(&mut m, s2);
+            m.op(cmp);
+            m.br_if(depth);
+        } else if let Some(bi) = scopes.iter().rposition(|&(k, cp, _)| k == 0 && cp == target) {
+            // forward branch to an enclosing loop's exit → break.
+            let depth = (scopes.len() - 1 - bi) as u32;
+            c.push_reg(&mut m, s1);
+            c.push_reg(&mut m, s2);
+            m.op(cmp);
+            m.br_if(depth);
+        } else {
+            // forward if-then: run [next, target) under the NEGATED condition.
+            let neg = match f3 {
+                0 => I64_NE,
+                1 => I64_EQ,
+                4 => I64_GE_S,
+                5 => I64_LT_S,
+                6 => I64_GE_U,
+                _ => I64_LT_U,
+            };
+            c.push_reg(&mut m, s1);
+            c.push_reg(&mut m, s2);
+            m.op(neg);
+            m.op(IF).op(VOID);
+            scopes.push((2, target, 0));
+        }
+        pc = next;
+        static_n += 1;
+    }
+    if !scopes.is_empty() {
+        return None; // unbalanced — refuse rather than emit broken wasm
+    }
+    if seg > 0 {
+        m.local_get(ITER)
+            .i64_const(seg as i64)
+            .op(I64_ADD)
+            .local_set(ITER);
+    }
+    c.flush_writes(&mut m);
+    c.set_pc_const(&mut m, region.end_pc);
+    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
+    Some(Block {
+        wasm: m.finish(),
+        len: region.end_pc - start_pc,
+        n_insns: static_n.max(1),
     })
 }
 
