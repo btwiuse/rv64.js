@@ -5,7 +5,7 @@
 # deb-python.mjs harnesses. Idempotent. Run in the nix dev shell:
 #
 #   nix develop -c tests/vs-v86/setup.sh [outdir]      # + DEBIAN=1 for python
-#   SC=<outdir> nix develop -c node tests/vs-v86/compare-sys.mjs
+#   ARTIFACTS=<outdir> nix develop -c node tests/vs-v86/compare-sys.mjs
 #
 # The v86 side (compare*.mjs, nbench i386, ...) additionally needs a built
 # copy/v86 checkout at <outdir>/v86 — see README "Reproducing".
@@ -35,8 +35,8 @@ cat <<EOF
 
 Setup complete in: $OUT
 Run benchmarks (add a built copy/v86 at $OUT/v86 for the v86 side):
-  SC=$OUT nix develop -c node tests/vs-v86/compare-sys.mjs   # system-mode alu/mixed
-  SC=$OUT nix develop -c node tests/vs-v86/compare-boot.mjs  # boot time
-  SC=$OUT nix develop -c node tests/vs-v86/nbench.mjs        # BYTEmark
-$([ "${DEBIAN:-0}" = 1 ] && echo "  SC=$OUT nix develop -c node tests/vs-v86/deb-python.mjs   # python fib(30)")
+  ARTIFACTS=$OUT nix develop -c node tests/vs-v86/compare-sys.mjs   # system-mode alu/mixed
+  ARTIFACTS=$OUT nix develop -c node tests/vs-v86/compare-boot.mjs  # boot time
+  ARTIFACTS=$OUT nix develop -c node tests/vs-v86/nbench.mjs        # BYTEmark
+$([ "${DEBIAN:-0}" = 1 ] && echo "  ARTIFACTS=$OUT nix develop -c node tests/vs-v86/deb-python.mjs   # python fib(30)")
 EOF

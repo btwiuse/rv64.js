@@ -1,15 +1,15 @@
 // rv64.js vs copy/v86 — Linux BOOT-TIME comparison (v86's linux-boot
 // benchmark). Both boot buildroot to a shell prompt; wall-clock ms, JIT on/off.
 //
-//   SC=<scratchpad> nix develop -c node tests/vs-v86/compare-boot.mjs
+//   ARTIFACTS=<scratchpad> nix develop -c node tests/vs-v86/compare-boot.mjs
 import { readFile, copyFile, access } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const SC = process.env.SC;
-const V86DIR = process.env.V86DIR || (SC && join(SC, "v86"));
+const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
+const V86DIR = process.env.V86DIR || (ARTIFACTS && join(ARTIFACTS, "v86"));
 const REPS = +(process.env.REPS || 3);
 
 const { RV64 } = await import(join(root, "web/rv64.js"));

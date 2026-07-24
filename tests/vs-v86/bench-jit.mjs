@@ -2,7 +2,7 @@
 // Best-of-3, rv64 side only. For a full fresh both-sides comparison (runs v86
 // live too) use compare.mjs — that's the canonical harness; this is the fast
 // rv64-only spot check.
-// Usage: SC=<dir-with-alu.rv64,rvbench.rv64> node tests/vs-v86/bench-jit.mjs
+// Usage: ARTIFACTS=<dir-with-alu.rv64,rvbench.rv64> node tests/vs-v86/bench-jit.mjs
 // Reports per workload: JIT ms, Minsn/s, JIT coverage, and ratio vs v86's
 // same-machine JIT (measured by compare.mjs 2026-07-23: ALU 2816ms, mixed
 // 1421ms). Ratio <1 = rv64 faster than v86.
@@ -12,10 +12,10 @@ import { dirname, join } from "node:path";
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const { RV64, Stop } = await import(join(root, "web/rv64.js"));
 const wasm = new Uint8Array(await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm")));
-const SC = process.env.SC;
+const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
 const WL = [
-  { name: "alu",   elf: SC + "/xbench/alu.rv64",     v86: 2816 },
-  { name: "mixed", elf: SC + "/xbench/rvbench.rv64", v86: 1421 },
+  { name: "alu",   elf: ARTIFACTS + "/xbench/alu.rv64",     v86: 2816 },
+  { name: "mixed", elf: ARTIFACTS + "/xbench/rvbench.rv64", v86: 1421 },
 ];
 const REPS = 3;
 async function run1(elf, jitOn) {

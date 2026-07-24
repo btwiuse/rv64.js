@@ -1,14 +1,14 @@
 // arch-python (v86's python fib(30) benchmark) on riscv64: boot a Debian
 // riscv64 rootfs (assembled by mk-debian-rootfs.sh) under our JIT machine and
 // time `python3 /fib.py`, JIT vs interpreter, with the wall-clock time source.
-//   SC=<dir-with-deb-rootfs.ext4> node tests/vs-v86/deb-python.mjs
+//   ARTIFACTS=<dir-with-deb-rootfs.ext4> node tests/vs-v86/deb-python.mjs
 import { readFile } from "node:fs/promises";
 const root = "/home/darren/src/arm64.js";
 const { RV64 } = await import(root + "/web/rv64.js");
 const wasm = await readFile(root + "/target/wasm32-unknown-unknown/release/rv64_wasm.wasm");
 const img = f => readFile(f).then(b => new Uint8Array(b));
 const [bios,kernel,disk] = await Promise.all([
-  img(root+"/web/images/bbl64.bin"), img(root+"/web/images/kernel-riscv64.bin"), img(process.env.SC+"/deb-rootfs.ext4")]);
+  img(root+"/web/images/bbl64.bin"), img(root+"/web/images/kernel-riscv64.bin"), img(process.env.ARTIFACTS+"/deb-rootfs.ext4")]);
 const enc = new TextEncoder();
 async function run(jit){
   const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit?1:0); vm.ex.sys_set_wallclock(1);

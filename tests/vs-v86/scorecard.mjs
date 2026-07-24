@@ -4,23 +4,23 @@
 // v86 has no user mode) and prints ONE table, then writes a timestamped
 // scorecard-<ts>.md + .json so before/after perf work is directly comparable.
 //
-//   SC=<artifacts> nix develop -c node tests/vs-v86/scorecard.mjs
+//   ARTIFACTS=<artifacts> nix develop -c node tests/vs-v86/scorecard.mjs
 //   FULL=1     include interpreter columns + JIT-over-interp (slow)
 //   NBENCH=1   include the BYTEmark suite (rv64 only, ~8 min)
 //   SKIP_V86=1 rv64 only
 //
-// Artifacts (build once with setup.sh; DEBIAN=1 for python): $SC/xbench/*,
-// $SC/root-nbench.bin, $SC/deb-riscv64.ext4, $SC/deb-i386.cpio.gz +
-// $SC/vmlinuz-i386, and a built copy/v86 checkout at $SC/v86.
+// Artifacts (build once with setup.sh; DEBIAN=1 for python): $ARTIFACTS/xbench/*,
+// $ARTIFACTS/root-nbench.bin, $ARTIFACTS/deb-riscv64.ext4, $ARTIFACTS/deb-i386.cpio.gz +
+// $ARTIFACTS/vmlinuz-i386, and a built copy/v86 checkout at $ARTIFACTS/v86.
 import { readFile, writeFile, copyFile, access } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const SC = process.env.SC;
-if (!SC) { console.error("set SC=<artifacts dir> (see setup.sh)"); process.exit(2); }
-const V86DIR = process.env.V86DIR || join(SC, "v86");
+const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
+if (!ARTIFACTS) { console.error("set ARTIFACTS=<artifacts dir> (see setup.sh)"); process.exit(2); }
+const V86DIR = process.env.V86DIR || join(ARTIFACTS, "v86");
 const FULL = !!+process.env.FULL;
 const WANT_NBENCH = !!+process.env.NBENCH;
 const WANT_V86 = !+process.env.SKIP_V86;
@@ -68,7 +68,7 @@ async function rvBootTime(jit) {
   return out.includes("~ #") ? performance.now() - t : null;
 }
 async function rvPython(jit) {
-  const disk = new Uint8Array(await readFile(join(SC, "deb-riscv64.ext4")));
+  const disk = new Uint8Array(await readFile(join(ARTIFACTS, "deb-riscv64.ext4")));
   const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); vm.ex.sys_set_wallclock(1);
   let out = ""; vm.onWrite = (fd, b) => (out += new TextDecoder().decode(b));
   vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice(), cmdline: "console=hvc0 root=/dev/vda rw init=/binit.sh", ramMB: 512 });
@@ -84,7 +84,7 @@ async function rvPython(jit) {
   return ts && td ? td - ts : null;
 }
 async function rvNbench(jit) {
-  const disk = new Uint8Array(await readFile(join(SC, "root-nbench.bin")));
+  const disk = new Uint8Array(await readFile(join(ARTIFACTS, "root-nbench.bin")));
   const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); vm.ex.sys_set_wallclock(1);
   let out = ""; vm.onWrite = (fd, b) => (out += new TextDecoder().decode(b));
   vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice() });
@@ -100,7 +100,7 @@ async function rvNbench(jit) {
 // ---------- v86: spawn its runners in the checkout, parse RESULT ----------
 function v86Spawn(script, env) {
   return new Promise((resolve) => {
-    const p = spawn("node", ["--max-old-space-size=4096", script], { cwd: V86DIR, env: { ...process.env, SC, ...env } });
+    const p = spawn("node", ["--max-old-space-size=4096", script], { cwd: V86DIR, env: { ...process.env, ARTIFACTS, ...env } });
     let buf = ""; p.stdout.on("data", (d) => (buf += d));
     p.on("close", () => { const m = buf.match(/RESULT ms=(\d+)/); resolve(m ? +m[1] : null); });
   });
@@ -123,10 +123,10 @@ const log = (m) => process.stderr.write(m);
 // compute (alu, mixed): one boot per JIT setting, run both binaries
 for (const jit of FULL ? [false, true] : [true]) {
   log(`[rv64 compute jit=${+jit}] boot…`);
-  const st = await rvComputeBoot(jit, join(SC, "xbench", "alu.rv64"));
+  const st = await rvComputeBoot(jit, join(ARTIFACTS, "xbench", "alu.rv64"));
   (R.ALU ??= {})[jit ? "rvj" : "rvi"] = rvRunBench(st); log(" alu");
   // reuse boot: swap /tmp/c to the mixed binary
-  const b64 = Buffer.from(await readFile(join(SC, "xbench", "rvbench_fs.rv64"))).toString("base64");
+  const b64 = Buffer.from(await readFile(join(ARTIFACTS, "xbench", "rvbench_fs.rv64"))).toString("base64");
   st.vm.consoleInput(enc.encode(": > /tmp/b\n")); step(st.vm, 1500);
   for (let o = 0; o < b64.length; o += 512) { st.vm.consoleInput(enc.encode(`printf %s '${b64.slice(o, o + 512)}' >> /tmp/b\n`)); step(st.vm, 3000); }
   st.vm.consoleInput(enc.encode("base64 -d /tmp/b > /tmp/c && chmod 755 /tmp/c\n")); step(st.vm, 12000);
@@ -135,7 +135,7 @@ for (const jit of FULL ? [false, true] : [true]) {
 // boot time
 for (const jit of FULL ? [false, true] : [true]) { log(`[rv64 boot jit=${+jit}]…`); (R.Boot ??= {})[jit ? "rvj" : "rvi"] = await rvBootTime(jit); log(" ok\n"); }
 // python (needs the debian image)
-if (await has(join(SC, "deb-riscv64.ext4"))) for (const jit of FULL ? [false, true] : [true]) { log(`[rv64 python jit=${+jit}]…`); (R["python fib(30)"] ??= {})[jit ? "rvj" : "rvi"] = await rvPython(jit); log(" ok\n"); }
+if (await has(join(ARTIFACTS, "deb-riscv64.ext4"))) for (const jit of FULL ? [false, true] : [true]) { log(`[rv64 python jit=${+jit}]…`); (R["python fib(30)"] ??= {})[jit ? "rvj" : "rvi"] = await rvPython(jit); log(" ok\n"); }
 
 // v86 side
 if (haveV86) {
@@ -143,13 +143,13 @@ if (haveV86) {
     log(`[v86 jit=${+jit}] alu`); (R.ALU ??= {})[jit ? "v8j" : "v8i"] = await v86Compute("alu.i386", jit);
     log(" mixed"); (R.Mixed ??= {})[jit ? "v8j" : "v8i"] = await v86Compute("rvbench_fs.i386", jit);
     log(" boot"); (R.Boot ??= {})[jit ? "v8j" : "v8i"] = await v86Boot(jit);
-    if (await has(join(SC, "vmlinuz-i386"))) { log(" python"); (R["python fib(30)"] ??= {})[jit ? "v8j" : "v8i"] = await v86Python(jit); }
+    if (await has(join(ARTIFACTS, "vmlinuz-i386"))) { log(" python"); (R["python fib(30)"] ??= {})[jit ? "v8j" : "v8i"] = await v86Python(jit); }
     log("\n");
   }
 }
 // nbench (rv64 only, slow)
 let nb = null;
-if (WANT_NBENCH && (await has(join(SC, "root-nbench.bin")))) {
+if (WANT_NBENCH && (await has(join(ARTIFACTS, "root-nbench.bin")))) {
   log("[rv64 nbench jit]…"); const nj = await rvNbench(true); log(" interp…"); const ni = await rvNbench(false); log(" ok\n");
   nb = { jit: nj, int: ni };
 }
@@ -168,6 +168,6 @@ if (nb) {
   for (const k of Object.keys(nb.jit)) md += `| ${k} | ${nb.int[k] ?? "—"} | ${nb.jit[k] ?? "—"} | ${nb.int[k] && nb.jit[k] ? (nb.jit[k] / nb.int[k]).toFixed(1) + "×" : "—"} |\n`;
 }
 console.log("\n" + md);
-await writeFile(join(SC, `scorecard-${ts}.md`), md);
-await writeFile(join(SC, `scorecard-${ts}.json`), JSON.stringify({ ts, results: R, nbench: nb }, null, 2));
-console.log(`saved ${join(SC, `scorecard-${ts}.md`)} (+ .json)`);
+await writeFile(join(ARTIFACTS, `scorecard-${ts}.md`), md);
+await writeFile(join(ARTIFACTS, `scorecard-${ts}.json`), JSON.stringify({ ts, results: R, nbench: nb }, null, 2));
+console.log(`saved ${join(ARTIFACTS, `scorecard-${ts}.md`)} (+ .json)`);

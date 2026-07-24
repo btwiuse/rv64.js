@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the fixed-work benchmark kernels for both ISAs into $OUT/xbench/, the
-# layout the compare*.mjs harnesses expect (SC=$OUT). Reproducible; run in the
+# layout the compare*.mjs harnesses expect (ARTIFACTS=$OUT). Reproducible; run in the
 # nix dev shell:  nix develop -c tests/vs-v86/build-kernels.sh [outdir]
 #
 #   alu.rv64 / rvbench_fs.rv64  freestanding riscv64 (raw ecalls, -nostdlib)

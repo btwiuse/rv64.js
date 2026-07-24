@@ -1,9 +1,9 @@
 import { readFile } from "node:fs/promises";
 const { V86 } = await import("./src/main.js");
-const SC = process.env.SC;
+const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
 // BIN selects the freestanding benchmark (default: the mixed rvbench_fs.i386;
 // set BIN=alu.i386 for pure ALU). Same source as the rv64 side, same work.
-const bin = new Uint8Array(await readFile(SC + "/xbench/" + (process.env.BIN || "rvbench_fs.i386")));
+const bin = new Uint8Array(await readFile(ARTIFACTS + "/xbench/" + (process.env.BIN || "rvbench_fs.i386")));
 const jit = !+process.env.DISABLE_JIT;
 const emulator = new V86({
     bios: { url: "./bios/seabios.bin" }, vga_bios: { url: "./bios/vgabios.bin" },

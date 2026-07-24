@@ -14,7 +14,7 @@
 // per-iteration loop dispatch and NO FP compilation, so expect it to trail
 // its own user-mode numbers (and likely v86, whose JIT is system-mode).
 //
-//   SC=<scratchpad> nix develop -c node tests/vs-v86/compare-sys.mjs
+//   ARTIFACTS=<scratchpad> nix develop -c node tests/vs-v86/compare-sys.mjs
 
 import { readFile, copyFile, access } from "node:fs/promises";
 import { spawn } from "node:child_process";
@@ -22,9 +22,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const SC = process.env.SC;
-if (!SC) { console.error("set SC=<dir with xbench/ binaries>"); process.exit(2); }
-const V86DIR = process.env.V86DIR || join(SC, "v86");
+const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
+if (!ARTIFACTS) { console.error("set ARTIFACTS=<dir with xbench/ binaries>"); process.exit(2); }
+const V86DIR = process.env.V86DIR || join(ARTIFACTS, "v86");
 const RUN_INTERP = !+process.env.SKIP_INTERP;
 
 const { RV64 } = await import(join(root, "web/rv64.js"));
@@ -56,7 +56,7 @@ async function bootInject(jit) {
   if (!out.includes("~ #")) throw new Error("boot failed");
   vm.consoleInput(enc.encode("stty -echo 2>/dev/null\n")); step(vm, 3000);
   for (const w of WL) {
-    const b64 = Buffer.from(await readFile(join(SC, "xbench", w.rv64))).toString("base64");
+    const b64 = Buffer.from(await readFile(join(ARTIFACTS, "xbench", w.rv64))).toString("base64");
     vm.consoleInput(enc.encode(`: > /tmp/${w.name}.b64\n`)); step(vm, 1500);
     for (let o = 0; o < b64.length; o += 512) {
       vm.consoleInput(enc.encode(`printf %s '${b64.slice(o, o + 512)}' >> /tmp/${w.name}.b64\n`));
@@ -86,7 +86,7 @@ function runOne(st, name) {
 
 function v86run(bin, jit) {
   return new Promise((resolve) => {
-    const env = { ...process.env, SC, BIN: bin, DISABLE_JIT: jit ? "0" : "1" };
+    const env = { ...process.env, ARTIFACTS, BIN: bin, DISABLE_JIT: jit ? "0" : "1" };
     const p = spawn("node", ["v86-compute.mjs"], { cwd: V86DIR, env });
     let buf = "";
     p.stdout.on("data", (d) => (buf += d));

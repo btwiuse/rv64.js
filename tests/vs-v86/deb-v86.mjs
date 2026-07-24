@@ -1,14 +1,14 @@
 // v86 side of the apples-to-apples python benchmark: boot the Debian i386
 // initramfs (mk-v86-debian.sh) and time `python3 /fib.py`. Runs inside the
-// copy/v86 checkout (imports ./src/main.js). Env: SC, DISABLE_JIT.
+// copy/v86 checkout (imports ./src/main.js). Env: ARTIFACTS, DISABLE_JIT.
 import { readFile } from "node:fs/promises";
 const { V86 } = await import("./src/main.js");
-const SC = process.env.SC;
+const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
 const jit = !+process.env.DISABLE_JIT;
 const e = new V86({
   bios: { url: "./bios/seabios.bin" }, vga_bios: { url: "./bios/vgabios.bin" },
-  bzimage: { buffer: (await readFile(SC + "/vmlinuz-i386")).buffer },
-  initrd: { buffer: (await readFile(SC + "/deb-i386.cpio.gz")).buffer },
+  bzimage: { buffer: (await readFile(ARTIFACTS + "/vmlinuz-i386")).buffer },
+  initrd: { buffer: (await readFile(ARTIFACTS + "/deb-i386.cpio.gz")).buffer },
   cmdline: "rdinit=/init console=ttyS0", autostart: true,
   memory_size: 1024 * 1024 * 1024, disable_jit: +process.env.DISABLE_JIT, log_level: 0,
 });

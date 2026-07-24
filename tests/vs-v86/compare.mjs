@@ -8,8 +8,8 @@
 // the headline ratio: our JIT vs v86's JIT.
 //
 // Inputs (external, see tests/vs-v86/README.md):
-//   SC       dir containing xbench/{alu,rvbench}.rv64 + xbench/{alu,rvbench_fs}.i386  (required)
-//   V86DIR   copy/v86 checkout, built (default $SC/v86); if absent, runs rv64 only
+//   ARTIFACTS       dir containing xbench/{alu,rvbench}.rv64 + xbench/{alu,rvbench_fs}.i386  (required)
+//   V86DIR   copy/v86 checkout, built (default $ARTIFACTS/v86); if absent, runs rv64 only
 //   WASM     rv64_wasm.wasm (default target/wasm32-unknown-unknown/release/…)
 //   JIT_REPS best-of-N for the (fast) JIT runs (default 3)
 //   SKIP_INTERP=1  skip the slow interpreter runs (JIT-vs-JIT only)
@@ -21,12 +21,12 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 
 const ROOT = "/home/darren/src/arm64.js";
-const SC = process.env.SC;
-if (!SC) {
-  console.error("set SC=<dir containing xbench/ benchmark binaries>");
+const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
+if (!ARTIFACTS) {
+  console.error("set ARTIFACTS=<dir containing xbench/ benchmark binaries>");
   process.exit(2);
 }
-const V86DIR = process.env.V86DIR || join(SC, "v86");
+const V86DIR = process.env.V86DIR || join(ARTIFACTS, "v86");
 const WASM = process.env.WASM || join(ROOT, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm");
 const JIT_REPS = +(process.env.JIT_REPS || 3);
 const RUN_INTERP = !+process.env.SKIP_INTERP;
@@ -59,7 +59,7 @@ async function rv64run(elfPath, jitOn) {
 
 function v86run(bin, jitOn) {
   return new Promise((resolve) => {
-    const env = { ...process.env, SC, BIN: bin, DISABLE_JIT: jitOn ? "0" : "1" };
+    const env = { ...process.env, ARTIFACTS, BIN: bin, DISABLE_JIT: jitOn ? "0" : "1" };
     const p = spawn("node", ["v86-compute.mjs"], { cwd: V86DIR, env });
     let buf = "";
     p.stdout.on("data", (d) => (buf += d));
@@ -89,7 +89,7 @@ console.log(`# NOTE: shared/noisy host — the JIT-vs-JIT ratio and coverage%% a
 
 const rows = [];
 for (const w of WL) {
-  const rvElf = join(SC, "xbench", w.rv64);
+  const rvElf = join(ARTIFACTS, "xbench", w.rv64);
   process.stderr.write(`[${w.name}] rv64 JIT…`);
   const rJit = await bestN(() => rv64run(rvElf, true), JIT_REPS);
   let rInt = null;

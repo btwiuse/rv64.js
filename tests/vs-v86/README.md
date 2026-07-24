@@ -39,7 +39,7 @@ below only for focused runs.
 
 ```sh
 nix develop -c tests/vs-v86/setup.sh target/bench           # build artifacts (DEBIAN=1 for python)
-SC=target/bench nix develop -c node tests/vs-v86/scorecard.mjs   # + FULL=1 (interp), NBENCH=1 (BYTEmark)
+ARTIFACTS=target/bench nix develop -c node tests/vs-v86/scorecard.mjs   # + FULL=1 (interp), NBENCH=1 (BYTEmark)
 ```
 
 It covers ALU, Mixed, Boot, python fib(30) (all with the v86 head-to-head) and
@@ -52,7 +52,7 @@ artifacts dir, ready for the harnesses — reproducibly, in the nix dev shell:
 
 ```sh
 nix develop -c tests/vs-v86/setup.sh target/bench          # + DEBIAN=1 for python
-SC=target/bench nix develop -c node tests/vs-v86/compare-sys.mjs
+ARTIFACTS=target/bench nix develop -c node tests/vs-v86/compare-sys.mjs
 ```
 
 Pieces (each runnable alone): `build-kernels.sh` (the fixed-work C kernels for
@@ -70,7 +70,7 @@ prints the table below.
 ```sh
 # SC points at the dir holding xbench/ (the compiled benchmark binaries);
 # V86DIR defaults to $SC/v86 (a built copy/v86 checkout — see "Reproducing").
-SC=<scratchpad> nix develop -c node tests/vs-v86/compare.mjs
+ARTIFACTS=<scratchpad> nix develop -c node tests/vs-v86/compare.mjs
 # JIT-vs-JIT only (skip the slow interpreter runs):  SKIP_INTERP=1
 ```
 
@@ -112,7 +112,7 @@ guest*, host-wall-clock timed between the guest's serial `BENCH_START` /
 `BENCH_DONE` markers. `compare-sys.mjs` is the driver:
 
 ```sh
-SC=<scratchpad> nix develop -c node tests/vs-v86/compare-sys.mjs   # SKIP_INTERP=1 for JIT-only
+ARTIFACTS=<scratchpad> nix develop -c node tests/vs-v86/compare-sys.mjs   # SKIP_INTERP=1 for JIT-only
 ```
 
 Fresh run (2026-07-23, after roadmap item 3f ported the loop + FP JIT into
@@ -184,7 +184,7 @@ riscv64-none-elf-strip -s nbench.rv64
 cp web/images/root-riscv64.bin root-nbench.bin
 debugfs -w -R 'write nbench.rv64 nbench' root-nbench.bin
 debugfs -w -R 'sif /nbench mode 0100755' root-nbench.bin
-SC=. ROOT_NBENCH=root-nbench.bin node tests/vs-v86/nbench.mjs
+ARTIFACTS=. ROOT_NBENCH=root-nbench.bin node tests/vs-v86/nbench.mjs
 ```
 
 ## Debian riscv64 userland (real python, glibc) — arch-python
@@ -201,7 +201,7 @@ image. The virtio-blk disk is read on demand, so it fits under wasm's 4 GB
 
 ```sh
 nix develop -c tests/vs-v86/mk-debian-rootfs.sh <outdir>   # -> deb-rootfs.ext4
-SC=<outdir> nix develop -c node tests/vs-v86/deb-python.mjs
+ARTIFACTS=<outdir> nix develop -c node tests/vs-v86/deb-python.mjs
 ```
 
 **arch-python — fib(30), APPLES-TO-APPLES** (same Debian trixie python 3.13 on
@@ -224,7 +224,7 @@ eval loop. Different JITs excel at different workload shapes.
 nix develop -c tests/vs-v86/mk-debian-rootfs.sh <out>            # riscv64 rootfs
 ARCH=i386 nix develop -c tests/vs-v86/mk-debian-rootfs.sh <out>  # i386 rootfs
 nix develop -c tests/vs-v86/mk-v86-debian.sh <out>               # v86 kernel + initramfs
-SC=<out> nix develop -c node tests/vs-v86/compare-python.mjs     # (v86 checkout at <out>/v86)
+ARTIFACTS=<out> nix develop -c node tests/vs-v86/compare-python.mjs     # (v86 checkout at <out>/v86)
 ```
 
 This Debian rootfs is also a glibc environment, so a glibc-built nbench there

@@ -8,13 +8,13 @@
 // newlib cross-gcc and bake it into a copy of the ext2 rootfs via debugfs, at
 // /nbench. Point ROOT_NBENCH at that image.
 //
-//   SC=<scratchpad> ROOT_NBENCH=<rootfs-with-nbench> node tests/vs-v86/nbench.mjs
+//   ARTIFACTS=<scratchpad> ROOT_NBENCH=<rootfs-with-nbench> node tests/vs-v86/nbench.mjs
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const disk = process.env.ROOT_NBENCH || join(process.env.SC || "", "root-nbench.bin");
+const disk = process.env.ROOT_NBENCH || join(process.env.ARTIFACTS || "", "root-nbench.bin");
 const { RV64 } = await import(join(root, "web/rv64.js"));
 const wasm = await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"));
 const img = (f) => readFile(f).then((b) => new Uint8Array(b));

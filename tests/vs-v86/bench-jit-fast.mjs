@@ -1,16 +1,16 @@
 // Fast, load-robust JIT delta harness. Interleaves JIT/interp so both sample
 // the same load window; reports best-of-N of each + the (load-robust) speedup
 // ratio, and cross-checks JIT output == interp output.
-// Usage: SC=<dir> node tests/vs-v86/bench-jit-fast.mjs
+// Usage: ARTIFACTS=<dir> node tests/vs-v86/bench-jit-fast.mjs
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const { RV64, Stop } = await import(join(root, "web/rv64.js"));
 const wasm = new Uint8Array(await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm")));
-const SC = process.env.SC;
-const WL = [{ name: "alu", elf: SC + "/xbench/alu_s.rv64" },
-           { name: "mixed", elf: SC + "/xbench/rvbench_s.rv64" }];
+const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
+const WL = [{ name: "alu", elf: ARTIFACTS + "/xbench/alu_s.rv64" },
+           { name: "mixed", elf: ARTIFACTS + "/xbench/rvbench_s.rv64" }];
 const REPS = 3;
 async function run1(bytes, jitOn) {
   const vm = await RV64.create(wasm); let out = "";

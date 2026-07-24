@@ -8,16 +8,16 @@
 //   nix develop -c tests/vs-v86/mk-debian-rootfs.sh <out>              # riscv64
 //   ARCH=i386 nix develop -c tests/vs-v86/mk-debian-rootfs.sh <out>    # i386
 //   nix develop -c tests/vs-v86/mk-v86-debian.sh <out>                 # v86 kernel+initramfs
-//   SC=<out> V86DIR=<out>/v86 nix develop -c node tests/vs-v86/compare-python.mjs
+//   ARTIFACTS=<out> V86DIR=<out>/v86 nix develop -c node tests/vs-v86/compare-python.mjs
 import { readFile, copyFile, access } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const SC = process.env.SC;
-if (!SC) { console.error("set SC=<artifacts dir>"); process.exit(2); }
-const V86DIR = process.env.V86DIR || join(SC, "v86");
+const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
+if (!ARTIFACTS) { console.error("set ARTIFACTS=<artifacts dir>"); process.exit(2); }
+const V86DIR = process.env.V86DIR || join(ARTIFACTS, "v86");
 const RUN_INTERP = !+process.env.SKIP_INTERP;
 
 const { RV64 } = await import(join(root, "web/rv64.js"));
@@ -25,7 +25,7 @@ const wasm = await readFile(join(root, "target/wasm32-unknown-unknown/release/rv
 const imgs = await Promise.all(
   ["bbl64.bin", "kernel-riscv64.bin"].map(async (f) => new Uint8Array(await readFile(join(root, "web/images", f)))),
 );
-const rvDisk = new Uint8Array(await readFile(join(SC, "deb-riscv64.ext4")));
+const rvDisk = new Uint8Array(await readFile(join(ARTIFACTS, "deb-riscv64.ext4")));
 const enc = new TextEncoder();
 
 async function rvRun(jit) {
@@ -51,7 +51,7 @@ async function rvRun(jit) {
 function v86Run(jit) {
   return new Promise((resolve) => {
     const p = spawn("node", ["--max-old-space-size=4096", "deb-v86.mjs"],
-      { cwd: V86DIR, env: { ...process.env, SC, DISABLE_JIT: jit ? "0" : "1" } });
+      { cwd: V86DIR, env: { ...process.env, ARTIFACTS, DISABLE_JIT: jit ? "0" : "1" } });
     let buf = ""; p.stdout.on("data", (d) => (buf += d));
     p.on("close", () => { const m = buf.match(/RESULT ms=(\d+) chk=(\S+)/); resolve(m ? { ms: +m[1], chk: m[2] } : { ms: null }); });
   });
