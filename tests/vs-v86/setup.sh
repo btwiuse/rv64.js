@@ -24,8 +24,11 @@ echo "== 3/3 nbench rootfs =="
 "$HERE/mk-nbench-rootfs.sh" "$OUT"
 
 if [ "${DEBIAN:-0}" = 1 ]; then
-    echo "== + Debian riscv64 rootfs (python) =="
+    echo "== + Debian riscv64 rootfs (python, arch-python) =="
     "$HERE/mk-debian-rootfs.sh" "$OUT"
+    echo "== + Debian i386 rootfs + v86 kernel/initramfs (apples-to-apples python) =="
+    ARCH=i386 "$HERE/mk-debian-rootfs.sh" "$OUT"
+    "$HERE/mk-v86-debian.sh" "$OUT"
 fi
 
 cat <<EOF
