@@ -90,7 +90,27 @@ with `tests/vs-v86` (baseline vs v86: ALU 50.5s vs 2.9s; mixed 17.1s vs 1.5s).
   59%→100% coverage, ~11×→31× over our interpreter, and from ~11× SLOWER than
   v86 to 2.5× FASTER.** Both benchmarks now beat v86 at 100% coverage (ALU 2×,
   mixed 2.5× faster). jit==interp checksums identical; Linux still boots under
-  JIT. This closes the v86 performance gap that motivated items 3a–3e.
+  JIT. This closes the v86 performance gap that motivated items 3a–3e —
+  **in user mode**. See 3f.
+
+- [ ] **3f. Port the 3a–3e JIT wins to SYSTEM mode** *(the real v86 gap — v86
+  has no user mode, so this is the only apples-to-apples comparison)* —
+  everything in 3a–3e is gated to user-mode (`lay.mem` / `f_base != 0`):
+  structured/nested-loop compilation (`loop_region`/`translate_loop`),
+  FP arith/compare in blocks, FP-in-locals, FLD/FSD. In system mode the JIT is
+  still the old ALU-inline + inline-TLB one with **per-iteration loop dispatch
+  and no FP compilation**. Measured with `tests/vs-v86/compare-sys.mjs` (both
+  emulators boot full Linux, run the same kernel in-guest, host-wall-clock):
+  **system-mode v86 JIT is ~10-12× FASTER than ours** (ALU 27.0s vs 2.76s;
+  mixed 18.0s vs 1.55s), and our system JIT gains only 2.7×/1.1× over its own
+  interpreter. Work: (1) allow `loop_region`/`translate_loop` in system blocks
+  — the blocker is that inline-TLB memory ops can *bail* mid-loop (miss/MMIO/
+  store-to-compiled-page), so a compiled loop needs a clean mid-iteration bail
+  path (flush locals, set pc, return) rather than the user-mode "only traps"
+  assumption; (2) enable FP-in-blocks for system mode (set `f_base`/`fcsr_addr`
+  to the live CPU FP file + honor its softfloat fast-path guard). This is the
+  largest remaining perf lever and the one that decides the v86 comparison that
+  counts.
 
 - [ ] **4. (Optional) residual-based flag recovery** — extend the FP fast
   path to work before NX is set, via error-free transformations (TwoSum
