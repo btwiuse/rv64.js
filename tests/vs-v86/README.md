@@ -189,17 +189,28 @@ nix develop -c tests/vs-v86/mk-debian-rootfs.sh <outdir>   # -> deb-rootfs.ext4
 SC=<outdir> nix develop -c node tests/vs-v86/deb-python.mjs
 ```
 
-**arch-python — fib(30) on riscv64** (Debian python 3.13, correct result 832040):
+**arch-python — fib(30), APPLES-TO-APPLES** (same Debian trixie python 3.13 on
+both emulators, both JIT; result 832040). The v86 side boots a Debian **i386**
+rootfs (same `mk-debian-rootfs.sh`, `ARCH=i386`) as an initramfs under a stock
+i386 kernel — because v86 has only IDE disks and its buildroot kernel lacks ATA,
+so booting the rootfs *as* an initramfs needs no block device. `mk-v86-debian.sh`
+builds those artifacts; `compare-python.mjs` runs both:
 
-| | full (`python3 fib.py`) | fib compute only |
-|---|---:|---:|
-| rv64 interp | 26.0 s | 24.8 s |
-| **rv64 JIT** | **16.8 s** | **15.4 s** |
+| | rv64 (riscv64) | v86 (i386) | winner |
+|---|---:|---:|---:|
+| fib(30), JIT | 15.4 s | **2.7 s** | **v86 ~5.6× faster** |
 
-JIT is ~1.55× over our interpreter — modest because CPython's eval loop is
-branchy and indirect-call-heavy (v86's JIT gets a similar factor on python).
-The v86-side head-to-head needs python in v86's guest too — a symmetric Debian
-**i386** rootfs booted in v86 would do it (not yet wired up).
+This is the honest flip side of the compute-loop result: rv64's structured-loop
+JIT wins on tight numeric loops (alu/mixed ~2× *faster* than v86), but v86's
+mature register-allocating JIT wins big on CPython's branchy, indirect-call-heavy
+eval loop. Different JITs excel at different workload shapes.
+
+```sh
+nix develop -c tests/vs-v86/mk-debian-rootfs.sh <out>            # riscv64 rootfs
+ARCH=i386 nix develop -c tests/vs-v86/mk-debian-rootfs.sh <out>  # i386 rootfs
+nix develop -c tests/vs-v86/mk-v86-debian.sh <out>               # v86 kernel + initramfs
+SC=<out> nix develop -c node tests/vs-v86/compare-python.mjs     # (v86 checkout at <out>/v86)
+```
 
 This Debian rootfs is also a glibc environment, so a glibc-built nbench there
 *can* read a `-cCMD` command file (unlike the newlib build above, since riscv64
