@@ -42,30 +42,36 @@ lazy-EFLAGS machinery; fixed-width decode; clean IEEE F/D vs x87). v86 wins
 via three techniques; below is our phased plan to adopt them, each measured
 with `tests/vs-v86` (baseline vs v86: ALU 50.5s vs 2.9s; mixed 17.1s vs 1.5s).
 
-- [ ] **3a. Phase 1 — registers in wasm locals** *(the #1 ALU win)* — today
-  every guest-register access is a linear-memory load/store to the CPU state
-  struct (`rv64-jit` `push_reg`/`store_post`); the xorshift loop does ~8
-  memory ops/iteration where v86 does zero. Cache the GPRs a block touches in
-  `i64` wasm locals (v86's `register_locals`): prologue loads read-regs →
-  locals; `push_reg`→`local.get`, `store_post`→`local.set`; **every exit and
-  every mid-block bail** flushes dirty locals → state (the interpreter reads
-  state). Moderate effort, large ALU win.
+- [x] **3a. Phase 1 — registers in wasm locals** *(done 2026-07-23)* — GPRs a
+  block touches live in `i64` wasm locals (`scan_regs` finds them; prologue
+  loads, `push_reg`→`local.get`/`store_post`→`local.set`, every exit and bail
+  flushes dirty locals → state). Standalone ~neutral by design (prologue/
+  epilogue ran per dispatch); the multiplier is Phase 3.
 
-- [ ] **3b. Phase 2 — FP ops inside JIT blocks** — FP currently *ends* the
-  block, so FP-heavy code gets ~0% coverage (half the mixed workload). Emit
-  wasm `f32/f64` ops under the interpreter's sticky-NX/RNE eligibility guard
-  (`cpu.rs fp_fast64/32`; JitLayout needs `fcsr_addr` + `f_base`), cache FPRs
-  in `f64` locals, bail otherwise. Easier for us than for v86 (no x87).
-  Differentially fuzz blocks against softfp like the interpreter fast path.
+- [x] **3c. Phase 3 — compile self-loops as one wasm function** *(done
+  2026-07-23)* — `detect_self_loop` spots a straight-line ALU body ending in a
+  branch back to start_pc and compiles it as one wasm `loop` (ITER counter +
+  LOOP_CAP safety yield; dynamic retired count via RETIRED_CELL). Registers
+  stay in locals across all iterations; the back-edge is a wasm `br_if`, no
+  dispatch. V8 then compiles the loop near-native. **Phase 1+3 result: pure
+  ALU went from 17.5× SLOWER than v86 to 0.5× — 2× FASTER — at 100% coverage,
+  62× over our own interpreter.** Measured by `tests/vs-v86/bench-jit*.mjs`.
 
-- [ ] **3c. Phase 3 — compile loops/regions as one wasm function** *(the
-  architectural leap, highest ceiling)* — today each basic block is its own
-  wasm function and a hot loop re-`call_indirect`s through the Rust dispatcher
-  every iteration, so V8 can't optimize across the back-edge and locals get
-  flushed/reloaded each time. Structure a hot region/loop into a single wasm
-  function with internal control flow (wasm `loop`/`br`), like v86's
-  `control_flow.rs` (SCC → Loop/Block/Dispatcher). Combined with Phase 1 this
-  keeps registers in locals across iterations → V8 JITs the loop near-native.
+- [x] **3b. Phase 2 — FP arithmetic + FMV inside JIT blocks** *(done
+  2026-07-23)* — FADD/FSUB/FMUL/FDIV.D and FMV.D.X/FMV.X.D emitted as inline
+  wasm `f64` ops under a runtime eligibility (rm==RNE, sticky-NX) + result-
+  normal guard, bailing to softfloat otherwise (FP regs stay in memory).
+  **Straight-line FP loop: 0%→73% coverage, 3.0× over interpreter.** But the
+  realistic mixed workload barely moves (still ~10× v86) — see below.
+
+- [ ] **3d. Remaining v86 gap — general loop-CFG + FP-in-locals** *(the last
+  step)* — branchy FP loops (the mixed benchmark: `if(f0>1e6)…`) fragment into
+  tiny blocks re-dispatched per iteration, so Phase 2's inline FP barely helps
+  (15% coverage). To match v86 here we need (1) to compile a loop WITH internal
+  control flow into one wasm function — v86's `control_flow.rs` SCC → Loop/
+  Block/Dispatcher structuring, generalising Phase 3's straight-line-only
+  self-loop — and (2) FP registers cached in `f64` locals (Phase 1 for FP),
+  and FP compares (FLT/FLE/FEQ) emitted inline. Largest remaining item.
 
 - [ ] **4. (Optional) residual-based flag recovery** — extend the FP fast
   path to work before NX is set, via error-free transformations (TwoSum
