@@ -374,12 +374,16 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                 }
             };
             call_block(b.idx, m as *mut _ as *mut u8);
-            m.cpu.insn_count += b.n as u64;
+            // Read the dynamic retired count the block wrote: self-loop blocks
+            // (Phase 3) run a runtime-variable number of iterations, so their
+            // length is not the static b.n.
+            let retired = unsafe { RETIRED_CELL };
+            m.cpu.insn_count += retired;
             unsafe {
-                JIT_RETIRED += b.n as u64;
+                JIT_RETIRED += retired;
                 JIT_DISPATCHES += 1;
             }
-            remaining = remaining.saturating_sub(b.n as u64);
+            remaining = remaining.saturating_sub(retired);
             chained += 1;
             if remaining == 0 {
                 return STOP_BUDGET;

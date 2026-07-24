@@ -24,6 +24,9 @@ use rv64_core::decode::*;
 use wasm_emit::*;
 
 const MAX_BLOCK: usize = 128;
+/// Max iterations a compiled self-loop runs per block call before yielding to
+/// the dispatcher (so an infinite guest loop still honours budget/interrupts).
+const LOOP_CAP: u64 = 1 << 24;
 // Scratch locals (local 0 is the state-pointer parameter).
 // SCR/SCR+1 are the general ALU scratch pair used by JALR etc.; the
 // memory path uses named i64 locals VA/PAGE/PA/VAL plus one i32 local IDXB.
@@ -32,10 +35,11 @@ const VA: u32 = 1;
 const PAGE: u32 = 2;
 const PA: u32 = 3;
 const VAL: u32 = 4;
-/// i32 local (declared after the i64 locals).
-const IDXB: u32 = 5;
-/// Total i64 scratch locals to declare.
-const N_I64_LOCALS: u32 = 4;
+/// Loop-iteration counter (Phase 3 self-loop compilation).
+const ITER: u32 = 5;
+/// Total i64 scratch locals to declare (register locals follow at 6+; the
+/// i32 IDXB local follows all i64 locals, so its index is dynamic).
+const N_I64_LOCALS: u32 = 5;
 
 /// Full-system memory access layout: emitted loads/stores probe the
 /// interpreter's own Load/Store TLBs inline; on a hit within guest RAM
@@ -406,6 +410,55 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
     (read, write)
 }
 
+/// If the block at `start_pc` is a simple self-loop — a straight-line run of
+/// ALU/LUI ops (no memory, no jumps, no FP/system) ending in a conditional
+/// branch back to `start_pc` — return the instruction count per iteration.
+/// Such a loop can be compiled into one wasm `loop` (Phase 3) so the register
+/// locals stay live across iterations instead of being flushed per dispatch.
+fn detect_self_loop(code: &[u8], base: u64, start_pc: u64) -> Option<u32> {
+    let mut pc = start_pc;
+    let mut n = 0u32;
+    while n < MAX_BLOCK as u32 {
+        let (insn, ilen) = fetch(code, base, pc)?;
+        match opcode(insn) {
+            0x37 | 0x17 | 0x13 => {}
+            0x33 => {
+                if !matches!(
+                    (funct7(insn), funct3(insn)),
+                    (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0)
+                ) {
+                    return None;
+                }
+            }
+            0x1b => {
+                if !matches!(funct3(insn), 0 | 1 | 5) {
+                    return None;
+                }
+            }
+            0x3b => {
+                if !matches!((funct7(insn), funct3(insn)), (0x00, 0) | (0x20, 0) | (0x01, 0)) {
+                    return None;
+                }
+            }
+            0x63 => {
+                if !matches!(funct3(insn), 0 | 1 | 4 | 5 | 6 | 7) {
+                    return None;
+                }
+                let target = pc.wrapping_add(imm_b(insn) as u64);
+                return if target == start_pc && n > 0 {
+                    Some(n + 1) // body instructions + the branch
+                } else {
+                    None
+                };
+            }
+            _ => return None,
+        }
+        pc = pc.wrapping_add(ilen);
+        n += 1;
+    }
+    None
+}
+
 /// Translate one basic block starting at `pc`. `code` is the guest code
 /// bytes and `base` its guest address. Returns None if the very first
 /// instruction isn't translatable (caller interprets it instead).
@@ -443,6 +496,32 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
             .i64_load(lay.x_base as u64 + r as u64 * 8)
             .local_set(reg_local[r]);
     }
+
+    // Phase 3: user-mode self-loop → wrap the body in one wasm `loop` so the
+    // register locals persist across iterations (no per-iteration dispatch,
+    // prologue, or epilogue). The terminating branch becomes the loop back-edge.
+    let self_loop = if lay.mem.is_some() {
+        detect_self_loop(code, base, start_pc)
+    } else {
+        None
+    };
+    if let Some(body_n) = self_loop {
+        m.i64_const(0).local_set(ITER);
+        m.op(LOOP).op(VOID); // $L (branch depth 0)
+        // Iteration cap → yield to the dispatcher, resuming at start_pc.
+        m.local_get(ITER).i64_const(LOOP_CAP as i64).op(I64_GE_U);
+        m.op(IF).op(VOID);
+        c.flush_writes(&mut m);
+        c.set_pc_const(&mut m, start_pc);
+        m.i32_const(0)
+            .local_get(ITER)
+            .i64_const(body_n as i64)
+            .op(I64_MUL)
+            .i64_store(lay.retired_addr as u64);
+        m.op(RETURN);
+        m.op(END); // close cap IF
+    }
+
     let mut pc = start_pc;
     let mut n = 0u32;
 
@@ -748,6 +827,31 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     7 => I64_GE_U,
                     _ => break, // before any stack pushes — stream stays balanced
                 };
+                // Phase 3: the back-branch of a compiled self-loop becomes the
+                // wasm loop back-edge (br_if $L), keeping registers in locals.
+                if let Some(body_n) = self_loop {
+                    if target == start_pc {
+                        // count this iteration, then loop back if the branch is taken
+                        m.local_get(ITER).i64_const(1).op(I64_ADD).local_set(ITER);
+                        c.push_reg(&mut m, s1);
+                        c.push_reg(&mut m, s2);
+                        m.op(cmp);
+                        m.br_if(0); // -> $L (loop top)
+                        m.op(END); // close loop $L (fall through = branch not taken = exit)
+                        c.flush_writes(&mut m);
+                        c.set_pc_const(&mut m, next_pc);
+                        m.i32_const(0)
+                            .local_get(ITER)
+                            .i64_const(body_n as i64)
+                            .op(I64_MUL)
+                            .i64_store(lay.retired_addr as u64);
+                        return Some(Block {
+                            wasm: m.finish(),
+                            len: next_pc - start_pc,
+                            n_insns: body_n,
+                        });
+                    }
+                }
                 c.push_reg(&mut m, s1);
                 c.push_reg(&mut m, s2);
                 m.op(cmp);
