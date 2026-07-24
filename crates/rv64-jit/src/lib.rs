@@ -153,6 +153,12 @@ struct Ctx {
     fp_local: [u32; 32],
     /// FP registers written anywhere in the block (flushed to state on exit).
     fp_write_mask: u32,
+    /// When a mid-block bail should report the retired count from a runtime
+    /// local (the loop's ITER accumulator) rather than a compile-time constant.
+    /// Set for compiled loops: an iteration count that can reach millions must
+    /// be reported accurately or the system-mode kernel clock (derived from
+    /// insn_count) stalls. `None` for basic blocks (retired == static index).
+    retired_local: Option<u32>,
 }
 
 impl Ctx {
@@ -354,11 +360,16 @@ impl Ctx {
     }
 
     /// Bail out of the block at instruction index `n` (retired so far),
-    /// leaving pc at `pc` for the interpreter to resume.
+    /// leaving pc at `pc` for the interpreter to resume. Inside a compiled
+    /// loop the true retired count is the runtime ITER accumulator, not `n`.
     fn bail(&self, m: &mut WasmModule, pc: u64, n: u32) {
         self.flush_writes(m);
         self.set_pc_const(m, pc);
-        self.set_retired(m, n);
+        if let Some(l) = self.retired_local {
+            m.i32_const(0).local_get(l).i64_store(self.lay.retired_addr as u64);
+        } else {
+            self.set_retired(m, n);
+        }
         m.op(RETURN);
     }
 
@@ -630,7 +641,12 @@ struct LoopRegion {
 /// register file is present. Returns None for anything not provably structured
 /// (the caller then compiles a plain basic block).
 fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option<LoopRegion> {
-    lay.mem?; // user-mode direct memory only
+    // Compile loops for user-mode (flat memory) or system-mode (inline TLB).
+    // System memory ops can bail mid-iteration; the compiled loop handles that
+    // (flush locals, set pc, report ITER-retired, return) — see translate_loop.
+    if lay.mem.is_none() && lay.sys.is_none() {
+        return None;
+    }
     // Pass A: linear walk to the back-edge that closes the outermost loop,
     // collecting every conditional branch. Every instruction must be handled.
     let mut branches: Vec<(u64, u64, u64)> = Vec::new(); // (pc, target, next)
@@ -869,6 +885,7 @@ fn build_ctx(
         idxb: N_I64_LOCALS + n_reg + n_fp + 1, // i32 local after all i64 locals
         fp_local,
         fp_write_mask: fp_write,
+        retired_local: None,
     };
     let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp, 1);
     let mut t = touched;
@@ -1188,10 +1205,13 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     // Structured loop region (nested loops + forward if-then/break) → compile
     // the whole thing as one wasm function so register locals persist across
     // every iteration of every level (3e-2 / v86 control-flow structuring).
-    if lay.mem.is_some() {
+    if lay.mem.is_some() || lay.sys.is_some() {
         if let Some(region) = loop_region(code, base, start_pc, &lay) {
             let (rm, wm, fr, fw) = scan_regs_region(code, base, start_pc, region.end_pc, &lay);
-            let (c, m) = build_ctx(lay, rm, wm, fr, fw);
+            let (mut c, m) = build_ctx(lay, rm, wm, fr, fw);
+            // Mid-loop bails (system TLB miss/MMIO, FP fast-path) must report the
+            // live iteration count, not a static index — see Ctx::retired_local.
+            c.retired_local = Some(ITER);
             if let Some(b) = translate_loop(m, &c, code, base, start_pc, &region, &lay) {
                 return Some(b);
             }
