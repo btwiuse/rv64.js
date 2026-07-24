@@ -1,8 +1,12 @@
 // FULL PERFORMANCE SCORECARD — rv64.js vs copy/v86, one command.
 //
-// Runs the whole benchmark suite (system-mode, the only fair basis vs v86 —
-// v86 has no user mode) and prints ONE table, then writes a timestamped
-// scorecard-<ts>.md + .json so before/after perf work is directly comparable.
+// SYSTEM EMULATION ONLY: both emulators boot a FULL Linux and run every
+// benchmark inside the guest. v86 has no user mode; comparing our user mode
+// against v86's system mode was a past mistake — never do it again. The bar
+// (user directive): rv64 must WIN or MATCH v86 on EVERY row, including every
+// individual nbench kernel. Prints ONE table with a per-row verdict and a
+// pass count, then writes a timestamped scorecard-<ts>.md + .json so
+// before/after perf work is directly comparable.
 //
 //   ARTIFACTS=<artifacts> nix develop -c node tests/vs-v86/scorecard.mjs
 //   FULL=1     include interpreter columns + JIT-over-interp (slow)
@@ -198,25 +202,57 @@ if (WANT_NBENCH && (await has(join(ARTIFACTS, "root-nbench.bin")))) {
 }
 
 // ---------- render ----------
+// The bar: rv64 must WIN or MATCH v86 on EVERY row (main benchmarks AND every
+// individual nbench kernel — no hiding losses inside a "mixed" summary).
+// Speed ratio is uniform across units: >1 = rv64 faster. MATCH allows 5%
+// (this host has documented double-digit run-to-run noise; verify borderline
+// rows with interleaved median-of-N, never a single run).
 const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 const ms = (x) => (x == null ? "—" : `${Math.round(x)}ms`);
-const ratio = (r) => (r?.rvj && r?.v8j ? (r.rvj / r.v8j).toFixed(2) + "× " + (r.rvj < r.v8j ? "rv64" : "v86") : "—");
 const speedup = (r) => (r?.rvi && r?.rvj ? (r.rvi / r.rvj).toFixed(1) + "×" : "—");
 const order = ["ALU", "Mixed", "Boot", "python fib(30)", "compile (tcc -c)"];
-let md = `# rv64.js vs v86 — performance scorecard\n\n_${ts}, system-mode, host wall-clock. Ratio = rv64 JIT vs v86 JIT (lower rv64 = rv64 faster)._\n\n`;
-md += `| Benchmark | rv64 interp | rv64 JIT | v86 interp | v86 JIT | rv64 JIT/interp | rv64 vs v86 JIT |\n|---|--:|--:|--:|--:|--:|--:|\n`;
-for (const k of order) { const r = R[k]; if (!r) continue; md += `| ${k} | ${ms(r.rvi)} | ${ms(r.rvj)} | ${ms(r.v8i)} | ${ms(r.v8j)} | ${speedup(r)} | ${ratio(r)} |\n`; }
-if (nb) {
-  // BYTEmark self-times iterations/sec (higher = faster); compare rv64 vs v86.
-  const nr = (a, b) => (a && b ? (a / b).toFixed(2) + "× " + (a > b ? "rv64" : "v86") : "—");
-  md += `\n**nbench (BYTEmark, iterations/sec, higher=better; ratio = rv64 JIT vs v86 JIT):**\n\n`;
-  md += `| Kernel | rv64 JIT | v86 JIT | rv64 vs v86 |${nb.int ? " rv64 interp |" : ""}\n|---|--:|--:|--:|${nb.int ? "--:|" : ""}\n`;
-  for (const k of Object.keys(nb.jit)) {
-    const rj = nb.jit[k], vj = nb.v8?.[k];
-    md += `| ${k} | ${rj ?? "—"} | ${vj ?? "—"} | ${nr(rj, vj)} |${nb.int ? ` ${nb.int[k] ?? "—"} |` : ""}\n`;
-  }
+
+// unified verdict rows: {name, rv, v8, unit, speed} with speed = rv64/v86 (>1 = rv64 faster)
+const rows = [];
+for (const k of order) {
+  const r = R[k]; if (!r) continue;
+  rows.push({ name: k, rv: ms(r.rvj), v8: ms(r.v8j), speedup: speedup(r),
+              speed: r.rvj && r.v8j ? r.v8j / r.rvj : null });
+}
+if (nb) for (const k of Object.keys(nb.jit)) {
+  const rj = nb.jit[k], vj = nb.v8?.[k];
+  rows.push({ name: `nbench ${k}`, rv: rj ?? "—", v8: vj ?? "—", speedup: "—",
+              speed: rj && vj ? rj / vj : null }); // iterations/sec: higher = faster
+}
+const verdict = (s) => s == null ? "—" : s >= 1.05 ? `**WIN** ${s.toFixed(2)}×` : s >= 0.95 ? `**MATCH** ${s.toFixed(2)}×` : `LOSS ${(1 / s).toFixed(2)}× behind`;
+const passing = rows.filter((r) => r.speed != null && r.speed >= 0.95);
+const scored = rows.filter((r) => r.speed != null);
+const failing = scored.filter((r) => r.speed < 0.95);
+
+let md = `# rv64.js vs v86 — SYSTEM-EMULATION scorecard
+
+**SYSTEM EMULATION ONLY.** Both emulators boot a **full Linux** and run every
+benchmark **inside the guest** (kernel + userland, JIT vs JIT, host wall-clock
+or in-guest self-timing). v86 has no user mode — a user-mode comparison is
+meaningless and was a past mistake; nothing user-mode appears in this table.
+
+_${ts}. Speed ratio is rv64/v86 (>1 = rv64 faster). The bar: WIN or MATCH on
+EVERY row. MATCH = within 5% (host noise; confirm borderline rows with
+interleaved median-of-N runs)._
+
+| # | Benchmark | rv64 JIT | v86 JIT | verdict (speed vs v86) |
+|--:|---|--:|--:|---|
+`;
+rows.forEach((r, i) => { md += `| ${i + 1} | ${r.name} | ${r.rv} | ${r.v8} | ${verdict(r.speed)} |\n`; });
+md += `\n**Overall: ${passing.length}/${scored.length} rows at win-or-match.**`;
+md += failing.length ? ` Failing: ${failing.map((r) => `${r.name} (${(1 / r.speed).toFixed(1)}× behind)`).join(", ")}.\n` : ` ALL ROWS PASS.\n`;
+if (!nb) md += `\n_nbench kernels not run (set NBENCH=1) — the bar includes them; a scorecard without them is INCOMPLETE._\n`;
+if (FULL) {
+  md += `\n<details><summary>interpreter columns (FULL=1)</summary>\n\n| Benchmark | rv64 interp | v86 interp | rv64 JIT/interp |\n|---|--:|--:|--:|\n`;
+  for (const k of order) { const r = R[k]; if (!r) continue; md += `| ${k} | ${ms(r.rvi)} | ${ms(r.v8i)} | ${speedup(r)} |\n`; }
+  md += `\n</details>\n`;
 }
 console.log("\n" + md);
 await writeFile(join(ARTIFACTS, `scorecard-${ts}.md`), md);
-await writeFile(join(ARTIFACTS, `scorecard-${ts}.json`), JSON.stringify({ ts, results: R, nbench: nb }, null, 2));
+await writeFile(join(ARTIFACTS, `scorecard-${ts}.json`), JSON.stringify({ ts, system_emulation: true, results: R, nbench: nb, pass: `${passing.length}/${scored.length}` }, null, 2));
 console.log(`saved ${join(ARTIFACTS, `scorecard-${ts}.md`)} (+ .json)`);
