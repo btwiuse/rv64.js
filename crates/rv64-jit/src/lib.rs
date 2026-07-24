@@ -147,6 +147,12 @@ struct Ctx {
     write_mask: u32,
     /// Dynamic index of the i32 IDXB scratch local (shifts with n_reg locals).
     idxb: u32,
+    /// Per-FP-register i64 local index, or 0 (= not cached, use memory). Same
+    /// scheme as reg_local but for f[0..31] (raw 64-bit bits, no NaN issues:
+    /// FP arith reinterprets to f64 and back).
+    fp_local: [u32; 32],
+    /// FP registers written anywhere in the block (flushed to state on exit).
+    fp_write_mask: u32,
 }
 
 impl Ctx {
@@ -182,9 +188,33 @@ impl Ctx {
         }
     }
 
-    /// Flush every block-written register local back to the CPU state struct.
-    /// Precedes every block exit and mid-block bail so the interpreter (which
-    /// reads registers from state) sees current values.
+    /// Read FP register f[r] (cached local or memory).
+    fn push_freg(&self, m: &mut WasmModule, r: usize) {
+        if self.fp_local[r] != 0 {
+            m.local_get(self.fp_local[r]);
+        } else {
+            m.i32_const(0).i64_load(self.lay.f_base as u64 + r as u64 * 8);
+        }
+    }
+
+    /// Push the memory-store address for f[r] if it isn't cached in a local.
+    fn store_freg_pre(&self, m: &mut WasmModule, r: usize) {
+        if self.fp_local[r] == 0 {
+            m.i32_const(0);
+        }
+    }
+
+    fn store_freg_post(&self, m: &mut WasmModule, r: usize) {
+        if self.fp_local[r] != 0 {
+            m.local_set(self.fp_local[r]);
+        } else {
+            m.i64_store(self.lay.f_base as u64 + r as u64 * 8);
+        }
+    }
+
+    /// Flush every block-written register local (GPR and FP) back to the CPU
+    /// state struct. Precedes every block exit and mid-block bail so the
+    /// interpreter (which reads registers from state) sees current values.
     fn flush_writes(&self, m: &mut WasmModule) {
         let mut w = self.write_mask;
         while w != 0 {
@@ -194,6 +224,16 @@ impl Ctx {
                 m.i32_const(0)
                     .local_get(self.reg_local[r])
                     .i64_store(self.lay.x_base as u64 + r as u64 * 8);
+            }
+        }
+        let mut w = self.fp_write_mask;
+        while w != 0 {
+            let r = w.trailing_zeros() as usize;
+            w &= w - 1;
+            if self.fp_local[r] != 0 {
+                m.i32_const(0)
+                    .local_get(self.fp_local[r])
+                    .i64_store(self.lay.f_base as u64 + r as u64 * 8);
             }
         }
     }
@@ -207,7 +247,6 @@ impl Ctx {
     /// flushed by bail. `op`: 0=add 1=sub 2=mul 3=div. `dyn_rm`: rm field is
     /// 0b111 (dynamic) so we must also check frm==RNE at runtime.
     fn fp_arith_d(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, d: usize, dyn_rm: bool, pc: u64, n: u32) {
-        let f = self.lay.f_base as u64;
         let fcsr = self.lay.fcsr_addr as u64;
         // Eligibility: bail if NX not set (fcsr&1==0) — or, for dynamic rm,
         // if frm != RNE ((fcsr>>5)&7 != 0).
@@ -227,8 +266,10 @@ impl Ctx {
         self.bail(m, pc, n);
         m.op(END);
         // r = f[s1] <op> f[s2]  (as f64), reinterpreted back to i64 bits.
-        m.i32_const(0).i64_load(f + s1 as u64 * 8).op(F64_REINTERPRET_I64);
-        m.i32_const(0).i64_load(f + s2 as u64 * 8).op(F64_REINTERPRET_I64);
+        self.push_freg(m, s1);
+        m.op(F64_REINTERPRET_I64);
+        self.push_freg(m, s2);
+        m.op(F64_REINTERPRET_I64);
         m.op(match op {
             0 => F64_ADD,
             1 => F64_SUB,
@@ -251,7 +292,9 @@ impl Ctx {
         self.bail(m, pc, n);
         m.op(END);
         // f[d] = r
-        m.i32_const(0).local_get(VAL).i64_store(f + d as u64 * 8);
+        self.store_freg_pre(m, d);
+        m.local_get(VAL);
+        self.store_freg_post(m, d);
     }
 
     /// Emit a double-precision FP compare (FLE/FLT/FEQ.D) as an inline wasm
@@ -259,11 +302,9 @@ impl Ctx {
     /// interpreter if either operand is inf/nan (the exact-flag/NV cases);
     /// finite operands compare exactly with no flag change.
     fn fp_cmp_d(&self, m: &mut WasmModule, f3: u32, s1: usize, s2: usize, d: usize, pc: u64, n: u32) {
-        let f = self.lay.f_base as u64;
         for &s in &[s1, s2] {
-            m.i32_const(0)
-                .i64_load(f + s as u64 * 8)
-                .i64_const(52)
+            self.push_freg(m, s);
+            m.i64_const(52)
                 .op(I64_SHR_U)
                 .i64_const(0x7ff)
                 .op(I64_AND)
@@ -274,8 +315,10 @@ impl Ctx {
             m.op(END);
         }
         if self.store_pre(m, d) {
-            m.i32_const(0).i64_load(f + s1 as u64 * 8).op(F64_REINTERPRET_I64);
-            m.i32_const(0).i64_load(f + s2 as u64 * 8).op(F64_REINTERPRET_I64);
+            self.push_freg(m, s1);
+            m.op(F64_REINTERPRET_I64);
+            self.push_freg(m, s2);
+            m.op(F64_REINTERPRET_I64);
             m.op(match f3 {
                 0 => F64_LE,
                 1 => F64_LT,
@@ -412,10 +455,14 @@ impl Ctx {
 /// Pre-scan a block — walking and terminating exactly like `translate_block`
 /// — to collect which guest registers it reads and writes, as 32-bit bitmaps.
 /// Used to decide which registers to cache in wasm locals.
-fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u32) {
+/// Returns (gpr_read, gpr_write, fp_read, fp_write) register bitmaps.
+fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u32, u32, u32) {
     let (mut read, mut write) = (0u32, 0u32);
+    let (mut fread, mut fwrite) = (0u32, 0u32);
     let mut pc = start_pc;
     let mut n = 0u32;
+    // FP registers: f0 is a real register (no hardwired-zero), so mark it too.
+    let fmark = |m: &mut u32, r: usize| *m |= 1 << r;
     let mark = |m: &mut u32, r: usize| {
         if r != 0 {
             *m |= 1 << r;
@@ -501,10 +548,25 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
             0x53 if lay.f_base != 0 => {
                 let f7 = funct7(insn);
                 match (f7 >> 2, f7 & 3, funct3(insn)) {
-                    (0..=3, 1, 0 | 7) => {}
-                    (0x14, 1, 0..=2) => mark(&mut write, d), // FLE/FLT/FEQ -> x[d]
-                    (0x1e, 1, 0) => mark(&mut read, s1),
-                    (0x1c, 1, 0) => mark(&mut write, d),
+                    (0..=3, 1, 0 | 7) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x14, 1, 0..=2) => {
+                        // FLE/FLT/FEQ: read FP s1,s2 -> write GPR x[d]
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        mark(&mut write, d);
+                    }
+                    (0x1e, 1, 0) => {
+                        mark(&mut read, s1); // FMV.D.X: x[s1] -> f[d]
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x1c, 1, 0) => {
+                        fmark(&mut fread, s1); // FMV.X.D: f[s1] -> x[d]
+                        mark(&mut write, d);
+                    }
                     _ => break,
                 }
             }
@@ -513,7 +575,7 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
         pc = next_pc;
         n += 1;
     }
-    (read, write)
+    (read, write, fread, fwrite)
 }
 
 /// Is `f7`/`f3` a FP op the JIT emits inline (arith / compare / FMV)?
@@ -616,9 +678,11 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     // Pass 1: find which guest registers the block reads/writes, so we can
     // cache them in wasm locals (v86-style register allocation) instead of
     // round-tripping every access through the CPU state struct in memory.
-    let (read_mask, write_mask) = scan_regs(code, base, start_pc, &lay);
+    let (read_mask, write_mask, fp_read, fp_write) = scan_regs(code, base, start_pc, &lay);
     let touched = read_mask | write_mask;
-    // Assign an i64 local (index 5, 6, ...) to each touched register.
+    let fp_touched = fp_read | fp_write;
+    // Assign i64 locals: GPRs first (index 6+), then FP registers, then the
+    // i32 IDXB. All follow the fixed scratch locals (VA/PAGE/PA/VAL/ITER).
     let mut reg_local = [0u32; 32];
     let mut n_reg = 0u32;
     for r in 1..32 {
@@ -627,17 +691,25 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
             n_reg += 1;
         }
     }
+    let mut fp_local = [0u32; 32];
+    let mut n_fp = 0u32;
+    for r in 0..32 {
+        if fp_touched & (1 << r) != 0 {
+            fp_local[r] = N_I64_LOCALS + 1 + n_reg + n_fp;
+            n_fp += 1;
+        }
+    }
     let c = Ctx {
         lay,
         reg_local,
         write_mask,
-        idxb: N_I64_LOCALS + n_reg + 1, // i32 local sits after all i64 locals
+        idxb: N_I64_LOCALS + n_reg + n_fp + 1, // i32 local after all i64 locals
+        fp_local,
+        fp_write_mask: fp_write,
     };
-    // 4 i64 scratch (VA/PAGE/PA/VAL) + n_reg register locals + 1 i32 (IDXB).
-    let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg, 1);
-    // Prologue: load each touched register from the state struct into its
-    // local. (Write-only regs are loaded too, so a mid-block bail can safely
-    // flush the whole write-set.)
+    let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp, 1);
+    // Prologue: load each touched GPR and FP register from state into its local
+    // (write-only regs too, so a mid-block bail can flush the whole write-set).
     let mut t = touched;
     while t != 0 {
         let r = t.trailing_zeros() as usize;
@@ -645,6 +717,14 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
         m.i32_const(0)
             .i64_load(lay.x_base as u64 + r as u64 * 8)
             .local_set(reg_local[r]);
+    }
+    let mut t = fp_touched;
+    while t != 0 {
+        let r = t.trailing_zeros() as usize;
+        t &= t - 1;
+        m.i32_const(0)
+            .i64_load(lay.f_base as u64 + r as u64 * 8)
+            .local_set(fp_local[r]);
     }
 
     // Phase 3 / 3d-2: user-mode structured self-loop → wrap the body in one
@@ -1052,7 +1132,6 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
             0x53 if lay.f_base != 0 => {
                 let f7 = funct7(insn);
                 let (fmt, fpop, f3) = (f7 & 3, f7 >> 2, funct3(insn));
-                let fb = lay.f_base as u64;
                 match (fpop, fmt, f3) {
                     // FADD/FSUB/FMUL/FDIV.D (static RNE or dynamic rounding)
                     (0..=3, 1, 0 | 7) => c.fp_arith_d(&mut m, fpop, s1, s2, d, f3 == 7, pc, n),
@@ -1060,14 +1139,14 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     (0x14, 1, 0..=2) => c.fp_cmp_d(&mut m, f3, s1, s2, d, pc, n),
                     // FMV.D.X: f[d] = x[s1] (raw 64-bit copy)
                     (0x1e, 1, 0) => {
-                        m.i32_const(0);
+                        c.store_freg_pre(&mut m, d);
                         c.push_reg(&mut m, s1);
-                        m.i64_store(fb + d as u64 * 8);
+                        c.store_freg_post(&mut m, d);
                     }
                     // FMV.X.D: x[d] = f[s1] (raw 64-bit copy)
                     (0x1c, 1, 0) => {
                         if c.store_pre(&mut m, d) {
-                            m.i32_const(0).i64_load(fb + s1 as u64 * 8);
+                            c.push_freg(&mut m, s1);
                             c.store_post(&mut m, d);
                         }
                     }
