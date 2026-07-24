@@ -519,6 +519,22 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 mark(&mut read, s1);
                 mark(&mut read, s2);
             }
+            // FLD / FSD (double, funct3==3): raw 8-byte copy mem<->f[]. User-
+            // mode only (needs f_base for the FP file; loop-opt is user-mode).
+            0x07 if lay.mem.is_some() && lay.f_base != 0 => {
+                if funct3(insn) != 3 {
+                    break;
+                }
+                mark(&mut read, s1);
+                fmark(&mut fwrite, d);
+            }
+            0x27 if lay.mem.is_some() && lay.f_base != 0 => {
+                if funct3(insn) != 3 {
+                    break;
+                }
+                mark(&mut read, s1);
+                fmark(&mut fread, s2);
+            }
             0x6f => {
                 mark(&mut write, d);
                 let target = pc.wrapping_add(imm_j(insn) as u64);
@@ -635,6 +651,12 @@ fn detect_structured_loop(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout
             }
             0x23 if lay.mem.is_some() => {
                 if funct3(insn) > 3 {
+                    return None;
+                }
+            }
+            // FLD / FSD (double) — inline in user-mode loops (see translate).
+            0x07 | 0x27 if lay.mem.is_some() && lay.f_base != 0 => {
+                if funct3(insn) != 3 {
                     return None;
                 }
             }
@@ -1008,6 +1030,34 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     c.push_reg(&mut m, s2);
                     m.op(store_op).raw_uleb(len_align(len)).raw_uleb(0);
                 }
+            }
+            // FLD: f[d] = mem[x[s1]+imm] (double). Raw 8-byte copy, bit-exact,
+            // no rounding/NaN concerns. User-mode direct access only.
+            0x07 if lay.mem.is_some() && lay.f_base != 0 => {
+                if funct3(insn) != 3 {
+                    break;
+                }
+                let (mem_base, size) = lay.mem.unwrap();
+                c.push_reg(&mut m, s1);
+                m.i64_const(imm_i(insn)).op(I64_ADD);
+                c.guest_addr(&mut m, size, 8); // i32 index, traps OOB
+                m.op(I64_LOAD).raw_uleb(len_align(8)).raw_uleb(mem_base as u64);
+                m.local_set(VAL);
+                c.store_freg_pre(&mut m, d);
+                m.local_get(VAL);
+                c.store_freg_post(&mut m, d);
+            }
+            // FSD: mem[x[s1]+imm] = f[s2] (double). Raw 8-byte copy.
+            0x27 if lay.mem.is_some() && lay.f_base != 0 => {
+                if funct3(insn) != 3 {
+                    break;
+                }
+                let (mem_base, size) = lay.mem.unwrap();
+                c.push_reg(&mut m, s1);
+                m.i64_const(imm_s(insn)).op(I64_ADD);
+                c.guest_addr(&mut m, size, 8); // i32 index
+                c.push_freg(&mut m, s2);
+                m.op(I64_STORE).raw_uleb(len_align(8)).raw_uleb(mem_base as u64);
             }
             // JAL: link; follow plain forward jumps (superblock chaining),
             // otherwise end the block with a constant pc.
