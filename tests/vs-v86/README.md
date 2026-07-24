@@ -30,6 +30,21 @@ The checksum printed by each run confirms every build does identical work
 (integer parts match bit-for-bit across x86/riscv64; the mixed FP checksum
 differs only by 32-bit-vs-64-bit rounding, with identical operation counts).
 
+## The scorecard (one command, full picture)
+
+`scorecard.mjs` runs the whole suite system-mode and prints **one table**, then
+saves a timestamped `scorecard-<ts>.md` + `.json` so before/after perf work is
+directly comparable. This is the entry point — use the individual harnesses
+below only for focused runs.
+
+```sh
+nix develop -c tests/vs-v86/setup.sh target/bench           # build artifacts (DEBIAN=1 for python)
+SC=target/bench nix develop -c node tests/vs-v86/scorecard.mjs   # + FULL=1 (interp), NBENCH=1 (BYTEmark)
+```
+
+It covers ALU, Mixed, Boot, python fib(30) (all with the v86 head-to-head) and
+optionally nbench (rv64 JIT-vs-interp). Needs a built `copy/v86` at `$SC/v86`.
+
 ## Automated setup (build everything once)
 
 `setup.sh` builds the wasm, the benchmark kernels, and the nbench rootfs into one
