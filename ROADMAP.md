@@ -64,14 +64,26 @@ with `tests/vs-v86` (baseline vs v86: ALU 50.5s vs 2.9s; mixed 17.1s vs 1.5s).
   **Straight-line FP loop: 0%→73% coverage, 3.0× over interpreter.** But the
   realistic mixed workload barely moves (still ~10× v86) — see below.
 
-- [ ] **3d. Remaining v86 gap — general loop-CFG + FP-in-locals** *(the last
-  step)* — branchy FP loops (the mixed benchmark: `if(f0>1e6)…`) fragment into
-  tiny blocks re-dispatched per iteration, so Phase 2's inline FP barely helps
-  (15% coverage). To match v86 here we need (1) to compile a loop WITH internal
-  control flow into one wasm function — v86's `control_flow.rs` SCC → Loop/
-  Block/Dispatcher structuring, generalising Phase 3's straight-line-only
-  self-loop — and (2) FP registers cached in `f64` locals (Phase 1 for FP),
-  and FP compares (FLT/FLE/FEQ) emitted inline. Largest remaining item.
+- [x] **3d. Remaining v86 gap — general loop-CFG + FP-in-locals** *(done
+  2026-07-23)* — three sub-steps landed: **3d-1** FP compares (FLE/FLT/FEQ.D →
+  GPR) emitted inline under a NaN/inf guard; **3d-2** `detect_structured_loop`
+  generalises Phase 3's straight-line self-loop to a loop WITH internal control
+  flow — a body of ALU/FP/user-mem ops plus nested forward if-then branches
+  (negated-cond wasm `if`, closed at its target via a `pending_ifs` stack) and
+  a back-edge `br_if` — compiled into ONE wasm `loop` (v86's `control_flow.rs`
+  structuring, minus the SCC machinery we don't yet need); **3d-3** FP registers
+  cached in `i64` wasm locals (Phase 1 for FP), removing per-iteration FP memory
+  traffic. **Results:** the branchy FP loop went 0%→100% coverage; pure FP loops
+  34-36× over the interpreter (was 3×); the realistic mixed benchmark 15%→59%
+  coverage, ~11×→~6.6× v86. The residual mixed gap is the two documented gaps
+  below, not the loop-CFG or FP machinery.
+
+- [ ] **3e. Remaining mixed-benchmark coverage (59%→higher)** — two structural
+  gaps keep the mixed workload from full coverage: (1) **nested while-loops**
+  (the integer insertion-sort inner loop) — `detect_structured_loop` handles
+  one loop level with forward if-then bodies but not a loop nested in a loop;
+  (2) **FP loads/stores** (FLD/FSD, opcodes 0x07/0x27) inside compiled blocks —
+  currently end the block. Both are additive to the 3d machinery.
 
 - [ ] **4. (Optional) residual-based flag recovery** — extend the FP fast
   path to work before NX is set, via error-free transformations (TwoSum
