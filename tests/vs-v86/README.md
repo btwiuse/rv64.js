@@ -73,6 +73,34 @@ FP width (riscv64 double vs i386 SSE rounding), same integer operation counts.
   turned out to be an easier JIT target than x86 (no condition-flag machinery,
   fixed-width decode, clean IEEE F/D).
 
+## System mode — the comparison that counts (v86 has no user mode)
+
+v86 is a full-system emulator; it has no user mode. The fair comparison boots a
+full Linux on **both** sides and runs the same fixed-work kernel *inside the
+guest*, host-wall-clock timed between the guest's serial `BENCH_START` /
+`BENCH_DONE` markers. `compare-sys.mjs` is the driver:
+
+```sh
+SC=<scratchpad> nix develop -c node tests/vs-v86/compare-sys.mjs   # SKIP_INTERP=1 for JIT-only
+```
+
+Fresh run (2026-07-23, after roadmap item 3f ported the loop + FP JIT into
+system mode). **rv64.js's JIT beats v86's here too:**
+
+| Workload | rv64 interp | **rv64 JIT** | v86 interp | **v86 JIT** | rv64 JIT vs v86 JIT |
+|---|---:|---:|---:|---:|---:|
+| ALU | 78.8 s | **1.42 s** | 83.2 s | 2.79 s | **0.51× — 2.0× faster** |
+| Mixed | 22.1 s | **0.66 s** | 25.7 s | 1.41 s | **0.47× — 2.1× faster** |
+
+JIT over each emulator's own interpreter: ALU rv64 **56×** / v86 30×; mixed
+rv64 **34×** / v86 18×. Checksums cross-verify (ALU `0xf858aba6` on both; mixed
+low-32 `16c84da4` matches).
+
+Before 3f this was the reverse — v86 was ~10–12× ahead — because rv64.js's JIT
+wins (structured/nested loops, FP-in-blocks) were user-mode gated. 3f enabled
+them for system blocks (mid-loop bail reports the live iteration count; the
+system FP file drives FP-in-blocks), and now rv64.js leads v86 in *both* modes.
+
 ## Reproducing
 
 Everything runs through the nix dev shell. Build the benchmarks (into `$SC/xbench/`):
