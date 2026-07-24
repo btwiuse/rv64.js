@@ -78,12 +78,19 @@ with `tests/vs-v86` (baseline vs v86: ALU 50.5s vs 2.9s; mixed 17.1s vs 1.5s).
   coverage, ~11×→~6.6× v86. The residual mixed gap is the two documented gaps
   below, not the loop-CFG or FP machinery.
 
-- [ ] **3e. Remaining mixed-benchmark coverage (59%→higher)** — two structural
-  gaps keep the mixed workload from full coverage: (1) **nested while-loops**
-  (the integer insertion-sort inner loop) — `detect_structured_loop` handles
-  one loop level with forward if-then bodies but not a loop nested in a loop;
-  (2) **FP loads/stores** (FLD/FSD, opcodes 0x07/0x27) inside compiled blocks —
-  currently end the block. Both are additive to the 3d machinery.
+- [x] **3e. Full mixed-benchmark coverage — FP load/store + nested loops**
+  *(done 2026-07-23)* — closed both structural gaps: **3e-1** inline FLD/FSD
+  (double FP load/store, raw 8-byte bit-exact copies); **3e-2** a full
+  structured-CFG compiler (`loop_region` detect+validate, `translate_loop`
+  emit) that generalises 3d-2's single self-loop to **properly-nested natural
+  loops plus forward if-then and forward loop-exit (break)** — nested wasm
+  `block`+`loop` pairs with a scope stack computing `br` depths, exact
+  retired-instruction accounting. The triple-nested insertion sort (a `break`
+  out of the inner `while`) now compiles as one wasm function. **Mixed:
+  59%→100% coverage, ~11×→31× over our interpreter, and from ~11× SLOWER than
+  v86 to 2.5× FASTER.** Both benchmarks now beat v86 at 100% coverage (ALU 2×,
+  mixed 2.5× faster). jit==interp checksums identical; Linux still boots under
+  JIT. This closes the v86 performance gap that motivated items 3a–3e.
 
 - [ ] **4. (Optional) residual-based flag recovery** — extend the FP fast
   path to work before NX is set, via error-free transformations (TwoSum
