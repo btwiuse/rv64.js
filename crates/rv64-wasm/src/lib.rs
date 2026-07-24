@@ -240,6 +240,11 @@ struct JitState {
     /// Last observed cpu.jit_flush_gen; a change means the va→pa code
     /// mapping was invalidated (satp/SFENCE) — drop everything.
     flush_gen: u64,
+    /// Superblock compilation (v86's function-per-page): the hot block-entry
+    /// pcs discovered in each guest code page (keyed by virtual page base). When
+    /// a new entry appears the page's superblock is recompiled to cover it, and
+    /// every entry's `cache`/`dispatch` slot points at the one superblock.
+    page_entries: std::collections::HashMap<u64, Vec<u64>>,
 }
 
 impl JitState {
@@ -259,11 +264,13 @@ impl JitState {
                 DISPATCH_SIZE
             ],
             flush_gen: 0,
+            page_entries: Default::default(),
         }
     }
     fn clear(&mut self) {
         self.cache.clear();
         self.hot.clear();
+        self.page_entries.clear();
         self.clear_dispatch();
     }
     #[inline]
@@ -342,9 +349,24 @@ static mut SYS_WALLCLOCK: bool = false;
 pub extern "C" fn sys_set_wallclock(on: u32) {
     unsafe { SYS_WALLCLOCK = on != 0 }
 }
+/// Opt-in: fold branchy code pages into one superblock (function-per-page with
+/// an internal br_table dispatch). Correct and validated, but per-page
+/// granularity doesn't capture CPython's multi-page eval loop and the
+/// recompile-on-new-entry cost regresses short warmups — off until whole-
+/// function superblocks + incremental compilation land. See translate_superblock.
+static mut SYS_SUPERBLOCK: bool = false;
+#[no_mangle]
+pub extern "C" fn sys_set_superblock(on: u32) {
+    unsafe { SYS_SUPERBLOCK = on != 0 }
+}
 /// Max chained block dispatches before returning to the interpreter (keeps
 /// interrupt/budget latency bounded in fully-jitted loops).
 const JIT_CHAIN_CAP: u32 = 64;
+/// Once a code page accumulates this many hot NON-loop block entries it is
+/// branchy enough (e.g. an interpreter's dispatch loop) to compile as one
+/// superblock — one wasm function covering the whole page with an internal
+/// br_table dispatch and registers cached in locals across all blocks.
+const SUPERBLOCK_THRESHOLD: usize = 6;
 
 /// Call a compiled block. The state pointer parameter deliberately escapes
 /// the emulator state into the opaque call so the compiler reloads CPU
@@ -354,6 +376,46 @@ fn call_block(idx: i32, state_ptr: *mut u8) {
     unsafe {
         let f: extern "C" fn(i32) = core::mem::transmute(idx as usize);
         f(state_ptr as i32);
+    }
+}
+
+// Standalone superblock-emitter validation: compile the sum-1..10 loop as a
+// 2-entry superblock and run it; must return 55 (x1). Exercises the internal
+// br_table dispatch, register-in-locals across blocks, loop back-edge and exit.
+static mut SBSTATE: [u64; 40] = [0; 40];
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sbtest() -> u64 {
+    const PROG: [u32; 7] = [
+        0x00000093, 0x00100113, 0x00b00193, 0x002080b3, 0x00110113, 0xfe311ce3, 0x00000073,
+    ];
+    let code: Vec<u8> = PROG.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let base = 0x1000u64;
+    unsafe {
+        SBSTATE = [0; 40];
+        let sp = SBSTATE.as_ptr() as u32;
+        SBSTATE[32] = base; // pc
+        let lay = rv64_jit::JitLayout {
+            x_base: sp,
+            pc_addr: sp + 256,
+            mem: None,
+            sys: None,
+            retired_addr: sp + 264,
+            f_base: 0,
+            fcsr_addr: 0,
+        };
+        let entries = [0x1000u64, 0x100c];
+        let blk = match rv64_jit::translate_superblock(&code, base, 0x1000, 0x40, &entries, lay) {
+            Some(b) => b,
+            None => return 0xDEAD_0001,
+        };
+        JIT_OUT = blk.wasm;
+        let idx = host_jit_register();
+        if idx < 0 {
+            return 0xDEAD_0002;
+        }
+        call_block(idx, sp as *mut u8);
+        SBSTATE[1] // x1 == 55 if correct
     }
 }
 
@@ -589,6 +651,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 });
                 m.bus.jit_unmark_page(ppage);
             }
+            jit.page_entries.clear(); // re-discover superblock entries
             jit.clear_dispatch(); // stale lines may point at dropped blocks
         }
         // --- JIT fast path: direct-mapped dispatch + cheap pa-verify ---
@@ -659,58 +722,103 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         // --- hot counting + compile (from physical code bytes) ---
         let pc = m.cpu.pc;
         if !jit.cache.contains_key(&pc) {
-            let c = jit.hot.entry(pc).or_insert(0);
-            *c += 1;
-            if *c >= unsafe { JIT_THRESHOLD } {
-                let entry = m.cpu.jit_probe_fetch(&mut m.bus, pc).and_then(|pa| {
-                    if pa < rv64_system::RAM_BASE {
-                        return None;
+            let hot = {
+                let c = jit.hot.entry(pc).or_insert(0);
+                *c += 1;
+                *c
+            };
+            if hot >= unsafe { JIT_THRESHOLD } {
+                if let Some(pa) = m.cpu.jit_probe_fetch(&mut m.bus, pc) {
+                    if pa >= rv64_system::RAM_BASE {
+                        let (lt, ld, st, sd) = m.cpu.jit_tlb_ptrs();
+                        let sysmem = rv64_jit::SysMem {
+                            tlb_load_tag: lt as u32,
+                            tlb_load_diff: ld as u32,
+                            tlb_store_tag: st as u32,
+                            tlb_store_diff: sd as u32,
+                            tlb_mask: (rv64_core::Cpu::jit_tlb_size() - 1) as u32,
+                            ram_off: m.bus.ram.as_ptr() as u32,
+                            ram_base: rv64_system::RAM_BASE,
+                            ram_size: m.bus.ram.len() as u64,
+                            jit_pages_off: m.bus.jit_pages.as_ptr() as u32,
+                        };
+                        let lay = rv64_jit::JitLayout {
+                            x_base: m.cpu.x.as_ptr() as u32,
+                            pc_addr: &m.cpu.pc as *const u64 as u32,
+                            mem: None,
+                            sys: Some(sysmem),
+                            retired_addr: retired_addr(),
+                            f_base: m.cpu.f.as_ptr() as u32,
+                            fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
+                        };
+                        let vpage = pc & !0xfff;
+                        let pa_page = pa & !0xfff;
+                        let pa_page_off = (pa_page - rv64_system::RAM_BASE) as usize;
+                        let off = (pa - rv64_system::RAM_BASE) as usize;
+                        let end = ((off + 1024).min(off | 0xfff) + 1).min(m.bus.ram.len());
+                        // Superblock path (opt-in): loop headers stay individual
+                        // (tight wasm loop); non-loop pages accumulate entries and
+                        // upgrade to a page superblock once branchy enough.
+                        let (is_loop, n_entries) = if unsafe { SYS_SUPERBLOCK } {
+                            let il = rv64_jit::is_loop_at(&m.bus.ram[off..end], pc, pc, lay);
+                            let ne = if il {
+                                0
+                            } else {
+                                let e = jit.page_entries.entry(vpage).or_default();
+                                if let Err(i) = e.binary_search(&pc) {
+                                    e.insert(i, pc);
+                                }
+                                e.len()
+                            };
+                            (il, ne)
+                        } else {
+                            (false, 0)
+                        };
+
+                        if !is_loop
+                            && n_entries >= SUPERBLOCK_THRESHOLD
+                            && pa_page_off + 0x1000 <= m.bus.ram.len()
+                        {
+                            // Compile / recompile the page superblock covering
+                            // every hot entry, and point them all at it.
+                            let entries = jit.page_entries[&vpage].clone();
+                            let code = &m.bus.ram[pa_page_off..pa_page_off + 0x1000];
+                            let sb = rv64_jit::translate_superblock(
+                                code, vpage, vpage, 0x1000, &entries, lay,
+                            );
+                            if let Some(blk) = sb {
+                                unsafe { JIT_OUT = blk.wasm };
+                                let idx = unsafe { host_jit_register() };
+                                if idx >= 0 {
+                                    m.bus.jit_mark_page(pa);
+                                    for &e in &entries {
+                                        let epa = pa_page + (e - vpage);
+                                        let jb = JitBlock { idx, n: 0, pa: epa };
+                                        jit.cache.insert(e, Some(jb));
+                                        jit.dispatch[JitState::dslot(e)] =
+                                            DispatchLine { pc: e, blk: jb };
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Individual block (loop or pre-threshold non-loop).
+                        let blk = rv64_jit::translate_block(&m.bus.ram[off..end], pc, pc, lay);
+                        let entry = blk.and_then(|blk| {
+                            unsafe { JIT_OUT = blk.wasm };
+                            let idx = unsafe { host_jit_register() };
+                            if idx < 0 {
+                                return None;
+                            }
+                            m.bus.jit_mark_page(pa);
+                            Some(JitBlock { idx, n: blk.n_insns, pa })
+                        });
+                        jit.cache.insert(pc, entry);
+                        if entry.is_some() {
+                            continue;
+                        }
                     }
-                    let off = (pa - rv64_system::RAM_BASE) as usize;
-                    // Cap the window at the page end: blocks must not span
-                    // pages (pa continuity isn't guaranteed across them).
-                    let end = ((off + 1024).min(off | 0xfff) + 1).min(m.bus.ram.len());
-                    let (lt, ld, st, sd) = m.cpu.jit_tlb_ptrs();
-                    let sysmem = rv64_jit::SysMem {
-                        tlb_load_tag: lt as u32,
-                        tlb_load_diff: ld as u32,
-                        tlb_store_tag: st as u32,
-                        tlb_store_diff: sd as u32,
-                        tlb_mask: (rv64_core::Cpu::jit_tlb_size() - 1) as u32,
-                        ram_off: m.bus.ram.as_ptr() as u32,
-                        ram_base: rv64_system::RAM_BASE,
-                        ram_size: m.bus.ram.len() as u64,
-                        jit_pages_off: m.bus.jit_pages.as_ptr() as u32,
-                    };
-                    let lay = rv64_jit::JitLayout {
-                        x_base: m.cpu.x.as_ptr() as u32,
-                        pc_addr: &m.cpu.pc as *const u64 as u32,
-                        mem: None,
-                        sys: Some(sysmem),
-                        retired_addr: retired_addr(),
-                        // FP-in-block: the live CPU FP file + fcsr. Blocks read/
-                        // write f[] directly; the softfloat fast-path guard (NX
-                        // sticky + rm==RNE, result-normal) keeps flags exact and
-                        // bails to the interpreter otherwise.
-                        f_base: m.cpu.f.as_ptr() as u32,
-                        fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
-                    };
-                    let blk = rv64_jit::translate_block(&m.bus.ram[off..end], pc, pc, lay)?;
-                    unsafe { JIT_OUT = blk.wasm };
-                    let idx = unsafe { host_jit_register() };
-                    if idx < 0 {
-                        return None;
-                    }
-                    m.bus.jit_mark_page(pa);
-                    Some(JitBlock {
-                        idx,
-                        n: blk.n_insns,
-                        pa,
-                    })
-                });
-                jit.cache.insert(pc, entry);
-                if entry.is_some() {
-                    continue;
                 }
             }
         }

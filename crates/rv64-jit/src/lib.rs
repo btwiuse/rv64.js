@@ -35,11 +35,14 @@ const VA: u32 = 1;
 const PAGE: u32 = 2;
 const PA: u32 = 3;
 const VAL: u32 = 4;
-/// Loop-iteration counter (Phase 3 self-loop compilation).
+/// Loop-iteration counter (Phase 3 self-loop compilation); also the retired-
+/// instruction accumulator in compiled loops and superblocks.
 const ITER: u32 = 5;
-/// Total i64 scratch locals to declare (register locals follow at 6+; the
+/// Superblock dispatch: the current target pc, fed to the internal `br_table`.
+const TPC: u32 = 6;
+/// Total i64 scratch locals to declare (register locals follow next; the
 /// i32 IDXB local follows all i64 locals, so its index is dynamic).
-const N_I64_LOCALS: u32 = 5;
+const N_I64_LOCALS: u32 = 6;
 
 /// Full-system memory access layout: emitted loads/stores probe the
 /// interpreter's own Load/Store TLBs inline; on a hit within guest RAM
@@ -1495,6 +1498,346 @@ fn translate_loop(
         n_insns: static_n.max(1),
     })
 }
+
+/// Scan the touched GP/FP registers across every entry block of a page-
+/// superblock (each block walked to its terminating control-flow / unhandled
+/// instruction). Over-approximating is safe (an unused local just gets loaded).
+fn scan_regs_super(
+    code: &[u8],
+    base: u64,
+    page_end: u64,
+    entries: &[u64],
+    lay: &JitLayout,
+) -> (u32, u32, u32, u32) {
+    let (mut r, mut w, mut fr, mut fw) = (0u32, 0u32, 0u32, 0u32);
+    let fmark = |m: &mut u32, x: usize| *m |= 1 << x;
+    let mark = |m: &mut u32, x: usize| {
+        if x != 0 {
+            *m |= 1 << x;
+        }
+    };
+    for &e in entries {
+        let mut pc = e;
+        let mut n = 0u32;
+        while n < MAX_BLOCK as u32 && pc < page_end {
+            let Some((insn, ilen)) = fetch(code, base, pc) else {
+                break;
+            };
+            let (d, s1, s2) = (rd(insn), rs1(insn), rs2(insn));
+            let op = opcode(insn);
+            match op {
+                0x63 => {
+                    mark(&mut r, s1);
+                    mark(&mut r, s2);
+                    break;
+                }
+                0x6f => {
+                    mark(&mut w, d);
+                    break;
+                }
+                0x67 => {
+                    mark(&mut r, s1);
+                    mark(&mut w, d);
+                    break;
+                }
+                0x37 | 0x17 => mark(&mut w, d),
+                0x13 | 0x1b => {
+                    mark(&mut r, s1);
+                    mark(&mut w, d);
+                }
+                0x33 | 0x3b => {
+                    if !alu_handled(op, funct7(insn), funct3(insn)) {
+                        break;
+                    }
+                    mark(&mut r, s1);
+                    mark(&mut r, s2);
+                    mark(&mut w, d);
+                }
+                0x03 => {
+                    if funct3(insn) == 7 {
+                        break;
+                    }
+                    mark(&mut r, s1);
+                    mark(&mut w, d);
+                }
+                0x23 => {
+                    if funct3(insn) > 3 {
+                        break;
+                    }
+                    mark(&mut r, s1);
+                    mark(&mut r, s2);
+                }
+                0x07 if lay.f_base != 0 => {
+                    if funct3(insn) != 3 {
+                        break;
+                    }
+                    mark(&mut r, s1);
+                    fmark(&mut fw, d);
+                }
+                0x27 if lay.f_base != 0 => {
+                    if funct3(insn) != 3 {
+                        break;
+                    }
+                    mark(&mut r, s1);
+                    fmark(&mut fr, s2);
+                }
+                0x53 if lay.f_base != 0 => {
+                    let f7 = funct7(insn);
+                    match (f7 >> 2, f7 & 3, funct3(insn)) {
+                        (0..=3, 1, 0 | 7) => {
+                            fmark(&mut fr, s1);
+                            fmark(&mut fr, s2);
+                            fmark(&mut fw, d);
+                        }
+                        (0x14, 1, 0..=2) => {
+                            fmark(&mut fr, s1);
+                            fmark(&mut fr, s2);
+                            mark(&mut w, d);
+                        }
+                        (0x1e, 1, 0) => {
+                            mark(&mut r, s1);
+                            fmark(&mut fw, d);
+                        }
+                        (0x1c, 1, 0) => {
+                            fmark(&mut fr, s1);
+                            mark(&mut w, d);
+                        }
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+            pc = pc.wrapping_add(ilen);
+            n += 1;
+        }
+    }
+    (r, w, fr, fw)
+}
+
+impl Ctx {
+    /// Set the superblock target-pc local to a compile-time constant.
+    fn set_tpc(&self, m: &mut WasmModule, pc: u64) {
+        m.i64_const(pc as i64).local_set(TPC);
+    }
+    /// Emit `ITER += k` (the retired-instruction accumulator), skipping k==0.
+    fn add_retired(&self, m: &mut WasmModule, k: u32) {
+        if k != 0 {
+            m.local_get(ITER)
+                .i64_const(k as i64)
+                .op(I64_ADD)
+                .local_set(ITER);
+        }
+    }
+    /// Emit one entry block's straight-line body: run until a control-flow /
+    /// unhandled instruction, add its length to `retired`, set TPC to the
+    /// successor, and `br depth_l` back to the dispatch loop (so the next block
+    /// is selected there, or the loop exits if the successor isn't in-page).
+    /// End a superblock entry body: continue the dispatch loop (`br depth_l`)
+    /// after counting the block. But if the block compiled ZERO instructions
+    /// (its first instruction is unhandled / off-page), it can make no progress,
+    /// so `br depth_exit` back to the host instead — otherwise setting TPC to
+    /// this same entry re-dispatches to itself forever (the cap can't help: it
+    /// never retires anything).
+    fn super_end(&self, m: &mut WasmModule, pc: u64, len: u32, depth_l: u32, depth_exit: u32) {
+        if len == 0 {
+            self.set_tpc(m, pc);
+            m.br(depth_exit);
+        } else {
+            self.add_retired(m, len);
+            self.set_tpc(m, pc);
+            m.br(depth_l);
+        }
+    }
+    fn emit_super_body(
+        &self,
+        m: &mut WasmModule,
+        lay: JitLayout,
+        code: &[u8],
+        base: u64,
+        entry_pc: u64,
+        page_end: u64,
+        depth_l: u32,
+        depth_exit: u32,
+    ) {
+        let mut pc = entry_pc;
+        let mut len = 0u32;
+        loop {
+            if pc >= page_end || len >= MAX_BLOCK as u32 {
+                self.super_end(m, pc, len, depth_l, depth_exit);
+                return;
+            }
+            let Some((insn, ilen)) = fetch(code, base, pc) else {
+                self.super_end(m, pc, len, depth_l, depth_exit);
+                return;
+            };
+            let op = opcode(insn);
+            let (d, s1, s2) = (rd(insn), rs1(insn), rs2(insn));
+            let next = pc.wrapping_add(ilen);
+            match op {
+                // Conditional branch: TPC = cond ? taken : next.
+                0x63 => {
+                    let cmp = match funct3(insn) {
+                        0 => I64_EQ,
+                        1 => I64_NE,
+                        4 => I64_LT_S,
+                        5 => I64_GE_S,
+                        6 => I64_LT_U,
+                        _ => I64_GE_U,
+                    };
+                    if !matches!(funct3(insn), 0 | 1 | 4 | 5 | 6 | 7) {
+                        self.super_end(m, pc, len, depth_l, depth_exit);
+                        return;
+                    }
+                    self.add_retired(m, len + 1);
+                    let taken = pc.wrapping_add(imm_b(insn) as u64);
+                    self.push_reg(m, s1);
+                    self.push_reg(m, s2);
+                    m.op(cmp);
+                    m.op(IF).op(VOID);
+                    self.set_tpc(m, taken);
+                    m.op(ELSE);
+                    self.set_tpc(m, next);
+                    m.op(END);
+                    m.br(depth_l); // IF closed above, back at body level
+                    return;
+                }
+                // JAL: link then TPC = target.
+                0x6f => {
+                    self.add_retired(m, len + 1);
+                    let target = pc.wrapping_add(imm_j(insn) as u64);
+                    if self.store_pre(m, d) {
+                        m.i64_const(next as i64);
+                        self.store_post(m, d);
+                    }
+                    self.set_tpc(m, target);
+                    m.br(depth_l);
+                    return;
+                }
+                // JALR: TPC = (x[s1]+imm) & ~1, link.
+                0x67 => {
+                    self.add_retired(m, len + 1);
+                    self.push_reg(m, s1);
+                    m.i64_const(imm_i(insn))
+                        .op(I64_ADD)
+                        .i64_const(!1)
+                        .op(I64_AND)
+                        .local_set(SCR);
+                    if self.store_pre(m, d) {
+                        m.i64_const(next as i64);
+                        self.store_post(m, d);
+                    }
+                    m.local_get(SCR).local_set(TPC);
+                    m.br(depth_l);
+                    return;
+                }
+                _ => {
+                    if emit_simple(m, self, lay, insn, pc, len) {
+                        pc = next;
+                        len += 1;
+                    } else {
+                        // Unhandled: leave the JIT at this pc (dispatch will exit).
+                        self.super_end(m, pc, len, depth_l, depth_exit);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Is `start_pc` a structured-loop header? Such blocks compile to a tight wasm
+/// loop (register-locals across iterations) and must NOT be folded into a
+/// superblock, whose per-iteration `br_table` dispatch would be far slower.
+pub fn is_loop_at(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> bool {
+    loop_region(code, base, start_pc, &lay).is_some()
+}
+
+/// Compile a whole page of basic blocks (v86's function-per-page) into one wasm
+/// function with an internal `br_table` dispatch loop and all touched registers
+/// cached in locals for the function's lifetime — so execution flows between
+/// blocks with no per-block prologue/epilogue, `call_indirect` or pa-verify (the
+/// per-dispatch overhead that dominates branchy code like the CPython eval
+/// loop). `entries` are the block-start pcs discovered hot in this page.
+pub fn translate_superblock(
+    code: &[u8],
+    base: u64,
+    page_base: u64,
+    page_span: u64,
+    entries: &[u64],
+    lay: JitLayout,
+) -> Option<Block> {
+    let n = entries.len();
+    if n == 0 || page_span == 0 || page_span > (1 << 16) {
+        return None;
+    }
+    let page_end = page_base + page_span;
+    let (rm, wm, fr, fw) = scan_regs_super(code, base, page_end, entries, &lay);
+    let (mut c, mut m) = build_ctx(lay, rm, wm, fr, fw);
+    c.retired_local = Some(ITER);
+
+    // slot (= (pc-page_base)/2) -> entry index, else n (= default -> exit).
+    let slots = (page_span / 2) as usize;
+    let mut slot_depth = vec![n as u32; slots];
+    for (i, &e) in entries.iter().enumerate() {
+        if e < page_base || e >= page_end {
+            return None;
+        }
+        slot_depth[((e - page_base) / 2) as usize] = i as u32;
+    }
+
+    m.i64_const(0).local_set(ITER); // retired accumulator
+    m.i32_const(0).i64_load(lay.pc_addr as u64).local_set(TPC);
+
+    m.op(BLOCK).op(VOID); // $exit  (depth 1 from loop body)
+    m.op(LOOP).op(VOID); // $L      (depth 0 from loop body)
+
+    // Cap → yield to the host (bound interrupt latency).
+    m.local_get(ITER).i64_const(LOOP_CAP as i64).op(I64_GE_U).br_if(1);
+    // Bounds: offset = TPC - page_base; exit if offset >=u span (also catches
+    // TPC < page_base, which wraps to a huge unsigned value).
+    m.local_get(TPC)
+        .i64_const(page_base as i64)
+        .op(I64_SUB)
+        .local_set(SCR);
+    m.local_get(SCR).i64_const(page_span as i64).op(I64_GE_U).br_if(1);
+
+    // Open the dispatch nest: block $default, then $e_{n-1}..$e_0 (innermost).
+    m.op(BLOCK).op(VOID); // $default (br_table default depth = n)
+    for _ in 0..n {
+        m.op(BLOCK).op(VOID);
+    }
+    // idx = offset >> 1 (i32); dispatch.
+    m.local_get(SCR)
+        .i64_const(1)
+        .op(I64_SHR_U)
+        .op(I32_WRAP_I64);
+    m.br_table(&slot_depth, n as u32);
+
+    // Close $e_0..$e_{n-1}, emitting each entry body after its block's end.
+    // At entry i's body the loop $L is at depth (n - i).
+    for i in 0..n {
+        m.op(END); // close $e_i
+        c.emit_super_body(&mut m, lay, code, base, entries[i], page_end, (n - i) as u32, (n - i + 1) as u32);
+    }
+    m.op(END); // close $default
+    // default: TPC wasn't a known entry in-page → exit ($exit at depth 1).
+    m.br(1);
+
+    m.op(END); // close loop $L
+    m.op(END); // close block $exit
+
+    // Exit: flush registers, publish TPC + retired.
+    c.flush_writes(&mut m);
+    m.i32_const(0).local_get(TPC).i64_store(lay.pc_addr as u64);
+    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
+
+    Some(Block {
+        wasm: m.finish(),
+        len: page_span,
+        n_insns: n as u32,
+    })
+}
+
 
 #[cfg(test)]
 mod tests {

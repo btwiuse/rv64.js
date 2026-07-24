@@ -69,7 +69,11 @@ pub const ELSE: u8 = 0x05;
 pub const END: u8 = 0x0b;
 pub const BR: u8 = 0x0c;
 pub const BR_IF: u8 = 0x0d;
+pub const BR_TABLE: u8 = 0x0e;
 pub const RETURN: u8 = 0x0f;
+pub const I32_SHR_U: u8 = 0x76;
+pub const I32_GE_U: u8 = 0x4f;
+pub const I32_SUB: u8 = 0x6b;
 pub const VOID: u8 = 0x40;
 
 fn uleb(out: &mut Vec<u8>, mut v: u64) {
@@ -190,6 +194,18 @@ impl WasmModule {
     pub fn br_if(&mut self, depth: u32) -> &mut Self {
         self.code.push(BR_IF);
         uleb(&mut self.code, depth as u64);
+        self
+    }
+
+    /// br_table: pop an i32 index, branch to `targets[index]` (block depths),
+    /// or `default` if the index is out of range.
+    pub fn br_table(&mut self, targets: &[u32], default: u32) -> &mut Self {
+        self.code.push(BR_TABLE);
+        uleb(&mut self.code, targets.len() as u64);
+        for &t in targets {
+            uleb(&mut self.code, t as u64);
+        }
+        uleb(&mut self.code, default as u64);
         self
     }
 
