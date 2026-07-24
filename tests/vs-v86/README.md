@@ -30,6 +30,22 @@ The checksum printed by each run confirms every build does identical work
 (integer parts match bit-for-bit across x86/riscv64; the mixed FP checksum
 differs only by 32-bit-vs-64-bit rounding, with identical operation counts).
 
+## Automated setup (build everything once)
+
+`setup.sh` builds the wasm, the benchmark kernels, and the nbench rootfs into one
+artifacts dir, ready for the harnesses — reproducibly, in the nix dev shell:
+
+```sh
+nix develop -c tests/vs-v86/setup.sh target/bench          # + DEBIAN=1 for python
+SC=target/bench nix develop -c node tests/vs-v86/compare-sys.mjs
+```
+
+Pieces (each runnable alone): `build-kernels.sh` (the fixed-work C kernels for
+both ISAs), `mk-nbench-rootfs.sh` (fetch + build nbench, bake into the buildroot
+rootfs), `mk-debian-rootfs.sh` (Debian riscv64 rootfs with python for
+arch-python). The v86 side still needs a built `copy/v86` checkout at
+`<outdir>/v86` (see "Reproducing").
+
 ## Running it — one command
 
 `compare.mjs` is the reusable driver: it runs **both** emulators fresh on the
