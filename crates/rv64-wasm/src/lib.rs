@@ -224,10 +224,14 @@ struct JitBlock {
 struct DispatchLine {
     pc: u64,
     blk: JitBlock,
+    /// cpu.map_gen at last successful pa-verify. The dispatch fast path only
+    /// re-probes the fetch TLB when the generation moved (SFENCE.VMA / satp
+    /// write) — not on all 200M+ dispatches of a hot workload.
+    gen: u64,
 }
 
 const NO_PC: u64 = u64::MAX;
-const DISPATCH_BITS: u32 = 14; // 16384 lines
+const DISPATCH_BITS: u32 = 17; // 131072 lines (sys block count can exceed 16k)
 const DISPATCH_SIZE: usize = 1 << DISPATCH_BITS;
 
 struct JitState {
@@ -252,6 +256,8 @@ struct JitState {
     /// HashMap per interpreted instruction taxes cold boot, so count in a u16
     /// array here and only touch `hot` when a slot actually gets hot.
     interp_hot: Vec<u16>,
+    /// DIAGNOSTIC: histogram of run_slice_until entry pcs.
+    slice_pcs: std::collections::HashMap<u64, u64>,
 }
 
 impl JitState {
@@ -266,13 +272,15 @@ impl JitState {
                         idx: 0,
                         n: 0,
                         pa: 0
-                    }
+                    },
+                    gen: 0,
                 };
                 DISPATCH_SIZE
             ],
             flush_gen: 0,
             page_entries: Default::default(),
             interp_hot: vec![0; DISPATCH_SIZE],
+            slice_pcs: Default::default(),
         }
     }
     fn clear(&mut self) {
@@ -282,6 +290,7 @@ impl JitState {
         for h in self.interp_hot.iter_mut() {
             *h = 0;
         }
+        self.slice_pcs.clear();
         self.clear_dispatch();
     }
     #[inline]
@@ -317,6 +326,32 @@ static mut SLICE_CALLS: u64 = 0;
 static mut SLICE_INSNS: u64 = 0;
 static mut JIT_DISPATCHES: u64 = 0;
 
+
+/// DIAGNOSTIC: dump the top interp-slice start pcs (count, pc, insn word).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn dump_slice_pcs() {
+    let m = unsafe { SYS.as_mut().expect("sys") };
+    let jit = unsafe { SYS_JIT.get_or_insert_with(JitState::new) };
+    let mut v: Vec<(u64, u64)> = jit.slice_pcs.iter().map(|(k, c)| (*c, *k)).collect();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    let mut out = String::new();
+    for (c, pc) in v.iter().take(16) {
+        let insn = m
+            .cpu
+            .jit_probe_fetch(&mut m.bus, *pc)
+            .and_then(|pa| {
+                let off = (pa - rv64_system::RAM_BASE) as usize;
+                m.bus.ram.get(off..off + 4).map(|b| {
+                    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                })
+            })
+            .unwrap_or(0);
+        out.push_str(&format!("SLPC {c} pc={pc:#x} insn={insn:#010x}\n"));
+    }
+    unsafe { host_write(2, out.as_ptr(), out.len()) };
+    jit.slice_pcs.clear();
+}
 /// jit_stat(0) = insns retired in JIT blocks, (1) = block dispatches,
 /// (2) = compiled blocks (user), (3) = compiled blocks (sys).
 #[no_mangle]
@@ -356,6 +391,8 @@ pub extern "C" fn jit_set_enabled(on: u32) {
 /// time via the guest clock (nbench) and realistic `date`/timeouts. Off by
 /// default so lockstep/differential testing stays reproducible.
 static mut SYS_WALLCLOCK: bool = false;
+static mut WALL_LAST_ICOUNT: u64 = 0;
+static mut WALL_IDLE_ITERS: u32 = 0;
 #[no_mangle]
 pub extern "C" fn sys_set_wallclock(on: u32) {
     unsafe { SYS_WALLCLOCK = on != 0 }
@@ -372,7 +409,7 @@ pub extern "C" fn sys_set_superblock(on: u32) {
 }
 /// Max chained block dispatches before returning to the interpreter (keeps
 /// interrupt/budget latency bounded in fully-jitted loops).
-const JIT_CHAIN_CAP: u32 = 64;
+const JIT_CHAIN_CAP: u32 = 256;
 /// Once a code page accumulates this many hot NON-loop block entries it is
 /// branchy enough (e.g. an interpreter's dispatch loop) to compile as one
 /// superblock — one wasm function covering the whole page with an internal
@@ -453,7 +490,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                 match jit.cache.get(&pc) {
                     Some(Some(b)) => {
                         let b = *b;
-                        jit.dispatch[JitState::dslot(pc)] = DispatchLine { pc, blk: b };
+                        jit.dispatch[JitState::dslot(pc)] = DispatchLine { pc, blk: b, gen: 0 };
                         b
                     }
                     _ => break,
@@ -642,9 +679,26 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
 
     while remaining > 0 && !m.power_off {
         // Refresh the wall-clock time source (opt-in) so the CLINT tracks real
-        // host time; per outer-loop iteration, not per instruction.
+        // host time. host_now_ms is a wasm->JS round-trip (~7% of a dispatch-
+        // heavy workload if done per iteration), so gate it: refresh only after
+        // ~16k retired insns (~40us at JIT speed, far finer than the 10ms kernel
+        // tick) or after 64 iterations without insn progress (WFI idle — time
+        // must still advance or timers never fire).
         if unsafe { SYS_WALLCLOCK } {
-            m.wall_ns = Some(unsafe { host_now_ms() } as u64 * 1_000_000);
+            let ic = m.cpu.insn_count;
+            let due = unsafe {
+                ic.wrapping_sub(WALL_LAST_ICOUNT) >= 16384 || WALL_IDLE_ITERS >= 64
+            };
+            if due {
+                unsafe {
+                    WALL_LAST_ICOUNT = ic;
+                    WALL_IDLE_ITERS = 0;
+                }
+                m.wall_ns = Some(unsafe { host_now_ms() } as u64 * 1_000_000);
+                m.wall_anchor_icount = ic;
+            } else {
+                unsafe { WALL_IDLE_ITERS += 1 };
+            }
         }
         // Mapping-change flush (satp/SFENCE): drop the whole cache.
         if m.cpu.jit_flush_gen != jit.flush_gen {
@@ -669,33 +723,49 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         let mut chained = 0u32;
         while chained < JIT_CHAIN_CAP {
             let pc = m.cpu.pc;
-            let line = jit.dispatch[JitState::dslot(pc)];
+            let slot = JitState::dslot(pc);
+            let line = jit.dispatch[slot];
+            // Verify the block's virtual pc still maps to the same physical
+            // code — but only when a mapping event (SFENCE.VMA / satp write,
+            // tracked by cpu.map_gen) happened since this line last verified.
+            // The common case is a single u64 compare instead of a fetch-TLB
+            // probe on every dispatch; the cache still survives the frequent
+            // data-page SFENCEs of malloc-heavy processes (one re-probe per
+            // block per event, not a flush).
             let b = if line.pc == pc {
+                if line.gen != m.cpu.map_gen {
+                    match m.cpu.jit_probe_fetch(&mut m.bus, pc) {
+                        Some(pa) if pa == line.blk.pa => {
+                            jit.dispatch[slot].gen = m.cpu.map_gen;
+                        }
+                        _ => {
+                            jit.cache.remove(&pc);
+                            jit.dispatch[slot].pc = NO_PC;
+                            break;
+                        }
+                    }
+                }
                 line.blk
             } else {
-                // dispatch miss: consult the authoritative cache, fill line
+                // dispatch miss: consult the authoritative cache, verify the
+                // mapping, fill the line stamped with the current generation.
                 match jit.cache.get(&pc) {
                     Some(Some(b)) => {
                         let b = *b;
-                        jit.dispatch[JitState::dslot(pc)] = DispatchLine { pc, blk: b };
+                        match m.cpu.jit_probe_fetch(&mut m.bus, pc) {
+                            Some(pa) if pa == b.pa => {}
+                            _ => {
+                                jit.cache.remove(&pc);
+                                break;
+                            }
+                        }
+                        jit.dispatch[slot] =
+                            DispatchLine { pc, blk: b, gen: m.cpu.map_gen };
                         b
                     }
                     _ => break, // uncompiled or blacklisted
                 }
             };
-            // Verify the block's virtual pc still maps to the same physical
-            // code. This catches stale code mappings (satp/remap) cheaply —
-            // a fetch-TLB probe, not a full flush — so the cache survives the
-            // frequent data-page SFENCEs of malloc-heavy processes. If the
-            // mapping changed, drop the block and fall to the interpreter.
-            match m.cpu.jit_probe_fetch(&mut m.bus, pc) {
-                Some(pa) if pa == b.pa => {}
-                _ => {
-                    jit.cache.remove(&pc);
-                    jit.dispatch[JitState::dslot(pc)].pc = NO_PC;
-                    break;
-                }
-            }
             call_block(b.idx, m as *mut _ as *mut u8);
             // Sys blocks with inline memory ops may bail mid-block; read the
             // count they actually retired (pc is set by the block either way).
@@ -803,8 +873,11 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                         let epa = pa_page + (e - vpage);
                                         let jb = JitBlock { idx, n: 0, pa: epa };
                                         jit.cache.insert(e, Some(jb));
-                                        jit.dispatch[JitState::dslot(e)] =
-                                            DispatchLine { pc: e, blk: jb };
+                                        jit.dispatch[JitState::dslot(e)] = DispatchLine {
+                                            pc: e,
+                                            blk: jb,
+                                            gen: m.cpu.map_gen,
+                                        };
                                     }
                                     continue;
                                 }

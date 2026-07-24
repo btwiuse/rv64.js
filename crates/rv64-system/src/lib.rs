@@ -362,6 +362,12 @@ pub struct Machine {
     /// self-timing benchmarks (nbench) reflect real throughput — the host layer
     /// refreshes it each slice. Monotonic-clamped so it never runs backward.
     pub wall_ns: Option<u64>,
+    /// insn_count at the moment `wall_ns` was last refreshed. Between (rate-
+    /// limited) refreshes, mtime advances by insns-since-anchor so guest-visible
+    /// time never freezes — code that spins on rdtime (kernel __delay, seqlock
+    /// retries) must always observe progress or it degenerates into millions of
+    /// single-instruction interpreter round-trips.
+    pub wall_anchor_icount: u64,
 }
 
 pub struct BootImages<'a> {
@@ -449,6 +455,7 @@ impl Machine {
             insns_per_tick: 10, // pretend 100 Minsn/s against the 10 MHz clock
             power_off: false,
             wall_ns: None, // deterministic instruction-counted time by default
+            wall_anchor_icount: 0,
         }
     }
 
@@ -533,8 +540,19 @@ impl Machine {
     /// via Bus::irq_lines; nothing else to propagate).
     pub fn sync_devices(&mut self) {
         let next = match self.wall_ns {
-            // ns → 10 MHz ticks (1e9 / RTC_FREQ = 100 ns/tick).
-            Some(ns) => ns / (1_000_000_000 / RTC_FREQ),
+            // ns → 10 MHz ticks (1e9 / RTC_FREQ = 100 ns/tick), plus insn-count
+            // interpolation since the last (rate-limited) host clock read so
+            // time visibly advances between refreshes (see wall_anchor_icount).
+            // The interpolation rate deliberately ASSUMES a fast host (500
+            // Minsn/s, 50 insns/tick): undershooting real time is safe (the
+            // next refresh jumps mtime forward), but overshooting makes the
+            // refresh clamp mtime into a frozen plateau — and frozen guest
+            // time turns any rdtime spin (kernel __delay) into an interpreter
+            // round-trip storm.
+            Some(ns) => {
+                ns / (1_000_000_000 / RTC_FREQ)
+                    + self.cpu.insn_count.wrapping_sub(self.wall_anchor_icount) / 50
+            }
             None => self.cpu.insn_count / self.insns_per_tick,
         };
         // Never let the clock run backward (host wall-clock can be non-monotonic).

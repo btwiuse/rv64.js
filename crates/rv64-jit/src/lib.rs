@@ -446,10 +446,7 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 mark(&mut write, d);
             }
             0x33 => {
-                if !matches!(
-                    (funct7(insn), funct3(insn)),
-                    (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0)
-                ) {
+                if !alu_handled(0x33, funct7(insn), funct3(insn)) {
                     break;
                 }
                 mark(&mut read, s1);
@@ -464,10 +461,11 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 mark(&mut write, d);
             }
             0x3b => {
-                if !matches!((funct7(insn), funct3(insn)), (0x00, 0) | (0x20, 0) | (0x01, 0)) {
+                if !alu_handled(0x3b, funct7(insn), funct3(insn)) {
                     break;
                 }
                 mark(&mut read, s1);
+                mark(&mut read, s2);
                 mark(&mut write, d);
             }
             0x03 if lay.mem.is_some() || lay.sys.is_some() => {
@@ -568,12 +566,31 @@ fn fp_handled(f7: u32, f3: u32) -> bool {
 }
 
 /// Is `f7`/`f3` a supported OP / OP-32 / OP-IMM-32 encoding?
+///
+/// THE single authority on which ALU encodings compile: every walker
+/// (scan_regs, loop_region, scan_regs_super) and emit_simple must consult
+/// this — if a scanner and the emitter ever disagree on where a block ends,
+/// register allocation desyncs from emission (historically a boot hang).
+/// Missing from the M extension: MULH/MULHSU/MULHU (0x33, 0x01, 1..=3) —
+/// wasm has no 64x64->high-64 multiply; emulating it costs ~20 ops.
 fn alu_handled(op: u32, f7: u32, f3: u32) -> bool {
     match op {
         0x37 | 0x17 | 0x13 => true,
-        0x33 => matches!((f7, f3), (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0)),
+        0x33 => matches!(
+            (f7, f3),
+            (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0) | (0x01, 4..=7)
+        ),
         0x1b => matches!(f3, 0 | 1 | 5),
-        0x3b => matches!((f7, f3), (0x00, 0) | (0x20, 0) | (0x01, 0)),
+        0x3b => matches!(
+            (f7, f3),
+            (0x00, 0)
+                | (0x20, 0)
+                | (0x01, 0)
+                | (0x00, 1) // SLLW
+                | (0x00, 5) // SRLW
+                | (0x20, 5) // SRAW
+                | (0x01, 4..=7) // DIVW/DIVUW/REMW/REMUW
+        ),
         _ => false,
     }
 }
@@ -921,12 +938,11 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                 c.store_post(m, d);
             }
         }
-        // OP (I and M-mul only; div falls back)
+        // OP (I, M mul + div/rem; MULH* falls back)
         0x33 => {
             let f7 = funct7(insn);
             let f3 = funct3(insn);
-            let supported = matches!((f7, f3), (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0));
-            if !supported {
+            if !alu_handled(0x33, f7, f3) {
                 return false;
             }
             if c.store_pre(m, d) {
@@ -976,6 +992,55 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                         c.push_reg(m, s2);
                         m.op(I64_AND);
                     }
+                    // DIV/DIVU/REM/REMU: wasm div/rem TRAP on zero divisor (and
+                    // div_s on MIN/-1) where riscv defines results, so divide by
+                    // a select-guarded safe divisor and select the architected
+                    // result afterwards. Straight-line (select, no control flow).
+                    // Stack on entry to each arm: [rs1] (the dividend).
+                    (0x01, 4) => {
+                        // safe = (rs2==0 || (rs1==MIN && rs2==-1)) ? 1 : rs2
+                        m.i64_const(1);
+                        c.push_reg(m, s2);
+                        c.push_reg(m, s2);
+                        m.op(I64_EQZ);
+                        c.push_reg(m, s1);
+                        m.i64_const(i64::MIN).op(I64_EQ);
+                        c.push_reg(m, s2);
+                        m.i64_const(-1).op(I64_EQ).op(I32_AND).op(I32_OR).op(SELECT);
+                        m.op(I64_DIV_S);
+                        // overflow (MIN/-1) -> MIN
+                        m.i64_const(i64::MIN);
+                        c.push_reg(m, s1);
+                        m.i64_const(i64::MIN).op(I64_EQ);
+                        c.push_reg(m, s2);
+                        m.i64_const(-1).op(I64_EQ).op(I32_AND).op(I32_EQZ).op(SELECT);
+                        // zero divisor -> -1
+                        m.i64_const(-1);
+                        c.push_reg(m, s2);
+                        m.op(I64_EQZ).op(I32_EQZ).op(SELECT);
+                    }
+                    (0x01, 5) => {
+                        m.i64_const(1);
+                        c.push_reg(m, s2);
+                        c.push_reg(m, s2);
+                        m.op(I64_EQZ).op(SELECT);
+                        m.op(I64_DIV_U);
+                        m.i64_const(-1); // zero divisor -> all ones
+                        c.push_reg(m, s2);
+                        m.op(I64_EQZ).op(I32_EQZ).op(SELECT);
+                    }
+                    (0x01, 6 | 7) => {
+                        // wasm rem_s(MIN,-1) is defined as 0 = riscv REM, so
+                        // only the zero divisor needs guarding: result is rs1.
+                        m.i64_const(1);
+                        c.push_reg(m, s2);
+                        c.push_reg(m, s2);
+                        m.op(I64_EQZ).op(SELECT);
+                        m.op(if f3 == 6 { I64_REM_S } else { I64_REM_U });
+                        c.push_reg(m, s1);
+                        c.push_reg(m, s2);
+                        m.op(I64_EQZ).op(I32_EQZ).op(SELECT);
+                    }
                     _ => unreachable!(),
                 }
                 c.store_post(m, d);
@@ -1016,20 +1081,111 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                 c.store_post(m, d);
             }
         }
-        // OP-32 (ADDW/SUBW/MULW)
+        // OP-32 (ADDW/SUBW/MULW, W-shifts, DIVW/DIVUW/REMW/REMUW)
         0x3b => {
             let (f7, f3) = (funct7(insn), funct3(insn));
-            if !matches!((f7, f3), (0x00, 0) | (0x20, 0) | (0x01, 0)) {
+            if !alu_handled(0x3b, f7, f3) {
                 return false;
             }
             if c.store_pre(m, d) {
-                c.push_reg(m, s1);
-                c.push_reg(m, s2);
-                m.op(match (f7, f3) {
-                    (0x00, 0) => I64_ADD,
-                    (0x20, 0) => I64_SUB,
-                    _ => I64_MUL,
-                });
+                // Operand pushers: signed = sext32(x[r]), unsigned = low 32
+                // zero-extended. (Recomputed per use — 3 ops from a local.)
+                let push_s = |m: &mut WasmModule, c: &Ctx, r: usize| {
+                    c.push_reg(m, r);
+                    m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S);
+                };
+                let push_u = |m: &mut WasmModule, c: &Ctx, r: usize| {
+                    c.push_reg(m, r);
+                    m.i64_const(0xffff_ffff).op(I64_AND);
+                };
+                const MIN32: i64 = i32::MIN as i64;
+                match (f7, f3) {
+                    (0x00, 0) | (0x20, 0) | (0x01, 0) => {
+                        c.push_reg(m, s1);
+                        c.push_reg(m, s2);
+                        m.op(match (f7, f3) {
+                            (0x00, 0) => I64_ADD,
+                            (0x20, 0) => I64_SUB,
+                            _ => I64_MUL,
+                        });
+                    }
+                    (0x00, 1) => {
+                        // SLLW: shift in 64, final wrap+sext truncates.
+                        c.push_reg(m, s1);
+                        c.push_reg(m, s2);
+                        m.i64_const(0x1f).op(I64_AND).op(I64_SHL);
+                    }
+                    (0x00, 5) => {
+                        // SRLW: logical shift of the low 32 bits.
+                        push_u(m, c, s1);
+                        c.push_reg(m, s2);
+                        m.i64_const(0x1f).op(I64_AND).op(I64_SHR_U);
+                    }
+                    (0x20, 5) => {
+                        // SRAW: arithmetic shift of sext32(rs1).
+                        push_s(m, c, s1);
+                        c.push_reg(m, s2);
+                        m.i64_const(0x1f).op(I64_AND).op(I64_SHR_S);
+                    }
+                    // 32-bit div/rem: same select-guard scheme as the 64-bit
+                    // forms (see 0x33), on sext32/zext32 operands. The final
+                    // shared wrap+sext below narrows every result (including
+                    // the -1 / MIN32 / rs1 fallbacks) to riscv's sext32.
+                    (0x01, 4) => {
+                        push_s(m, c, s1);
+                        m.i64_const(1);
+                        push_s(m, c, s2);
+                        push_s(m, c, s2);
+                        m.op(I64_EQZ);
+                        push_s(m, c, s1);
+                        m.i64_const(MIN32).op(I64_EQ);
+                        push_s(m, c, s2);
+                        m.i64_const(-1).op(I64_EQ).op(I32_AND).op(I32_OR).op(SELECT);
+                        m.op(I64_DIV_S);
+                        m.i64_const(MIN32);
+                        push_s(m, c, s1);
+                        m.i64_const(MIN32).op(I64_EQ);
+                        push_s(m, c, s2);
+                        m.i64_const(-1).op(I64_EQ).op(I32_AND).op(I32_EQZ).op(SELECT);
+                        m.i64_const(-1);
+                        push_s(m, c, s2);
+                        m.op(I64_EQZ).op(I32_EQZ).op(SELECT);
+                    }
+                    (0x01, 5) => {
+                        push_u(m, c, s1);
+                        m.i64_const(1);
+                        push_u(m, c, s2);
+                        push_u(m, c, s2);
+                        m.op(I64_EQZ).op(SELECT);
+                        m.op(I64_DIV_U);
+                        m.i64_const(-1);
+                        push_u(m, c, s2);
+                        m.op(I64_EQZ).op(I32_EQZ).op(SELECT);
+                    }
+                    (0x01, 6) => {
+                        push_s(m, c, s1);
+                        m.i64_const(1);
+                        push_s(m, c, s2);
+                        push_s(m, c, s2);
+                        m.op(I64_EQZ).op(SELECT);
+                        m.op(I64_REM_S);
+                        push_s(m, c, s1);
+                        push_s(m, c, s2);
+                        m.op(I64_EQZ).op(I32_EQZ).op(SELECT);
+                    }
+                    (0x01, 7) => {
+                        push_u(m, c, s1);
+                        m.i64_const(1);
+                        push_u(m, c, s2);
+                        push_u(m, c, s2);
+                        m.op(I64_EQZ).op(SELECT);
+                        m.op(I64_REM_U);
+                        push_u(m, c, s1);
+                        push_u(m, c, s2);
+                        m.op(I64_EQZ).op(I32_EQZ).op(SELECT);
+                    }
+                    _ => unreachable!(),
+                }
                 m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S);
                 c.store_post(m, d);
             }

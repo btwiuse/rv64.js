@@ -62,6 +62,11 @@ pub struct Cpu {
     /// dispatch. Privilege changes do NOT bump it (they flush the data TLB
     /// but leave va→pa identity for a given satp intact).
     pub jit_flush_gen: u64,
+    /// Bumped on every event after which a cached va→pa translation may be
+    /// stale (SFENCE.VMA, satp write). Cheaper sibling of jit_flush_gen: the
+    /// JIT dispatcher re-verifies a block's code mapping only when this moved,
+    /// instead of a fetch-TLB probe on every single dispatch.
+    pub map_gen: u64,
     // Direct-mapped TLBs (virtual page tag -> pa-va diff), one per access
     // type so permission bits never need re-checking on a hit.
     tlb_tag: [[u64; TLB_SIZE]; 3],
@@ -104,6 +109,7 @@ impl Cpu {
             exc_counts: [0; 16],
             irq_counts: [0; 16],
             jit_flush_gen: 0,
+            map_gen: 0,
             tlb_tag: [[TLB_INVALID; TLB_SIZE]; 3],
             tlb_diff: [[0; TLB_SIZE]; 3],
             jtlb_tag: [[TLB_INVALID; TLB_SIZE]; 2],
@@ -1063,6 +1069,7 @@ impl Cpu {
                         }
                     }
                     self.flush_tlb();
+                    self.map_gen += 1; // cached translations must re-verify
                     // NOTE: do NOT bump jit_flush_gen here. SFENCE.VMA is
                     // issued on every page-table change — including the
                     // frequent data mmaps of a malloc-heavy process (a
@@ -1595,6 +1602,7 @@ impl Cpu {
                     self.flush_tlb();
                     if changed {
                         self.jit_flush_gen += 1; // address space switched
+                        self.map_gen += 1;
                     }
                 }
             }

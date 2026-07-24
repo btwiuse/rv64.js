@@ -75,6 +75,13 @@ pub const I32_SHR_U: u8 = 0x76;
 pub const I32_GE_U: u8 = 0x4f;
 pub const I32_SUB: u8 = 0x6b;
 pub const VOID: u8 = 0x40;
+// division / remainder (trap-guarded at emission: riscv division never traps)
+pub const I64_DIV_S: u8 = 0x7f;
+pub const I64_DIV_U: u8 = 0x80;
+pub const I64_REM_S: u8 = 0x81;
+pub const I64_REM_U: u8 = 0x82;
+/// Untyped select: [val1 val2 cond] -> cond != 0 ? val1 : val2.
+pub const SELECT: u8 = 0x1b;
 
 fn uleb(out: &mut Vec<u8>, mut v: u64) {
     loop {
