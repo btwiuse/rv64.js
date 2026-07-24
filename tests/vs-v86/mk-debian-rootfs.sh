@@ -22,12 +22,17 @@ MIRROR="${MIRROR:-http://deb.debian.org/debian}"
 INCLUDE="${INCLUDE:-python3,libc-bin}"
 
 rm -rf "$ROOT"
+# --foreign can exit non-zero (it stops before the second stage we can't run),
+# so don't let set -e abort on it; verify by the downloaded .debs instead.
 fakeroot debootstrap --foreign --arch="$ARCH" --variant=minbase \
-    --include="$INCLUDE" --no-check-gpg "$SUITE" "$ROOT" "$MIRROR"
+    --include="$INCLUDE" --no-check-gpg "$SUITE" "$ROOT" "$MIRROR" || true
+shopt -s nullglob
+debs=("$ROOT"/var/cache/apt/archives/*.deb)
+[ "${#debs[@]}" -gt 0 ] || { echo "debootstrap first stage failed (no .debs)"; exit 1; }
 
-# Unpack the downloaded-but-unconfigured packages (python3, nbench, deps). Bare
+# Unpack the downloaded-but-unconfigured packages (python3 + deps). Bare
 # programs need no maintainer-script configuration.
-for d in "$ROOT"/var/cache/apt/archives/*.deb; do fakeroot dpkg-deb -x "$d" "$ROOT/"; done
+for d in "${debs[@]}"; do fakeroot dpkg-deb -x "$d" "$ROOT/"; done
 
 # nbench (Debian package) reads NNET.DAT from the cwd; expose it at / and drop a
 # tiny command file (glibc's open works, unlike the newlib build) for short runs.
