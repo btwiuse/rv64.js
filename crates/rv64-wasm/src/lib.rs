@@ -245,6 +245,13 @@ struct JitState {
     /// a new entry appears the page's superblock is recompiled to cover it, and
     /// every entry's `cache`/`dispatch` slot points at the one superblock.
     page_entries: std::collections::HashMap<u64, Vec<u64>>,
+    /// Cheap direct-mapped hot counter for the interpreter-fallback path: an
+    /// interpreted stretch's interior blocks never reach the fast-path hot map
+    /// (run_slice_until never returns to the fast path inside a stretch), so
+    /// they'd stay interpreted forever (~half of fib's time). Bumping a real
+    /// HashMap per interpreted instruction taxes cold boot, so count in a u16
+    /// array here and only touch `hot` when a slot actually gets hot.
+    interp_hot: Vec<u16>,
 }
 
 impl JitState {
@@ -265,12 +272,16 @@ impl JitState {
             ],
             flush_gen: 0,
             page_entries: Default::default(),
+            interp_hot: vec![0; DISPATCH_SIZE],
         }
     }
     fn clear(&mut self) {
         self.cache.clear();
         self.hot.clear();
         self.page_entries.clear();
+        for h in self.interp_hot.iter_mut() {
+            *h = 0;
+        }
         self.clear_dispatch();
     }
     #[inline]
@@ -841,8 +852,27 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             // loop that overshoot was ~half of all instructions). The first
             // instruction always runs (pc may be a block that just bailed here),
             // so no spin.
+            // Stop when pc reaches a compiled block; ALSO hot-count each
+            // uncompiled pc and stop once it's hot enough, so the interior of an
+            // interpreted stretch actually reaches the compile threshold (else
+            // run_slice_until would interpret the whole stretch forever without
+            // any of its blocks ever tiering up — that residual is ~half of
+            // fib's wall time).
+            let thr = unsafe { JIT_THRESHOLD }.min(u16::MAX as u32) as u16;
             let ran = m.run_slice_until(remaining.min(SYS_WARM_SLICE), |pc| {
-                jit.dispatch[JitState::dslot(pc)].pc == pc
+                if jit.dispatch[JitState::dslot(pc)].pc == pc {
+                    return true;
+                }
+                let slot = JitState::dslot(pc);
+                let cnt = &mut jit.interp_hot[slot];
+                *cnt = cnt.saturating_add(1);
+                if *cnt < thr {
+                    return false; // cold: cheap array bump only, no HashMap
+                }
+                // Hot stretch interior: force it onto the fast-path hot map so
+                // the compile step tiers it up, and stop interpreting here.
+                jit.hot.insert(pc, unsafe { JIT_THRESHOLD });
+                true
             });
             unsafe {
                 SLICE_CALLS += 1;
