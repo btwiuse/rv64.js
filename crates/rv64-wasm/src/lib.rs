@@ -261,8 +261,6 @@ struct JitState {
     /// HashMap per interpreted instruction taxes cold boot, so count in a u16
     /// array here and only touch `hot` when a slot actually gets hot.
     interp_hot: Vec<u16>,
-    /// DIAGNOSTIC: histogram of run_slice_until entry pcs.
-    slice_pcs: std::collections::HashMap<u64, u64>,
     /// Physical page -> pcs of cache entries whose code lives there (blocks
     /// AND pa-stamped blacklist sentinels). Lets dirty-page invalidation drop
     /// exactly the affected entries instead of scanning the whole cache per
@@ -286,7 +284,6 @@ impl JitState {
             flush_gen: 0,
             page_entries: Default::default(),
             interp_hot: vec![0; DISPATCH_SIZE],
-            slice_pcs: Default::default(),
             page_blocks: Default::default(),
         }
     }
@@ -297,7 +294,6 @@ impl JitState {
         for h in self.interp_hot.iter_mut() {
             *h = 0;
         }
-        self.slice_pcs.clear();
         self.page_blocks.clear();
         self.clear_dispatch();
     }
@@ -335,31 +331,6 @@ static mut SLICE_INSNS: u64 = 0;
 static mut JIT_DISPATCHES: u64 = 0;
 
 
-/// DIAGNOSTIC: dump the top interp-slice start pcs (count, pc, insn word).
-#[no_mangle]
-#[allow(static_mut_refs)]
-pub extern "C" fn dump_slice_pcs() {
-    let m = unsafe { SYS.as_mut().expect("sys") };
-    let jit = unsafe { SYS_JIT.get_or_insert_with(JitState::new) };
-    let mut v: Vec<(u64, u64)> = jit.slice_pcs.iter().map(|(k, c)| (*c, *k)).collect();
-    v.sort_unstable_by(|a, b| b.cmp(a));
-    let mut out = String::new();
-    for (c, pc) in v.iter().take(16) {
-        let insn = m
-            .cpu
-            .jit_probe_fetch(&mut m.bus, *pc)
-            .and_then(|pa| {
-                let off = (pa - rv64_system::RAM_BASE) as usize;
-                m.bus.ram.get(off..off + 4).map(|b| {
-                    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-                })
-            })
-            .unwrap_or(0);
-        out.push_str(&format!("SLPC {c} pc={pc:#x} insn={insn:#010x}\n"));
-    }
-    unsafe { host_write(2, out.as_ptr(), out.len()) };
-    jit.slice_pcs.clear();
-}
 /// jit_stat(0) = insns retired in JIT blocks, (1) = block dispatches,
 /// (2) = compiled blocks (user), (3) = compiled blocks (sys).
 #[no_mangle]
