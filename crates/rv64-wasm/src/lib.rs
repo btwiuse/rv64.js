@@ -217,17 +217,22 @@ struct JitBlock {
     pa: u64,
 }
 
-/// Direct-mapped dispatch line: `pc` is the full key, `blk` its block.
-/// A slot with `pc == NO_PC` is empty. Indexed by low pc bits — a single
-/// array read + compare replaces the HashMap+SipHash lookup on the hot path.
+/// Direct-mapped dispatch line: `pc` is the full key. A slot with
+/// `pc == NO_PC` is empty. Indexed by low pc bits — a single array read +
+/// compare replaces the HashMap+SipHash lookup on the hot path. Deliberately
+/// PACKED to 16 bytes: at 200M+ dispatches/s the line load is the loop's main
+/// memory traffic, and 16B lines double how many fit in cache versus carrying
+/// the whole JitBlock (pa/n live in `cache` and are only needed on the rare
+/// verify path).
 #[derive(Clone, Copy)]
 struct DispatchLine {
     pc: u64,
-    blk: JitBlock,
-    /// cpu.map_gen at last successful pa-verify. The dispatch fast path only
-    /// re-probes the fetch TLB when the generation moved (SFENCE.VMA / satp
-    /// write) — not on all 200M+ dispatches of a hot workload.
-    gen: u64,
+    /// Function-table index (JitBlock.idx; < 0 = blacklisted sentinel).
+    idx: i32,
+    /// Low 32 bits of cpu.map_gen at last successful pa-verify. The fast path
+    /// re-verifies via the authoritative cache only when the generation moved
+    /// (SFENCE.VMA / satp write); a wraparound false-mismatch just re-probes.
+    gen: u32,
 }
 
 const NO_PC: u64 = u64::MAX;
@@ -273,11 +278,7 @@ impl JitState {
             dispatch: vec![
                 DispatchLine {
                     pc: NO_PC,
-                    blk: JitBlock {
-                        idx: 0,
-                        n: 0,
-                        pa: 0
-                    },
+                    idx: 0,
                     gen: 0,
                 };
                 DISPATCH_SIZE
@@ -423,7 +424,7 @@ pub extern "C" fn sys_set_superblock(on: u32) {
 }
 /// Max chained block dispatches before returning to the interpreter (keeps
 /// interrupt/budget latency bounded in fully-jitted loops).
-const JIT_CHAIN_CAP: u32 = 256;
+const JIT_CHAIN_CAP: u32 = 1024;
 /// Once a code page accumulates this many hot NON-loop block entries it is
 /// branchy enough (e.g. an interpreter's dispatch loop) to compile as one
 /// superblock — one wasm function covering the whole page with an internal
@@ -498,22 +499,22 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
         while chained < JIT_CHAIN_CAP {
             let pc = m.cpu.pc;
             let line = jit.dispatch[JitState::dslot(pc)];
-            let b = if line.pc == pc {
-                line.blk
+            let idx = if line.pc == pc {
+                line.idx
             } else {
                 match jit.cache.get(&pc) {
                     Some(Some(b)) => {
-                        let b = *b;
-                        jit.dispatch[JitState::dslot(pc)] = DispatchLine { pc, blk: b, gen: 0 };
-                        b
+                        let idx = b.idx;
+                        jit.dispatch[JitState::dslot(pc)] = DispatchLine { pc, idx, gen: 0 };
+                        idx
                     }
                     _ => break,
                 }
             };
-            if b.idx < 0 {
-                break; // blacklisted (pa-verified for the current mapping)
+            if idx < 0 {
+                break; // blacklisted (user mode never blacklists with pa, but keep the invariant)
             }
-            call_block(b.idx, m as *mut _ as *mut u8);
+            call_block(idx, m as *mut _ as *mut u8);
             // Read the dynamic retired count the block wrote: self-loop blocks
             // (Phase 3) run a runtime-variable number of iterations, so their
             // length is not the static b.n.
@@ -751,35 +752,32 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             jit.page_entries.clear(); // re-discover superblock entries
         }
         // --- JIT fast path: direct-mapped dispatch + cheap pa-verify ---
+        // Per-dispatch bookkeeping accumulates in LOCALS and flushes once after
+        // the chain: at ~200M+ dispatches per second of guest compute, the five
+        // read-modify-writes this loop used to do per iteration (insn_count,
+        // remaining, two stat counters, chain counter) were a measurable slice
+        // of total wall time. map_gen is hoisted too — blocks can't execute
+        // satp/SFENCE (SYSTEM never compiles; blocks bail AT it), so it cannot
+        // move inside a chain.
+        let map_gen = m.cpu.map_gen as u32;
+        let mptr = m as *mut rv64_system::Machine as *mut u8;
         let mut chained = 0u32;
+        let mut retired_sum = 0u64;
         while chained < JIT_CHAIN_CAP {
             let pc = m.cpu.pc;
             let slot = JitState::dslot(pc);
+            // Fast path: line hit AND no mapping event since it verified —
+            // one 16-byte load and two compares, then straight to the call.
+            // Any other case (miss, or SFENCE.VMA/satp moved cpu.map_gen)
+            // resolves through the authoritative cache with a fetch-TLB
+            // probe and refills the line stamped with the current generation
+            // — so the cache survives the frequent data-page SFENCEs of
+            // malloc-heavy processes (one re-probe per block per event, not
+            // a flush).
             let line = jit.dispatch[slot];
-            // Verify the block's virtual pc still maps to the same physical
-            // code — but only when a mapping event (SFENCE.VMA / satp write,
-            // tracked by cpu.map_gen) happened since this line last verified.
-            // The common case is a single u64 compare instead of a fetch-TLB
-            // probe on every dispatch; the cache still survives the frequent
-            // data-page SFENCEs of malloc-heavy processes (one re-probe per
-            // block per event, not a flush).
-            let b = if line.pc == pc {
-                if line.gen != m.cpu.map_gen {
-                    match m.cpu.jit_probe_fetch(&mut m.bus, pc) {
-                        Some(pa) if pa == line.blk.pa => {
-                            jit.dispatch[slot].gen = m.cpu.map_gen;
-                        }
-                        _ => {
-                            jit.cache.remove(&pc);
-                            jit.dispatch[slot].pc = NO_PC;
-                            break;
-                        }
-                    }
-                }
-                line.blk
+            let idx = if line.pc == pc && line.gen == map_gen {
+                line.idx
             } else {
-                // dispatch miss: consult the authoritative cache, verify the
-                // mapping, fill the line stamped with the current generation.
                 match jit.cache.get(&pc) {
                     Some(Some(b)) => {
                         let b = *b;
@@ -787,29 +785,24 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             Some(pa) if pa == b.pa => {}
                             _ => {
                                 jit.cache.remove(&pc);
+                                jit.dispatch[slot].pc = NO_PC;
                                 break;
                             }
                         }
-                        jit.dispatch[slot] =
-                            DispatchLine { pc, blk: b, gen: m.cpu.map_gen };
-                        b
+                        jit.dispatch[slot] = DispatchLine { pc, idx: b.idx, gen: map_gen };
+                        b.idx
                     }
                     _ => break, // uncompiled or blacklisted
                 }
             };
-            if b.idx < 0 {
+            if idx < 0 {
                 break; // blacklisted (pa-verified for the current mapping)
             }
-            call_block(b.idx, m as *mut _ as *mut u8);
+            call_block(idx, mptr);
             // Sys blocks with inline memory ops may bail mid-block; read the
             // count they actually retired (pc is set by the block either way).
             let retired = unsafe { RETIRED_CELL };
-            m.cpu.insn_count += retired;
-            unsafe {
-                JIT_RETIRED += retired;
-                JIT_DISPATCHES += 1;
-            }
-            remaining = remaining.saturating_sub(retired);
+            retired_sum += retired;
             chained += 1;
             // A block that retired nothing bailed on its very first instruction
             // (TLB miss / MMIO / FP fast-path). It makes no progress, so stop
@@ -819,6 +812,12 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 break;
             }
         }
+        m.cpu.insn_count += retired_sum;
+        unsafe {
+            JIT_RETIRED += retired_sum;
+            JIT_DISPATCHES += chained as u64;
+        }
+        remaining = remaining.saturating_sub(retired_sum);
 
         // If we stopped only because we hit the chain cap (the next pc is still
         // compiled and making progress), keep running in the JIT: advance the
@@ -914,8 +913,8 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                         }
                                         jit.dispatch[JitState::dslot(e)] = DispatchLine {
                                             pc: e,
-                                            blk: jb,
-                                            gen: m.cpu.map_gen,
+                                            idx,
+                                            gen: m.cpu.map_gen as u32,
                                         };
                                     }
                                     continue;
