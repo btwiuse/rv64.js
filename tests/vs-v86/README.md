@@ -101,6 +101,70 @@ wins (structured/nested loops, FP-in-blocks) were user-mode gated. 3f enabled
 them for system blocks (mid-loop bail reports the live iteration count; the
 system FP file drives FP-in-blocks), and now rv64.js leads v86 in *both* modes.
 
+## nbench (BYTEmark) — v86's actual arch-bytemark compute benchmark
+
+v86's flagship compute benchmark (`tests/benchmark/arch-bytemark.js`) runs the
+real **nbench** (BYTEmark, Uwe Mayer's Linux port) inside a booted Linux. We run
+the *same* nbench source, built for riscv64, inside our full-system Linux
+(`nbench.mjs`). It exercises 10 kernels grouped into INTEGER / FP / MEMORY
+indices (NUMERIC SORT, STRING SORT, BITFIELD, FP EMULATION, FOURIER, ASSIGNMENT,
+IDEA, HUFFMAN, NEURAL NET, LU DECOMPOSITION).
+
+**The clock caveat (important):** nbench *self-times* via the guest clock. Our
+default clock is instruction-counted (deterministic — see "Clock" below), which
+would make nbench's scores identical JIT-vs-interp. So `nbench.mjs` enables the
+opt-in **wall-clock** time source (`sys_set_wallclock`), making the self-timed
+scores reflect real throughput exactly as they do under v86.
+
+Our results (riscv64, wall-clock, JIT vs our interpreter; "New Index" =
+×AMD-K6/233, v86's own scale). The JIT's per-kernel effect is what BYTEmark is
+designed to expose:
+
+| Kernel | interp iters/s | JIT iters/s | JIT speedup |
+|---|---:|---:|---:|
+| NUMERIC SORT | 33.6 | 65.4 | 1.9× |
+| STRING SORT | 0.63 | 23.2 | **37×** |
+| BITFIELD | 8.7e6 | 5.5e8 | **64×** |
+| FP EMULATION | 4.08 | 12.4 | 3.0× |
+| FOURIER | 741 | 728 | 1.0× (libm sin/cos/pow — not JIT'd) |
+| ASSIGNMENT | 0.86 | 5.15 | **6.0×** |
+| IDEA | 142 | 353 | 2.5× |
+| HUFFMAN | 67 | 71 | 1.1× |
+
+**v86-side head-to-head is not yet wired up** — two environment blockers:
+building nbench for i386 needs 32-bit glibc (`gnu/stubs-32.h`), absent from this
+nix env (our freestanding kernels use `-nostdlib`, but nbench needs full libc);
+and v86's own arch-bytemark needs its Arch-Linux image + snapshot, not
+downloaded here. Options to close it: fetch v86's Arch image
+(`tests/benchmark/fetch-download.js`) and run its real arch-bytemark, or get a
+32-bit libc to build `nbench.i386` and inject it into v86's buildroot.
+
+Build + bake (riscv64 side), for `nbench.mjs`:
+
+```sh
+# newlib cross-gcc; needs pointer.h=`#define LONG64`, a popen-free hardware()
+# stub, and stub sysinfo.c/sysinfoc.c (see git history for the exact stubs).
+riscv64-none-elf-gcc -DLINUX -O2 -static -march=rv64gc -mabi=lp64d \
+  -o nbench.rv64 nbench0.c nbench1.c sysspec.c misc.c emfloat.c hwstub.c -lm
+riscv64-none-elf-strip -s nbench.rv64
+# bake into a copy of the ext2 rootfs (nbench has no in-guest open() — riscv64
+# Linux only has openat and newlib's open isn't wired — so no command file;
+# lower MINIMUM_SECONDS in nmglobal.h at build time instead of via -cCMD):
+cp web/images/root-riscv64.bin root-nbench.bin
+debugfs -w -R 'write nbench.rv64 nbench' root-nbench.bin
+debugfs -w -R 'sif /nbench mode 0100755' root-nbench.bin
+SC=. ROOT_NBENCH=root-nbench.bin node tests/vs-v86/nbench.mjs
+```
+
+## Clock: instruction-counted (default) vs wall-clock (opt-in)
+
+Our CLINT `mtime` is derived from `insn_count` — deterministic "virtual time"
+(QEMU's `-icount`), which our lockstep/differential testing vs Spike relies on.
+`sys_set_wallclock(1)` opts into a real host-wall-clock source instead (like v86
+and real hardware), so `gettimeofday`/`clock` and self-timing benchmarks reflect
+real time. Both are correct emulator behaviour; the default stays deterministic
+so validation is reproducible. See the commit adding `Machine::wall_ns`.
+
 ## Reproducing
 
 Everything runs through the nix dev shell. Build the benchmarks (into `$SC/xbench/`):
