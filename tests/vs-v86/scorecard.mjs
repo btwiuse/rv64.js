@@ -45,6 +45,11 @@ const bbl = new Uint8Array(await readFile(join(root, "web/images/bbl64.bin")));
 const kern = new Uint8Array(await readFile(join(root, "web/images/kernel-riscv64.bin")));
 const enc = new TextEncoder();
 const step = (vm, n) => { for (let i = 0; i < n; i++) vm.runSystem(2_000_000n); };
+// Yield to the JS event loop periodically inside run loops: async-compiled
+// superblock modules resolve on the microtask queue, which a synchronous
+// loop starves (v86's runners are event-driven and yield constantly — this
+// also makes the two sides' host behavior symmetric).
+const tick = () => new Promise((r) => setImmediate(r));
 const has = async (p) => { try { await access(p); return true; } catch { return false; } };
 
 // ---------- rv64: boot buildroot, inject a freestanding binary, time it ----------
@@ -65,7 +70,7 @@ async function rvComputeBoot(jit, binPath) {
   const st = { vm, out: "", start: null, done: null, ts: null, td: null };
   watchMarkers(vm, st);
   vm.bootLinux({ bios: bbl, kernel: kern, disk: (new Uint8Array(await readFile(join(root, "web/images/root-riscv64.bin")))).slice() });
-  for (let i = 0; i < 40000 && !st.out.includes("~ #"); i++) vm.runSystem(5_000_000n);
+  for (let i = 0; i < 40000 && !st.out.includes("~ #"); i++) { vm.runSystem(5_000_000n); if ((i & 15) === 0) await tick(); }
   vm.consoleInput(enc.encode("stty -echo 2>/dev/null\n")); step(vm, 3000);
   const b64 = Buffer.from(await readFile(binPath)).toString("base64");
   vm.consoleInput(enc.encode(": > /tmp/b\n")); step(vm, 1500);
@@ -73,12 +78,13 @@ async function rvComputeBoot(jit, binPath) {
   vm.consoleInput(enc.encode("base64 -d /tmp/b > /tmp/c && chmod 755 /tmp/c\n")); step(vm, 12000);
   return st;
 }
-function rvRunBench(st) {
+async function rvRunBench(st) {
   st.out = ""; st.ts = null; st.td = null; st.start = "BENCH_START"; st.done = "BENCH_DONE";
   st.vm.consoleInput(enc.encode("/tmp/c\n"));
   const t0 = performance.now();
   for (let i = 0; i < 2_000_000 && st.td === null; i++) {
     st.vm.runSystem(5_000_000n);
+    if ((i & 15) === 0) await tick();
     if (performance.now() - t0 > 200000) break;
   }
   if (st.ts === null || st.td === null) return null;
@@ -90,7 +96,7 @@ async function rvBootTime(jit) {
   let out = ""; vm.onWrite = (fd, b) => (out += new TextDecoder().decode(b));
   const t = performance.now();
   vm.bootLinux({ bios: bbl, kernel: kern, disk: (new Uint8Array(await readFile(join(root, "web/images/root-riscv64.bin")))).slice() });
-  for (let i = 0; i < 200000 && !out.includes("~ #"); i++) vm.runSystem(2_000_000n);
+  for (let i = 0; i < 200000 && !out.includes("~ #"); i++) { vm.runSystem(2_000_000n); if ((i & 15) === 0) await tick(); }
   return out.includes("~ #") ? performance.now() - t : null;
 }
 async function rvPython(jit) {
@@ -99,12 +105,13 @@ async function rvPython(jit) {
   const st = { vm, out: "", start: null, done: null, ts: null, td: null };
   watchMarkers(vm, st);
   vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice(), cmdline: "console=hvc0 root=/dev/vda rw init=/binit.sh", ramMB: 512 });
-  for (let i = 0; i < 400000 && !st.out.includes("BENCH_READY"); i++) vm.runSystem(3_000_000n);
+  for (let i = 0; i < 400000 && !st.out.includes("BENCH_READY"); i++) { vm.runSystem(3_000_000n); if ((i & 15) === 0) await tick(); }
   st.out = ""; st.start = "FIB_START"; st.done = "FIB_DONE";
   vm.consoleInput(enc.encode("/usr/bin/python3 /fib.py\n"));
   const t = performance.now();
   for (let i = 0; i < 6_000_000 && st.td === null; i++) {
     vm.runSystem(4_000_000n);
+    if ((i & 15) === 0) await tick();
     if (performance.now() - t > 300000) break;
   }
   return st.ts !== null && st.td !== null ? st.td - st.ts : null;
@@ -114,10 +121,10 @@ async function rvNbench(jit) {
   const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); if (SB && jit) vm.ex.sys_set_superblock(1); vm.ex.sys_set_wallclock(1);
   let out = ""; vm.onWrite = (fd, b) => (out += new TextDecoder().decode(b));
   vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice() });
-  for (let i = 0; i < 60000 && !out.includes("~ #"); i++) vm.runSystem(2_000_000n);
+  for (let i = 0; i < 60000 && !out.includes("~ #"); i++) { vm.runSystem(2_000_000n); if ((i & 15) === 0) await tick(); }
   out = ""; vm.consoleInput(enc.encode("cd / && ./nbench\n"));
   const t = performance.now();
-  for (let i = 0; i < 40_000_000; i++) { vm.runSystem(4_000_000n); if (out.includes("Trademarks")) break; if (performance.now() - t > 240000) break; }
+  for (let i = 0; i < 40_000_000; i++) { vm.runSystem(4_000_000n); if ((i & 15) === 0) await tick(); if (out.includes("Trademarks")) break; if (performance.now() - t > 240000) break; }
   const rows = {};
   for (const m of out.matchAll(/^([A-Z][A-Z ]+?)\s+:\s+([\d.e+]+)\s+:/gm)) rows[m[1].trim()] = +m[2];
   return rows;
@@ -132,7 +139,7 @@ async function rvCompile(jit) {
   const st = { vm, out: "", start: null, done: null, ts: null, td: null };
   watchMarkers(vm, st);
   vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice() });
-  for (let i = 0; i < 40000 && !st.out.includes("~ #"); i++) vm.runSystem(5_000_000n);
+  for (let i = 0; i < 40000 && !st.out.includes("~ #"); i++) { vm.runSystem(5_000_000n); if ((i & 15) === 0) await tick(); }
   if (!st.out.includes("~ #")) return null;
   vm.consoleInput(enc.encode("stty -echo 2>/dev/null\n")); step(vm, 3000);
   st.out = ""; st.start = "RUN_START"; st.done = "RUN_DONE";
@@ -140,6 +147,7 @@ async function rvCompile(jit) {
   const t = performance.now();
   for (let i = 0; i < 2_000_000; i++) {
     vm.runSystem(5_000_000n);
+    if ((i & 15) === 0) await tick();
     if (st.td !== null && /[0-9a-f]{32}/.test(st.out)) break;
     if (performance.now() - t > 300000) break;
   }
@@ -193,13 +201,13 @@ const log = (m) => process.stderr.write(m);
 for (const jit of FULL ? [false, true] : [true]) {
   log(`[rv64 compute jit=${+jit}] boot…`);
   const st = await rvComputeBoot(jit, join(ARTIFACTS, "xbench", "alu.rv64"));
-  { const r = rvRunBench(st); const row = (R.ALU ??= {}); row[jit ? "rvj" : "rvi"] = r?.ms ?? null; row[jit ? "rvj_chk" : "rvi_chk"] = r?.chk ?? null; } log(" alu");
+  { const r = await rvRunBench(st); const row = (R.ALU ??= {}); row[jit ? "rvj" : "rvi"] = r?.ms ?? null; row[jit ? "rvj_chk" : "rvi_chk"] = r?.chk ?? null; } log(" alu");
   // reuse boot: swap /tmp/c to the mixed binary
   const b64 = Buffer.from(await readFile(join(ARTIFACTS, "xbench", "rvbench_fs.rv64"))).toString("base64");
   st.vm.consoleInput(enc.encode(": > /tmp/b\n")); step(st.vm, 1500);
   for (let o = 0; o < b64.length; o += 512) { st.vm.consoleInput(enc.encode(`printf %s '${b64.slice(o, o + 512)}' >> /tmp/b\n`)); step(st.vm, 3000); }
   st.vm.consoleInput(enc.encode("base64 -d /tmp/b > /tmp/c && chmod 755 /tmp/c\n")); step(st.vm, 12000);
-  { const r = rvRunBench(st); const row = (R.Mixed ??= {}); row[jit ? "rvj" : "rvi"] = r?.ms ?? null; row[jit ? "rvj_chk" : "rvi_chk"] = r?.chk ?? null; } log(" mixed\n");
+  { const r = await rvRunBench(st); const row = (R.Mixed ??= {}); row[jit ? "rvj" : "rvi"] = r?.ms ?? null; row[jit ? "rvj_chk" : "rvi_chk"] = r?.chk ?? null; } log(" mixed\n");
 }
 // boot time
 for (const jit of FULL ? [false, true] : [true]) {
