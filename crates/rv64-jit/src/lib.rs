@@ -717,6 +717,51 @@ impl Ctx {
         }
         // PAGE = va >> 12
         m.local_get(VA).i64_const(12).op(I64_SHR_U).local_set(PAGE);
+        // Page coalescing (memory-dense blocks, scratch allocated): the last
+        // successfully probed (page -> linear offset) per access class is
+        // cached in block locals — repeat accesses to the same page skip the
+        // fused-TLB index/tag work entirely. Nothing a block can execute
+        // invalidates a va->linear mapping mid-block (no satp/SFENCE/CSR
+        // compile; page jit-marking happens at compile time), so a hit is
+        // always safe. Locals are initialized to an impossible page (-1) in
+        // the prologue.
+        let cache = if self.fma_scratch != 0 {
+            let base = self.fma_scratch + 8 + if store { 2 } else { 0 };
+            Some((base, base + 1)) // (cached page, cached off)
+        } else {
+            None
+        };
+        if let Some((cpg, coff)) = cache {
+            m.local_get(PAGE).local_get(cpg).op(I64_EQ);
+            m.op(IF).op(0x7f); // i32 result: the linear index
+            m.local_get(VA).local_get(coff).op(I64_ADD).op(I32_WRAP_I64);
+            m.op(ELSE);
+            // slow probe; on success cache (page, off) for later accesses
+            self.tlb_idx_tag_check(m, sys, tag_base, pc, n);
+            m.local_get_i32(self.idxb).i64_load_at(off_base as u64);
+            m.local_set(coff);
+            m.local_get(PAGE).local_set(cpg);
+            m.local_get(VA).local_get(coff).op(I64_ADD).op(I32_WRAP_I64);
+            m.op(END);
+            return;
+        }
+        self.tlb_idx_tag_check(m, sys, tag_base, pc, n);
+        // linear index = (va + ftlb_off[idx]) as i32
+        m.local_get(VA);
+        m.local_get_i32(self.idxb).i64_load_at(off_base as u64);
+        m.op(I64_ADD).op(I32_WRAP_I64);
+    }
+
+    /// Fused-TLB index computation + tag compare; bails on miss. Leaves
+    /// IDXB holding the entry index for the caller's off-load.
+    fn tlb_idx_tag_check(
+        &self,
+        m: &mut WasmModule,
+        sys: &SysMem,
+        tag_base: u32,
+        pc: u64,
+        n: u32,
+    ) {
         // IDXB (i32) = ((page & mask) << 3)
         m.local_get(PAGE)
             .op(I32_WRAP_I64)
@@ -731,10 +776,6 @@ impl Ctx {
         m.op(IF).op(VOID);
         self.bail(m, pc, n);
         m.op(END);
-        // linear index = (va + ftlb_off[idx]) as i32
-        m.local_get(VA);
-        m.local_get_i32(self.idxb).i64_load_at(off_base as u64);
-        m.op(I64_ADD).op(I32_WRAP_I64);
     }
 }
 
@@ -744,6 +785,7 @@ impl Ctx {
 /// Returns (gpr_read, gpr_write, fp_read, fp_write) register bitmaps.
 fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u32, u32, u32) {
     let (mut read, mut write) = (0u32, 0u32);
+    let mut mem_ops = 0u32;
     let (mut fread, mut fwrite) = (0u32, 0u32);
     let mut pc = start_pc;
     let mut n = 0u32;
@@ -795,6 +837,7 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 }
                 mark(&mut read, s1);
                 mark(&mut write, d);
+                mem_ops += 1;
             }
             0x23 if lay.mem.is_some() || lay.sys.is_some() => {
                 if funct3(insn) > 3 {
@@ -802,6 +845,7 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 }
                 mark(&mut read, s1);
                 mark(&mut read, s2);
+                mem_ops += 1;
             }
             // FLD / FSD (double, funct3==3): raw 8-byte copy mem<->f[], user-mode
             // direct or system inline-TLB (needs f_base for the FP file).
@@ -902,6 +946,9 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
         }
         pc = next_pc;
         n += 1;
+    }
+    if mem_ops >= 3 {
+        read |= 1; // bit 0: allocate scratch (memory page-cache; see build_ctx)
     }
     (read, write, fread, fwrite)
 }
@@ -1139,6 +1186,7 @@ fn scan_regs_region(
     _lay: &JitLayout,
 ) -> (u32, u32, u32, u32) {
     let (mut read, mut write, mut fread, mut fwrite) = (0u32, 0u32, 0u32, 0u32);
+    let mut mem_ops = 0u32;
     let fmark = |m: &mut u32, r: usize| *m |= 1 << r;
     let mark = |m: &mut u32, r: usize| {
         if r != 0 {
@@ -1165,14 +1213,17 @@ fn scan_regs_region(
             0x03 => {
                 mark(&mut read, s1);
                 mark(&mut write, d);
+                mem_ops += 1;
             }
             0x23 => {
                 mark(&mut read, s1);
                 mark(&mut read, s2);
+                mem_ops += 1;
             }
             0x07 => {
                 mark(&mut read, s1);
                 fmark(&mut fwrite, d);
+                mem_ops += 1;
             }
             0x27 => {
                 mark(&mut read, s1);
@@ -1229,6 +1280,9 @@ fn scan_regs_region(
         }
         pc = pc.wrapping_add(ilen);
     }
+    if mem_ops >= 3 {
+        read |= 1; // bit 0: allocate scratch (memory page-cache; see build_ctx)
+    }
     (read, write, fread, fwrite)
 }
 
@@ -1267,7 +1321,7 @@ fn build_ctx(
             n_fp += 1;
         }
     }
-    let n_fma = if want_fma { 8 } else { 0 };
+    let n_fma = if want_fma { 12 } else { 0 };
     let c = Ctx {
         lay,
         reg_local,
@@ -1295,6 +1349,13 @@ fn build_ctx(
         m.i32_const(0)
             .i64_load(lay.f_base as u64 + r as u64 * 8)
             .local_set(fp_local[r]);
+    }
+    if want_fma {
+        // memory page-cache locals ([8]=load pg, [10]=store pg) must start
+        // at an impossible page: locals zero-init and page 0 is a real page.
+        let base = N_I64_LOCALS + 1 + n_reg + n_fp;
+        m.i64_const(-1).local_set(base + 8);
+        m.i64_const(-1).local_set(base + 10);
     }
     (c, m)
 }
