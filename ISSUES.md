@@ -672,3 +672,51 @@ hold a caller and a callee 16KB apart — so nearly every call and return is a
 host dispatch. The fix is a region built from the call graph rather than from
 address adjacency (a two-level dispatch over a sparse page set); that is
 designed but not built.
+
+
+## NEXT: INCREMENTAL REGION EXTENSION (the one project both remaining rows share)
+
+Design, from this session's measurements (2026-07-25):
+
+**Why.** compile (2.2x) is cross-page calls at 9 insns/host-dispatch; FOURIER
+(~1.15x) is fmadd sites reachable only through cross-page libm calls, where
+the shipped hardware-FMA path cannot help until the sites live inside big
+functions. Every alternative is measured out: per-block tail calls (~1.2us/hop
+cross-instance), page-contiguous regions (can't span tcc's call graph),
+reachability-driven sparse regions (rebuild cost/codegen regressed FP rows),
+build-count increases (always lose: 19 builds -> 3.1s, 52 -> 5.8s), node 22
+(V8 12 tiering punishes many small modules: ASSIGNMENT 19 -> 2.6), relaxed
+SIMD on node 20 (experimental flag taxes all compilation).
+
+**What.** A region function must EXTEND when its misses say so, without
+discarding V8's optimized code for the old version. Since wasm functions are
+immutable, extension = compile the SUPERSET function asynchronously and
+REPOINT entries when it lands (machinery exists: sys_sb_ready), but with two
+changes from today's rebuild:
+1. The OLD function keeps running until the new one LANDS (today: entries are
+   already repointed to individual blocks during the gap — that is the
+   FP EMULATION 2568 -> 550 MIPS cliff). Repoint only on landing; never
+   un-install the old function early.
+2. Extension is DRIVEN BY MEASURED EXITS: count, per region function, exits
+   whose TPC resolved to a page NOT in the region (a cheap in-function
+   counter per region, or host-side: attribute dispatch-line misses following
+   a region exit). Extend with the top exit-target pages, weighted; cap total
+   size by V8 compile cost (~4KB/page module bytes, measured ~15-40ms per
+   8-page build).
+3. Keep the sparse dispatch (one range check per contiguous run — commit
+   5b69da6 on branch sparse-regions has run-level discovery + run-level
+   resolve, both needed).
+4. The sparse-regions branch also carries the miss-counter reset + per-page
+   exponential cooldown; keep both, but key the cooldown to the REGION (its
+   lead page), not each member page.
+
+**Where.** Branch sparse-regions holds the working sparse translator
+(translate_superblock_sparse, call-graph selection, run-level fixes). Main
+holds the same plus the network-stack preservation. The 11/13-measured JIT
+is commit 46736c3 (rv64-jit/rv64-wasm/web) if a baseline comparison is
+needed.
+
+**Acceptance.** The full battery (run-all stage 7 incl. amo-diff), then
+ARTIFACTS=<sc> NBENCH=1 SB=1 REPS=3 scorecard: 13/13 win-or-match with no
+nbench-flagged instability. FP EMULATION/ASSIGNMENT/IDEA must not regress
+below their 11/13 values (235 iter/s / 19 / 4500-5000).
