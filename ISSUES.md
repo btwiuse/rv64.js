@@ -649,7 +649,20 @@ closed. What the remaining rows turned out to be, and what fixed them:
   follows the continuation, and a run nbench flags as uncertain is now
   INVALID — an unstable number is not a result.
 
-Remaining loss: **compile (tcc -c)**, ~2.6x behind v86. Measured, not
+Scorecard after this work: **11 of 13 rows win-or-match** (valid run, all
+kernels reported, none flagged statistically uncertain). Two rows remain, both
+diagnosed:
+
+**nbench FOURIER**, ~1.1-1.2x behind. The kernel's cost is the exact FMADD
+emulation: ~35 f64 operations (Dekker two-product, Knuth two-sum,
+round-to-odd) per guest `fmadd.d`, because neither wasm nor JavaScript exposes
+a fused multiply-add. The i386 build cannot contract into FMA at all, so v86's
+guest executes a plain multiply and add — the asymmetry is real work, not a
+harness artifact. Trimming the guards around the sequence moved it 345 -> 353
+MIPS, confirming the sequence itself is the floor. Getting this row needs
+either a cheaper exact algorithm or a wasm fma.
+
+**compile (tcc -c)**, ~2.2x behind v86. Measured, not
 guessed: the row is ~100% user-mode tcc, 340M guest instructions at 9 insns
 per dispatch. It is not module-build cost (~4us each), not TLB-miss bails
 (removing all 1.2M of them is a wash), and not superblock coverage (more page
