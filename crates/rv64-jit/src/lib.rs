@@ -333,9 +333,7 @@ impl Ctx {
     /// FSQRT.D: wasm f64.sqrt is exactly rounded (RNE), so under the same
     /// eligibility as arith it is bit-exact; negative/inf/zero inputs produce
     /// non-normal results and fall to the result guard.
-    fn fp_sqrt_d(&self, m: &mut WasmModule, s1: usize, d: usize, dyn_rm: bool, pc: u64, n: u32) {
-        self.fp_fs_guard(m, pc, n);
-        self.fp_eligibility(m, dyn_rm, pc, n);
+    fn fp_sqrt_d(&self, m: &mut WasmModule, s1: usize, d: usize, _dyn_rm: bool, pc: u64, n: u32) {
         self.push_freg(m, s1);
         m.op(F64_REINTERPRET_I64).op(F64_SQRT);
         m.op(I64_REINTERPRET_F64).local_set(VAL);
@@ -350,7 +348,6 @@ impl Ctx {
     /// riscv clamps + flags) bail to softfloat; NX (non-integral input) is
     /// covered by the sticky-NX eligibility.
     fn fp_cvt_w_d(&self, m: &mut WasmModule, s1: usize, d: usize, pc: u64, n: u32) {
-        self.fp_fs_guard(m, pc, n);
         self.fp_eligibility(m, false, pc, n);
         // in-range: -2^31-1 < f  &&  f < 2^31  (NaN fails both -> bail)
         m.i64_const((-2147483649.0f64).to_bits() as i64)
@@ -381,11 +378,9 @@ impl Ctx {
     /// variants are EXACT (no flags, any rounding mode) and need no guards at
     /// all; the 64-bit ones round (NX for |v| > 2^53) — wasm's converts are
     /// exactly rounded RNE, so sticky-NX eligibility makes them bit-exact.
-    fn fp_cvt_d_int(&self, m: &mut WasmModule, s1: usize, d: usize, v: u32, dyn_rm: bool, pc: u64, n: u32) {
-        self.fp_fs_guard(m, pc, n);
+    fn fp_cvt_d_int(&self, m: &mut WasmModule, s1: usize, d: usize, v: u32, _dyn_rm: bool, _pc: u64, _n: u32) {
         if v >= 2 {
-            self.fp_eligibility(m, dyn_rm, pc, n);
-        }
+            }
         self.store_freg_pre(m, d);
         self.push_reg(m, s1);
         match v {
@@ -415,8 +410,7 @@ impl Ctx {
     /// non-normal result. Scratch: 8 i64 locals at Ctx::fma_scratch.
     #[allow(clippy::too_many_arguments)]
     fn fp_fmadd_d(&self, m: &mut WasmModule, s1: usize, s2: usize, s3: usize, d: usize,
-                  neg_prod: bool, neg_c: bool, dyn_rm: bool, pc: u64, n: u32) {
-        self.fp_fs_guard(m, pc, n);
+                  neg_prod: bool, neg_c: bool, _dyn_rm: bool, pc: u64, n: u32) {
         debug_assert!(self.fma_scratch != 0);
         let fs = self.fma_scratch;
         let (fa, fb, fc, fp, f4, f5, f6, f7l) =
@@ -426,7 +420,6 @@ impl Ctx {
         let fconst = |m: &mut WasmModule, v: f64| {
             m.i64_const(v.to_bits() as i64).op(F64_REINTERPRET_I64);
         };
-        self.fp_eligibility(m, dyn_rm, pc, n);
         // load operands (bits), applying the variant's sign flips
         self.push_freg(m, s1);
         if neg_prod {
@@ -599,9 +592,7 @@ impl Ctx {
         self.store_freg_post(m, d);
     }
 
-    fn fp_arith_d(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, d: usize, dyn_rm: bool, pc: u64, n: u32) {
-        self.fp_fs_guard(m, pc, n);
-        self.fp_eligibility(m, dyn_rm, pc, n);
+    fn fp_arith_d(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, d: usize, _dyn_rm: bool, pc: u64, n: u32) {
         // r = f[s1] <op> f[s2]  (as f64), reinterpreted back to i64 bits.
         self.push_freg(m, s1);
         m.op(F64_REINTERPRET_I64);
@@ -626,7 +617,6 @@ impl Ctx {
     /// interpreter if either operand is inf/nan (the exact-flag/NV cases);
     /// finite operands compare exactly with no flag change.
     fn fp_cmp_d(&self, m: &mut WasmModule, f3: u32, s1: usize, s2: usize, d: usize, pc: u64, n: u32) {
-        self.fp_fs_guard(m, pc, n);
         for &s in &[s1, s2] {
             self.push_freg(m, s);
             m.i64_const(52)
@@ -1291,6 +1281,47 @@ fn build_ctx(
     (c, m)
 }
 
+/// Emit the hoisted per-BLOCK FP gate: mstatus.FS == Dirty (system mode),
+/// fcsr.NX already sticky, and frm == RNE. None of these can change inside
+/// a compiled block — CSR writes never compile, and the covered FP ops only
+/// SET exception flags (never clear) — so ONE check at entry covers every
+/// FP instruction the block contains, replacing the per-instruction
+/// eligibility/FS checks (5-9 wasm ops each) on FP-dense code. Bails with
+/// pc = block start and zero retired: nothing has executed, the interpreter
+/// replays from the top, and the first FP instruction performs the
+/// architectural transition (FS trap/Dirty, NX set) exactly as before.
+/// Conservative for blocks whose only FP ops are static-RNE while guest
+/// frm != RNE (they run interpreted until frm returns) — frm changes are
+/// rare and transient in real code.
+fn emit_block_fp_gate(c: &Ctx, m: &mut WasmModule, start_pc: u64) {
+    let fcsr = c.lay.fcsr_addr as u64;
+    // bad = (fcsr & 1) == 0  ||  ((fcsr >> 5) & 7) != 0
+    m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
+    m.i32_const(0)
+        .i64_load(fcsr)
+        .i64_const(5)
+        .op(I64_SHR_U)
+        .i64_const(7)
+        .op(I64_AND)
+        .op(I64_EQZ)
+        .op(I32_EQZ);
+    m.op(I32_OR);
+    if c.lay.mstatus_addr != 0 {
+        m.i32_const(0)
+            .i64_load(c.lay.mstatus_addr as u64)
+            .i64_const(13)
+            .op(I64_SHR_U)
+            .i64_const(3)
+            .op(I64_AND)
+            .i64_const(3)
+            .op(I64_NE);
+        m.op(I32_OR);
+    }
+    m.op(IF).op(VOID);
+    c.bail(m, start_pc, 0);
+    m.op(END);
+}
+
 /// Emit one non-control-flow guest instruction (LUI/AUIPC, OP-IMM(-32),
 /// OP(-32), load/store, FLD/FSD, FP arith/compare/FMV). Returns false — before
 /// emitting anything — if `insn` is a branch/jump or an unsupported encoding;
@@ -1674,7 +1705,6 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
             if funct3(insn) != 3 {
                 return false;
             }
-            c.fp_fs_guard(m, pc, n);
             c.push_reg(m, s1);
             m.i64_const(imm_i(insn)).op(I64_ADD);
             let off = if let Some((mem_base, size)) = lay.mem {
@@ -1695,7 +1725,6 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
             if funct3(insn) != 3 {
                 return false;
             }
-            c.fp_fs_guard(m, pc, n);
             c.push_reg(m, s1);
             m.i64_const(imm_s(insn)).op(I64_ADD);
             if let Some((mem_base, size)) = lay.mem {
@@ -1719,14 +1748,12 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                 (0..=3, 1, 0 | 7) => c.fp_arith_d(m, fpop, s1, s2, d, f3 == 7, pc, n),
                 (0x14, 1, 0..=2) => c.fp_cmp_d(m, f3, s1, s2, d, pc, n),
                 (0x1e, 1, 0) => {
-                    c.fp_fs_guard(m, pc, n);
-                    c.store_freg_pre(m, d);
+                            c.store_freg_pre(m, d);
                     c.push_reg(m, s1);
                     c.store_freg_post(m, d);
                 }
                 (0x1c, 1, 0) => {
-                    c.fp_fs_guard(m, pc, n);
-                    if c.store_pre(m, d) {
+                            if c.store_pre(m, d) {
                         c.push_freg(m, s1);
                         c.store_post(m, d);
                     }
@@ -2293,10 +2320,15 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     if lay.mem.is_some() || lay.sys.is_some() {
         if let Some(region) = loop_region(code, base, start_pc, &lay) {
             let (rm, wm, fr, fw) = scan_regs_region(code, base, start_pc, region.end_pc, &lay);
-            let (mut c, m) = build_ctx(lay, rm, wm, fr, fw);
+            let (mut c, mut m) = build_ctx(lay, rm, wm, fr, fw);
             // Mid-loop bails (system TLB miss/MMIO, FP fast-path) must report the
             // live iteration count, not a static index — see Ctx::retired_local.
             c.retired_local = Some(ITER);
+            if fr | fw != 0 {
+                // ITER is a zero-initialized wasm local here, so the bail
+                // correctly reports zero retired before the loop starts.
+                emit_block_fp_gate(&c, &mut m, start_pc);
+            }
             if let Some(b) = translate_loop(m, &c, code, base, start_pc, &region, &lay) {
                 return Some(b);
             }
@@ -2307,6 +2339,9 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     // op. Registers the block touches live in wasm locals for its lifetime.
     let (read_mask, write_mask, fp_read, fp_write) = scan_regs(code, base, start_pc, &lay);
     let (c, mut m) = build_ctx(lay, read_mask, write_mask, fp_read, fp_write);
+    if fp_read | fp_write != 0 {
+        emit_block_fp_gate(&c, &mut m, start_pc);
+    }
 
     let mut pc = start_pc;
     let mut n = 0u32;
@@ -2985,6 +3020,41 @@ pub fn translate_superblock(
 
     m.i64_const(0).local_set(ITER); // retired accumulator
     m.i32_const(0).i64_load(lay.pc_addr as u64).local_set(TPC);
+    // Hoisted FP gate (see emit_block_fp_gate): FS == Dirty, NX sticky and
+    // frm == RNE, checked once — none can change inside compiled code.
+    // Superblocks are multi-entry, so the bail restores the RUNTIME entry pc
+    // from TPC and reports zero retired (ITER is still its zero initial
+    // value).
+    if (fr | fw) != 0 {
+        let fcsr = lay.fcsr_addr as u64;
+        m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
+        m.i32_const(0)
+            .i64_load(fcsr)
+            .i64_const(5)
+            .op(I64_SHR_U)
+            .i64_const(7)
+            .op(I64_AND)
+            .op(I64_EQZ)
+            .op(I32_EQZ);
+        m.op(I32_OR);
+        if lay.mstatus_addr != 0 {
+            m.i32_const(0)
+                .i64_load(lay.mstatus_addr as u64)
+                .i64_const(13)
+                .op(I64_SHR_U)
+                .i64_const(3)
+                .op(I64_AND)
+                .i64_const(3)
+                .op(I64_NE);
+            m.op(I32_OR);
+        }
+        m.op(IF).op(VOID);
+        c.flush_writes(&mut m);
+        m.i32_const(0).local_get(TPC).i64_store(lay.pc_addr as u64);
+        m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
+        m.op(RETURN);
+        m.op(END);
+    }
 
     m.op(BLOCK).op(VOID); // $exit  (depth 1 from loop body)
     m.op(LOOP).op(VOID); // $L      (depth 0 from loop body)
