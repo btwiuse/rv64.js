@@ -35,6 +35,8 @@ enum Access {
 const TLB_BITS: u32 = 12;
 const TLB_SIZE: usize = 1 << TLB_BITS;
 const TLB_INVALID: u64 = !0;
+/// Instructions between interrupt polls in the interpreter (see irq_poll_cd).
+const IRQ_POLL_INTERVAL: u32 = 32;
 
 /// RV64I hart state + interpreter.
 ///
@@ -67,6 +69,13 @@ pub struct Cpu {
     /// dispatch. Privilege changes do NOT bump it (they flush the data TLB
     /// but leave va→pa identity for a given satp intact).
     pub jit_flush_gen: u64,
+    /// Instructions still to run before the next interrupt poll. Sampling the
+    /// bus's interrupt lines is a virtual call plus a CLINT/PLIC evaluation; at
+    /// one poll per instruction it was most of the interpreter's cost. Between
+    /// polls the lines can only change when devices advance (the host's
+    /// sync_devices) — a guest write that could make an interrupt deliverable
+    /// resets this to zero, so enabling interrupts still takes effect at once.
+    irq_poll_cd: u32,
     /// Bumped on every event after which a cached va→pa translation may be
     /// stale (SFENCE.VMA, satp write). Cheaper sibling of jit_flush_gen: the
     /// JIT dispatcher re-verifies a block's code mapping only when this moved,
@@ -114,6 +123,7 @@ impl Cpu {
             exc_counts: [0; 16],
             irq_counts: [0; 16],
             jit_flush_gen: 0,
+            irq_poll_cd: 0,
             map_gen: 0,
             tlb_tag: [[TLB_INVALID; TLB_SIZE]; 3],
             tlb_diff: [[0; TLB_SIZE]; 3],
@@ -434,6 +444,8 @@ impl Cpu {
 
     /// Enter the trap handler for an exception or interrupt.
     pub fn take_trap(&mut self, cause: u64, tval: u64, is_interrupt: bool) {
+        // Entering a trap changes xIE and mode; re-poll on the next instruction.
+        self.irq_poll_cd = 0;
         // A trap between an LR and its SC must invalidate the reservation, so
         // the SC fails and the guest's LR/SC loop retries. Linux's atomics rely
         // on this: without it, an interrupt handler that updates the same word
@@ -571,7 +583,12 @@ impl Cpu {
         let system = self.sys.is_some();
         for _ in 0..budget {
             if system {
-                self.check_interrupts(bus);
+                if self.irq_poll_cd == 0 {
+                    self.irq_poll_cd = IRQ_POLL_INTERVAL;
+                    self.check_interrupts(bus);
+                } else {
+                    self.irq_poll_cd -= 1;
+                }
             }
             match self.step(bus) {
                 Ok(None) => {}
@@ -1027,6 +1044,7 @@ impl Cpu {
                 }
                 // MRET
                 (0x3020_0073, _) => {
+                    self.irq_poll_cd = 0; // MPIE restores interrupt enable
                     let sys = self
                         .sys
                         .as_mut()
@@ -1048,6 +1066,7 @@ impl Cpu {
                 }
                 // SRET
                 (0x1020_0073, _) => {
+                    self.irq_poll_cd = 0; // SPIE restores interrupt enable
                     let sys = self
                         .sys
                         .as_mut()
@@ -1518,6 +1537,10 @@ impl Cpu {
 
     /// Write a CSR; false = unimplemented/read-only.
     fn csr_write(&mut self, csr: u32, v: u64) -> bool {
+        // Enabling interrupts (mstatus/sstatus.xIE, mie/sie) or clearing a
+        // pending bit must be visible to the very next instruction, so drop the
+        // interpreter's interrupt-poll countdown (see irq_poll_cd).
+        self.irq_poll_cd = 0;
         if csr >> 10 == 3 {
             return false; // read-only region
         }

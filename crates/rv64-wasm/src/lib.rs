@@ -628,6 +628,7 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             20 => ZR_FS,
             21 => DROP_SELF,
             22 => DROP_REGION,
+            31 => TLB_FILLS,
             23 => DIRTY_EVENTS,
             24 => DIRTY_DROPPED,
             25 => SB_ENTRIES_IN,
@@ -726,13 +727,21 @@ const SB_SPACE_CAP: usize = 16384;
 /// pages: a long-running kernel gets thousands of compiles, while a short cold
 /// workload like `tcc -c` (340M instructions total) can't spend a third of its
 /// runtime compiling page functions it will barely execute.
-const SB_COMPILE_SPACING: u64 = 4_000_000;
+const SB_COMPILE_SPACING: u64 = 16_000_000;
 /// Deferred superblock requests kept before new ones are dropped.
 const SB_QUEUE_CAP: usize = 64;
 /// Individually-compiled hot pcs on a superblocked page before its page
 /// function is rebuilt to cover them.
 const SB_MISSED_TRIGGER: u32 = 8;
 static mut SB_LAST_ICOUNT: u64 = 0;
+/// Guest TLB misses served inside compiled code (jit_stat 31). In-block TLB
+/// fill is off by default: it costs register pressure in every memory-op block
+/// and buys ~10% on an in-guest `tcc -c` (whose symbol tables thrash the TLB)
+/// while costing ~15% on CPython's eval loop, whose working set never misses.
+/// Switching it from a measured miss rate was tried and made the CPython row
+/// worse without flipping the tcc row, so the policy stays explicit:
+/// jit_set_tlb_fill(1) for guests with a working set past the 4096-entry TLB.
+static mut TLB_FILLS: u64 = 0;
 /// Leaders per superblock. Every entry into the function loads the register
 /// UNION over all its bodies and every exit stores the written union, so a
 /// function that covers more of the page pays more on each entry — worth it
@@ -2029,6 +2038,7 @@ pub extern "C" fn jit_set_tlb_fill(on: u32) {
 #[allow(static_mut_refs)]
 pub extern "C" fn jit_tlb_fill(va: u64, store: u32) -> i64 {
     unsafe {
+        TLB_FILLS += 1;
         match SYS.as_mut() {
             Some(m) => m
                 .cpu

@@ -128,7 +128,25 @@ async function rvNbench(jit) {
   const t = performance.now();
   for (let i = 0; i < 40_000_000; i++) { vm.runSystem(4_000_000n); if ((i & 3) === 0) await tick(); if (out.includes("Trademarks")) break; if (performance.now() - t > 340000) break; }
   const rows = {};
-  for (const m of out.matchAll(/^([A-Z][A-Z ]+?)\s+:\s+([\d.e+]+)\s+:/gm)) rows[m[1].trim()] = +m[2];
+  // nbench prints `NAME : iters/sec : ...`, but when its own repeated
+  // measurements disagree it inserts "** WARNING: ... NOT 95 % statistically
+  // certain" lines and puts the numbers on a LATER line with an empty name.
+  // Treat those as belonging to the kernel whose name last appeared — dropping
+  // them made valid runs look like missing rows (and hid the warning itself).
+  let last = null;
+  for (const line of out.split("\n")) {
+    const named = line.match(/^([A-Z][A-Z ]+?)\s+:\s*([\d.e+]*)/);
+    if (named) {
+      last = named[1].trim();
+      if (named[2]) { rows[last] = +named[2]; last = null; }
+      continue;
+    }
+    const cont = line.match(/^\s+:\s+([\d.e+]+)\s+:/);
+    if (cont && last) { rows[last] = +cont[1]; last = null; }
+    if (/NOT 95 % statistically certain|variation among the individual results/.test(line)) {
+      rows.__unstable = (rows.__unstable || 0) + (last ? 0 : 1);
+    }
+  }
   return rows;
 }
 // compile benchmark: boot the buildroot image with our riscv64 tcc + w.c, time
@@ -366,6 +384,14 @@ if (WANT_NBENCH) {
   for (const k of KERNELS) {
     need(nb?.jit?.[k] != null, `nbench ${k}: rv64 kernel missing`);
     if (haveV86) need(nb?.v8?.[k] != null, `nbench ${k}: v86 kernel missing`);
+  }
+  // nbench's own statistical check: if it says a kernel's repeats disagreed,
+  // that row is not trustworthy, whichever side it happened on.
+  if (nb?.jit?.__unstable) {
+    problems.push(`nbench: rv64 reported ${nb.jit.__unstable} kernel(s) as statistically uncertain`);
+  }
+  if (nb?.v8?.__unstable) {
+    problems.push(`nbench: v86 reported ${nb.v8.__unstable} kernel(s) as statistically uncertain`);
   }
 }
 if (problems.length) {

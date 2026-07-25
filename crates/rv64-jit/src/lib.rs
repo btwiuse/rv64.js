@@ -1301,6 +1301,15 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 mark(&mut write, d);
                 mem_ops += 1;
             }
+            0x2f if lay.sys.is_some() => {
+                if !amo_handled(insn) {
+                    break;
+                }
+                mark(&mut read, s1);
+                mark(&mut read, s2);
+                mark(&mut write, d);
+                mem_ops += 1;
+            }
             0x23 if lay.mem.is_some() || lay.sys.is_some() => {
                 if funct3(insn) > 3 {
                     break;
@@ -1503,6 +1512,15 @@ fn fp_handled(insn: u32) -> bool {
     }
 }
 
+/// Is this an atomic memory operation the JIT emits inline? Single-hart, so
+/// AMO* is just load / modify / store through the same inline TLB as any other
+/// access — but LR/SC are NOT compiled (they carry reservation state the
+/// interpreter owns). aq/rl ordering bits are irrelevant on one hart.
+fn amo_handled(insn: u32) -> bool {
+    matches!(funct3(insn), 2 | 3)
+        && matches!(insn >> 27, 0 | 1 | 4 | 8 | 0xc | 0x10 | 0x14 | 0x18 | 0x1c)
+}
+
 /// Is this FMADD-family (0x43/0x47/0x4b/0x4f) instruction one the JIT emits
 /// inline? Double precision (fmt bits [26:25] == 1), rm RNE or dynamic.
 /// Same single-authority contract as fp_handled/alu_handled.
@@ -1613,6 +1631,11 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
             }
             0x23 => {
                 if funct3(insn) > 3 {
+                    return None;
+                }
+            }
+            0x2f if lay.sys.is_some() => {
+                if !amo_handled(insn) {
                     return None;
                 }
             }
@@ -1744,6 +1767,11 @@ fn scan_regs_region(
                 mem_ops += 1;
             }
             0x23 => {
+                mark(&mut read, s1);
+                mark(&mut read, s2);
+                mem_ops += 1;
+            }
+            0x2f if _lay.sys.is_some() => {
                 mark(&mut read, s1);
                 mark(&mut read, s2);
                 mem_ops += 1;
@@ -2038,6 +2066,7 @@ fn body_fp_kind(
                 if alu_handled(op, funct7(insn), funct3(insn)) => {}
             0x03 if funct3(insn) != 7 => {}
             0x23 if funct3(insn) <= 3 => {}
+            0x2f if amo_handled(insn) => {}
             _ => {
                 if stop_at_branch {
                     break;
@@ -2475,6 +2504,95 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                 c.tlb_index(m, &lay.sys.unwrap(), len, true, pc, n);
                 c.push_freg(m, s2);
                 m.op(st).raw_uleb(len_align(len)).raw_uleb(0);
+            }
+        }
+        // AMO (single hart): read-modify-write through the inline store TLB.
+        0x2f if lay.sys.is_some() => {
+            if !amo_handled(insn) {
+                return false;
+            }
+            let len = if funct3(insn) == 3 { 8 } else { 4 };
+            let f5 = insn >> 27;
+            c.push_reg(m, s1);
+            c.tlb_index(m, &lay.sys.unwrap(), len, true, pc, n);
+            m.op(I64_EXTEND_I32_U).local_set(PA);
+            // Natural alignment is architectural for AMO; a misaligned one
+            // faults, so leave it to the interpreter.
+            m.local_get(VA)
+                .i64_const((len - 1) as i64)
+                .op(I64_AND)
+                .op(I64_EQZ)
+                .op(I32_EQZ);
+            m.op(IF).op(VOID);
+            c.bail(m, pc, n);
+            m.op(END);
+            // old = mem[addr] (sign-extended for .W, as rd receives it)
+            m.local_get(PA).op(I32_WRAP_I64);
+            m.op(if len == 8 { I64_LOAD } else { I64_LOAD32_S })
+                .raw_uleb(len_align(len))
+                .raw_uleb(0);
+            m.local_set(VAL);
+            // mem[addr] = op(old, x[rs2])
+            m.local_get(PA).op(I32_WRAP_I64);
+            let push_rs2 = |m: &mut WasmModule| c.push_reg(m, s2);
+            match f5 {
+                0 => {
+                    m.local_get(VAL);
+                    push_rs2(m);
+                    m.op(I64_ADD);
+                }
+                1 => push_rs2(m),
+                4 => {
+                    m.local_get(VAL);
+                    push_rs2(m);
+                    m.op(I64_XOR);
+                }
+                8 => {
+                    m.local_get(VAL);
+                    push_rs2(m);
+                    m.op(I64_OR);
+                }
+                0xc => {
+                    m.local_get(VAL);
+                    push_rs2(m);
+                    m.op(I64_AND);
+                }
+                // min/max: select between the two values on a comparison of
+                // their .W-truncated (or full .D) forms.
+                _ => {
+                    let unsigned = f5 == 0x18 || f5 == 0x1c;
+                    let want_less = f5 == 0x10 || f5 == 0x18; // MIN / MINU
+                    m.local_get(VAL);
+                    push_rs2(m);
+                    // comparison operands
+                    m.local_get(VAL);
+                    if len == 4 && unsigned {
+                        m.i64_const(0xffff_ffff).op(I64_AND);
+                    }
+                    push_rs2(m);
+                    if len == 4 {
+                        if unsigned {
+                            m.i64_const(0xffff_ffff).op(I64_AND);
+                        } else {
+                            m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S);
+                        }
+                    }
+                    m.op(match (unsigned, want_less) {
+                        (false, true) => I64_LT_S,
+                        (false, false) => I64_GT_S,
+                        (true, true) => I64_LT_U,
+                        (true, false) => I64_GT_U,
+                    });
+                    m.op(SELECT); // cond ? old : x[rs2]
+                }
+            }
+            m.op(if len == 8 { I64_STORE } else { I64_STORE32 })
+                .raw_uleb(len_align(len))
+                .raw_uleb(0);
+            // x[rd] = old
+            if c.store_pre(m, d) {
+                m.local_get(VAL);
+                c.store_post(m, d);
             }
         }
         // OP-FP: double add/sub/mul/div + compares + FMV.D.X/FMV.X.D inline.
@@ -3481,6 +3599,15 @@ fn scan_regs_super(
                     mark(&mut r, &mut uses, s1);
                     mark(&mut r, &mut uses, s2);
                 }
+                0x2f if lay.sys.is_some() => {
+                    if !amo_handled(insn) {
+                        break;
+                    }
+                    mark(&mut r, &mut uses, s1);
+                    mark(&mut r, &mut uses, s2);
+                    mark(&mut w, &mut uses, d);
+                    mem_ops += 1;
+                }
                 0x07 if lay.f_base != 0 => {
                     if !matches!(funct3(insn), 2 | 3) {
                         break;
@@ -3792,6 +3919,7 @@ pub fn emittable_at(code: &[u8], base: u64, pc: u64, lay: JitLayout) -> bool {
         0x37 | 0x17 | 0x13 | 0x33 | 0x1b | 0x3b => alu_handled(op, funct7(insn), funct3(insn)),
         0x03 => funct3(insn) != 7,
         0x23 => funct3(insn) <= 3,
+        0x2f => lay.sys.is_some() && amo_handled(insn),
         0x07 | 0x27 => lay.f_base != 0 && matches!(funct3(insn), 2 | 3),
         0x53 => lay.f_base != 0 && fp_handled(insn),
         0x43 | 0x47 | 0x4b | 0x4f => lay.f_base != 0 && fma_handled(op, insn),
@@ -3902,6 +4030,7 @@ pub fn discover_page_leaders_ext(
                         }
                         0x03 => funct3(insn) != 7,
                         0x23 => funct3(insn) <= 3,
+                        0x2f => amo_handled(insn),
                         0x07 | 0x27 => matches!(funct3(insn), 2 | 3),
                         0x53 => fp_handled(insn),
                         0x43 | 0x47 | 0x4b | 0x4f => fma_handled(op, insn),

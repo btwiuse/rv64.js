@@ -35,6 +35,7 @@ pub const I64_NE: u8 = 0x52;
 pub const I64_LT_S: u8 = 0x53;
 pub const I64_LT_U: u8 = 0x54;
 pub const I64_GT_U: u8 = 0x56;
+pub const I64_GT_S: u8 = 0x55;
 pub const I64_GE_S: u8 = 0x59; // (0x58 is le_u — was wrong before)
 pub const I64_GE_U: u8 = 0x5a;
 // typed i64 memory ops
