@@ -587,24 +587,74 @@ mod tests {
         (dev, vec![0u8; 64 * 1024])
     }
 
+    /// Ring addresses for one queue. Queue 0 lives at the low set; a
+    /// two-queue device (net) puts queue 1 at the high set.
+    struct Ring {
+        desc: usize,
+        avail: usize,
+        used: usize,
+    }
+    const RING0: Ring = Ring {
+        desc: DESC,
+        avail: AVAIL,
+        used: USED,
+    };
+    const RING1: Ring = Ring {
+        desc: 0x6000,
+        avail: 0x7000,
+        used: 0x8000,
+    };
+
     fn setup_queue(dev: &mut VirtioDev) {
-        dev.write(0x030, 0); // queue_sel = 0
+        setup_ring(dev, 0, &RING0);
+    }
+
+    fn setup_ring(dev: &mut VirtioDev, qi: u32, r: &Ring) {
+        dev.write(0x030, qi); // queue_sel
         dev.write(0x038, NUM); // queue_num
-        dev.write(0x080, (BASE + DESC as u64) as u32);
-        dev.write(0x084, ((BASE + DESC as u64) >> 32) as u32);
-        dev.write(0x090, (BASE + AVAIL as u64) as u32);
-        dev.write(0x094, ((BASE + AVAIL as u64) >> 32) as u32);
-        dev.write(0x0a0, (BASE + USED as u64) as u32);
-        dev.write(0x0a4, ((BASE + USED as u64) >> 32) as u32);
+        dev.write(0x080, (BASE + r.desc as u64) as u32);
+        dev.write(0x084, ((BASE + r.desc as u64) >> 32) as u32);
+        dev.write(0x090, (BASE + r.avail as u64) as u32);
+        dev.write(0x094, ((BASE + r.avail as u64) >> 32) as u32);
+        dev.write(0x0a0, (BASE + r.used as u64) as u32);
+        dev.write(0x0a4, ((BASE + r.used as u64) >> 32) as u32);
         dev.write(0x044, 1); // queue_ready
     }
 
     fn put_desc(ram: &mut [u8], i: usize, addr: usize, len: u32, flags: u16, next: u16) {
-        let o = DESC + i * 16;
+        put_desc_in(ram, &RING0, i, addr, len, flags, next);
+    }
+
+    fn put_desc_in(
+        ram: &mut [u8],
+        r: &Ring,
+        i: usize,
+        addr: usize,
+        len: u32,
+        flags: u16,
+        next: u16,
+    ) {
+        let o = r.desc + i * 16;
         ram[o..o + 8].copy_from_slice(&(BASE + addr as u64).to_le_bytes());
         ram[o + 8..o + 12].copy_from_slice(&len.to_le_bytes());
         ram[o + 12..o + 14].copy_from_slice(&flags.to_le_bytes());
         ram[o + 14..o + 16].copy_from_slice(&next.to_le_bytes());
+    }
+
+    /// Put chain head `head` on the avail ring and publish index `n`.
+    fn publish(ram: &mut [u8], r: &Ring, head: u16, n: u16) {
+        let slot = (n as usize - 1) % NUM as usize;
+        ram[r.avail + 4 + slot * 2..r.avail + 6 + slot * 2].copy_from_slice(&head.to_le_bytes());
+        ram[r.avail + 2..r.avail + 4].copy_from_slice(&n.to_le_bytes());
+    }
+
+    /// (chain head, bytes written) from used-ring entry `n` (1-based).
+    fn used_entry(ram: &[u8], r: &Ring, n: u16) -> (u32, u32) {
+        let slot = (n as usize - 1) % NUM as usize;
+        (
+            u32_at(ram, r.used + 4 + slot * 8),
+            u32_at(ram, r.used + 8 + slot * 8),
+        )
     }
 
     fn u16_at(ram: &[u8], off: usize) -> u16 {
@@ -647,19 +697,16 @@ mod tests {
         ram[REQ..REQ + msg.len()].copy_from_slice(&msg);
         put_desc(ram, 0, REQ, msg.len() as u32, 1 /* NEXT */, 1);
         put_desc(ram, 1, REPLY, 4096, 2 /* WRITE */, 0);
-        // avail.ring[slot] = chain head, then publish the new index.
-        let slot = (n as usize - 1) % NUM as usize;
-        ram[AVAIL + 4 + slot * 2..AVAIL + 6 + slot * 2].copy_from_slice(&0u16.to_le_bytes());
-        ram[AVAIL + 2..AVAIL + 4].copy_from_slice(&n.to_le_bytes());
+        publish(ram, &RING0, 0, n);
 
         assert_eq!(dev.write(0x050, 0), Some(0), "QueueNotify selects queue 0");
         dev.process(0, ram, BASE);
 
         // The device must have published exactly one more used entry.
         assert_eq!(u16_at(ram, USED + 2), n, "used.idx after request {n}");
-        let uslot = (n as usize - 1) % NUM as usize;
-        assert_eq!(u32_at(ram, USED + 4 + uslot * 8), 0, "used entry is chain 0");
-        let len = u32_at(ram, USED + 8 + uslot * 8) as usize;
+        let (head, len) = used_entry(ram, &RING0, n);
+        assert_eq!(head, 0, "used entry is chain 0");
+        let len = len as usize;
         let reply = ram[REPLY..REPLY + len].to_vec();
         assert_eq!(u32_at(&reply, 0) as usize, len, "reply size field");
         assert_ne!(reply[4], 7, "unexpected Rlerror: {:?}", &reply[7..11]);
@@ -754,10 +801,173 @@ mod tests {
         let o = DESC;
         ram[o..o + 8].copy_from_slice(&0xdead_0000u64.to_le_bytes());
         put_desc(&mut ram, 1, REPLY, 4096, 2, 0);
-        ram[AVAIL + 4..AVAIL + 6].copy_from_slice(&0u16.to_le_bytes());
-        ram[AVAIL + 2..AVAIL + 4].copy_from_slice(&1u16.to_le_bytes());
+        publish(&mut ram, &RING0, 0, 1);
         dev.process(0, &mut ram, BASE);
         assert_eq!(u16_at(&ram, USED + 2), 1, "chain consumed");
+    }
+
+    // ---- virtio-net ----
+
+    const FRAME: usize = 0x9000; // guest TX frame buffer
+    const RXBUF: usize = 0xa000; // guest RX buffer
+
+    const TEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0xab, 0xcd, 0xef];
+
+    fn net_device() -> (VirtioDev, Vec<u8>) {
+        let dev = VirtioDev::new(Backend::Net {
+            mac: TEST_MAC,
+            inbox: Vec::new(),
+            outbox: Vec::new(),
+        });
+        (dev, vec![0u8; 64 * 1024])
+    }
+
+    #[test]
+    fn advertises_a_net_device_and_its_mac() {
+        let (mut dev, _) = net_device();
+        assert_eq!(dev.read(0x008), 1); // virtio device id 1 = net
+        dev.write(0x014, 0);
+        assert_eq!(dev.read(0x010), 1 << 5, "VIRTIO_NET_F_MAC only");
+        dev.write(0x014, 1);
+        assert_eq!(dev.read(0x010), 1, "VIRTIO_F_VERSION_1");
+        // The MAC is read byte-wise out of config space; without F_MAC (and a
+        // readable MAC) the guest would invent a random address instead.
+        let mac: Vec<u8> = (0..6).map(|i| dev.read_sized(0x100 + i, 1) as u8).collect();
+        assert_eq!(&mac, &TEST_MAC);
+        // status is only meaningful with VIRTIO_NET_F_STATUS, which we do not
+        // offer — the guest treats the link as up unconditionally.
+        assert_eq!(dev.read_sized(0x106, 2), 0);
+    }
+
+    #[test]
+    fn transmits_a_guest_frame_stripped_of_its_header() {
+        let (mut dev, mut ram) = net_device();
+        setup_ring(&mut dev, 1, &RING1);
+
+        // The guest writes virtio_net_hdr_v1 then the Ethernet frame.
+        let payload: Vec<u8> = (0..60u8).collect();
+        ram[FRAME..FRAME + NET_HDR_LEN].fill(0);
+        ram[FRAME + NET_HDR_LEN..FRAME + NET_HDR_LEN + payload.len()].copy_from_slice(&payload);
+        put_desc_in(
+            &mut ram,
+            &RING1,
+            0,
+            FRAME,
+            (NET_HDR_LEN + payload.len()) as u32,
+            0,
+            0,
+        );
+        publish(&mut ram, &RING1, 0, 1);
+
+        assert_eq!(dev.write(0x050, 1), Some(1), "notify selects the TX queue");
+        dev.process(1, &mut ram, BASE);
+
+        assert_eq!(u16_at(&ram, RING1.used + 2), 1, "TX chain consumed");
+        let out = dev.net_take_output();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], payload, "header must be stripped, frame intact");
+        assert!(dev.net_take_output().is_empty(), "drained once");
+    }
+
+    #[test]
+    fn transmits_a_frame_split_across_descriptors() {
+        let (mut dev, mut ram) = net_device();
+        setup_ring(&mut dev, 1, &RING1);
+        // Linux hands the header and the payload as separate sg entries.
+        let payload: Vec<u8> = (0..100u8).map(|i| i ^ 0x5a).collect();
+        ram[FRAME..FRAME + NET_HDR_LEN].fill(0);
+        ram[RXBUF..RXBUF + payload.len()].copy_from_slice(&payload);
+        put_desc_in(&mut ram, &RING1, 0, FRAME, NET_HDR_LEN as u32, 1, 1);
+        put_desc_in(&mut ram, &RING1, 1, RXBUF, payload.len() as u32, 0, 0);
+        publish(&mut ram, &RING1, 0, 1);
+        dev.process(1, &mut ram, BASE);
+        assert_eq!(dev.net_take_output()[0], payload);
+    }
+
+    #[test]
+    fn receives_a_frame_into_a_guest_buffer() {
+        let (mut dev, mut ram) = net_device();
+        setup_ring(&mut dev, 0, &RING0);
+
+        let frame: Vec<u8> = (0..74u8).map(|i| i.wrapping_mul(3)).collect();
+        dev.net_input(&frame);
+        assert!(dev.net_rx_pending());
+
+        put_desc_in(&mut ram, &RING0, 0, RXBUF, 2048, 2 /* WRITE */, 0);
+        publish(&mut ram, &RING0, 0, 1);
+        dev.process(0, &mut ram, BASE);
+
+        let (head, len) = used_entry(&ram, &RING0, 1);
+        assert_eq!(head, 0);
+        assert_eq!(len as usize, NET_HDR_LEN + frame.len());
+        // num_buffers = 1 at offset 10. Linux sizes hdr_len from VERSION_1, so
+        // a 10-byte header here would shift every frame by two bytes.
+        assert_eq!(&ram[RXBUF..RXBUF + 10], &[0u8; 10]);
+        assert_eq!(u16_at(&ram, RXBUF + 10), 1, "num_buffers");
+        assert_eq!(&ram[RXBUF + NET_HDR_LEN..RXBUF + NET_HDR_LEN + frame.len()], &frame[..]);
+        assert!(!dev.net_rx_pending(), "frame consumed");
+        assert!(dev.irq_pending(), "RX must raise the interrupt");
+    }
+
+    #[test]
+    fn an_rx_buffer_with_no_frame_is_left_on_the_ring() {
+        let (mut dev, mut ram) = net_device();
+        setup_ring(&mut dev, 0, &RING0);
+        put_desc_in(&mut ram, &RING0, 0, RXBUF, 2048, 2, 0);
+        publish(&mut ram, &RING0, 0, 1);
+        dev.process(0, &mut ram, BASE);
+        // Nothing to deliver: the buffer stays available for the next frame
+        // rather than being consumed empty.
+        assert_eq!(u16_at(&ram, RING0.used + 2), 0);
+        assert!(!dev.irq_pending());
+        // It is still there when a frame turns up.
+        dev.net_input(b"late frame");
+        dev.process(0, &mut ram, BASE);
+        assert_eq!(u16_at(&ram, RING0.used + 2), 1);
+    }
+
+    #[test]
+    fn an_undersized_rx_buffer_drops_the_frame_instead_of_wedging() {
+        let (mut dev, mut ram) = net_device();
+        setup_ring(&mut dev, 0, &RING0);
+        dev.net_input(&vec![7u8; 1500]);
+        put_desc_in(&mut ram, &RING0, 0, RXBUF, 64, 2, 0);
+        publish(&mut ram, &RING0, 0, 1);
+        dev.process(0, &mut ram, BASE);
+        // Keeping an unsendable frame at the head would stall the queue forever.
+        assert!(!dev.net_rx_pending(), "oversized frame dropped");
+        assert_eq!(u16_at(&ram, RING0.used + 2), 0, "buffer not consumed");
+    }
+
+    #[test]
+    fn mailboxes_are_bounded() {
+        let (mut dev, mut ram) = net_device();
+        setup_ring(&mut dev, 1, &RING1);
+        // A guest that never posts RX buffers must not grow host memory.
+        for _ in 0..NET_QUEUE_LIMIT + 50 {
+            dev.net_input(b"flood");
+        }
+        let Backend::Net { inbox, .. } = &dev.backend else {
+            unreachable!()
+        };
+        assert_eq!(inbox.len(), NET_QUEUE_LIMIT);
+        // Nor must a host that never collects.
+        ram[FRAME..FRAME + NET_HDR_LEN + 4].fill(1);
+        for n in 1..=(NET_QUEUE_LIMIT as u16 + 50) {
+            put_desc_in(&mut ram, &RING1, 0, FRAME, (NET_HDR_LEN + 4) as u32, 0, 0);
+            publish(&mut ram, &RING1, 0, n);
+            dev.process(1, &mut ram, BASE);
+        }
+        assert_eq!(dev.net_take_output().len(), NET_QUEUE_LIMIT);
+    }
+
+    #[test]
+    fn an_over_long_frame_is_refused() {
+        let (mut dev, _) = net_device();
+        dev.net_input(&vec![0u8; NET_MAX_FRAME + 1]);
+        assert!(!dev.net_rx_pending(), "frame larger than NET_MAX_FRAME");
+        dev.net_input(&vec![0u8; NET_MAX_FRAME]);
+        assert!(dev.net_rx_pending(), "a frame at the limit is accepted");
     }
 }
 

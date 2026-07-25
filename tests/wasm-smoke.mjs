@@ -151,24 +151,139 @@ for (const [name, argv, wantExit, wantOut] of guests) {
     vm.onWrite = (fd, b) => {
       out += new TextDecoder().decode(b);
     };
+
+    // The browser has no host filesystem, so a 9p export is an in-memory tree
+    // built from a tarball the page fetched. Exercising it here is what proves
+    // sys_stage_fs_tar + MemFs::load_tar + the 9p device under the JIT.
+    const GUEST_MAC = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    const HOST_MAC = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+    const HOST_IP = [10, 0, 2, 2];
+    const GUEST_IP = [10, 0, 2, 15];
+
+    // Frames the guest transmits arrive here via the host_net_send import —
+    // the same path web/rv64.js hands to a WebSocket relay.
+    const sent = [];
+    vm.onNetSend = (frame) => {
+      sent.push(frame);
+      // Answer ARP requests for our address so the guest's stack completes a
+      // neighbour entry. ARP needs no checksums, which keeps this small; the
+      // full IP/ICMP peer lives in the native net_boot test.
+      const reply = arpReply(frame);
+      if (reply) vm.netInput(reply);
+    };
+
     vm.bootLinux({
       bios: new Uint8Array(await readFile(img("bbl64.bin"))),
       kernel: new Uint8Array(await readFile(img("kernel-riscv64.bin"))),
       disk: new Uint8Array(await readFile(img("root-riscv64.bin"))),
+      fsTar: tarball([["greeting.txt", "from-the-tarball\n"]]),
+      fsTag: "hostshare",
+      net: true,
     });
     for (let i = 0; i < 20000 && !out.includes("~ #"); i++) {
       vm.runSystem(10_000_000n);
     }
     const gotShell = out.includes("~ #");
-    let cmdOk = false;
-    if (gotShell) {
-      vm.consoleInput(new TextEncoder().encode("echo smoke-$((6*7))\n"));
-      for (let i = 0; i < 400 && !out.includes("smoke-42"); i++) {
+
+    // Run `cmd` and wait for `marker`. The guest echoes what we type, so a
+    // marker must not appear verbatim in the command — quoting a character
+    // (OK_'x') keeps the typed and printed forms different.
+    const run = (cmd, marker, slices = 800) => {
+      if (!gotShell) return false;
+      if (cmd.includes(marker)) throw new Error(`marker ${marker} would match the echo`);
+      vm.consoleInput(new TextEncoder().encode(cmd + "\n"));
+      for (let i = 0; i < slices && !out.includes(marker); i++) {
         vm.runSystem(10_000_000n);
       }
-      cmdOk = out.includes("smoke-42");
-    }
+      return out.includes(marker);
+    };
+
+    const cmdOk = run("echo smoke-$((6*7))", "smoke-42");
     check("linux boot (wasm)", gotShell && cmdOk, `jit-blocks=${vm.jitBlocks ?? 0}`);
+
+    // 9p, in the browser's configuration: mount the tar-backed export and read
+    // a file out of it.
+    const mounted = run(
+      "mkdir -p /9p && mount -t 9p -o trans=virtio,version=9p2000.L hostshare /9p && echo MOUNT_'O'K",
+      "MOUNT_OK",
+    );
+    const read9p = mounted && run("cat /9p/greeting.txt", "from-the-tarball");
+    check("virtio-9p over tar (wasm)", mounted && read9p);
+
+    // virtio-net: frames out through host_net_send, frames in through
+    // sys_net_input, both under the JIT.
+    run(`ifconfig eth0 ${GUEST_IP.join(".")} netmask 255.255.255.0 up && echo UP_'O'K`, "UP_OK");
+    // Several attempts so an ARP reply is never racing a single timeout.
+    run(`ping -c 3 -W 2 ${HOST_IP.join(".")}`, "packets transmitted", 2000);
+    const arpRequest = sent.find(
+      (f) =>
+        f.length >= 42 &&
+        f[12] === 0x08 &&
+        f[13] === 0x06 &&
+        [...f.slice(38, 42)].join(".") === HOST_IP.join("."),
+    );
+    const macOnWire =
+      arpRequest && [...arpRequest.slice(6, 12)].join(",") === GUEST_MAC.join(",");
+    check(
+      "virtio-net TX + MAC from config space (wasm)",
+      !!arpRequest && macOnWire,
+      `frames=${sent.length}`,
+    );
+    // The guest only records a neighbour entry if it parsed a frame we injected.
+    const hostMacStr = HOST_MAC.map((b) => b.toString(16).padStart(2, "0")).join(":");
+    const arpTable = run("cat /proc/net/arp", hostMacStr);
+    check("virtio-net RX into the guest stack (wasm)", arpTable);
+
+    function tarball(entries) {
+      const blocks = [];
+      for (const [name, content] of entries) {
+        const data = new TextEncoder().encode(content);
+        const b = new Uint8Array(512 + Math.ceil(data.length / 512) * 512);
+        const put = (off, s) => {
+          for (let i = 0; i < s.length; i++) b[off + i] = s.charCodeAt(i);
+        };
+        put(0, name);
+        put(100, "0000644\0"); // mode
+        put(124, data.length.toString(8).padStart(11, "0") + "\0"); // size
+        b[156] = 0x30; // typeflag '0' = regular file
+        put(257, "ustar");
+        b.set(data, 512);
+        blocks.push(b);
+      }
+      blocks.push(new Uint8Array(1024)); // end-of-archive
+      const total = blocks.reduce((n, b) => n + b.length, 0);
+      const tar = new Uint8Array(total);
+      let off = 0;
+      for (const b of blocks) {
+        tar.set(b, off);
+        off += b.length;
+      }
+      return tar;
+    }
+
+    /** ARP reply for a request aimed at HOST_IP, else null. */
+    function arpReply(f) {
+      if (f.length < 42 || f[12] !== 0x08 || f[13] !== 0x06) return null;
+      if (f[21] !== 1) return null; // not a request
+      if ([...f.slice(38, 42)].join(".") !== HOST_IP.join(".")) return null;
+      const senderMac = f.slice(6, 12);
+      const senderIp = f.slice(28, 32);
+      const r = new Uint8Array(42);
+      r.set(senderMac, 0);
+      r.set(HOST_MAC, 6);
+      r[12] = 0x08;
+      r[13] = 0x06;
+      r[15] = 1; // htype: ethernet
+      r[16] = 0x08; // ptype: ipv4
+      r[18] = 6;
+      r[19] = 4;
+      r[21] = 2; // oper: reply
+      r.set(HOST_MAC, 22);
+      r.set(HOST_IP, 28);
+      r.set(senderMac, 32);
+      r.set(senderIp, 38);
+      return r;
+    }
   }
 }
 

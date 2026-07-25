@@ -1172,17 +1172,18 @@ fn build_superblock(
                                 && ((pa & !0xfff) - rv64_system::RAM_BASE) as usize + 0x1000
                                     <= m.bus.ram.len()
                         };
-                        // Grow the region where the guest's hot code says to:
-                        // a virtually contiguous neighbour joins if it has hot
-                        // pcs of its own (a statically linked binary's .text is
-                        // contiguous, so a caller and its callee a few pages
-                        // apart are exactly this case — the compile row ran at
-                        // 9 insns/dispatch because every cross-page call was a
-                        // host dispatch), or if this page's hot code sits
-                        // within a block's reach of the shared edge. Pages
-                        // whose hot code is self-contained stay single-page:
-                        // a bigger function is slower to compile and register-
-                        // allocates worse, so growth has to pay for itself.
+                        // Assemble the region from the CALL GRAPH, not from
+                        // address adjacency: pages join when the code already
+                        // in the region calls into them and they are hot
+                        // (page_entries non-empty), plus the contiguous next/
+                        // previous page when hot code sits within a block's
+                        // reach of the shared edge (loops straddle page
+                        // boundaries; calls do not care about distance). The
+                        // sparse translator resolves a target to (page, slot)
+                        // with one compare per page, so a caller and a callee
+                        // hundreds of KB apart still transfer inside one
+                        // function — the compile row's 9 insns per host
+                        // dispatch were exactly these cross-page calls.
                         const EDGE: u64 = 0x80;
                         let seeds = jit.page_entries[&(aspace, vpage)].clone();
                         let hot = |jit: &JitState, va: u64| {
@@ -1191,87 +1192,92 @@ fn build_superblock(
                                 .is_some_and(|e| !e.is_empty())
                         };
                         let mut pages: Vec<(u64, u64)> = vec![(vpage, pa_page)];
-                        let edge_fwd =
-                            seeds.iter().any(|&e| (e & 0xfff) >= 0x1000 - EDGE);
-                        let mut va = vpage + 0x1000;
-                        while pages.len() < MAX_REGION_PAGES
-                            && (hot(jit, va) || (va == vpage + 0x1000 && edge_fwd))
-                        {
-                            match m.cpu.jit_probe_fetch(&mut m.bus, va) {
-                                Some(p) if ram_ok(m, p) => pages.push((va, p & !0xfff)),
-                                _ => break,
-                            }
-                            va += 0x1000;
-                        }
-                        let edge_bwd = seeds.iter().any(|&e| (e & 0xfff) < EDGE);
-                        let mut va = vpage.wrapping_sub(0x1000);
-                        while va < vpage
-                            && pages.len() < MAX_REGION_PAGES
-                            && (hot(jit, va)
-                                || (va == vpage - 0x1000 && edge_bwd))
-                        {
-                            match m.cpu.jit_probe_fetch(&mut m.bus, va) {
-                                Some(p) if ram_ok(m, p) => pages.insert(0, (va, p & !0xfff)),
-                                _ => break,
-                            }
-                            va = va.wrapping_sub(0x1000);
-                        }
-                        // Seeds come from every page in the region, so
-                        // discovery reaches the neighbours' functions too.
-                        let seeds: Vec<u64> = {
-                            let mut v = seeds;
-                            for &(pva, _) in &pages {
-                                if pva != vpage {
-                                    if let Some(e) = jit.page_entries.get(&(aspace, pva)) {
-                                        v.extend_from_slice(e);
+                        let mut probe_add =
+                            |m: &mut rv64_system::Machine,
+                             pages: &mut Vec<(u64, u64)>,
+                             va: u64| {
+                                if pages.len() >= MAX_REGION_PAGES
+                                    || pages.iter().any(|&(v, _)| v == va)
+                                {
+                                    return;
+                                }
+                                if let Some(p) = m.cpu.jit_probe_fetch(&mut m.bus, va) {
+                                    if ram_ok(m, p) {
+                                        pages.push((va, p & !0xfff));
                                     }
                                 }
+                            };
+                        if seeds.iter().any(|&e| (e & 0xfff) >= 0x1000 - EDGE) {
+                            probe_add(m, &mut pages, vpage + 0x1000);
+                        }
+                        if vpage >= 0x1000
+                            && seeds.iter().any(|&e| (e & 0xfff) < EDGE)
+                        {
+                            probe_add(m, &mut pages, vpage - 0x1000);
+                        }
+                        // Breadth-first over call targets; each accepted page's
+                        // own calls extend the frontier.
+                        let mut scanned = 0usize;
+                        while scanned < pages.len() && pages.len() < MAX_REGION_PAGES {
+                            let (va, pp) = pages[scanned];
+                            scanned += 1;
+                            let o = (pp - rv64_system::RAM_BASE) as usize;
+                            let targets = rv64_jit::page_call_targets(
+                                &m.bus.ram[o..o + 0x1000],
+                                va,
+                            );
+                            for t in targets {
+                                if hot(jit, t & !0xfff) {
+                                    probe_add(m, &mut pages, t & !0xfff);
+                                }
                             }
-                            v.sort_unstable();
-                            v.dedup();
-                            v
-                        };
-                        let mut start_va = pages[0].0;
-                        let mut span = (pages.len() * 0x1000) as u64;
-                        let mut code = Vec::with_capacity(span as usize);
+                        }
+                        // Ascending order keeps virtually contiguous pages
+                        // adjacent in the concat, which is what lets bodies
+                        // flow across their shared boundary.
+                        pages.sort_unstable_by_key(|&(va, _)| va);
+                        let mut code = Vec::with_capacity(pages.len() * 0x1000);
                         for &(_, pp) in &pages {
                             let o = (pp - rv64_system::RAM_BASE) as usize;
                             code.extend_from_slice(&m.bus.ram[o..o + 0x1000]);
                         }
-                        let (mut entries, back_targets) =
-                            rv64_jit::discover_page_leaders_ext(
-                                &code, start_va, start_va, span, &seeds, MAX_LEADERS,
-                            );
-                        // A leader whose OWN page holds a complete loop
-                        // keeps its tight individual loop-region block (the
-                        // br_table body is slower for those) — the test is
-                        // page-clamped exactly like the individual compile
-                        // path, so a loop that spans pages is NOT excluded
-                        // here: the region is the only thing that can hold
-                        // it whole.
-                        entries.retain(|&e| {
-                            let po = ((e & !0xfff) - start_va) as usize;
-                            let page = &code[po..po + 0x1000];
-                            rv64_jit::emittable_at(&code, start_va, e, lay)
-                                && (!back_targets.contains(&e)
-                                    || !rv64_jit::is_loop_at(page, e & !0xfff, e, lay))
-                        });
-                        // Trim to the pages leaders actually landed on.
-                        if let (Some(&lo), Some(&hi)) =
-                            (entries.first(), entries.last())
-                        {
-                            let (lo, hi) = (lo & !0xfff, hi & !0xfff);
-                            if lo > start_va || hi + 0x1000 < start_va + span {
-                                let off = (lo - start_va) as usize;
-                                let len = (hi + 0x1000 - lo) as usize;
-                                code = code[off..off + len].to_vec();
-                                pages.retain(|&(va, _)| va >= lo && va <= hi);
-                                start_va = lo;
-                                span = len as u64;
+                        let vas: Vec<u64> = pages.iter().map(|&(va, _)| va).collect();
+                        // Leaders per page (each page's OWN hot pcs seed it),
+                        // dropping unemittable pcs and loop headers — those
+                        // keep their tight individual loop-region blocks.
+                        let mut entries: Vec<u64> = Vec::new();
+                        for (k, &(va, _)) in pages.iter().enumerate() {
+                            if entries.len() >= MAX_LEADERS {
+                                break;
                             }
+                            let slice = &code[k * 0x1000..(k + 1) * 0x1000];
+                            let pseeds: Vec<u64> = jit
+                                .page_entries
+                                .get(&(aspace, va))
+                                .map(|v| v.clone())
+                                .unwrap_or_default();
+                            let use_seeds =
+                                if va == vpage { &seeds } else { &pseeds };
+                            if use_seeds.is_empty() {
+                                continue;
+                            }
+                            let (mut l, back) = rv64_jit::discover_page_leaders_ext(
+                                slice,
+                                va,
+                                va,
+                                0x1000,
+                                use_seeds,
+                                MAX_LEADERS - entries.len(),
+                            );
+                            l.retain(|&e| {
+                                rv64_jit::emittable_at(slice, va, e, lay)
+                                    && (!back.contains(&e)
+                                        || !rv64_jit::is_loop_at(slice, va, e, lay))
+                            });
+                            entries.extend(l);
                         }
-                        let sb = rv64_jit::translate_superblock(
-                            &code, start_va, start_va, span, &entries, lay,
+                        let sb = rv64_jit::translate_superblock_sparse(
+                            &code, &vas, &entries, lay,
                         );
                         if sb.is_none() {
                             unsafe { SB_XLATE_FAIL += 1 };
@@ -1951,12 +1957,16 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
         }
         SB_LANDED += 1;
         JIT_TABLE_ENTRIES += 1;
-        let start_va = p.pages[0].0;
         if p.pages.len() > 1 {
             jit.regions.insert(idx, p.pages.clone());
         }
         for &e in &p.entries {
-            let pi = ((e & !0xfff) - start_va) as usize >> 12;
+            // Sparse regions: find the entry's page by lookup (pages are in
+            // dispatch order, not address order).
+            let Some(pi) = p.pages.iter().position(|&(va, _)| va == e & !0xfff)
+            else {
+                continue;
+            };
             let epa = p.pages[pi].1 + (e & 0xfff);
             let jb = JitBlock { idx, n: 0, pa: epa };
             let prev = jit.cache.insert(e, Some(jb));

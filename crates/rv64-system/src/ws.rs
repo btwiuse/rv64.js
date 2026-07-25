@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 /// A connected relay. Frames in, frames out; no interpretation of contents.
+#[derive(Debug)]
 pub struct Relay {
     sock: TcpStream,
     /// Bytes read but not yet forming a complete WebSocket frame.
