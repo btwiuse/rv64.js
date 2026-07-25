@@ -1764,249 +1764,220 @@ struct CopyLoop {
     s: usize,
     d: usize,
     n: usize,
+    /// limit register for `bltu l, n` back-edges; 0 (x0) for `bnez n` loops
+    /// (continue while n != 0 — identical emission since x0 reads as 0).
     l: usize,
     t_mask: u32,
-    k: u32,
+    /// bytes moved per iteration (= element count x element size)
+    stride: i64,
+    /// lowest load offset relative to S at iteration entry (window is
+    /// [w0, w0 + stride) for both directions)
+    w0: i64,
     body_n: u32,
     end_pc: u64,
-    /// true = descending copy (musl memmove's backward loop): offsets are
-    /// -8..-8k, pointers/count decrease, chunks copy [P-bytes, P).
+    /// true = pointers/count decrease each iteration
     bwd: bool,
 }
 
-fn detect_copy_loop(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
-    let mut pc = start_pc;
-    let mut k: u32 = 0;
-    let (mut s, mut d) = (usize::MAX, usize::MAX);
-    let mut t_mask = 0u32;
-    loop {
-        let Some((i1, l1)) = fetch(code, base, pc) else { break };
-        if opcode(i1) != 0x03 || funct3(i1) != 3 {
-            break;
-        }
-        let (t, sb, off) = (rd(i1), rs1(i1), imm_i(i1));
-        if off != (k as i64) * 8 {
-            return None;
-        }
-        if k == 0 {
-            s = sb;
-        } else if sb != s {
-            return None;
-        }
-        let (i2, l2) = fetch(code, base, pc.wrapping_add(l1))?;
-        if opcode(i2) != 0x23 || funct3(i2) != 3 || rs2(i2) != t || imm_s(i2) != (k as i64) * 8 {
-            return None;
-        }
-        let db = rs1(i2);
-        if k == 0 {
-            d = db;
-        } else if db != d {
-            return None;
-        }
-        if t == 0 || t == s || t == d {
-            return None;
-        }
-        t_mask |= 1 << t;
-        pc = pc.wrapping_add(l1 + l2);
-        k += 1;
-        if k > 16 {
-            return None;
-        }
-    }
-    if k < 4 {
-        return None;
-    }
-    let w = (k as i64) * 8;
-    let mut n = usize::MAX;
-    let mut seen = [false; 3];
-    for _ in 0..3 {
-        let (i, l) = fetch(code, base, pc)?;
-        if opcode(i) != 0x13 || funct3(i) != 0 || rd(i) != rs1(i) {
-            return None;
-        }
-        let (r, im) = (rd(i), imm_i(i));
-        if r == d && im == w && !seen[0] {
-            seen[0] = true;
-        } else if r == s && im == w && !seen[1] {
-            seen[1] = true;
-        } else if im == -w && r != s && r != d && r != 0 && !seen[2] {
-            seen[2] = true;
-            n = r;
-        } else {
-            return None;
-        }
-        pc = pc.wrapping_add(l);
-    }
-    let (bi, bl) = fetch(code, base, pc)?;
-    if opcode(bi) != 0x63 || funct3(bi) != 6 || rs2(bi) != n {
-        return None;
-    }
-    let l_reg = rs1(bi);
-    if pc.wrapping_add(imm_b(bi) as u64) != start_pc {
-        return None;
-    }
-    if l_reg == 0 || l_reg == s || l_reg == d || l_reg == n || s == 0 || d == 0 || n == 0 || s == d
-        || t_mask & (1 << l_reg) != 0 || t_mask & (1 << n) != 0
-    {
-        return None;
-    }
-    Some(CopyLoop {
-        s,
-        d,
-        n,
-        l: l_reg,
-        t_mask,
-        k,
-        body_n: 2 * k + 4,
-        end_pc: pc.wrapping_add(bl),
-        bwd: false,
-    })
+#[derive(Clone, Copy, PartialEq)]
+enum Val {
+    /// origin-register value plus a compile-time offset (reg 0 = constant 0)
+    Affine(u8, i64),
+    /// holds the value loaded from S + offset this iteration
+    Loaded(i64),
+    Unknown,
 }
 
-/// The BACKWARD twin (musl memmove's descending loop): k-1 pairs of
-/// `ld T, -8i(S); sd T, -8i(D)` for i = 1..k-1, then `ld T2, -8k(S)`, three
-/// staging adds {TD = D-8k; TS = S-8k; N += -8k} interleaved with
-/// `sd T2, -8k(D)` in any order, two `mv` (ADD rd, x0, rs) writing S and D
-/// from the staging temps, and `bltu L, N` back to the start.
-fn detect_copy_loop_bwd(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
+/// Symbolically evaluate up to 24 instructions from `start_pc` as ONE
+/// iteration of a candidate copy loop, in ANY instruction order/staging
+/// (clang emits at least four layouts of the same loop). Accepts when the
+/// iteration's complete architectural effect is exactly:
+///   - k same-size loads from a contiguous window [w0, w0+stride) off S,
+///   - the same window stored to D (each store's value = the same-offset load),
+///   - S and D net-advanced by +/-stride, N net-decremented by stride,
+///   - any number of temp registers clobbered (their final values are
+///     reproduced by the real tail iterations the emitter always leaves),
+///   - back-edge `bltu L, N -> start` (L loop-invariant) or `bnez N -> start`
+///     (encoded as L = x0: continue while 0 <u N).
+fn detect_copy_loop(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
+    let mut val: [Val; 32] = [Val::Unknown; 32];
+    for (r, v) in val.iter_mut().enumerate() {
+        *v = Val::Affine(r as u8, 0);
+    }
+    let mut s_reg = usize::MAX;
+    let mut d_reg = usize::MAX;
+    let mut loads: Vec<(i64, u64)> = Vec::new(); // (offset, size)
+    let mut stores: Vec<(i64, u64)> = Vec::new();
+    let mut written = 0u32;
     let mut pc = start_pc;
-    let mut i: u32 = 1;
-    let (mut s, mut d) = (usize::MAX, usize::MAX);
-    let mut t_mask = 0u32;
     let mut body_n = 0u32;
     loop {
-        let Some((i1, l1)) = fetch(code, base, pc) else { return None };
-        if opcode(i1) != 0x03 || funct3(i1) != 3 {
+        if body_n > 24 {
             return None;
         }
-        let (t, sb, off) = (rd(i1), rs1(i1), imm_i(i1));
-        if off != -8 * (i as i64) {
-            return None;
-        }
-        if i == 1 {
-            s = sb;
-        } else if sb != s {
-            return None;
-        }
-        let (i2, l2) = fetch(code, base, pc.wrapping_add(l1))?;
-        // pairs stop when the ld's partner isn't the matching sd (the final
-        // load's store is interleaved with the staging adds)
-        if opcode(i2) == 0x23 && funct3(i2) == 3 && rs2(i2) == t && imm_s(i2) == -8 * (i as i64) {
-            let db = rs1(i2);
-            if i == 1 {
-                d = db;
-            } else if db != d {
-                return None;
-            }
-            if t == 0 || t == s || t == d {
-                return None;
-            }
-            t_mask |= 1 << t;
-            pc = pc.wrapping_add(l1 + l2);
-            body_n += 2;
-            i += 1;
-            if i > 16 {
-                return None;
-            }
-            continue;
-        }
-        // final load: ld T2, -8k(S) with k == i
-        let k = i;
-        if k < 4 || sb != s || off != -8 * (k as i64) {
-            return None;
-        }
-        let t2 = t;
-        if t2 == 0 || t2 == s || t2 == d {
-            return None;
-        }
-        t_mask |= 1 << t2;
-        pc = pc.wrapping_add(l1);
-        body_n += 1;
-        let w = 8 * (k as i64);
-        // next 4 insns: {TD = D + -w, TS = S + -w, N += -w, sd T2, -w(D)} any order
-        let (mut td, mut ts, mut n) = (usize::MAX, usize::MAX, usize::MAX);
-        let mut stored = false;
-        for _ in 0..4 {
-            let (ii, il) = fetch(code, base, pc)?;
-            if opcode(ii) == 0x23 && funct3(ii) == 3 {
-                if stored || rs2(ii) != t2 || rs1(ii) != d || imm_s(ii) != -w {
+        let (insn, il) = fetch(code, base, pc)?;
+        let (rd_i, s1, s2) = (rd(insn), rs1(insn), rs2(insn));
+        match opcode(insn) {
+            // loads: ld (f3=3) and lbu (f3=4)
+            0x03 if matches!(funct3(insn), 3 | 4) => {
+                let sz = if funct3(insn) == 3 { 8 } else { 1 };
+                let Val::Affine(b, c) = val[s1] else { return None };
+                if b == 0 {
                     return None;
                 }
-                stored = true;
-            } else if opcode(ii) == 0x13 && funct3(ii) == 0 && imm_i(ii) == -w {
-                let (r, b) = (rd(ii), rs1(ii));
-                if b == d && r != d && td == usize::MAX && r != 0 {
-                    td = r;
-                } else if b == s && r != s && ts == usize::MAX && r != 0 {
-                    ts = r;
-                } else if b == r && r == rs1(ii) && n == usize::MAX && r != s && r != d && r != 0 {
-                    n = r;
+                if s_reg == usize::MAX {
+                    s_reg = b as usize;
+                } else if b as usize != s_reg {
+                    return None;
+                }
+                let off = c + imm_i(insn);
+                if loads.iter().any(|&(o, _)| o == off) || rd_i == 0 {
+                    return None;
+                }
+                loads.push((off, sz));
+                val[rd_i] = Val::Loaded(off);
+                written |= 1 << rd_i;
+            }
+            // stores: sd (f3=3) and sb (f3=0)
+            0x23 if matches!(funct3(insn), 0 | 3) => {
+                let sz = if funct3(insn) == 3 { 8 } else { 1 };
+                let Val::Affine(b, c) = val[s1] else { return None };
+                if b == 0 {
+                    return None;
+                }
+                if d_reg == usize::MAX {
+                    d_reg = b as usize;
+                } else if b as usize != d_reg {
+                    return None;
+                }
+                let off = c + imm_s(insn);
+                let Val::Loaded(lo) = val[s2] else { return None };
+                if lo != off {
+                    return None; // value must come from the same window slot
+                }
+                if stores.iter().any(|&(o, _)| o == off) {
+                    return None;
+                }
+                // sizes must match the load of that offset
+                if loads.iter().find(|&&(o, _)| o == off)?.1 != sz {
+                    return None;
+                }
+                stores.push((off, sz));
+            }
+            // addi rd, rs1, imm — affine arithmetic
+            0x13 if funct3(insn) == 0 => {
+                if rd_i == 0 {
+                    return None;
+                }
+                val[rd_i] = match val[s1] {
+                    Val::Affine(b, c) => Val::Affine(b, c + imm_i(insn)),
+                    _ => Val::Unknown,
+                };
+                written |= 1 << rd_i;
+            }
+            // add rd, x0, rs2 (mv) — value copy; other ADD forms unsupported
+            0x33 if funct3(insn) == 0 && funct7(insn) == 0 => {
+                if rd_i == 0 {
+                    return None;
+                }
+                if s1 == 0 {
+                    val[rd_i] = val[s2];
+                } else if s2 == 0 {
+                    val[rd_i] = val[s1];
                 } else {
                     return None;
                 }
-            } else {
-                return None;
+                written |= 1 << rd_i;
             }
-            pc = pc.wrapping_add(il);
-            body_n += 1;
-        }
-        if !stored || td == usize::MAX || ts == usize::MAX || n == usize::MAX {
-            return None;
-        }
-        // two mv (ADD rd, x0, rs): S <- TS and D <- TD, either order
-        let mut got_s = false;
-        let mut got_d = false;
-        for _ in 0..2 {
-            let (ii, il) = fetch(code, base, pc)?;
-            if opcode(ii) != 0x33 || funct3(ii) != 0 || funct7(ii) != 0 || rs1(ii) != 0 {
-                return None;
+            // back-edge: bltu L, N (f3=6) or bne N, x0 (f3=1, rs2=x0)
+            0x63 => {
+                let (l_reg, n_reg) = match funct3(insn) {
+                    6 => (s1, s2),
+                    1 if s2 == 0 => (0, s1),
+                    _ => return None,
+                };
+                if pc.wrapping_add(imm_b(insn) as u64) != start_pc {
+                    return None;
+                }
+                body_n += 1;
+                let end_pc = pc.wrapping_add(il);
+                // --- validate the iteration's net effect ---
+                if s_reg == usize::MAX || d_reg == usize::MAX || s_reg == d_reg {
+                    return None;
+                }
+                if loads.len() != stores.len() || loads.is_empty() {
+                    return None;
+                }
+                let sz = loads[0].1;
+                if loads.iter().any(|&(_, z)| z != sz) {
+                    return None;
+                }
+                let mut offs: Vec<i64> = loads.iter().map(|&(o, _)| o).collect();
+                offs.sort_unstable();
+                let w0 = offs[0];
+                for (i, &o) in offs.iter().enumerate() {
+                    if o != w0 + (i as i64) * sz as i64 {
+                        return None; // window must be contiguous
+                    }
+                }
+                let stride = (loads.len() as i64) * sz as i64;
+                // net effects on S, D, N; L must be untouched (loop-invariant)
+                let step = match (val[s_reg], val[d_reg]) {
+                    (Val::Affine(bs, cs), Val::Affine(bd, cd))
+                        if bs as usize == s_reg && bd as usize == d_reg && cs == cd =>
+                    {
+                        cs
+                    }
+                    _ => return None,
+                };
+                if step != stride && step != -stride {
+                    return None;
+                }
+                let bwd = step < 0;
+                match val[n_reg] {
+                    Val::Affine(bn, cn) if bn as usize == n_reg && cn == -stride => {}
+                    _ => return None,
+                }
+                if l_reg != 0 {
+                    match val[l_reg] {
+                        Val::Affine(bl, 0) if bl as usize == l_reg => {}
+                        _ => return None,
+                    }
+                }
+                if n_reg == 0
+                    || s_reg == 0
+                    || d_reg == 0
+                    || n_reg == s_reg
+                    || n_reg == d_reg
+                    || l_reg == s_reg
+                    || l_reg == d_reg
+                    || l_reg == n_reg
+                {
+                    return None;
+                }
+                // temp/clobber set: everything written except S, D, N
+                let t_mask =
+                    written & !(1u32 << s_reg) & !(1 << d_reg) & !(1 << n_reg);
+                if t_mask & (1 << l_reg) != 0 && l_reg != 0 {
+                    return None;
+                }
+                return Some(CopyLoop {
+                    s: s_reg,
+                    d: d_reg,
+                    n: n_reg,
+                    l: l_reg,
+                    t_mask,
+                    stride,
+                    w0,
+                    body_n,
+                    end_pc,
+                    bwd,
+                });
             }
-            if rd(ii) == s && rs2(ii) == ts {
-                got_s = true;
-            } else if rd(ii) == d && rs2(ii) == td {
-                got_d = true;
-            } else {
-                return None;
-            }
-            pc = pc.wrapping_add(il);
-            body_n += 1;
+            _ => return None,
         }
-        if !got_s || !got_d {
-            return None;
-        }
-        // bltu L, N -> start
-        let (bi, bl) = fetch(code, base, pc)?;
-        if opcode(bi) != 0x63 || funct3(bi) != 6 || rs2(bi) != n {
-            return None;
-        }
-        let l_reg = rs1(bi);
-        if pc.wrapping_add(imm_b(bi) as u64) != start_pc {
-            return None;
-        }
-        t_mask |= (1 << td) | (1 << ts);
-        if l_reg == 0
-            || [s, d, n].contains(&l_reg)
-            || t_mask & (1 << l_reg) != 0
-            || t_mask & (1 << n) != 0
-            || s == 0
-            || d == 0
-            || n == 0
-            || s == d
-        {
-            return None;
-        }
+        pc = pc.wrapping_add(il);
         body_n += 1;
-        return Some(CopyLoop {
-            s,
-            d,
-            n,
-            l: l_reg,
-            t_mask,
-            k,
-            body_n,
-            end_pc: pc.wrapping_add(bl),
-            bwd: true,
-        });
     }
 }
 
@@ -2035,9 +2006,21 @@ fn translate_copy_loop(
     let fs = c.fma_scratch;
     debug_assert!(fs != 0);
     let (srci, dsti, kb) = (fs, fs + 1, fs + 2);
-    let (rs, rd_, rn, rl) =
-        (c.reg_local[cl.s], c.reg_local[cl.d], c.reg_local[cl.n], c.reg_local[cl.l]);
-    let w = (cl.k as i64) * 8;
+    let (rs, rd_, rn) = (c.reg_local[cl.s], c.reg_local[cl.d], c.reg_local[cl.n]);
+    let rl = if cl.l == 0 { 0 } else { c.reg_local[cl.l] };
+    // push the loop limit: constant 0 for bnez-style loops (l == x0)
+    let push_l = |m: &mut WasmModule| {
+        if rl == 0 {
+            m.i64_const(0);
+        } else {
+            m.local_get(rl);
+        }
+    };
+    let w = cl.stride;
+    // anchor addend: the copy window per iteration is [P + w0, P + w0 + stride);
+    // ascending chunks start at (P + w0), descending chunks end (exclusive) at
+    // (P + w0 + stride) — page rooms and probe addresses derive from these.
+    let adj = cl.w0 + if cl.bwd { cl.stride } else { 0 };
 
     m.i64_const(0).local_set(ITER);
     m.op(LOOP).op(VOID); // $head
@@ -2059,11 +2042,12 @@ fn translate_copy_loop(
     m.op(BLOCK).op(VOID); // $normal — bulk path brs here to fall back
     {
         // guest loop must be continuing at all: L <u N, else normal path exits
-        m.local_get(rl).local_get(rn).op(I64_LT_U).op(I32_EQZ).br_if(0);
+        push_l(&mut m);
+        m.local_get(rn).op(I64_LT_U).op(I32_EQZ).br_if(0);
         // kb = iterations we may bulk = (N - L - 1) / w, page-bounded both sides
-        m.local_get(rn)
-            .local_get(rl)
-            .op(I64_SUB)
+        m.local_get(rn);
+        push_l(&mut m);
+        m.op(I64_SUB)
             .i64_const(1)
             .op(I64_SUB)
             .i64_const(w)
@@ -2074,9 +2058,16 @@ fn translate_copy_loop(
         // room formula: ascending copies have 4096 - (P & 4095) bytes above P,
         // descending have ((P - 1) & 4095) + 1 bytes below (exclusive-top P).
         let room = |m: &mut WasmModule, ptr: u32, bwd: bool| {
+            // anchor = ptr + adj (window start for fwd, exclusive top for bwd)
+            let anchor = |m: &mut WasmModule| {
+                m.local_get(ptr);
+                if adj != 0 {
+                    m.i64_const(adj).op(I64_ADD);
+                }
+            };
             if bwd {
-                m.local_get(ptr)
-                    .i64_const(1)
+                anchor(m);
+                m.i64_const(1)
                     .op(I64_SUB)
                     .i64_const(4095)
                     .op(I64_AND)
@@ -2084,7 +2075,8 @@ fn translate_copy_loop(
                     .op(I64_ADD);
             } else {
                 m.i64_const(4096);
-                m.local_get(ptr).i64_const(4095).op(I64_AND);
+                anchor(m);
+                m.i64_const(4095).op(I64_AND);
                 m.op(I64_SUB);
             }
             m.i64_const(w).op(I64_DIV_U);
@@ -2115,6 +2107,9 @@ fn translate_copy_loop(
         m.local_get(kb).op(I64_LT_U).br_if(0);
         // probe src range START (load class); miss -> $normal
         m.local_get(rs);
+        if adj != 0 {
+            m.i64_const(adj).op(I64_ADD);
+        }
         if cl.bwd {
             m.local_get(kb).op(I64_SUB);
         }
@@ -2134,6 +2129,9 @@ fn translate_copy_loop(
         m.op(I64_ADD).local_set(srci);
         // probe dst range START (store class); miss -> $normal
         m.local_get(rd_);
+        if adj != 0 {
+            m.i64_const(adj).op(I64_ADD);
+        }
         if cl.bwd {
             m.local_get(kb).op(I64_SUB);
         }
@@ -2196,8 +2194,9 @@ fn translate_copy_loop(
         .i64_const(cl.body_n as i64)
         .op(I64_ADD)
         .local_set(ITER);
-    // continue while L <u N
-    m.local_get(rl).local_get(rn).op(I64_LT_U).br_if(0);
+    // continue while L <u N (L == const 0 for bnez-style loops)
+    push_l(&mut m);
+    m.local_get(rn).op(I64_LT_U).br_if(0);
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, cl.end_pc);
     m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
@@ -2282,9 +2281,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     // Bulk-copyable self-loop (memcpy/memmove word loops): one wasm
     // memory.copy per page-bounded chunk — see translate_copy_loop.
     if lay.sys.is_some() {
-        if let Some(cl) = detect_copy_loop(code, base, start_pc)
-            .or_else(|| detect_copy_loop_bwd(code, base, start_pc))
-        {
+        if let Some(cl) = detect_copy_loop(code, base, start_pc) {
             if let Some(b) = translate_copy_loop(&cl, code, base, start_pc, lay) {
                 return Some(b);
             }
@@ -3083,14 +3080,69 @@ mod tests {
             | (((imm >> 5) & 0x3f) << 25)
             | (((imm >> 12) & 1) << 31);
         code.extend_from_slice(&bltu.to_le_bytes());
-        let cl = detect_copy_loop_bwd(&code, 0x1000, 0x1000);
+        let cl = detect_copy_loop(&code, 0x1000, 0x1000);
         assert!(cl.is_some(), "bwd copy loop not detected");
         let cl = cl.unwrap();
         assert!(cl.bwd);
-        assert_eq!(cl.k, 8);
+        assert_eq!((cl.stride, cl.w0), (64, -64));
         assert_eq!((cl.s, cl.d, cl.n, cl.l), (14, 13, 12, 16)); // a4,a3,a2,a6
         assert_eq!(cl.body_n, 22);
         assert_eq!(cl.end_pc, 0x1000 + code.len() as u64);
+    }
+
+    /// The symbolic matcher must also cover memmove's 8-byte descending tail
+    /// loop and memcpy's ascending byte loop (encodings from the shipped
+    /// binary; these small-move paths dominate STRING SORT's time).
+    #[test]
+    fn detects_tail_copy_loops() {
+        // 8B bwd: ld a7,-8(a5); addi a4,a5,-8; addi a3,a1,-8; addi a2,a2,-8;
+        //         sd a7,-8(a1); mv a5,a4; mv a1,a3; bltu a6,a2,start
+        let words: &[u32] = &[0xff87b883, 0xff878713, 0xff858693];
+        let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        code.extend_from_slice(&0x1661u16.to_le_bytes()); // c.addi a2,-8
+        code.extend_from_slice(&0xff15bc23u32.to_le_bytes());
+        code.extend_from_slice(&0x87bau16.to_le_bytes()); // c.mv a5,a4
+        code.extend_from_slice(&0x85b6u16.to_le_bytes()); // c.mv a1,a3
+        let off = -(code.len() as i64);
+        let imm = off as u32;
+        let bltu = 0x63
+            | (6 << 12)
+            | (16 << 15)
+            | (12 << 20)
+            | (((imm >> 11) & 1) << 7)
+            | (((imm >> 1) & 0xf) << 8)
+            | (((imm >> 5) & 0x3f) << 25)
+            | (((imm >> 12) & 1) << 31);
+        code.extend_from_slice(&bltu.to_le_bytes());
+        let cl = detect_copy_loop(&code, 0x1000, 0x1000).expect("8B bwd tail");
+        assert!(cl.bwd);
+        assert_eq!((cl.stride, cl.w0), (8, -8));
+        assert_eq!((cl.s, cl.d, cl.n, cl.l), (15, 11, 12, 16)); // a5,a1,a2,a6
+
+        // byte fwd: lbu a3,0(a1); c.addi a2,-1; c.addi a1,1; addi a4,a5,1;
+        //           sb a3,0(a5); c.mv a5,a4; bnez a2,start
+        let mut code: Vec<u8> = 0x0005c683u32.to_le_bytes().to_vec();
+        code.extend_from_slice(&0x167du16.to_le_bytes()); // c.addi a2,-1
+        code.extend_from_slice(&0x0585u16.to_le_bytes()); // c.addi a1,1
+        code.extend_from_slice(&0x00178713u32.to_le_bytes());
+        code.extend_from_slice(&0x00d78023u32.to_le_bytes());
+        code.extend_from_slice(&0x87bau16.to_le_bytes()); // c.mv a5,a4
+        // bne a2, x0 -> start
+        let off = -(code.len() as i64);
+        let imm = off as u32;
+        let bne = 0x63
+            | (1 << 12)
+            | (12 << 15) // rs1 = a2
+            | (0 << 20)  // rs2 = x0
+            | (((imm >> 11) & 1) << 7)
+            | (((imm >> 1) & 0xf) << 8)
+            | (((imm >> 5) & 0x3f) << 25)
+            | (((imm >> 12) & 1) << 31);
+        code.extend_from_slice(&bne.to_le_bytes());
+        let cl = detect_copy_loop(&code, 0x1000, 0x1000).expect("byte fwd tail");
+        assert!(!cl.bwd);
+        assert_eq!((cl.stride, cl.w0), (1, 0));
+        assert_eq!((cl.s, cl.d, cl.n, cl.l), (11, 15, 12, 0)); // a1,a5,a2,x0
     }
 
     /// Fuzz the FMADD fast-path twin against the softfloat oracle: every
