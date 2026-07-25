@@ -124,7 +124,7 @@ async function rvNbench(jit) {
   for (let i = 0; i < 60000 && !out.includes("~ #"); i++) { vm.runSystem(2_000_000n); if ((i & 15) === 0) await tick(); }
   out = ""; vm.consoleInput(enc.encode("cd / && ./nbench\n"));
   const t = performance.now();
-  for (let i = 0; i < 40_000_000; i++) { vm.runSystem(4_000_000n); if ((i & 15) === 0) await tick(); if (out.includes("Trademarks")) break; if (performance.now() - t > 240000) break; }
+  for (let i = 0; i < 40_000_000; i++) { vm.runSystem(4_000_000n); if ((i & 15) === 0) await tick(); if (out.includes("Trademarks")) break; if (performance.now() - t > 340000) break; }
   const rows = {};
   for (const m of out.matchAll(/^([A-Z][A-Z ]+?)\s+:\s+([\d.e+]+)\s+:/gm)) rows[m[1].trim()] = +m[2];
   return rows;
