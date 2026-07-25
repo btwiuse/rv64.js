@@ -259,9 +259,22 @@ if (await has(join(ARTIFACTS, "cc-bench.img"))) for (const jit of FULL ? [false,
 }
 
 // nbench (BYTEmark) — rv64 JIT vs v86 JIT, both self-timed; gated (slow, ~8 min)
+const NB_KERNELS = ["NUMERIC SORT", "STRING SORT", "BITFIELD", "FP EMULATION",
+                    "FOURIER", "ASSIGNMENT", "IDEA", "HUFFMAN"];
+// The guest hvc console can drop report lines under output bursts; a rerun
+// is safe (nbench self-times in-guest) and the manifest still flags a
+// persistent failure.
+async function rvNbenchComplete(jit) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const rows = await rvNbench(jit);
+    if (NB_KERNELS.every((k) => rows[k] != null)) return rows;
+    log(` [retry: missing ${NB_KERNELS.filter((k) => rows[k] == null).join("/")}]`);
+  }
+  return rvNbench(jit);
+}
 let nb = null;
 if (WANT_NBENCH && (await has(join(ARTIFACTS, "root-nbench.bin")))) {
-  log("[rv64 nbench jit]…"); const nj = await rvNbench(true);
+  log("[rv64 nbench jit]…"); const nj = await rvNbenchComplete(true);
   let ni = null; if (FULL) { log(" interp…"); ni = await rvNbench(false); }
   let v8 = null;
   if (haveV86 && (await has(join(ARTIFACTS, "deb-i386-bench.cpio.gz")))) { log(" v86…"); v8 = await v86Nbench(); }
