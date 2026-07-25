@@ -248,10 +248,11 @@ impl Ctx {
     /// exact flags). FP registers stay in memory (f_base); GPR locals are
     /// flushed by bail. `op`: 0=add 1=sub 2=mul 3=div. `dyn_rm`: rm field is
     /// 0b111 (dynamic) so we must also check frm==RNE at runtime.
-    fn fp_arith_d(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, d: usize, dyn_rm: bool, pc: u64, n: u32) {
+    /// FP fast-path eligibility: bail unless fcsr.NX is already sticky (host
+    /// f64 ops can't report new flag sets exactly) — and, for a dynamic
+    /// rounding mode, unless frm == RNE (the only mode wasm f64 implements).
+    fn fp_eligibility(&self, m: &mut WasmModule, dyn_rm: bool, pc: u64, n: u32) {
         let fcsr = self.lay.fcsr_addr as u64;
-        // Eligibility: bail if NX not set (fcsr&1==0) — or, for dynamic rm,
-        // if frm != RNE ((fcsr>>5)&7 != 0).
         m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
         if dyn_rm {
             m.i32_const(0)
@@ -267,20 +268,12 @@ impl Ctx {
         m.op(IF).op(VOID);
         self.bail(m, pc, n);
         m.op(END);
-        // r = f[s1] <op> f[s2]  (as f64), reinterpreted back to i64 bits.
-        self.push_freg(m, s1);
-        m.op(F64_REINTERPRET_I64);
-        self.push_freg(m, s2);
-        m.op(F64_REINTERPRET_I64);
-        m.op(match op {
-            0 => F64_ADD,
-            1 => F64_SUB,
-            2 => F64_MUL,
-            _ => F64_DIV,
-        });
-        m.op(I64_REINTERPRET_F64).local_set(VAL);
-        // Bail unless the result is a normal number: exp in [1, 0x7fe], i.e.
-        // (exp - 1) <=u 0x7fd. Catches inf/nan (0x7ff) and subnormal/zero (0).
+    }
+
+    /// Bail unless the i64 in VAL, viewed as an f64, is a NORMAL number:
+    /// exp in [1, 0x7fe]. Catches inf/nan (0x7ff) and subnormal/zero (0),
+    /// whose flag/rounding corner cases the softfloat interpreter must own.
+    fn fp_result_normal_guard(&self, m: &mut WasmModule, pc: u64, n: u32) {
         m.local_get(VAL)
             .i64_const(52)
             .op(I64_SHR_U)
@@ -293,6 +286,98 @@ impl Ctx {
         m.op(IF).op(VOID);
         self.bail(m, pc, n);
         m.op(END);
+    }
+
+    /// FSQRT.D: wasm f64.sqrt is exactly rounded (RNE), so under the same
+    /// eligibility as arith it is bit-exact; negative/inf/zero inputs produce
+    /// non-normal results and fall to the result guard.
+    fn fp_sqrt_d(&self, m: &mut WasmModule, s1: usize, d: usize, dyn_rm: bool, pc: u64, n: u32) {
+        self.fp_eligibility(m, dyn_rm, pc, n);
+        self.push_freg(m, s1);
+        m.op(F64_REINTERPRET_I64).op(F64_SQRT);
+        m.op(I64_REINTERPRET_F64).local_set(VAL);
+        self.fp_result_normal_guard(m, pc, n);
+        self.store_freg_pre(m, d);
+        m.local_get(VAL);
+        self.store_freg_post(m, d);
+    }
+
+    /// FCVT.W.D rtz: truncating double -> signed 32. Range-guarded so
+    /// i64.trunc_f64_s cannot trap and NV cases (NaN / out of range, which
+    /// riscv clamps + flags) bail to softfloat; NX (non-integral input) is
+    /// covered by the sticky-NX eligibility.
+    fn fp_cvt_w_d(&self, m: &mut WasmModule, s1: usize, d: usize, pc: u64, n: u32) {
+        self.fp_eligibility(m, false, pc, n);
+        // in-range: -2^31-1 < f  &&  f < 2^31  (NaN fails both -> bail)
+        m.i64_const((-2147483649.0f64).to_bits() as i64)
+            .op(F64_REINTERPRET_I64);
+        self.push_freg(m, s1);
+        m.op(F64_REINTERPRET_I64).op(F64_LT);
+        self.push_freg(m, s1);
+        m.op(F64_REINTERPRET_I64);
+        m.i64_const((2147483648.0f64).to_bits() as i64)
+            .op(F64_REINTERPRET_I64)
+            .op(F64_LT)
+            .op(I32_AND)
+            .op(I32_EQZ);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+        if self.store_pre(m, d) {
+            self.push_freg(m, s1);
+            m.op(F64_REINTERPRET_I64)
+                .op(I64_TRUNC_F64_S)
+                .op(I32_WRAP_I64)
+                .op(I64_EXTEND_I32_S);
+            self.store_post(m, d);
+        }
+    }
+
+    /// FCVT.D.{W,WU,L,LU} (`v` = rs2 variant): int -> double. The 32-bit
+    /// variants are EXACT (no flags, any rounding mode) and need no guards at
+    /// all; the 64-bit ones round (NX for |v| > 2^53) — wasm's converts are
+    /// exactly rounded RNE, so sticky-NX eligibility makes them bit-exact.
+    fn fp_cvt_d_int(&self, m: &mut WasmModule, s1: usize, d: usize, v: u32, dyn_rm: bool, pc: u64, n: u32) {
+        if v >= 2 {
+            self.fp_eligibility(m, dyn_rm, pc, n);
+        }
+        self.store_freg_pre(m, d);
+        self.push_reg(m, s1);
+        match v {
+            0 => {
+                m.op(I32_WRAP_I64)
+                    .op(I64_EXTEND_I32_S)
+                    .op(F64_CONVERT_I64_S);
+            }
+            1 => {
+                m.i64_const(0xffff_ffff).op(I64_AND).op(F64_CONVERT_I64_S);
+            }
+            2 => {
+                m.op(F64_CONVERT_I64_S);
+            }
+            _ => {
+                m.op(F64_CONVERT_I64_U);
+            }
+        }
+        m.op(I64_REINTERPRET_F64);
+        self.store_freg_post(m, d);
+    }
+
+    fn fp_arith_d(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, d: usize, dyn_rm: bool, pc: u64, n: u32) {
+        self.fp_eligibility(m, dyn_rm, pc, n);
+        // r = f[s1] <op> f[s2]  (as f64), reinterpreted back to i64 bits.
+        self.push_freg(m, s1);
+        m.op(F64_REINTERPRET_I64);
+        self.push_freg(m, s2);
+        m.op(F64_REINTERPRET_I64);
+        m.op(match op {
+            0 => F64_ADD,
+            1 => F64_SUB,
+            2 => F64_MUL,
+            _ => F64_DIV,
+        });
+        m.op(I64_REINTERPRET_F64).local_set(VAL);
+        self.fp_result_normal_guard(m, pc, n);
         // f[d] = r
         self.store_freg_pre(m, d);
         m.local_get(VAL);
@@ -525,6 +610,9 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
             // OP-FP (mirror translate_block): FP arith touches no GPRs;
             // FMV.D.X reads a GPR, FMV.X.D writes one; others end the block.
             0x53 if lay.f_base != 0 => {
+                if !fp_handled(insn) {
+                    break;
+                }
                 let f7 = funct7(insn);
                 match (f7 >> 2, f7 & 3, funct3(insn)) {
                     (0..=3, 1, 0 | 7) => {
@@ -546,6 +634,18 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                         fmark(&mut fread, s1); // FMV.X.D: f[s1] -> x[d]
                         mark(&mut write, d);
                     }
+                    (0x0b, 1, 0 | 7) => {
+                        fmark(&mut fread, s1); // FSQRT.D
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x18, 1, 1) => {
+                        fmark(&mut fread, s1); // FCVT.W.D rtz: f -> GPR
+                        mark(&mut write, d);
+                    }
+                    (0x1a, 1, 0 | 7) => {
+                        mark(&mut read, s1); // FCVT.D.int: GPR -> f
+                        fmark(&mut fwrite, d);
+                    }
                     _ => break,
                 }
             }
@@ -557,12 +657,26 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
     (read, write, fread, fwrite)
 }
 
-/// Is `f7`/`f3` a FP op the JIT emits inline (arith / compare / FMV)?
-fn fp_handled(f7: u32, f3: u32) -> bool {
-    matches!(
-        (f7 >> 2, f7 & 3, f3),
-        (0..=3, 1, 0 | 7) | (0x14, 1, 0..=2) | (0x1e, 1, 0) | (0x1c, 1, 0)
-    )
+/// Is this OP-FP (0x53) instruction one the JIT emits inline?
+///
+/// THE single authority for FP, like alu_handled for integer ops: every
+/// scanner and the emitter must agree or block boundaries desync. Takes the
+/// whole insn because FCVT variants are selected by the rs2 FIELD.
+/// Covered: D arith (FADD/FSUB/FMUL/FDIV), compares, FMV both ways, FSQRT.D,
+/// FCVT.W.D (rtz), FCVT.D.{W,WU,L,LU}.
+fn fp_handled(insn: u32) -> bool {
+    let f7 = funct7(insn);
+    let f3 = funct3(insn);
+    match (f7 >> 2, f7 & 3, f3) {
+        (0..=3, 1, 0 | 7) => true,        // FADD/FSUB/FMUL/FDIV.D (rne | dyn)
+        (0x14, 1, 0..=2) => true,         // FLE/FLT/FEQ.D
+        (0x1e, 1, 0) => true,             // FMV.D.X
+        (0x1c, 1, 0) => true,             // FMV.X.D
+        (0x0b, 1, 0 | 7) => true,         // FSQRT.D (rne | dyn)
+        (0x18, 1, 1) => rs2(insn) == 0,   // FCVT.W.D rtz only (signed 32)
+        (0x1a, 1, 0 | 7) => rs2(insn) <= 3, // FCVT.D.{W,WU,L,LU} (rne | dyn)
+        _ => false,
+    }
 }
 
 /// Is `f7`/`f3` a supported OP / OP-32 / OP-IMM-32 encoding?
@@ -635,7 +749,7 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
                 }
             }
             0x53 if lay.f_base != 0 => {
-                if !fp_handled(funct7(insn), funct3(insn)) {
+                if !fp_handled(insn) {
                     return None;
                 }
             }
@@ -806,6 +920,18 @@ fn scan_regs_region(
                     (0x1c, 1, 0) => {
                         fmark(&mut fread, s1);
                         mark(&mut write, d);
+                    }
+                    (0x0b, 1, 0 | 7) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x18, 1, 1) => {
+                        fmark(&mut fread, s1);
+                        mark(&mut write, d);
+                    }
+                    (0x1a, 1, 0 | 7) => {
+                        mark(&mut read, s1);
+                        fmark(&mut fwrite, d);
                     }
                     _ => {}
                 }
@@ -1295,6 +1421,9 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
         }
         // OP-FP: double add/sub/mul/div + compares + FMV.D.X/FMV.X.D inline.
         0x53 if lay.f_base != 0 => {
+            if !fp_handled(insn) {
+                return false;
+            }
             let f7 = funct7(insn);
             let (fmt, fpop, f3) = (f7 & 3, f7 >> 2, funct3(insn));
             match (fpop, fmt, f3) {
@@ -1311,6 +1440,9 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                         c.store_post(m, d);
                     }
                 }
+                (0x0b, 1, 0 | 7) => c.fp_sqrt_d(m, s1, d, f3 == 7, pc, n),
+                (0x18, 1, 1) => c.fp_cvt_w_d(m, s1, d, pc, n),
+                (0x1a, 1, 0 | 7) => c.fp_cvt_d_int(m, s1, d, s2 as u32, f3 == 7, pc, n),
                 _ => return false,
             }
         }
@@ -1689,6 +1821,9 @@ fn scan_regs_super(
                     fmark(&mut fr, s2);
                 }
                 0x53 if lay.f_base != 0 => {
+                    if !fp_handled(insn) {
+                        break;
+                    }
                     let f7 = funct7(insn);
                     match (f7 >> 2, f7 & 3, funct3(insn)) {
                         (0..=3, 1, 0 | 7) => {
@@ -1708,6 +1843,18 @@ fn scan_regs_super(
                         (0x1c, 1, 0) => {
                             fmark(&mut fr, s1);
                             mark(&mut w, d);
+                        }
+                        (0x0b, 1, 0 | 7) => {
+                            fmark(&mut fr, s1);
+                            fmark(&mut fw, d);
+                        }
+                        (0x18, 1, 1) => {
+                            fmark(&mut fr, s1);
+                            mark(&mut w, d);
+                        }
+                        (0x1a, 1, 0 | 7) => {
+                            mark(&mut r, s1);
+                            fmark(&mut fw, d);
                         }
                         _ => break,
                     }
@@ -1934,7 +2081,7 @@ pub fn discover_page_leaders(
                         0x03 => funct3(insn) != 7,
                         0x23 => funct3(insn) <= 3,
                         0x07 | 0x27 => funct3(insn) == 3,
-                        0x53 => fp_handled(funct7(insn), funct3(insn)),
+                        0x53 => fp_handled(insn),
                         _ => false,
                     };
                     if !handled {

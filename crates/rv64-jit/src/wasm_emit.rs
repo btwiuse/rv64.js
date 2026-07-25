@@ -82,6 +82,12 @@ pub const I64_REM_S: u8 = 0x81;
 pub const I64_REM_U: u8 = 0x82;
 /// Untyped select: [val1 val2 cond] -> cond != 0 ? val1 : val2.
 pub const SELECT: u8 = 0x1b;
+// FP conversions / sqrt (FP fast path: FCVT + FSQRT inline)
+pub const F64_SQRT: u8 = 0x9f;
+pub const F64_GE: u8 = 0x66;
+pub const I64_TRUNC_F64_S: u8 = 0xb0; // traps out-of-range: range-guarded at emission
+pub const F64_CONVERT_I64_S: u8 = 0xb9;
+pub const F64_CONVERT_I64_U: u8 = 0xba;
 
 fn uleb(out: &mut Vec<u8>, mut v: u64) {
     loop {
