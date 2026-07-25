@@ -16,7 +16,9 @@ RVF="-static -O2 -march=rv64gc -mabi=lp64d"
 
 # riscv64 freestanding (self-contained _start + raw ecalls, no libc)
 $RVCC -nostdlib $RVF -o "$XB/alu.rv64"        "$HERE/alu.c"
-$RVCC -nostdlib $RVF -o "$XB/rvbench_fs.rv64" "$HERE/rvbench_fs.c"
+# -ffp-contract=off: i386 (SSE2, no fma) cannot contract, so the riscv64
+# build must not either or the FP folds diverge (fmadd single-rounds).
+$RVCC -nostdlib $RVF -ffp-contract=off -o "$XB/rvbench_fs.rv64" "$HERE/rvbench_fs.c"
 # riscv64 libc (newlib): -ffp-contract=off so gcc emits mul+add, not FMADD —
 # the JIT translates those bit-exactly (no wasm fma) and it matches v86's build.
 $RVCC          $RVF -ffp-contract=off -o "$XB/rvbench.rv64" "$HERE/rvbench.c"
@@ -26,10 +28,14 @@ $RVCC          $RVF -ffp-contract=off -o "$XB/rvbench.rv64" "$HERE/rvbench.c"
 # freestanding twin of rvbench.c — identical work).
 # -fno-stack-protector is REQUIRED: the nixpkgs cc-wrapper enables the
 # stack protector by default, whose %gs:0x14 canary reads fault in a
-# freestanding (no-TLS) binary. NO -msse2: v86 executes SSE2 ~13x slower
-# than x87 and the x87 build is the established cross-ISA checksum baseline
-# (mixed low-32 16c84da4 matches the riscv64 build).
-I386F="-m32 -nostdlib -static -no-pie -O2 -fno-stack-protector"
+# freestanding (no-TLS) binary.
+# -msse2 -mfpmath=sse is REQUIRED for cross-ISA comparability: without
+# -mfpmath=sse, gcc keeps double math on x87 whose 80-bit intermediates
+# produce a different FP fold than the riscv64 IEEE-double build (and v86
+# executes the x87 pattern of this kernel ~10x slower). SSE2 doubles are
+# bit-identical to riscv64 doubles, so the Mixed checksum cross-check holds
+# for freshly built artifacts on BOTH sides.
+I386F="-m32 -msse2 -mfpmath=sse -nostdlib -static -no-pie -O2 -fno-stack-protector"
 gcc $I386F -o "$XB/alu.i386"        "$HERE/alu.c"
 gcc $I386F -o "$XB/rvbench_fs.i386" "$HERE/rvbench_fs.c"
 
