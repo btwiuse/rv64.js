@@ -720,3 +720,28 @@ needed.
 ARTIFACTS=<sc> NBENCH=1 SB=1 REPS=3 scorecard: 13/13 win-or-match with no
 nbench-flagged instability. FP EMULATION/ASSIGNMENT/IDEA must not regress
 below their 11/13 values (235 iter/s / 19 / 4500-5000).
+
+
+## OPEN (found 2026-07-25 session end): HUFFMAN collapse on the sparse tree — SUSPECTED MISCOMPILE
+
+Every scorecard/nbench after the sparse-regions alignment reads HUFFMAN at
+~131 iter/s (was 1756-2377). The JIT profile during the collapsed runs is
+HEALTHY — 81 insns/dispatch, 100% coverage, tiny fallback counts — but the
+kernel retires ~16x more guest instructions per self-timed iteration. A
+healthy dispatch profile plus exploded per-iteration instruction counts means
+the guest is EXECUTING DIFFERENT CODE PATHS, i.e. a suspected miscompile that
+perturbs data-dependent loop trip counts without failing alu/mixed checksums,
+the 150-program differential, amo-diff, or boot.
+
+Prime suspect: the run-level sparse changes (originally branch commit
+5b69da6, carried to main in the 0e64d5b alignment) — whole-run leader
+discovery and run-level TPC resolve — interacting with F-extension bodies.
+The last configuration with a GOOD full-scorecard HUFFMAN (1756) was the
+cap-3 sparse tree WITHOUT the run-level changes (commit a19ea3b).
+
+Next session, FIRST: bisect HUFFMAN between a19ea3b's JIT and HEAD (fast
+check: SBFORCE=1 nb-rvonly, HUFFMAN row only), and extend a differential to
+cover an in-guest compression loop (HUFFMAN-shaped: bit-packing over
+data-dependent branches) so this class is caught by the battery, not by the
+scorecard. Until it lands, scorecard results from this tree should not be
+trusted for FOURIER/HUFFMAN comparisons either (FOURIER also reads unstable).
