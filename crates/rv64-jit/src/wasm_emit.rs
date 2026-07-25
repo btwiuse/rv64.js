@@ -191,6 +191,27 @@ impl WasmModule {
         self
     }
 
+    /// SIMD (0xfd-prefixed). Emitted ONLY when the host has probed that the
+    /// engine validates relaxed SIMD AND that relaxed_madd is FUSED on this
+    /// hardware (the spec allows either; only the fused form is bit-exact for
+    /// the guest's fmadd).
+    pub fn i64x2_splat(&mut self) -> &mut Self {
+        self.code.push(0xfd);
+        uleb(&mut self.code, 0x12);
+        self
+    }
+    pub fn f64x2_relaxed_madd(&mut self) -> &mut Self {
+        self.code.push(0xfd);
+        uleb(&mut self.code, 0x107);
+        self
+    }
+    pub fn f64x2_extract_lane0(&mut self) -> &mut Self {
+        self.code.push(0xfd);
+        uleb(&mut self.code, 0x21);
+        self.code.push(0x00);
+        self
+    }
+
     /// i32.load (align 2, constant offset).
     pub fn i32_load(&mut self, offset: u64) -> &mut Self {
         self.code.push(0x28);

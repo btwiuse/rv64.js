@@ -2320,6 +2320,12 @@ pub extern "C" fn sb_trace_pc(pc: u64) {
     unsafe { TRACE_PC = pc };
 }
 
+/// Enable the hardware fused-madd FMADD path (host proves fusedness first).
+#[no_mangle]
+pub extern "C" fn jit_set_hw_fma(on: u32) {
+    rv64_jit::set_hw_fma(on != 0);
+}
+
 /// Enable direct block-to-block tail-call chaining (host feature-detects
 /// wasm tail-call support first).
 #[no_mangle]

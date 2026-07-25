@@ -67,6 +67,17 @@ static TLB_FILL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// Enabled by the host after feature-detecting tail-call support; blocks
 /// compiled while off simply return to the dispatch loop as before.
 static CHAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Hardware fused multiply-add via f64x2.relaxed_madd. The host enables this
+/// only after empirically proving BOTH that the engine validates the opcode
+/// and that it is fused (a=b=1+2^-52, c=-(1+2^-51) must give 2^-104, not 0).
+static HW_FMA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_hw_fma(on: bool) {
+    HW_FMA.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+fn hw_fma_enabled() -> bool {
+    HW_FMA.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_chain(on: bool) {
     CHAIN.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -863,6 +874,40 @@ impl Ctx {
         m.op(IF).op(VOID);
         self.bail(m, pc, n);
         m.op(END);
+        // Hardware path: one fused f64x2.relaxed_madd replaces the entire
+        // Dekker/TwoSum/round-to-odd sequence (~30 f64 ops). Bit-exact by
+        // construction — a true fused a*b+c under RNE IS the guest's fmadd —
+        // and the host only enables it after proving fusedness empirically.
+        // The operand guard above and the result guard below are kept
+        // unchanged, so the FLAG behavior is identical: in-band operands can
+        // only raise NX (covered by the block's sticky-NX gate); overflow,
+        // subnormal and the exotic NV cases bail to softfloat exactly as the
+        // emulated path does.
+        if hw_fma_enabled() {
+            m.local_get(fa).i64x2_splat();
+            m.local_get(fb).i64x2_splat();
+            m.local_get(fc).i64x2_splat();
+            m.f64x2_relaxed_madd().f64x2_extract_lane0();
+            m.op(I64_REINTERPRET_F64).local_set(VAL);
+            m.local_get(VAL)
+                .i64_const(52)
+                .op(I64_SHR_U)
+                .i64_const(0x7ff)
+                .op(I64_AND)
+                .i64_const(1)
+                .op(I64_SUB)
+                .i64_const(0x7fd)
+                .op(I64_GT_U);
+            m.local_get(VAL).i64_const(1).op(I64_SHL).op(I64_EQZ).op(I32_EQZ);
+            m.op(I32_AND);
+            m.op(IF).op(VOID);
+            self.bail(m, pc, n);
+            m.op(END);
+            self.store_freg_pre(m, d);
+            m.local_get(VAL);
+            self.store_freg_post(m, d);
+            return;
+        }
         // p = a * b, band-checked
         getf(m, fa);
         getf(m, fb);

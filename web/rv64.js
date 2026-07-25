@@ -135,6 +135,31 @@ export class RV64 {
         ? await WebAssembly.instantiateStreaming(wasmSource, imports)
         : await WebAssembly.instantiate(wasmSource, imports);
     vm = new RV64(instance);
+    // Hardware FMA: use f64x2.relaxed_madd for the guest's FMADD family iff
+    // the engine validates it AND it is fused on this hardware (the spec
+    // allows unfused; only fused is bit-exact). Probe empirically:
+    // a=b=1+2^-52, c=-(1+2^-51) gives 2^-104 fused, 0 unfused.
+    try {
+      const sec = (id, p) => [id, p.length, ...p];
+      const code = [0x00,
+        0x20, 0, 0xfd, 0x12, 0x20, 1, 0xfd, 0x12, 0x20, 2, 0xfd, 0x12,
+        0xfd, 0x87, 0x02, 0xfd, 0x21, 0x00, 0x0b];
+      const mod = new WebAssembly.Module(new Uint8Array([
+        0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+        ...sec(1, [1, 0x60, 3, 0x7e, 0x7e, 0x7e, 1, 0x7c]),
+        ...sec(3, [1, 0]),
+        ...sec(7, [1, 1, 0x74, 0, 0]),
+        ...sec(10, [1, code.length, ...code]),
+      ]));
+      const bits = (x) => new BigInt64Array(new Float64Array([x]).buffer)[0];
+      const r = new WebAssembly.Instance(mod, {}).exports.t(
+        bits(1 + 2 ** -52), bits(1 + 2 ** -52), bits(-(1 + 2 ** -51)));
+      if (r !== 0 && Math.abs(r - 2 ** -104) < 2 ** -150) {
+        vm.ex.jit_set_hw_fma?.(1);
+      }
+    } catch {
+      /* no relaxed SIMD: the exact emulated fma stays in charge */
+    }
     // Direct block chaining needs wasm tail calls (return_call_indirect,
     // shipped by default in V8 11.2+). Feature-detect with a 1-function probe
     // so older engines just keep the plain dispatch loop.
