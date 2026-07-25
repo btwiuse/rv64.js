@@ -158,6 +158,12 @@ impl Cpu {
     /// compiled FP instructions bail unless mstatus.FS == Dirty, so FS=Off
     /// traps and Initial/Clean transition through the interpreter exactly
     /// like fp_check/fp_dirty.
+    /// Address of cpu.map_gen (u64; blocks compare its low 32 bits against a
+    /// dispatch line's generation stamp before tail-calling the next block).
+    pub fn jit_map_gen_ptr(&self) -> usize {
+        &self.map_gen as *const u64 as usize
+    }
+
     pub fn jit_mstatus_ptr(&self) -> usize {
         self.sys.as_ref().map_or(0, |s| &s.mstatus as *const u64 as usize)
     }

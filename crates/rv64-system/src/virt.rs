@@ -481,6 +481,8 @@ pub struct VirtImages<'a> {
     pub disk: Option<Vec<u8>>,
     /// Host filesystem exported over virtio-9p; see [`crate::BootImages::fs`].
     pub fs: Option<crate::p9::Server>,
+    /// MAC for a virtio-net device; see [`crate::BootImages::net`].
+    pub net: Option<[u8; 6]>,
 }
 
 pub struct VirtMachine {
@@ -509,7 +511,9 @@ impl VirtMachine {
 
         let _ = kend;
         // One mmio slot per device we will instantiate below, in the same order.
-        let n_virtio = images.disk.is_some() as usize + images.fs.is_some() as usize;
+        let n_virtio = images.disk.is_some() as usize
+            + images.fs.is_some() as usize
+            + images.net.is_some() as usize;
         // Place initrd + DTB near the TOP of RAM (as QEMU/U-Boot do) so the
         // kernel's early allocations near the Image don't clobber them.
         // Layout from the top down: [DTB][initrd][fw_dynamic_info], each
@@ -547,6 +551,13 @@ impl VirtMachine {
         }
         if let Some(srv) = images.fs {
             virtio.push(VirtioDev::new(Backend::Fs { srv }));
+        }
+        if let Some(mac) = images.net {
+            virtio.push(VirtioDev::new(Backend::Net {
+                mac,
+                inbox: Vec::new(),
+                outbox: Vec::new(),
+            }));
         }
 
         // fw_dynamic_info struct (OpenSBI reads it from a2). fw_jump.bin bakes
@@ -603,6 +614,25 @@ impl VirtMachine {
     }
     pub fn console_input(&mut self, bytes: &[u8]) {
         self.bus.uart_input(bytes);
+    }
+
+    /// Deliver an inbound Ethernet frame to the guest's NIC. `poll_virtio`
+    /// already runs every slice here, so it lands as soon as the guest has a
+    /// buffer posted.
+    pub fn net_input(&mut self, frame: &[u8]) {
+        if let Some(dev) = self.bus.virtio.iter_mut().find(|d| d.device_id() == 1) {
+            dev.net_input(frame);
+        }
+    }
+
+    /// Collect the Ethernet frames the guest has transmitted.
+    pub fn net_take_output(&mut self) -> Vec<Vec<u8>> {
+        self.bus
+            .virtio
+            .iter_mut()
+            .find(|d| d.device_id() == 1)
+            .map(|d| d.net_take_output())
+            .unwrap_or_default()
     }
 
     pub fn sync_devices(&mut self) {

@@ -4,7 +4,8 @@
 //!
 //! Usage:
 //!   rv64-vboot <opensbi.bin> <kernel-Image> [--initrd FILE] [--disk FILE]
-//!              [--9p DIR] [--9p-tag TAG] [--ram GB] [-- <cmdline...>]
+//!              [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT] [--net-mac MAC]
+//!              [--ram GB] [-- <cmdline...>]
 //!
 //! `--9p DIR` exports a host directory over virtio-9p. Note that the stock
 //! Debian/nixpkgs riscv64 kernels ship 9p as modules (`9pnet_virtio`, `9p`),
@@ -12,7 +13,7 @@
 //!   mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
 
 use rv64_system::virt::{VirtImages, VirtMachine};
-use rv64_system::{p9, p9fs};
+use rv64_system::{p9, p9fs, ws};
 use std::io::{Read, Write};
 
 fn main() {
@@ -26,6 +27,8 @@ fn main() {
     let mut disk_path = None;
     let mut share = None;
     let mut tag = "host".to_string();
+    let mut relay_url = None;
+    let mut mac = rv64_system::virtio::DEFAULT_MAC;
     let mut ram_gb = 2.0f64;
     let mut positional = Vec::new();
     let mut it = args.into_iter();
@@ -35,12 +38,20 @@ fn main() {
             "--disk" => disk_path = it.next(),
             "--9p" => share = it.next(),
             "--9p-tag" => tag = it.next().unwrap_or(tag),
+            "--net" => relay_url = it.next(),
+            "--net-mac" => {
+                mac = it
+                    .next()
+                    .as_deref()
+                    .and_then(parse_mac)
+                    .unwrap_or_else(|| { eprintln!("bad --net-mac"); std::process::exit(2) })
+            }
             "--ram" => ram_gb = it.next().and_then(|v| v.parse().ok()).unwrap_or(2.0),
             _ => positional.push(a),
         }
     }
     if positional.len() < 2 {
-        eprintln!("usage: rv64-vboot <opensbi.bin> <kernel> [--initrd F] [--disk F] [--9p DIR] [--9p-tag TAG] [--ram GB] [-- cmdline]");
+        eprintln!("usage: rv64-vboot <opensbi.bin> <kernel> [--initrd F] [--disk F] [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT] [--net-mac MAC] [--ram GB] [-- cmdline]");
         std::process::exit(2);
     }
     let opensbi = std::fs::read(&positional[0]).expect("read opensbi");
@@ -51,6 +62,23 @@ fn main() {
         eprintln!("[vboot] 9p: exporting {dir} as tag '{tag}'");
         p9::Server::new(tag, Box::new(p9fs::HostFs::new(dir)))
     });
+
+    // Connect the relay before booting: a NIC the guest can see but that has
+    // nowhere to send is worse than no NIC at all.
+    let mut relay = match &relay_url {
+        Some(url) => match ws::Relay::connect(url) {
+            Ok(r) => {
+                eprintln!("[vboot] net: relay {url}, mac {}", fmt_mac(&mac));
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!("[vboot] net: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+    let net = relay.is_some().then_some(mac);
 
     let ram_bytes = (ram_gb * (1u64 << 30) as f64) as u64;
     eprintln!(
@@ -63,7 +91,7 @@ fn main() {
 
     let mut m = VirtMachine::new(
         ram_bytes,
-        VirtImages { opensbi: &opensbi, kernel: &kernel, cmdline: &cmdline, initrd: initrd.as_deref(), disk, fs },
+        VirtImages { opensbi: &opensbi, kernel: &kernel, cmdline: &cmdline, initrd: initrd.as_deref(), disk, fs, net },
     );
 
     let _raw = RawTerm::enable();
@@ -102,6 +130,19 @@ fn main() {
             eprintln!("\r\n[vboot] powered off");
             break;
         }
+        // Pump the relay both ways once per slice.
+        if let Some(r) = relay.as_mut() {
+            for frame in m.net_take_output() {
+                r.send(&frame);
+            }
+            for frame in r.recv() {
+                m.net_input(&frame);
+            }
+            if r.is_closed() {
+                eprintln!("\r\n[vboot] net: relay closed");
+                relay = None;
+            }
+        }
         let mut buf = [0u8; 256];
         if let Ok(n) = stdin.read(&mut buf) {
             if n > 0 {
@@ -134,6 +175,20 @@ fn main() {
             }
         }
     }
+}
+
+/// Parse `52:54:00:12:34:56`.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for byte in out.iter_mut() {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
+}
+
+fn fmt_mac(mac: &[u8; 6]) -> String {
+    mac.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
 }
 
 /// Format the last ~20 user syscalls from the CPU ring buffer, decoding

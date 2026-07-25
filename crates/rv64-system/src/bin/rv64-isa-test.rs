@@ -166,6 +166,7 @@ fn main() {
                 cmdline: "",
                 disk: None,
                 fs: None,
+                net: None,
             },
         );
         match load_test(&elf, &mut m.bus.ram) {
