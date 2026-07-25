@@ -215,6 +215,15 @@ impl WasmModule {
 
     /// br_table: pop an i32 index, branch to `targets[index]` (block depths),
     /// or `default` if the index is out of range.
+    /// bulk-memory memory.copy: pops [dst_i32, src_i32, len_i32].
+    pub fn memory_copy(&mut self) -> &mut Self {
+        self.code.push(0xfc);
+        uleb(&mut self.code, 10);
+        self.code.push(0x00); // dst memidx
+        self.code.push(0x00); // src memidx
+        self
+    }
+
     pub fn br_table(&mut self, targets: &[u32], default: u32) -> &mut Self {
         self.code.push(BR_TABLE);
         uleb(&mut self.code, targets.len() as u64);

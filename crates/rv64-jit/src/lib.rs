@@ -1752,6 +1752,278 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
 /// Translate a block starting at `start_pc`. `code` is the guest code bytes and
 /// `base` its guest address. Returns None if the first instruction isn't
 /// translatable (caller interprets it instead).
+
+/// A forward bulk-copyable self-loop — clang's musl memcpy/memmove(fwd) and
+/// fastmem shape: k pairs of `ld T, 8i(S); sd T, 8i(D)` at ascending offsets
+/// 0,8,..,8(k-1), three ADDIs advancing D and S by 8k and N by -8k, then
+/// `bltu L, N` back to the start (continue while N > L).
+struct CopyLoop {
+    s: usize,
+    d: usize,
+    n: usize,
+    l: usize,
+    t_mask: u32,
+    k: u32,
+    body_n: u32,
+    end_pc: u64,
+}
+
+fn detect_copy_loop(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
+    let mut pc = start_pc;
+    let mut k: u32 = 0;
+    let (mut s, mut d) = (usize::MAX, usize::MAX);
+    let mut t_mask = 0u32;
+    loop {
+        let Some((i1, l1)) = fetch(code, base, pc) else { break };
+        if opcode(i1) != 0x03 || funct3(i1) != 3 {
+            break;
+        }
+        let (t, sb, off) = (rd(i1), rs1(i1), imm_i(i1));
+        if off != (k as i64) * 8 {
+            return None;
+        }
+        if k == 0 {
+            s = sb;
+        } else if sb != s {
+            return None;
+        }
+        let (i2, l2) = fetch(code, base, pc.wrapping_add(l1))?;
+        if opcode(i2) != 0x23 || funct3(i2) != 3 || rs2(i2) != t || imm_s(i2) != (k as i64) * 8 {
+            return None;
+        }
+        let db = rs1(i2);
+        if k == 0 {
+            d = db;
+        } else if db != d {
+            return None;
+        }
+        if t == 0 || t == s || t == d {
+            return None;
+        }
+        t_mask |= 1 << t;
+        pc = pc.wrapping_add(l1 + l2);
+        k += 1;
+        if k > 16 {
+            return None;
+        }
+    }
+    if k < 4 {
+        return None;
+    }
+    let w = (k as i64) * 8;
+    let mut n = usize::MAX;
+    let mut seen = [false; 3];
+    for _ in 0..3 {
+        let (i, l) = fetch(code, base, pc)?;
+        if opcode(i) != 0x13 || funct3(i) != 0 || rd(i) != rs1(i) {
+            return None;
+        }
+        let (r, im) = (rd(i), imm_i(i));
+        if r == d && im == w && !seen[0] {
+            seen[0] = true;
+        } else if r == s && im == w && !seen[1] {
+            seen[1] = true;
+        } else if im == -w && r != s && r != d && r != 0 && !seen[2] {
+            seen[2] = true;
+            n = r;
+        } else {
+            return None;
+        }
+        pc = pc.wrapping_add(l);
+    }
+    let (bi, bl) = fetch(code, base, pc)?;
+    if opcode(bi) != 0x63 || funct3(bi) != 6 || rs2(bi) != n {
+        return None;
+    }
+    let l_reg = rs1(bi);
+    if pc.wrapping_add(imm_b(bi) as u64) != start_pc {
+        return None;
+    }
+    if l_reg == 0 || l_reg == s || l_reg == d || l_reg == n || s == 0 || d == 0 || n == 0 || s == d
+        || t_mask & (1 << l_reg) != 0 || t_mask & (1 << n) != 0
+    {
+        return None;
+    }
+    Some(CopyLoop {
+        s,
+        d,
+        n,
+        l: l_reg,
+        t_mask,
+        k,
+        body_n: 2 * k + 4,
+        end_pc: pc.wrapping_add(bl),
+    })
+}
+
+/// Compile a detected copy loop: the fast path performs the architectural
+/// effect of many iterations with ONE wasm `memory.copy` per page-bounded
+/// chunk (through the fused load/store TLBs, so MMIO / non-writable /
+/// compiled-page invariants hold), and ALWAYS leaves the tail (N' > L
+/// guaranteed) to the in-block normal body — which sets the temp registers
+/// exactly as real execution would. Retirement is exact: each chunk adds
+/// iterations x body_n to ITER; the normal body adds body_n; mid-body bails
+/// report ITER + position (Ctx::bail). This is the riscv64 counter to v86's
+/// rep-movs bulk-copy fast path.
+fn translate_copy_loop(
+    cl: &CopyLoop,
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    lay: JitLayout,
+) -> Option<Block> {
+    let sys = lay.sys?;
+    let read_mask =
+        (1u32 << cl.s) | (1 << cl.d) | (1 << cl.n) | (1 << cl.l) | cl.t_mask | 1; // bit 0: scratch
+    let write_mask = (1u32 << cl.s) | (1 << cl.d) | (1 << cl.n) | cl.t_mask;
+    let (mut c, mut m) = build_ctx(lay, read_mask, write_mask, 0, 0);
+    c.retired_local = Some(ITER);
+    let fs = c.fma_scratch;
+    debug_assert!(fs != 0);
+    let (srci, dsti, kb) = (fs, fs + 1, fs + 2);
+    let (rs, rd_, rn, rl) =
+        (c.reg_local[cl.s], c.reg_local[cl.d], c.reg_local[cl.n], c.reg_local[cl.l]);
+    let w = (cl.k as i64) * 8;
+
+    m.i64_const(0).local_set(ITER);
+    m.op(LOOP).op(VOID); // $head
+    // fuel guard (safe yield at the loop head)
+    m.local_get(ITER);
+    if lay.fuel_addr != 0 {
+        m.i32_const(0).i64_load(lay.fuel_addr as u64);
+    } else {
+        m.i64_const(LOOP_CAP as i64);
+    }
+    m.op(I64_GE_U);
+    m.op(IF).op(VOID);
+    c.flush_writes(&mut m);
+    c.set_pc_const(&mut m, start_pc);
+    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
+    m.op(RETURN);
+    m.op(END);
+
+    m.op(BLOCK).op(VOID); // $normal — bulk path brs here to fall back
+    {
+        // guest loop must be continuing at all: L <u N, else normal path exits
+        m.local_get(rl).local_get(rn).op(I64_LT_U).op(I32_EQZ).br_if(0);
+        // kb = iterations we may bulk = (N - L - 1) / w, page-bounded both sides
+        m.local_get(rn)
+            .local_get(rl)
+            .op(I64_SUB)
+            .i64_const(1)
+            .op(I64_SUB)
+            .i64_const(w)
+            .op(I64_DIV_U)
+            .local_set(kb);
+        m.local_get(kb).op(I64_EQZ).br_if(0);
+        // srci temp <- src in-page room (iterations)
+        m.i64_const(4096);
+        m.local_get(rs).i64_const(4095).op(I64_AND);
+        m.op(I64_SUB).i64_const(w).op(I64_DIV_U).local_set(srci);
+        m.local_get(srci).local_get(kb);
+        m.local_get(srci).local_get(kb).op(I64_LT_U).op(SELECT);
+        m.local_set(kb);
+        // dst room likewise
+        m.i64_const(4096);
+        m.local_get(rd_).i64_const(4095).op(I64_AND);
+        m.op(I64_SUB).i64_const(w).op(I64_DIV_U).local_set(srci);
+        m.local_get(srci).local_get(kb);
+        m.local_get(srci).local_get(kb).op(I64_LT_U).op(SELECT);
+        m.local_set(kb);
+        m.local_get(kb).op(I64_EQZ).br_if(0);
+        // probe src (load class); miss -> $normal
+        m.local_get(rs).local_set(VA);
+        m.local_get(VA).i64_const(12).op(I64_SHR_U).local_set(PAGE);
+        m.local_get(PAGE)
+            .op(I32_WRAP_I64)
+            .i32_const(sys.tlb_mask as i32)
+            .op(I32_AND)
+            .i32_const(3)
+            .op(I32_SHL)
+            .local_set_i32(c.idxb);
+        m.local_get_i32(c.idxb).i64_load_at(sys.ftlb_load_tag as u64);
+        m.local_get(PAGE).op(I64_NE).br_if(0);
+        m.local_get(VA);
+        m.local_get_i32(c.idxb).i64_load_at(sys.ftlb_load_off as u64);
+        m.op(I64_ADD).local_set(srci);
+        // probe dst (store class); miss -> $normal
+        m.local_get(rd_).local_set(VA);
+        m.local_get(VA).i64_const(12).op(I64_SHR_U).local_set(PAGE);
+        m.local_get(PAGE)
+            .op(I32_WRAP_I64)
+            .i32_const(sys.tlb_mask as i32)
+            .op(I32_AND)
+            .i32_const(3)
+            .op(I32_SHL)
+            .local_set_i32(c.idxb);
+        m.local_get_i32(c.idxb).i64_load_at(sys.ftlb_store_tag as u64);
+        m.local_get(PAGE).op(I64_NE).br_if(0);
+        m.local_get(VA);
+        m.local_get_i32(c.idxb).i64_load_at(sys.ftlb_store_off as u64);
+        m.op(I64_ADD).local_set(dsti);
+        // kb <- BYTES (= iters * w)
+        m.local_get(kb).i64_const(w).op(I64_MUL).local_set(kb);
+        // overlap-propagation hazard: the REAL loop reads bytes it has just
+        // written when 0 < D-S < bytes (forward store-to-load propagation);
+        // memory.copy has memmove semantics and would differ. musl's fwd
+        // paths guarantee D-S >= len, but the detector could match user code
+        // that doesn't — fall back to the exact normal body in that case
+        // (D == S is conservatively included; it's semantically a no-op copy
+        // either way).
+        m.local_get(rd_).local_get(rs).op(I64_SUB);
+        m.local_get(kb).op(I64_LT_U).br_if(0);
+        // memory.copy(dst, src, bytes)
+        m.local_get(dsti).op(I32_WRAP_I64);
+        m.local_get(srci).op(I32_WRAP_I64);
+        m.local_get(kb).op(I32_WRAP_I64);
+        m.memory_copy();
+        // S += bytes; D += bytes; N -= bytes
+        m.local_get(rs).local_get(kb).op(I64_ADD).local_set(rs);
+        m.local_get(rd_).local_get(kb).op(I64_ADD).local_set(rd_);
+        m.local_get(rn).local_get(kb).op(I64_SUB).local_set(rn);
+        // ITER += (bytes / w) * body_n
+        m.local_get(kb)
+            .i64_const(w)
+            .op(I64_DIV_U)
+            .i64_const(cl.body_n as i64)
+            .op(I64_MUL)
+            .local_get(ITER)
+            .op(I64_ADD)
+            .local_set(ITER);
+        m.br(1); // continue $head (fuel re-checked per chunk)
+    }
+    m.op(END); // $normal
+
+    // NORMAL BODY: one real iteration (exact temps/flags/bail semantics)
+    let mut pc = start_pc;
+    let mut i = 0u32;
+    while i < cl.body_n - 1 {
+        let (insn, il) = fetch(code, base, pc)?;
+        if !emit_simple(&mut m, &c, lay, insn, pc, i) {
+            return None;
+        }
+        pc = pc.wrapping_add(il);
+        i += 1;
+    }
+    m.local_get(ITER)
+        .i64_const(cl.body_n as i64)
+        .op(I64_ADD)
+        .local_set(ITER);
+    // continue while L <u N
+    m.local_get(rl).local_get(rn).op(I64_LT_U).br_if(0);
+    c.flush_writes(&mut m);
+    c.set_pc_const(&mut m, cl.end_pc);
+    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
+    m.op(RETURN);
+    m.op(END); // loop
+
+    Some(Block {
+        wasm: m.finish(),
+        len: cl.end_pc - start_pc,
+        n_insns: cl.body_n,
+    })
+}
+
 /// Host-side twin of the FMADD.D fast path the JIT emits (fp_fmadd_d): every
 /// f64 operation here corresponds 1:1 to an emitted wasm op, and both are
 /// IEEE-754 binary64 round-to-nearest-even — so the fuzz test proving this
@@ -1820,6 +2092,15 @@ pub fn fma_fastpath_ref(ab: u64, bb: u64, cb: u64) -> Option<u64> {
 }
 
 pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> Option<Block> {
+    // Bulk-copyable self-loop (memcpy/memmove word loops): one wasm
+    // memory.copy per page-bounded chunk — see translate_copy_loop.
+    if lay.sys.is_some() {
+        if let Some(cl) = detect_copy_loop(code, base, start_pc) {
+            if let Some(b) = translate_copy_loop(&cl, code, base, start_pc, lay) {
+                return Some(b);
+            }
+        }
+    }
     // Structured loop region (nested loops + forward if-then/break) → compile
     // the whole thing as one wasm function so register locals persist across
     // every iteration of every level (3e-2 / v86 control-flow structuring).
