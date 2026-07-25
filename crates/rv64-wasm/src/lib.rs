@@ -341,6 +341,9 @@ static mut RETIRED_CELL: u64 = 0;
 /// compiled loops/superblocks yield once they retire this many instructions,
 /// so caller budgets and the interrupt quantum hold to block granularity.
 static mut FUEL_CELL: u64 = 0;
+/// Diagnostics: emitted copy-loop fast paths bump this cell once per bulk
+/// chunk (the emitter receives its address via JitLayout.copystat_addr).
+static mut COPY_CHUNKS: u64 = 0;
 
 #[allow(static_mut_refs)]
 fn retired_addr() -> u32 {
@@ -349,6 +352,10 @@ fn retired_addr() -> u32 {
 
 fn fuel_addr() -> u32 {
     unsafe { &FUEL_CELL as *const u64 as u32 }
+}
+
+fn copystat_addr() -> u32 {
+    unsafe { &COPY_CHUNKS as *const u64 as u32 }
 }
 
 /// Longest compiled-code residency between interrupt/device checks, in guest
@@ -394,6 +401,7 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             3 => SYS_JIT.as_ref().map_or(0, |j| j.cache.len() as u64),
             4 => SLICE_CALLS,
             5 => SLICE_INSNS,
+            8 => COPY_CHUNKS,
             _ => 0,
         }
     }
@@ -503,6 +511,7 @@ pub extern "C" fn sbtest() -> u64 {
             fcsr_addr: 0,
             fuel_addr: 0,
             mstatus_addr: 0,
+            copystat_addr: 0,
         };
         let entries = [0x1000u64, 0x100c];
         let blk = match rv64_jit::translate_superblock(&code, base, 0x1000, 0x40, &entries, lay) {
@@ -585,6 +594,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
                     fuel_addr: fuel_addr(),
                     mstatus_addr: 0, // user mode: no privileged FP state
+                    copystat_addr: 0,
                 };
                 let end = (pc as usize + 1024).min(m.mem.len());
                 let entry = rv64_jit::translate_block(&m.mem[pc as usize..end], pc, pc, lay)
@@ -890,6 +900,15 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             break;
         }
         if chained == JIT_CHAIN_CAP || retired_sum >= round_budget {
+            // Quantum boundary: re-anchor the wall clock BEFORE advancing
+            // devices — a full quantum (1M insns) can pass in well under the
+            // interpolation model's assumptions when bulk fast paths run,
+            // and mtime must track real time, not extrapolated time.
+            if unsafe { SYS_WALLCLOCK } {
+                m.wall_ns = Some(unsafe { host_now_ms() } as u64 * 1_000_000);
+                m.wall_anchor_icount = m.cpu.insn_count;
+                unsafe { WALL_LAST_ICOUNT = m.cpu.insn_count };
+            }
             m.sync_devices();
             m.cpu.check_interrupts(&mut m.bus);
             continue;
@@ -924,6 +943,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
                             fuel_addr: fuel_addr(),
                             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
+                            copystat_addr: copystat_addr(),
                         };
                         let vpage = pc & !0xfff;
                         let pa_page = pa & !0xfff;

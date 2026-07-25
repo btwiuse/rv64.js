@@ -559,8 +559,19 @@ impl Machine {
             // time turns any rdtime spin (kernel __delay) into an interpreter
             // round-trip storm.
             Some(ns) => {
+                // Clamp the interpolated advance: bulk-copy fast paths retire
+                // guest instructions far faster than the assumed 500 Minsn/s,
+                // and an unclamped extrapolation makes guest time run FAST —
+                // deflating every self-timed benchmark score. The host layer
+                // refreshes the real clock at quantum boundaries, so the
+                // clamp bounds the error to ~33us of guest time per refresh.
                 ns / (1_000_000_000 / RTC_FREQ)
-                    + self.cpu.insn_count.wrapping_sub(self.wall_anchor_icount) / 50
+                    + self
+                        .cpu
+                        .insn_count
+                        .wrapping_sub(self.wall_anchor_icount)
+                        .min(16384)
+                        / 50
             }
             None => self.cpu.insn_count / self.insns_per_tick,
         };

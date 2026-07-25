@@ -95,6 +95,8 @@ pub struct JitLayout {
     /// trap and Initial/Clean must transition to Dirty; one interpreter step
     /// does both exactly (fp_check/fp_dirty).
     pub mstatus_addr: u32,
+    /// Diagnostic cell the copy-loop fast path bumps per bulk chunk (0 = off).
+    pub copystat_addr: u32,
 }
 
 impl JitLayout {
@@ -110,6 +112,7 @@ impl JitLayout {
             fcsr_addr: 0,
             fuel_addr: 0,
             mstatus_addr: 0,
+            copystat_addr: 0,
         }
     }
 }
@@ -1766,6 +1769,9 @@ struct CopyLoop {
     k: u32,
     body_n: u32,
     end_pc: u64,
+    /// true = descending copy (musl memmove's backward loop): offsets are
+    /// -8..-8k, pointers/count decrease, chunks copy [P-bytes, P).
+    bwd: bool,
 }
 
 fn detect_copy_loop(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
@@ -1853,7 +1859,155 @@ fn detect_copy_loop(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
         k,
         body_n: 2 * k + 4,
         end_pc: pc.wrapping_add(bl),
+        bwd: false,
     })
+}
+
+/// The BACKWARD twin (musl memmove's descending loop): k-1 pairs of
+/// `ld T, -8i(S); sd T, -8i(D)` for i = 1..k-1, then `ld T2, -8k(S)`, three
+/// staging adds {TD = D-8k; TS = S-8k; N += -8k} interleaved with
+/// `sd T2, -8k(D)` in any order, two `mv` (ADD rd, x0, rs) writing S and D
+/// from the staging temps, and `bltu L, N` back to the start.
+fn detect_copy_loop_bwd(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
+    let mut pc = start_pc;
+    let mut i: u32 = 1;
+    let (mut s, mut d) = (usize::MAX, usize::MAX);
+    let mut t_mask = 0u32;
+    let mut body_n = 0u32;
+    loop {
+        let Some((i1, l1)) = fetch(code, base, pc) else { return None };
+        if opcode(i1) != 0x03 || funct3(i1) != 3 {
+            return None;
+        }
+        let (t, sb, off) = (rd(i1), rs1(i1), imm_i(i1));
+        if off != -8 * (i as i64) {
+            return None;
+        }
+        if i == 1 {
+            s = sb;
+        } else if sb != s {
+            return None;
+        }
+        let (i2, l2) = fetch(code, base, pc.wrapping_add(l1))?;
+        // pairs stop when the ld's partner isn't the matching sd (the final
+        // load's store is interleaved with the staging adds)
+        if opcode(i2) == 0x23 && funct3(i2) == 3 && rs2(i2) == t && imm_s(i2) == -8 * (i as i64) {
+            let db = rs1(i2);
+            if i == 1 {
+                d = db;
+            } else if db != d {
+                return None;
+            }
+            if t == 0 || t == s || t == d {
+                return None;
+            }
+            t_mask |= 1 << t;
+            pc = pc.wrapping_add(l1 + l2);
+            body_n += 2;
+            i += 1;
+            if i > 16 {
+                return None;
+            }
+            continue;
+        }
+        // final load: ld T2, -8k(S) with k == i
+        let k = i;
+        if k < 4 || sb != s || off != -8 * (k as i64) {
+            return None;
+        }
+        let t2 = t;
+        if t2 == 0 || t2 == s || t2 == d {
+            return None;
+        }
+        t_mask |= 1 << t2;
+        pc = pc.wrapping_add(l1);
+        body_n += 1;
+        let w = 8 * (k as i64);
+        // next 4 insns: {TD = D + -w, TS = S + -w, N += -w, sd T2, -w(D)} any order
+        let (mut td, mut ts, mut n) = (usize::MAX, usize::MAX, usize::MAX);
+        let mut stored = false;
+        for _ in 0..4 {
+            let (ii, il) = fetch(code, base, pc)?;
+            if opcode(ii) == 0x23 && funct3(ii) == 3 {
+                if stored || rs2(ii) != t2 || rs1(ii) != d || imm_s(ii) != -w {
+                    return None;
+                }
+                stored = true;
+            } else if opcode(ii) == 0x13 && funct3(ii) == 0 && imm_i(ii) == -w {
+                let (r, b) = (rd(ii), rs1(ii));
+                if b == d && r != d && td == usize::MAX && r != 0 {
+                    td = r;
+                } else if b == s && r != s && ts == usize::MAX && r != 0 {
+                    ts = r;
+                } else if b == r && r == rs1(ii) && n == usize::MAX && r != s && r != d && r != 0 {
+                    n = r;
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+            pc = pc.wrapping_add(il);
+            body_n += 1;
+        }
+        if !stored || td == usize::MAX || ts == usize::MAX || n == usize::MAX {
+            return None;
+        }
+        // two mv (ADD rd, x0, rs): S <- TS and D <- TD, either order
+        let mut got_s = false;
+        let mut got_d = false;
+        for _ in 0..2 {
+            let (ii, il) = fetch(code, base, pc)?;
+            if opcode(ii) != 0x33 || funct3(ii) != 0 || funct7(ii) != 0 || rs1(ii) != 0 {
+                return None;
+            }
+            if rd(ii) == s && rs2(ii) == ts {
+                got_s = true;
+            } else if rd(ii) == d && rs2(ii) == td {
+                got_d = true;
+            } else {
+                return None;
+            }
+            pc = pc.wrapping_add(il);
+            body_n += 1;
+        }
+        if !got_s || !got_d {
+            return None;
+        }
+        // bltu L, N -> start
+        let (bi, bl) = fetch(code, base, pc)?;
+        if opcode(bi) != 0x63 || funct3(bi) != 6 || rs2(bi) != n {
+            return None;
+        }
+        let l_reg = rs1(bi);
+        if pc.wrapping_add(imm_b(bi) as u64) != start_pc {
+            return None;
+        }
+        t_mask |= (1 << td) | (1 << ts);
+        if l_reg == 0
+            || [s, d, n].contains(&l_reg)
+            || t_mask & (1 << l_reg) != 0
+            || t_mask & (1 << n) != 0
+            || s == 0
+            || d == 0
+            || n == 0
+            || s == d
+        {
+            return None;
+        }
+        body_n += 1;
+        return Some(CopyLoop {
+            s,
+            d,
+            n,
+            l: l_reg,
+            t_mask,
+            k,
+            body_n,
+            end_pc: pc.wrapping_add(bl),
+            bwd: true,
+        });
+    }
 }
 
 /// Compile a detected copy loop: the fast path performs the architectural
@@ -1916,23 +2070,55 @@ fn translate_copy_loop(
             .op(I64_DIV_U)
             .local_set(kb);
         m.local_get(kb).op(I64_EQZ).br_if(0);
-        // srci temp <- src in-page room (iterations)
-        m.i64_const(4096);
-        m.local_get(rs).i64_const(4095).op(I64_AND);
-        m.op(I64_SUB).i64_const(w).op(I64_DIV_U).local_set(srci);
+        // in-page room in ITERATIONS for each pointer; direction decides the
+        // room formula: ascending copies have 4096 - (P & 4095) bytes above P,
+        // descending have ((P - 1) & 4095) + 1 bytes below (exclusive-top P).
+        let room = |m: &mut WasmModule, ptr: u32, bwd: bool| {
+            if bwd {
+                m.local_get(ptr)
+                    .i64_const(1)
+                    .op(I64_SUB)
+                    .i64_const(4095)
+                    .op(I64_AND)
+                    .i64_const(1)
+                    .op(I64_ADD);
+            } else {
+                m.i64_const(4096);
+                m.local_get(ptr).i64_const(4095).op(I64_AND);
+                m.op(I64_SUB);
+            }
+            m.i64_const(w).op(I64_DIV_U);
+        };
+        room(&mut m, rs, cl.bwd);
+        m.local_set(srci);
         m.local_get(srci).local_get(kb);
         m.local_get(srci).local_get(kb).op(I64_LT_U).op(SELECT);
         m.local_set(kb);
-        // dst room likewise
-        m.i64_const(4096);
-        m.local_get(rd_).i64_const(4095).op(I64_AND);
-        m.op(I64_SUB).i64_const(w).op(I64_DIV_U).local_set(srci);
+        room(&mut m, rd_, cl.bwd);
+        m.local_set(srci);
         m.local_get(srci).local_get(kb);
         m.local_get(srci).local_get(kb).op(I64_LT_U).op(SELECT);
         m.local_set(kb);
         m.local_get(kb).op(I64_EQZ).br_if(0);
-        // probe src (load class); miss -> $normal
-        m.local_get(rs).local_set(VA);
+        // kb <- BYTES
+        m.local_get(kb).i64_const(w).op(I64_MUL).local_set(kb);
+        // overlap-propagation hazard: the REAL loop reads bytes it has just
+        // written when the trailing pointer is within `bytes` ahead of the
+        // leading one — ascending: 0 <= D-S < bytes; descending: 0 <= S-D <
+        // bytes. memory.copy is memmove-semantics and would differ; fall back
+        // to the exact normal body. (Equality is conservatively included.)
+        if cl.bwd {
+            m.local_get(rs).local_get(rd_).op(I64_SUB);
+        } else {
+            m.local_get(rd_).local_get(rs).op(I64_SUB);
+        }
+        m.local_get(kb).op(I64_LT_U).br_if(0);
+        // probe src range START (load class); miss -> $normal
+        m.local_get(rs);
+        if cl.bwd {
+            m.local_get(kb).op(I64_SUB);
+        }
+        m.local_set(VA);
         m.local_get(VA).i64_const(12).op(I64_SHR_U).local_set(PAGE);
         m.local_get(PAGE)
             .op(I32_WRAP_I64)
@@ -1946,8 +2132,12 @@ fn translate_copy_loop(
         m.local_get(VA);
         m.local_get_i32(c.idxb).i64_load_at(sys.ftlb_load_off as u64);
         m.op(I64_ADD).local_set(srci);
-        // probe dst (store class); miss -> $normal
-        m.local_get(rd_).local_set(VA);
+        // probe dst range START (store class); miss -> $normal
+        m.local_get(rd_);
+        if cl.bwd {
+            m.local_get(kb).op(I64_SUB);
+        }
+        m.local_set(VA);
         m.local_get(VA).i64_const(12).op(I64_SHR_U).local_set(PAGE);
         m.local_get(PAGE)
             .op(I32_WRAP_I64)
@@ -1961,25 +2151,22 @@ fn translate_copy_loop(
         m.local_get(VA);
         m.local_get_i32(c.idxb).i64_load_at(sys.ftlb_store_off as u64);
         m.op(I64_ADD).local_set(dsti);
-        // kb <- BYTES (= iters * w)
-        m.local_get(kb).i64_const(w).op(I64_MUL).local_set(kb);
-        // overlap-propagation hazard: the REAL loop reads bytes it has just
-        // written when 0 < D-S < bytes (forward store-to-load propagation);
-        // memory.copy has memmove semantics and would differ. musl's fwd
-        // paths guarantee D-S >= len, but the detector could match user code
-        // that doesn't — fall back to the exact normal body in that case
-        // (D == S is conservatively included; it's semantically a no-op copy
-        // either way).
-        m.local_get(rd_).local_get(rs).op(I64_SUB);
-        m.local_get(kb).op(I64_LT_U).br_if(0);
+        if lay.copystat_addr != 0 {
+            // diagnostic: accumulate BYTES bulk-copied (kb holds bytes here)
+            m.i32_const(0);
+            m.i32_const(0).i64_load(lay.copystat_addr as u64);
+            m.local_get(kb).op(I64_ADD);
+            m.i64_store(lay.copystat_addr as u64);
+        }
         // memory.copy(dst, src, bytes)
         m.local_get(dsti).op(I32_WRAP_I64);
         m.local_get(srci).op(I32_WRAP_I64);
         m.local_get(kb).op(I32_WRAP_I64);
         m.memory_copy();
-        // S += bytes; D += bytes; N -= bytes
-        m.local_get(rs).local_get(kb).op(I64_ADD).local_set(rs);
-        m.local_get(rd_).local_get(kb).op(I64_ADD).local_set(rd_);
+        // S/D advance in the copy direction; N always decreases
+        let ptr_step = if cl.bwd { I64_SUB } else { I64_ADD };
+        m.local_get(rs).local_get(kb).op(ptr_step).local_set(rs);
+        m.local_get(rd_).local_get(kb).op(ptr_step).local_set(rd_);
         m.local_get(rn).local_get(kb).op(I64_SUB).local_set(rn);
         // ITER += (bytes / w) * body_n
         m.local_get(kb)
@@ -2095,7 +2282,9 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     // Bulk-copyable self-loop (memcpy/memmove word loops): one wasm
     // memory.copy per page-bounded chunk — see translate_copy_loop.
     if lay.sys.is_some() {
-        if let Some(cl) = detect_copy_loop(code, base, start_pc) {
+        if let Some(cl) = detect_copy_loop(code, base, start_pc)
+            .or_else(|| detect_copy_loop_bwd(code, base, start_pc))
+        {
             if let Some(b) = translate_copy_loop(&cl, code, base, start_pc, lay) {
                 return Some(b);
             }
@@ -2860,6 +3049,49 @@ pub fn translate_superblock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The backward copy-loop detector must match musl memmove's descending
+    /// loop VERBATIM (encodings lifted from the nbench musl binary's disasm).
+    #[test]
+    fn detects_musl_memmove_bwd_loop() {
+        let words: &[u32] = &[
+            0xff873583, 0xfeb6bc23, // ld a1,-8(a4);  sd a1,-8(a3)
+            0xff073583, 0xfeb6b823, // ld a1,-16(a4); sd a1,-16(a3)
+            0xfe873583, 0xfeb6b423, // -24
+            0xfe073583, 0xfeb6b023, // -32
+            0xfd873583, 0xfcb6bc23, // -40
+            0xfd073583, 0xfcb6b823, // -48
+            0xfc873583, 0xfcb6b423, // -56
+            0xfc073883, // ld a7,-64(a4)
+            0xfc068593, // addi a1,a3,-64
+            0xfc070793, // addi a5,a4,-64
+            0xfc060613, // addi a2,a2,-64
+            0xfd16b023, // sd a7,-64(a3)
+        ];
+        let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        code.extend_from_slice(&0x873eu16.to_le_bytes()); // c.mv a4,a5
+        code.extend_from_slice(&0x86aeu16.to_le_bytes()); // c.mv a3,a1
+        // bltu a6,a2, back to start: offset = -(len so far)
+        let off = -(code.len() as i64);
+        let imm = off as u32;
+        let bltu = 0x63
+            | (6 << 12)
+            | (16 << 15) // rs1 = a6
+            | (12 << 20) // rs2 = a2
+            | (((imm >> 11) & 1) << 7)
+            | (((imm >> 1) & 0xf) << 8)
+            | (((imm >> 5) & 0x3f) << 25)
+            | (((imm >> 12) & 1) << 31);
+        code.extend_from_slice(&bltu.to_le_bytes());
+        let cl = detect_copy_loop_bwd(&code, 0x1000, 0x1000);
+        assert!(cl.is_some(), "bwd copy loop not detected");
+        let cl = cl.unwrap();
+        assert!(cl.bwd);
+        assert_eq!(cl.k, 8);
+        assert_eq!((cl.s, cl.d, cl.n, cl.l), (14, 13, 12, 16)); // a4,a3,a2,a6
+        assert_eq!(cl.body_n, 22);
+        assert_eq!(cl.end_pc, 0x1000 + code.len() as u64);
+    }
 
     /// Fuzz the FMADD fast-path twin against the softfloat oracle: every
     /// input where the fast path produces a result must be bit-identical to
