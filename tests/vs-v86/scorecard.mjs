@@ -197,6 +197,29 @@ if (haveV86 && (await has(join(V86DIR, "src/main.js")))) {
 const R = {}; // name -> {rvj, rvi, v8j, v8i}
 const log = (m) => process.stderr.write(m);
 
+// v86 side runs FIRST: the rv64 rows compile thousands of wasm modules whose
+// background tier-up would otherwise pollute the v86 subprocesses (measured
+// 4x on the compile row). Order symmetric-quiet for both sides.
+// v86 side
+if (haveV86) {
+  for (const jit of FULL ? [false, true] : [true]) {
+    log(`[v86 jit=${+jit}] alu`);
+    { const r = await v86Compute("alu.i386", jit); const row = (R.ALU ??= {}); row[jit ? "v8j" : "v8i"] = r?.ms ?? null; row[jit ? "v8j_chk" : "v8i_chk"] = r?.chk ?? null; }
+    log(" mixed");
+    { const r = await v86Compute("rvbench_fs.i386", jit); const row = (R.Mixed ??= {}); row[jit ? "v8j" : "v8i"] = r?.ms ?? null; row[jit ? "v8j_chk" : "v8i_chk"] = r?.chk ?? null; }
+    log(" boot"); (R.Boot ??= {})[jit ? "v8j" : "v8i"] = (await v86Boot(jit))?.ms ?? null;
+    if (await has(join(ARTIFACTS, "vmlinuz-i386"))) { log(" python"); (R["python fib(30)"] ??= {})[jit ? "v8j" : "v8i"] = (await v86Python(jit))?.ms ?? null; }
+    if (await has(join(ARTIFACTS, "deb-i386-bench.cpio.gz"))) {
+      log(" compile");
+      const r = await v86Compile(jit);
+      const row = (R["compile (tcc -c)"] ??= {});
+      row[jit ? "v8j" : "v8i"] = r?.ms ?? null;
+      row[jit ? "v8j_md5" : "v8i_md5"] = r?.md5 ?? null;
+    }
+    log("\n");
+  }
+}
+
 // compute (alu, mixed): one boot per JIT setting, run both binaries
 for (const jit of FULL ? [false, true] : [true]) {
   log(`[rv64 compute jit=${+jit}] boot…`);
@@ -235,25 +258,6 @@ if (await has(join(ARTIFACTS, "cc-bench.img"))) for (const jit of FULL ? [false,
   log(" ok\n");
 }
 
-// v86 side
-if (haveV86) {
-  for (const jit of FULL ? [false, true] : [true]) {
-    log(`[v86 jit=${+jit}] alu`);
-    { const r = await v86Compute("alu.i386", jit); const row = (R.ALU ??= {}); row[jit ? "v8j" : "v8i"] = r?.ms ?? null; row[jit ? "v8j_chk" : "v8i_chk"] = r?.chk ?? null; }
-    log(" mixed");
-    { const r = await v86Compute("rvbench_fs.i386", jit); const row = (R.Mixed ??= {}); row[jit ? "v8j" : "v8i"] = r?.ms ?? null; row[jit ? "v8j_chk" : "v8i_chk"] = r?.chk ?? null; }
-    log(" boot"); (R.Boot ??= {})[jit ? "v8j" : "v8i"] = (await v86Boot(jit))?.ms ?? null;
-    if (await has(join(ARTIFACTS, "vmlinuz-i386"))) { log(" python"); (R["python fib(30)"] ??= {})[jit ? "v8j" : "v8i"] = (await v86Python(jit))?.ms ?? null; }
-    if (await has(join(ARTIFACTS, "deb-i386-bench.cpio.gz"))) {
-      log(" compile");
-      const r = await v86Compile(jit);
-      const row = (R["compile (tcc -c)"] ??= {});
-      row[jit ? "v8j" : "v8i"] = r?.ms ?? null;
-      row[jit ? "v8j_md5" : "v8i_md5"] = r?.md5 ?? null;
-    }
-    log("\n");
-  }
-}
 // nbench (BYTEmark) — rv64 JIT vs v86 JIT, both self-timed; gated (slow, ~8 min)
 let nb = null;
 if (WANT_NBENCH && (await has(join(ARTIFACTS, "root-nbench.bin")))) {
