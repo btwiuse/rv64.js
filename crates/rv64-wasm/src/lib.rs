@@ -475,6 +475,47 @@ pub extern "C" fn dprof_get(which: u32, i: u32) -> u64 {
     }
 }
 
+/// Histogram of the INSTRUCTION the JIT gave up on (diagnostic, DPROF_ON):
+/// keyed by the encoding fields that select an emitter path. Interpreted
+/// instructions cost ~300x a compiled one, so a handful of missing encodings
+/// can dominate a kernel's wall time.
+const IHIST_N: usize = 1024;
+static mut IHIST_KEY: [u32; IHIST_N] = [0; IHIST_N];
+static mut IHIST_CNT: [u64; IHIST_N] = [0; IHIST_N];
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn ihist_get(which: u32, i: u32) -> u64 {
+    let i = i as usize % IHIST_N;
+    unsafe {
+        if which == 0 {
+            IHIST_KEY[i] as u64
+        } else {
+            IHIST_CNT[i]
+        }
+    }
+}
+
+#[allow(static_mut_refs)]
+fn ihist_hit(insn: u32) {
+    // opcode + funct3 + funct7 (and the rs2 field, which selects FCVT variants)
+    let key = if insn & 3 != 3 {
+        insn & 0xffff // compressed: whole halfword
+    } else {
+        insn & 0xfff0_707f
+    };
+    unsafe {
+        let h = ((key ^ (key >> 13)).wrapping_mul(0x9e37_79b9) >> 18) as usize & (IHIST_N - 1);
+        if IHIST_KEY[h] != key {
+            if IHIST_CNT[h] != 0 {
+                return;
+            }
+            IHIST_KEY[h] = key;
+        }
+        IHIST_CNT[h] += 1;
+    }
+}
+
 #[inline(always)]
 #[allow(static_mut_refs)]
 fn dprof_hit(pc: u64, retired: u64) {
@@ -1107,6 +1148,19 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
 
         // --- hot counting + compile (from physical code bytes) ---
         let pc = m.cpu.pc;
+        if unsafe { DPROF_ON } {
+            if let Some(pa) = m.cpu.jit_probe_fetch(&mut m.bus, pc) {
+                let o = (pa.wrapping_sub(rv64_system::RAM_BASE)) as usize;
+                if pa >= rv64_system::RAM_BASE && o + 4 <= m.bus.ram.len() {
+                    ihist_hit(u32::from_le_bytes([
+                        m.bus.ram[o],
+                        m.bus.ram[o + 1],
+                        m.bus.ram[o + 2],
+                        m.bus.ram[o + 3],
+                    ]));
+                }
+            }
+        }
         if !jit_table_full() && !jit.cache.contains_key(&pc) {
             let hot = {
                 let c = jit.hot.entry(pc).or_insert(0);

@@ -53,7 +53,7 @@ function randInsn() {
   const rd = 1 + (rnd() % 30);
   const rs1 = rnd() % 31;
   const rs2 = rnd() % 31;
-  switch (rnd() % 12) {
+  switch (rnd() % 13) {
     case 0: { // OP: add/sub/sll/slt/sltu/xor/srl/sra/or/and
       const f3 = rnd() % 8;
       const f7 = (f3 === 0 || f3 === 5) && rnd() % 2 ? 0x20 : 0x00;
@@ -96,6 +96,8 @@ function randInsn() {
       if (rnd() % 3 === 0) return R(0x53, 1, 0x61, rd, rnd() % 32, 0); // fcvt.w.d rtz
       return R(0x53, 0, 0x69, rnd() % 32, rs1, rnd() % 4); // fcvt.d.{w,wu,l,lu}
     }
+    case 12: // FSGNJ/FSGNJN/FSGNJX.D (copysign / fneg / fabs / fmv.d)
+      return R(0x53, rnd() % 3, 0x11, rnd() % 32, rnd() % 32, rnd() % 32);
     default: // FP compare (writes GPR) or fsqrt
       return rnd() % 2
         ? R(0x53, rnd() % 3, 0x51, rd, rnd() % 32, rnd() % 32) // fle/flt/feq.d

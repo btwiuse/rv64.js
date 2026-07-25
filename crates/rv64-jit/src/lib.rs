@@ -214,6 +214,34 @@ impl Ctx {
         }
     }
 
+    /// FSGNJ.D / FSGNJN.D / FSGNJX.D: rd takes rs1's magnitude with a sign
+    /// taken from rs2 (f3=0), rs2 negated (f3=1), or the two signs XORed
+    /// (f3=2) — the encodings C compilers emit for `copysign`, `fneg`/`fabs`
+    /// (rs1 == rs2) and plain double moves. Pure bit manipulation of the raw
+    /// pattern: no rounding, no exception flags, no NaN canonicalization.
+    fn fp_sgnj_d(&self, m: &mut WasmModule, f3: u32, s1: usize, s2: usize, d: usize) {
+        const SIGN: i64 = i64::MIN;
+        self.store_freg_pre(m, d);
+        if s1 == s2 && f3 == 0 {
+            self.push_freg(m, s1); // fmv.d
+        } else if f3 == 2 {
+            // rd = rs1 ^ (rs2 & sign)
+            self.push_freg(m, s1);
+            self.push_freg(m, s2);
+            m.i64_const(SIGN).op(I64_AND).op(I64_XOR);
+        } else {
+            self.push_freg(m, s1);
+            m.i64_const(!SIGN).op(I64_AND);
+            self.push_freg(m, s2);
+            m.i64_const(SIGN).op(I64_AND);
+            if f3 == 1 {
+                m.i64_const(SIGN).op(I64_XOR); // sign of -rs2
+            }
+            m.op(I64_OR);
+        }
+        self.store_freg_post(m, d);
+    }
+
     /// Read FP register f[r] (cached local or memory).
     fn push_freg(&self, m: &mut WasmModule, r: usize) {
         if self.fp_local[r] != 0 {
@@ -906,6 +934,11 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                         fmark(&mut fread, s2);
                         fmark(&mut fwrite, d);
                     }
+                    (4, 1, 0..=2) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        fmark(&mut fwrite, d);
+                    }
                     (0x14, 1, 0..=2) => {
                         // FLE/FLT/FEQ: read FP s1,s2 -> write GPR x[d]
                         fmark(&mut fread, s1);
@@ -962,12 +995,15 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
 /// scanner and the emitter must agree or block boundaries desync. Takes the
 /// whole insn because FCVT variants are selected by the rs2 FIELD.
 /// Covered: D arith (FADD/FSUB/FMUL/FDIV), compares, FMV both ways, FSQRT.D,
-/// FCVT.W.D (rtz), FCVT.D.{W,WU,L,LU}.
+/// FCVT.W.D (rtz), FCVT.D.{W,WU,L,LU}, FSGNJ/FSGNJN/FSGNJX.D — which is how
+/// every libm spells fabs, fneg, copysign and register-to-register moves (76%
+/// of everything nbench FOURIER dropped to the interpreter).
 fn fp_handled(insn: u32) -> bool {
     let f7 = funct7(insn);
     let f3 = funct3(insn);
     match (f7 >> 2, f7 & 3, f3) {
         (0..=3, 1, 0 | 7) => true,        // FADD/FSUB/FMUL/FDIV.D (rne | dyn)
+        (4, 1, 0..=2) => true,            // FSGNJ/FSGNJN/FSGNJX.D (bit ops)
         (0x14, 1, 0..=2) => true,         // FLE/FLT/FEQ.D
         (0x1e, 1, 0) => rs2(insn) == 0,   // FMV.D.X (rs2 is a fixed field)
         (0x1c, 1, 0) => rs2(insn) == 0,   // FMV.X.D (rs2 is a fixed field)
@@ -1236,6 +1272,11 @@ fn scan_regs_region(
                 let f7 = funct7(insn);
                 match (f7 >> 2, f7 & 3, funct3(insn)) {
                     (0..=3, 1, 0 | 7) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        fmark(&mut fwrite, d);
+                    }
+                    (4, 1, 0..=2) => {
                         fmark(&mut fread, s1);
                         fmark(&mut fread, s2);
                         fmark(&mut fwrite, d);
@@ -1828,6 +1869,7 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
             let (fmt, fpop, f3) = (f7 & 3, f7 >> 2, funct3(insn));
             match (fpop, fmt, f3) {
                 (0..=3, 1, 0 | 7) => c.fp_arith_d(m, fpop, s1, s2, d, f3 == 7, pc, n),
+                (4, 1, 0..=2) => c.fp_sgnj_d(m, f3, s1, s2, d),
                 (0x14, 1, 0..=2) => c.fp_cmp_d(m, f3, s1, s2, d, pc, n),
                 (0x1e, 1, 0) => {
                             c.store_freg_pre(m, d);
@@ -2816,6 +2858,11 @@ fn scan_regs_super(
                     let f7 = funct7(insn);
                     match (f7 >> 2, f7 & 3, funct3(insn)) {
                         (0..=3, 1, 0 | 7) => {
+                            fmark(&mut fr, &mut fuses, s1);
+                            fmark(&mut fr, &mut fuses, s2);
+                            fmark(&mut fw, &mut fuses, d);
+                        }
+                        (4, 1, 0..=2) => {
                             fmark(&mut fr, &mut fuses, s1);
                             fmark(&mut fr, &mut fuses, s2);
                             fmark(&mut fw, &mut fuses, d);
