@@ -66,6 +66,34 @@ export class RV64 {
             return -1;
           }
         },
+        // Async variant for LARGE modules (page superblocks): compiles on
+        // V8's background threads via WebAssembly.compile so guest execution
+        // never stalls on a big synchronous Module build. When ready, the
+        // function lands in the table and sys_sb_ready(ticket, idx) is
+        // invoked — on the JS microtask queue, i.e. strictly BETWEEN
+        // runSystem calls, never during wasm execution.
+        host_jit_register_async: (ticket) => {
+          const bytes = new Uint8Array(
+            vm.ex.memory.buffer,
+            vm.ex.jit_out_ptr(),
+            vm.ex.jit_out_len(),
+          ).slice();
+          WebAssembly.compile(bytes)
+            .then((mod) =>
+              WebAssembly.instantiate(mod, { env: { memory: vm.ex.memory } }),
+            )
+            .then((inst) => {
+              const table = vm.ex.__indirect_function_table;
+              const idx = table.grow(1);
+              table.set(idx, inst.exports.run);
+              vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
+              vm.ex.sys_sb_ready(ticket, idx);
+            })
+            .catch((e) => {
+              console.warn("async jit register failed:", e);
+              vm.ex.sys_sb_ready(ticket, -1);
+            });
+        },
       },
     };
     const { instance } =

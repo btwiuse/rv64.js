@@ -214,6 +214,15 @@ impl SystemBus {
     }
 
     /// Clear a single compiled-code page's bit (after its blocks are dropped).
+    /// Is this physical page still marked as holding compiled code? Used by
+    /// async superblock registration to reject a compile whose source page
+    /// was written (and therefore invalidated) while compiling.
+    pub fn jit_page_marked(&self, page: u64) -> bool {
+        self.jit_pages
+            .get(page as usize / 64)
+            .map_or(false, |w| w & (1 << (page % 64)) != 0)
+    }
+
     pub fn jit_unmark_page(&mut self, page: u64) {
         if let Some(w) = self.jit_pages.get_mut(page as usize / 64) {
             *w &= !(1 << (page % 64));

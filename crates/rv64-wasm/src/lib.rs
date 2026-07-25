@@ -30,6 +30,10 @@ extern "C" {
     /// jit_out_ptr/jit_out_len), append its `run` function to this module's
     /// exported function table, and return the table index (-1 on failure).
     fn host_jit_register() -> i32;
+    /// Async variant for large modules (page superblocks): compiles on V8
+    /// background threads; sys_sb_ready(ticket, idx) fires between runSystem
+    /// calls when the function is in the table (idx -1 = failed).
+    fn host_jit_register_async(ticket: u64);
 }
 
 struct JsHost;
@@ -351,6 +355,23 @@ fn fuel_addr() -> u32 {
 /// instructions: ~2.5ms at JIT speed. Loops yield at this bound even when the
 /// caller's budget is larger (P0 interrupt-latency contract).
 const INTERRUPT_QUANTUM: u64 = 1 << 20;
+
+/// A page superblock compiling asynchronously on V8's background threads.
+/// Guest execution continues on individual blocks meanwhile; when JS calls
+/// sys_sb_ready the entries are repointed — after validating that the boot
+/// generation, the va→pa mapping, and the (dirty-tracked) code page are all
+/// still the ones the compile was issued against.
+struct PendingSb {
+    ticket: u64,
+    boot_gen: u64,
+    vpage: u64,
+    pa_page: u64,
+    entries: Vec<u64>,
+}
+static mut PENDING_SB: Vec<PendingSb> = Vec::new();
+static mut NEXT_SB_TICKET: u64 = 1;
+/// Bumped by sys_boot: async results from a previous machine must be dropped.
+static mut BOOT_GEN: u64 = 0;
 
 // Perf instrumentation: guest instructions retired inside JIT blocks vs
 // total, and dispatch counts (block calls). Exposed via jit_stat().
@@ -697,6 +718,8 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
         // A new machine means every compiled block and stat is stale — a
         // second boot in the same wasm instance must never execute code
         // generated from the previous guest (ISSUES.md P2 cache lifecycle).
+        BOOT_GEN += 1;
+        PENDING_SB.clear();
         if let Some(j) = SYS_JIT.as_mut() {
             j.clear();
         }
@@ -951,29 +974,32 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                 code, vpage, vpage, 0x1000, &entries, lay,
                             );
                             if let Some(blk) = sb {
+                                // Large module: compile it ASYNC on V8's
+                                // background threads (ISSUES.md/perf: the sync
+                                // Module build of a page function stalls the
+                                // guest for ms — the cold-compile cost that
+                                // kept superblocks gated). Execution continues
+                                // on individual blocks; sys_sb_ready repoints
+                                // the entries once the function is in the
+                                // table, after re-validating page identity.
                                 unsafe { JIT_OUT = blk.wasm };
-                                let idx = unsafe { host_jit_register() };
-                                if idx >= 0 {
-                                    m.bus.jit_mark_page(pa);
-                                    m.cpu.clear_store_jtlb(); // this page may now hold code
-                                    jit.superblocked.insert(vpage); // compile once
-                                    for &e in &entries {
-                                        let epa = pa_page + (e - vpage);
-                                        let jb = JitBlock { idx, n: 0, pa: epa };
-                                        if jit.cache.insert(e, Some(jb)).is_none() {
-                                            jit.page_blocks
-                                                .entry((epa - rv64_system::RAM_BASE) >> 12)
-                                                .or_default()
-                                                .push(e);
-                                        }
-                                        jit.dispatch[JitState::dslot(e)] = DispatchLine {
-                                            pc: e,
-                                            idx,
-                                            gen: m.cpu.map_gen as u32,
-                                        };
-                                    }
-                                    continue;
+                                m.bus.jit_mark_page(pa);
+                                m.cpu.clear_store_jtlb(); // page may now hold code
+                                jit.superblocked.insert(vpage); // in flight: don't re-trigger
+                                unsafe {
+                                    let ticket = NEXT_SB_TICKET;
+                                    NEXT_SB_TICKET += 1;
+                                    PENDING_SB.push(PendingSb {
+                                        ticket,
+                                        boot_gen: BOOT_GEN,
+                                        vpage,
+                                        pa_page,
+                                        entries,
+                                    });
+                                    host_jit_register_async(ticket);
                                 }
+                                // fall through: this pc still gets an
+                                // individual block right now.
                             }
                         }
 
@@ -1103,6 +1129,51 @@ pub extern "C" fn sys_console_input() {
     unsafe {
         let bytes = core::mem::take(&mut STAGING);
         m.console_input(&bytes);
+    }
+}
+
+/// Async superblock completion (called by JS between runSystem calls, never
+/// during wasm execution). Validates that the machine, the code page, and
+/// the va→pa mapping are still the ones the compile was issued against
+/// before repointing the page's entries at the new function.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
+    unsafe {
+        let Some(pos) = PENDING_SB.iter().position(|p| p.ticket == ticket) else {
+            return;
+        };
+        let p = PENDING_SB.swap_remove(pos);
+        if idx < 0 || p.boot_gen != BOOT_GEN {
+            return;
+        }
+        let Some(m) = SYS.as_mut() else { return };
+        let Some(jit) = SYS_JIT.as_mut() else { return };
+        let ppage = (p.pa_page - rv64_system::RAM_BASE) >> 12;
+        // page written (dirtied/unmarked) or remapped while compiling → drop;
+        // un-superblock so the page can retry with fresh bytes.
+        let stale = !m.bus.jit_page_marked(ppage)
+            || m.bus.jit_dirty_pages.contains(&ppage)
+            || !matches!(
+                m.cpu.jit_probe_fetch(&mut m.bus, p.entries[0]),
+                Some(pa) if pa & !0xfff == p.pa_page
+            );
+        if stale {
+            jit.superblocked.remove(&p.vpage);
+            return;
+        }
+        for &e in &p.entries {
+            let epa = p.pa_page + (e - p.vpage);
+            let jb = JitBlock { idx, n: 0, pa: epa };
+            if jit.cache.insert(e, Some(jb)).is_none() {
+                jit.page_blocks.entry(ppage).or_default().push(e);
+            }
+            jit.dispatch[JitState::dslot(e)] = DispatchLine {
+                pc: e,
+                idx,
+                gen: m.cpu.map_gen as u32,
+            };
+        }
     }
 }
 
