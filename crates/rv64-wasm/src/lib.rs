@@ -657,6 +657,36 @@ pub extern "C" fn user_exit_code() -> i32 {
     unsafe { USER.as_ref().map(|e| e.exit_code).unwrap_or(-1) }
 }
 
+/// Read a user-machine GPR (differential testing: full architectural-state
+/// comparison between JIT and interpreter runs).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn user_reg(i: u32) -> u64 {
+    unsafe {
+        USER.as_ref()
+            .map(|e| e.machine.cpu.x[(i & 31) as usize])
+            .unwrap_or(0)
+    }
+}
+
+/// Read a user-machine FP register (raw bits).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn user_freg(i: u32) -> u64 {
+    unsafe {
+        USER.as_ref()
+            .map(|e| e.machine.cpu.f[(i & 31) as usize])
+            .unwrap_or(0)
+    }
+}
+
+/// User-machine fcsr (flags + rounding mode).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn user_fcsr() -> u32 {
+    unsafe { USER.as_ref().map(|e| e.machine.cpu.fcsr).unwrap_or(0) }
+}
+
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn user_pc() -> u64 {
