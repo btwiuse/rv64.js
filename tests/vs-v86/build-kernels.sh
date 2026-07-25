@@ -24,7 +24,10 @@ $RVCC          $RVF -ffp-contract=off -o "$XB/rvbench.rv64" "$HERE/rvbench.c"
 # i386 freestanding for v86 (nixpkgs gcc has no 32-bit glibc headers, so the
 # benchmarks stay -nostdlib; that's why the mixed v86 build is rvbench_fs, the
 # freestanding twin of rvbench.c — identical work).
-I386F="-m32 -nostdlib -static -no-pie -O2"
+# -fno-stack-protector is REQUIRED: the nixpkgs cc-wrapper enables the
+# stack protector by default, whose %gs:0x14 canary reads fault in a
+# freestanding (no-TLS) binary. -msse2 = documented FP baseline for v86.
+I386F="-m32 -msse2 -nostdlib -static -no-pie -O2 -fno-stack-protector"
 gcc $I386F -o "$XB/alu.i386"        "$HERE/alu.c"
 gcc $I386F -o "$XB/rvbench_fs.i386" "$HERE/rvbench_fs.c"
 
