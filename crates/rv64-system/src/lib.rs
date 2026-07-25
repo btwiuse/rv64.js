@@ -11,6 +11,8 @@
 //! Boots the same bbl64.bin/kernel/rootfs images TinyEMU ships.
 
 pub mod dtb;
+pub mod httpproxy;
+pub mod netstack;
 pub mod p9;
 pub mod p9fs;
 pub mod virt;

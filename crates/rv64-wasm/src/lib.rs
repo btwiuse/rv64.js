@@ -433,7 +433,11 @@ struct PendingSb {
 /// a host dispatch (measured: nbench NUMERIC SORT ran its sift loop as six
 /// 2-10 instruction blocks, 5.6 insns per dispatch, because the loop sits
 /// across a page boundary).
-const MAX_REGION_PAGES: usize = 8;
+// 3, not 8: the call-graph BFS at 8 pages regressed CPython's eval loop
+// 2.4s -> 7s (big glued functions rebuild more and codegen worse); at 3 the
+// sparse mechanics keep loop-straddling pages together and pull in ONE hot
+// callee, which is where the measured value was.
+const MAX_REGION_PAGES: usize = 3;
 static mut PENDING_SB: Vec<PendingSb> = Vec::new();
 static mut NEXT_SB_TICKET: u64 = 1;
 // Superblock lifecycle counters (diagnostic, jit_stat 10..14).
