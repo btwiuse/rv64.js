@@ -173,6 +173,22 @@ impl Cpu {
         }
     }
 
+    /// Fill the fused JIT-TLB row for `va` without raising a fault, returning
+    /// the offset a compiled block needs (`linear_index = va + off`), or None
+    /// if the access can't be served inline — unmapped, permission-denied,
+    /// MMIO, or a page holding compiled code. Compiled blocks call this on a
+    /// TLB miss and carry on; None sends them to the interpreter, which
+    /// re-executes the instruction and raises the exact architectural fault.
+    pub fn jit_fill_tlb<B: Bus>(&mut self, bus: &mut B, va: u64, store: bool) -> Option<i64> {
+        let access = if store { Access::Store } else { Access::Load };
+        let pa = self.translate(bus, va, access).ok()?;
+        let off = bus.jit_fast_off(va, pa, store)?;
+        let idx = ((va >> 12) as usize) & (TLB_SIZE - 1);
+        self.jtlb_tag[store as usize][idx] = va >> 12;
+        self.jtlb_off[store as usize][idx] = off;
+        Some(off)
+    }
+
     /// Translate a fetch address without raising a fault (JIT support:
     /// verify that a va-keyed compiled block still maps to the same
     /// physical code before dispatching to it).

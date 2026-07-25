@@ -5,6 +5,10 @@ pub struct WasmModule {
     code: Vec<u8>,
     n_locals_i64: u32,
     n_locals_i32: u32,
+    /// Import `env.tlb_fill: (i64 va, i32 store) -> i64` and call it on a
+    /// fused-TLB miss. It resolves to the host module's own exported function,
+    /// so the call is wasm->wasm with no JS frame.
+    wants_tlb_fill: bool,
 }
 
 // Opcodes we use.
@@ -141,6 +145,7 @@ impl WasmModule {
             code: Vec::new(),
             n_locals_i64,
             n_locals_i32: 0,
+            wants_tlb_fill: false,
         }
     }
 
@@ -149,10 +154,25 @@ impl WasmModule {
             code: Vec::new(),
             n_locals_i64,
             n_locals_i32,
+            wants_tlb_fill: false,
         }
     }
 
     // -- instruction stream helpers --
+
+    /// Declare the tlb_fill import (function index 0; the block body becomes
+    /// function index 1).
+    pub fn use_tlb_fill(&mut self) -> &mut Self {
+        self.wants_tlb_fill = true;
+        self
+    }
+
+    /// call $tlb_fill — pops (i64 va, i32 store), pushes the i64 offset or -1.
+    pub fn call_tlb_fill(&mut self) -> &mut Self {
+        self.code.push(0x10);
+        uleb(&mut self.code, 0);
+        self
+    }
 
     pub fn op(&mut self, opcode: u8) -> &mut Self {
         self.code.push(opcode);
@@ -262,12 +282,25 @@ impl WasmModule {
         // The parameter is the emulator-state pointer: the host passes it so
         // the pointer visibly escapes into the generated code, which stops
         // LLVM from caching CPU state in registers across block calls.
-        let mut sec = vec![1u8]; // count
+        let mut sec = vec![if self.wants_tlb_fill { 2u8 } else { 1u8 }]; // count
         sec.extend_from_slice(&[0x60, 1, 0x7f, 0]);
+        if self.wants_tlb_fill {
+            // type 1: (i64, i32) -> i64
+            sec.extend_from_slice(&[0x60, 2, 0x7e, 0x7f, 1, 0x7e]);
+        }
         section(&mut m, 1, &sec);
 
-        // import section: env.memory, min 1 page
-        let mut sec = vec![1u8];
+        // import section: env.memory (+ env.tlb_fill when the body uses it)
+        let mut sec = vec![if self.wants_tlb_fill { 2u8 } else { 1u8 }];
+        if self.wants_tlb_fill {
+            // imported functions come first in the index space, so declare
+            // tlb_fill (func 0) before memory; the body is then func 1.
+            sec.push(3);
+            sec.extend_from_slice(b"env");
+            sec.push(8);
+            sec.extend_from_slice(b"tlb_fill");
+            sec.extend_from_slice(&[0x00, 0x01]); // func, type 1
+        }
         sec.push(3);
         sec.extend_from_slice(b"env");
         sec.push(6);
@@ -278,11 +311,11 @@ impl WasmModule {
         // function section: 1 function of type 0
         section(&mut m, 3, &[1, 0]);
 
-        // export section: "run" -> func 0
+        // export section: "run" -> the body function
         let mut sec = vec![1u8];
         sec.push(3);
         sec.extend_from_slice(b"run");
-        sec.extend_from_slice(&[0x00, 0x00]);
+        sec.extend_from_slice(&[0x00, if self.wants_tlb_fill { 1 } else { 0 }]);
         section(&mut m, 7, &sec);
 
         // code section (param is local 0; i64 locals then i32 locals — the

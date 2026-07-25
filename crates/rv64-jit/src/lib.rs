@@ -27,6 +27,9 @@ const MAX_BLOCK: usize = 128;
 /// Uses (across all bodies) a register needs before a superblock caches it in
 /// a wasm local instead of leaving it in the machine's register file memory.
 const SB_HOIST_MIN: u32 = 8;
+/// Same idea for a basic block, whose prologue/epilogue is paid on every
+/// single dispatch.
+const BLOCK_HOIST_MIN: u32 = 3;
 /// Max iterations a compiled self-loop runs per block call before yielding to
 /// the dispatcher (so an infinite guest loop still honours budget/interrupts).
 const LOOP_CAP: u64 = 1 << 24;
@@ -43,9 +46,23 @@ const VAL: u32 = 4;
 const ITER: u32 = 5;
 /// Superblock dispatch: the current target pc, fed to the internal `br_table`.
 const TPC: u32 = 6;
+/// Resolved fused-TLB offset for the access in flight (set on the hit path or
+/// by the host's tlb_fill call).
+const SCR2: u32 = 7;
+
+/// Host-filled TLB misses inside compiled code (see tlb_idx_tag_fill). The
+/// call site costs register pressure in every memory-op block, so this stays
+/// switchable while both sides are measured.
+static TLB_FILL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub fn set_tlb_fill(on: bool) {
+    TLB_FILL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+fn tlb_fill_enabled() -> bool {
+    TLB_FILL.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Total i64 scratch locals to declare (register locals follow next; the
 /// i32 IDXB local follows all i64 locals, so its index is dynamic).
-const N_I64_LOCALS: u32 = 6;
+const N_I64_LOCALS: u32 = 7;
 
 /// Full-system memory access layout: emitted loads/stores probe the
 /// interpreter's own Load/Store TLBs inline; on a hit within guest RAM
@@ -1084,20 +1101,73 @@ impl Ctx {
             m.op(IF).op(0x7f); // i32 result: the linear index
             m.local_get(VA).local_get(coff).op(I64_ADD).op(I32_WRAP_I64);
             m.op(ELSE);
-            // slow probe; on success cache (page, off) for later accesses
-            self.tlb_idx_tag_check(m, sys, tag_base, pc, n);
-            m.local_get_i32(self.idxb).i64_load_at(off_base as u64);
-            m.local_set(coff);
+            // slow probe (host-filled on miss); cache (page, off) for later
+            self.tlb_idx_tag_fill(m, sys, tag_base, off_base, store, pc, n);
+            m.local_get(SCR2).local_set(coff);
             m.local_get(PAGE).local_set(cpg);
             m.local_get(VA).local_get(coff).op(I64_ADD).op(I32_WRAP_I64);
             m.op(END);
             return;
         }
-        self.tlb_idx_tag_check(m, sys, tag_base, pc, n);
-        // linear index = (va + ftlb_off[idx]) as i32
-        m.local_get(VA);
+        self.tlb_idx_tag_fill(m, sys, tag_base, off_base, store, pc, n);
+        // linear index = (va + off) as i32
+        m.local_get(VA).local_get(SCR2).op(I64_ADD).op(I32_WRAP_I64);
+    }
+
+    /// Fused-TLB index computation + tag compare. On a miss, ask the host to
+    /// walk the page tables and fill the row (a wasm->wasm call, no JS frame)
+    /// and carry on with the offset it returns; only an access the host can't
+    /// serve inline — unmapped, permission fault, MMIO, or a page holding
+    /// compiled code — bails to the interpreter, which re-executes the
+    /// instruction and raises the exact architectural fault.
+    ///
+    /// Before this, every TLB miss inside compiled code bailed. On `tcc -c`,
+    /// whose symbol tables and allocations thrash a 4096-entry direct-mapped
+    /// TLB, that was ~560k bails and 19M interpreted instructions — 94% JIT
+    /// coverage that still spent most of its wall clock in the interpreter.
+    ///
+    /// Leaves the resolved offset in SCR2 and IDXB holding the entry index.
+    fn tlb_idx_tag_fill(
+        &self,
+        m: &mut WasmModule,
+        sys: &SysMem,
+        tag_base: u32,
+        off_base: u32,
+        store: bool,
+        pc: u64,
+        n: u32,
+    ) {
+        if !tlb_fill_enabled() {
+            self.tlb_idx_tag_check(m, sys, tag_base, pc, n);
+            m.local_get_i32(self.idxb)
+                .i64_load_at(off_base as u64)
+                .local_set(SCR2);
+            return;
+        }
+        m.use_tlb_fill();
+        // IDXB (i32) = ((page & mask) << 3)
+        m.local_get(PAGE)
+            .op(I32_WRAP_I64)
+            .i32_const(sys.tlb_mask as i32)
+            .op(I32_AND)
+            .i32_const(3)
+            .op(I32_SHL)
+            .local_set_i32(self.idxb);
+        m.local_get_i32(self.idxb).i64_load_at(tag_base as u64);
+        m.local_get(PAGE).op(I64_NE);
+        m.op(IF).op(VOID);
+        // miss: off = tlb_fill(va, store)
+        m.local_get(VA).i32_const(store as i32);
+        m.call_tlb_fill();
+        m.local_set(SCR2);
+        m.local_get(SCR2).i64_const(-1).op(I64_EQ);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+        m.op(ELSE);
         m.local_get_i32(self.idxb).i64_load_at(off_base as u64);
-        m.op(I64_ADD).op(I32_WRAP_I64);
+        m.local_set(SCR2);
+        m.op(END);
     }
 
     /// Fused-TLB index computation + tag compare; bails on miss. Leaves
@@ -1133,15 +1203,21 @@ impl Ctx {
 /// Returns (gpr_read, gpr_write, fp_read, fp_write) register bitmaps.
 fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u32, u32, u32) {
     let (mut read, mut write) = (0u32, 0u32);
+    // Uses per register: hoisting one into a wasm local costs a load in the
+    // prologue and a store in the epilogue, paid on EVERY dispatch of the
+    // block. A register a short block touches once or twice is cheaper left in
+    // the register file, which the emitter reads and writes directly.
+    let mut uses = [0u32; 32];
     let mut mem_ops = 0u32;
     let (mut fread, mut fwrite) = (0u32, 0u32);
     let mut pc = start_pc;
     let mut n = 0u32;
     // FP registers: f0 is a real register (no hardwired-zero), so mark it too.
     let fmark = |m: &mut u32, r: usize| *m |= 1 << r;
-    let mark = |m: &mut u32, r: usize| {
+    let mut mark = |m: &mut u32, r: usize| {
         if r != 0 {
             *m |= 1 << r;
+            uses[r] += 1;
         }
     };
     while n < MAX_BLOCK as u32 {
@@ -1345,6 +1421,8 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
         pc = next_pc;
         n += 1;
     }
+    let _ = uses; // per-block hoist filtering measured neutral: a block's
+    // prologue is not where its dispatch cost lives (see BLOCK_HOIST_MIN).
     if mem_ops >= 3 {
         read |= 1; // bit 0: allocate scratch (memory page-cache; see build_ctx)
     }

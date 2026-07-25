@@ -33,7 +33,8 @@ const V86DIR = process.env.V86DIR || join(ARTIFACTS, "v86");
 const FULL = !!+process.env.FULL;
 const WANT_NBENCH = !!+process.env.NBENCH;
 const WANT_V86 = !+process.env.SKIP_V86;
-const SB = !!+process.env.SB; // run rv64 with page superblocks (single config for ALL rows)
+const SB = !!+process.env.SB;
+const TLBFILL = process.env.TLBFILL === undefined ? 1 : +process.env.TLBFILL; // run rv64 with page superblocks (single config for ALL rows)
 // REPS>1 repeats the wall-clock main rows and reports the MEDIAN (ISSUES.md
 // P1: single fixed-order samples are not trustworthy on a noisy shared host).
 // nbench self-times in-guest over MINIMUM_SECONDS and needs no repetition.
@@ -67,7 +68,7 @@ function watchMarkers(vm, st) {
 }
 async function rvComputeBoot(jit, binPath) {
   const vm = await RV64.create(wasm);
-  vm.ex.jit_set_enabled(jit ? 1 : 0); if (SB && jit) vm.ex.sys_set_superblock(1);
+  vm.ex.jit_set_enabled(jit ? 1 : 0); vm.ex.jit_set_tlb_fill(TLBFILL); if (SB && jit) vm.ex.sys_set_superblock(1);
   const st = { vm, out: "", start: null, done: null, ts: null, td: null };
   watchMarkers(vm, st);
   vm.bootLinux({ bios: bbl, kernel: kern, disk: (new Uint8Array(await readFile(join(root, "web/images/root-riscv64.bin")))).slice() });
@@ -93,7 +94,7 @@ async function rvRunBench(st) {
   return { ms: st.td - st.ts, chk };
 }
 async function rvBootTime(jit) {
-  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); if (SB && jit) vm.ex.sys_set_superblock(1);
+  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); vm.ex.jit_set_tlb_fill(TLBFILL); if (SB && jit) vm.ex.sys_set_superblock(1);
   let out = ""; vm.onWrite = (fd, b) => (out += new TextDecoder().decode(b));
   const t = performance.now();
   vm.bootLinux({ bios: bbl, kernel: kern, disk: (new Uint8Array(await readFile(join(root, "web/images/root-riscv64.bin")))).slice() });
@@ -102,7 +103,7 @@ async function rvBootTime(jit) {
 }
 async function rvPython(jit) {
   const disk = new Uint8Array(await readFile(join(ARTIFACTS, "deb-riscv64.ext4")));
-  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); if (SB && jit) vm.ex.sys_set_superblock(1); vm.ex.sys_set_wallclock(1);
+  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); vm.ex.jit_set_tlb_fill(TLBFILL); if (SB && jit) vm.ex.sys_set_superblock(1); vm.ex.sys_set_wallclock(1);
   const st = { vm, out: "", start: null, done: null, ts: null, td: null };
   watchMarkers(vm, st);
   vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice(), cmdline: "console=hvc0 root=/dev/vda rw init=/binit.sh", ramMB: 512 });
@@ -119,13 +120,13 @@ async function rvPython(jit) {
 }
 async function rvNbench(jit) {
   const disk = new Uint8Array(await readFile(join(ARTIFACTS, "root-nbench.bin")));
-  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); if (SB && jit) vm.ex.sys_set_superblock(1); vm.ex.sys_set_wallclock(1);
+  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); vm.ex.jit_set_tlb_fill(TLBFILL); if (SB && jit) vm.ex.sys_set_superblock(1); vm.ex.sys_set_wallclock(1);
   let out = ""; vm.onWrite = (fd, b) => (out += new TextDecoder().decode(b));
   vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice() });
   for (let i = 0; i < 60000 && !out.includes("~ #"); i++) { vm.runSystem(2_000_000n); if ((i & 15) === 0) await tick(); }
   out = ""; vm.consoleInput(enc.encode("cd / && ./nbench\n"));
   const t = performance.now();
-  for (let i = 0; i < 40_000_000; i++) { vm.runSystem(4_000_000n); if ((i & 15) === 0) await tick(); if (out.includes("Trademarks")) break; if (performance.now() - t > 340000) break; }
+  for (let i = 0; i < 40_000_000; i++) { vm.runSystem(4_000_000n); if ((i & 3) === 0) await tick(); if (out.includes("Trademarks")) break; if (performance.now() - t > 340000) break; }
   const rows = {};
   for (const m of out.matchAll(/^([A-Z][A-Z ]+?)\s+:\s+([\d.e+]+)\s+:/gm)) rows[m[1].trim()] = +m[2];
   return rows;
@@ -136,7 +137,7 @@ async function rvNbench(jit) {
 // tcc commit as the v86 side.
 async function rvCompile(jit) {
   const disk = new Uint8Array(await readFile(join(ARTIFACTS, "cc-bench.img")));
-  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); if (SB && jit) vm.ex.sys_set_superblock(1);
+  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); vm.ex.jit_set_tlb_fill(TLBFILL); if (SB && jit) vm.ex.sys_set_superblock(1);
   const st = { vm, out: "", start: null, done: null, ts: null, td: null };
   watchMarkers(vm, st);
   vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice() });

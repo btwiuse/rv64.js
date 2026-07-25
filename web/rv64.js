@@ -54,7 +54,10 @@ export class RV64 {
             ).slice();
             const mod = new WebAssembly.Module(bytes);
             const inst = new WebAssembly.Instance(mod, {
-              env: { memory: vm.ex.memory },
+              // tlb_fill: blocks that probe the guest TLB inline call back
+              // into the core to walk the page tables on a miss (wasm->wasm,
+              // no JS frame) instead of bailing to the interpreter.
+              env: { memory: vm.ex.memory, tlb_fill: vm.ex.jit_tlb_fill },
             });
             const table = vm.ex.__indirect_function_table;
             const idx = table.grow(1);
@@ -80,7 +83,9 @@ export class RV64 {
           ).slice();
           WebAssembly.compile(bytes)
             .then((mod) =>
-              WebAssembly.instantiate(mod, { env: { memory: vm.ex.memory } }),
+              WebAssembly.instantiate(mod, {
+                env: { memory: vm.ex.memory, tlb_fill: vm.ex.jit_tlb_fill },
+              }),
             )
             .then((inst) => {
               const table = vm.ex.__indirect_function_table;

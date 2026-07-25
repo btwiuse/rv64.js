@@ -293,6 +293,11 @@ struct JitState {
     /// Pages that wanted a superblock while the compile budget was spent.
     /// Drained one per quantum boundary, oldest first.
     sb_queue: Vec<(u64, u64)>,
+    /// Pages whose superblock is queued or compiling. A hot pc on one of them
+    /// waits for the page function instead of getting its own module — the
+    /// wait is at most a quantum, and the module it would have built is the
+    /// expensive part.
+    sb_inflight: std::collections::HashSet<(u64, u64)>,
     /// Table index -> the (virtual page, physical page) list a MULTI-page
     /// superblock was compiled over. Entries carry their own page's pa (probed
     /// like any block at dispatch); this is the rest of the region, verified on
@@ -323,6 +328,7 @@ impl JitState {
             regions: Default::default(),
             sb_gen: Default::default(),
             sb_queue: Vec::new(),
+            sb_inflight: Default::default(),
         }
     }
     fn clear(&mut self) {
@@ -333,6 +339,7 @@ impl JitState {
         self.regions.clear();
         self.sb_gen.clear();
         self.sb_queue.clear();
+        self.sb_inflight.clear();
         for h in self.interp_hot.iter_mut() {
             *h = 0;
         }
@@ -504,13 +511,33 @@ static mut IHIST_CNT: [u64; IHIST_N] = [0; IHIST_N];
 pub extern "C" fn ihist_get(which: u32, i: u32) -> u64 {
     let i = i as usize % IHIST_N;
     unsafe {
-        if which == 0 {
-            IHIST_KEY[i] as u64
-        } else {
-            IHIST_CNT[i]
+        match which {
+            0 => IHIST_KEY[i] as u64,
+            1 => IHIST_CNT[i],
+            _ => IHIST_INSNS[i],
         }
     }
 }
+
+#[allow(static_mut_refs)]
+fn ihist_slot(insn: u32) -> usize {
+    let key = if insn & 3 != 3 {
+        insn & 0xffff
+    } else {
+        insn & 0xfff0_707f
+    };
+    unsafe {
+        let h = ((key ^ (key >> 13)).wrapping_mul(0x9e37_79b9) >> 18) as usize & (IHIST_N - 1);
+        if IHIST_KEY[h] != key && IHIST_CNT[h] != 0 {
+            return usize::MAX;
+        }
+        h
+    }
+}
+
+/// Interpreted instructions charged to the fallback that started the stretch.
+static mut IHIST_INSNS: [u64; IHIST_N] = [0; IHIST_N];
+static mut IHIST_LAST: usize = usize::MAX;
 
 #[allow(static_mut_refs)]
 fn ihist_hit(insn: u32) {
@@ -529,6 +556,7 @@ fn ihist_hit(insn: u32) {
             IHIST_KEY[h] = key;
         }
         IHIST_CNT[h] += 1;
+        IHIST_LAST = h;
     }
 }
 
@@ -644,6 +672,11 @@ const JIT_CHAIN_CAP: u32 = 1024;
 /// branchy enough (e.g. an interpreter's dispatch loop) to compile as one
 /// superblock — one wasm function covering the whole page with an internal
 /// br_table dispatch and registers cached in locals across all blocks.
+/// Hot pcs on a page before it is compiled as one function. Low on purpose:
+/// every individual block is its own WebAssembly module — a Module build, an
+/// Instance, and a table growth each — so a page's worth of them costs far
+/// more than the single page function that covers the same code (an in-guest
+/// `tcc -c` built 8517 block modules against 54 page functions).
 const SUPERBLOCK_THRESHOLD: usize = 6;
 /// How many times one page may be recompiled as a superblock as more of it
 /// turns out to be hot (see JitState::sb_gen).
@@ -1508,11 +1541,22 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                     && !jit.sb_queue.contains(&(aspace, vpage))
                                 {
                                     jit.sb_queue.push((aspace, vpage));
+                                    jit.sb_inflight.insert((aspace, vpage));
                                 }
                             }
                         }
+                        // A page function is queued or compiling for this page:
+                        // wait for it rather than building a module for one
+                        // block. Loop headers still compile individually — the
+                        // superblock deliberately leaves them out.
+                        let wait_for_page_fn =
+                            !is_loop && jit.sb_inflight.contains(&(aspace, vpage));
                         // Individual block (loop or pre-threshold non-loop).
-                        let blk = rv64_jit::translate_block(&m.bus.ram[off..end], pc, pc, lay);
+                        let blk = if wait_for_page_fn {
+                            None
+                        } else {
+                            rv64_jit::translate_block(&m.bus.ram[off..end], pc, pc, lay)
+                        };
                         let entry = blk.and_then(|blk| {
                             unsafe { JIT_OUT = blk.wasm };
                             let idx = unsafe { host_jit_register() };
@@ -1541,6 +1585,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             // different address space at the same va, and the
                             // dirty-page tracker naturally drops it if the code
                             // bytes are overwritten.
+                            None if wait_for_page_fn => {} // the page function will cover it
                             None => {
                                 m.bus.jit_mark_page(pa);
                                 m.cpu.clear_store_jtlb();
@@ -1584,6 +1629,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             // run_slice_until would interpret the whole stretch forever without
             // any of its blocks ever tiering up — that residual is ~half of
             // fib's wall time).
+            let icount_before = m.cpu.insn_count;
             let ran = m.run_slice_until(remaining.min(SYS_WARM_SLICE), |pc| {
                 if jit.dispatch[JitState::dslot(pc)].pc == pc {
                     return true;
@@ -1608,6 +1654,13 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             unsafe {
                 SLICE_CALLS += 1;
                 SLICE_INSNS += ran;
+                if DPROF_ON && IHIST_LAST != usize::MAX {
+                    // Charge the whole interpreted stretch to whatever the JIT
+                    // gave up on: one unsupported instruction can drag dozens
+                    // of interpreted instructions behind it.
+                    IHIST_INSNS[IHIST_LAST] += m.cpu.insn_count - icount_before;
+                    IHIST_LAST = usize::MAX;
+                }
             }
             remaining = remaining.saturating_sub(ran.max(1));
         }
@@ -1679,6 +1732,9 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
             let ppage = (pp - rv64_system::RAM_BASE) >> 12;
             !m.bus.jit_page_marked(ppage) || m.bus.jit_dirty_pages.contains(&ppage)
         });
+        for &(va, _) in &p.pages {
+            jit.sb_inflight.remove(&(p.aspace, va));
+        }
         if stale {
             SB_STALE += 1;
             for &(va, _) in &p.pages {
@@ -1855,6 +1911,38 @@ pub extern "C" fn sb_debug(vpage: u64) -> u64 {
         }
         v |= (jit.page_entries.get(&(aspace, vpage)).map_or(0, |e| e.len()) as u64) << 8;
         v
+    }
+}
+
+/// Toggle host-filled TLB misses inside compiled blocks (perf A/B).
+#[no_mangle]
+pub extern "C" fn jit_set_tlb_fill(on: u32) {
+    rv64_jit::set_tlb_fill(on != 0);
+}
+
+/// Fused-TLB refill for compiled blocks: called from generated code (a
+/// wasm->wasm call through the module's `env.tlb_fill` import) when an inline
+/// probe misses. Returns the offset such that `linear = va + off`, or -1 when
+/// the access can't be served inline (unmapped, permission fault, MMIO, or a
+/// page holding compiled code) — the block then bails and the interpreter
+/// re-executes the instruction, raising the exact architectural fault.
+///
+/// Reentrancy: this runs inside a `call_block` that sys_run made while it
+/// holds the machine. That is the same contract compiled code already has —
+/// blocks write the register file and TLB rows through raw addresses, and the
+/// block call is opaque to the compiler (the machine pointer is passed in
+/// precisely so nothing is cached across it).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn jit_tlb_fill(va: u64, store: u32) -> i64 {
+    unsafe {
+        match SYS.as_mut() {
+            Some(m) => m
+                .cpu
+                .jit_fill_tlb(&mut m.bus, va, store != 0)
+                .unwrap_or(-1),
+            None => -1,
+        }
     }
 }
 
