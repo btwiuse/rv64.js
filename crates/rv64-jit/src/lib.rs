@@ -50,10 +50,13 @@ const TPC: u32 = 6;
 /// by the host's tlb_fill call).
 const SCR2: u32 = 7;
 
-/// Host-filled TLB misses inside compiled code (see tlb_idx_tag_fill). The
-/// call site costs register pressure in every memory-op block, so this stays
-/// switchable while both sides are measured.
-static TLB_FILL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// Host-filled TLB misses inside compiled code (see tlb_idx_tag_fill).
+/// DEFAULT OFF, measured: it removes 1.2M bails from an in-guest `tcc -c` for
+/// no wall-clock change (the miss path was cheap), while the call site's
+/// register pressure costs ~15% on CPython's eval loop, whose working set
+/// never misses. Kept switchable — a guest with a larger working set than the
+/// 4096-entry TLB is exactly where it would pay off.
+static TLB_FILL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn set_tlb_fill(on: bool) {
     TLB_FILL.store(on, std::sync::atomic::Ordering::Relaxed);
 }

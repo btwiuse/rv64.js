@@ -34,7 +34,7 @@ const FULL = !!+process.env.FULL;
 const WANT_NBENCH = !!+process.env.NBENCH;
 const WANT_V86 = !+process.env.SKIP_V86;
 const SB = !!+process.env.SB;
-const TLBFILL = process.env.TLBFILL === undefined ? 1 : +process.env.TLBFILL; // run rv64 with page superblocks (single config for ALL rows)
+const TLBFILL = process.env.TLBFILL === undefined ? 0 : +process.env.TLBFILL; // run rv64 with page superblocks (single config for ALL rows)
 // REPS>1 repeats the wall-clock main rows and reports the MEDIAN (ISSUES.md
 // P1: single fixed-order samples are not trustworthy on a noisy shared host).
 // nbench self-times in-guest over MINIMUM_SECONDS and needs no repetition.

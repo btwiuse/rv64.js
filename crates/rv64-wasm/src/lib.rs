@@ -293,10 +293,11 @@ struct JitState {
     /// Pages that wanted a superblock while the compile budget was spent.
     /// Drained one per quantum boundary, oldest first.
     sb_queue: Vec<(u64, u64)>,
-    /// Pages whose superblock is queued or compiling. A hot pc on one of them
-    /// waits for the page function instead of getting its own module — the
-    /// wait is at most a quantum, and the module it would have built is the
-    /// expensive part.
+    /// Pages whose superblock module is COMPILING (issued, awaiting the async
+    /// result). A hot pc on one of them waits for the page function rather
+    /// than building its own module — a wait of one async compile. Pages that
+    /// are merely queued are NOT included: the queue drains on the compile
+    /// budget, and making cold code wait that long cost boot 2.9x.
     sb_inflight: std::collections::HashSet<(u64, u64)>,
     /// Table index -> the (virtual page, physical page) list a MULTI-page
     /// superblock was compiled over. Entries carry their own page's pa (probed
@@ -1541,7 +1542,6 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                     && !jit.sb_queue.contains(&(aspace, vpage))
                                 {
                                     jit.sb_queue.push((aspace, vpage));
-                                    jit.sb_inflight.insert((aspace, vpage));
                                 }
                             }
                         }
