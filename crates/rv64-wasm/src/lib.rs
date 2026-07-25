@@ -358,6 +358,20 @@ fn copystat_addr() -> u32 {
     unsafe { &COPY_CHUNKS as *const u64 as u32 }
 }
 
+/// Wasm function-table entries are unreclaimable (invalidated blocks become
+/// unreachable but their slots persist), so unbounded compilation — reboots,
+/// address-space churn, self-modifying code — would grow the table forever
+/// (ISSUES.md P2). Above this bound the JIT stops COMPILING new blocks
+/// (existing blocks keep running; the interpreter covers the rest). 1M
+/// entries ~= a few hundred MB of compiled code, far beyond any observed
+/// workload (fib ~20k, boot ~2k, tcc ~15k) but a hard stop for runaways.
+const JIT_TABLE_CAP: u64 = 1_000_000;
+static mut JIT_TABLE_ENTRIES: u64 = 0;
+
+fn jit_table_full() -> bool {
+    unsafe { JIT_TABLE_ENTRIES >= JIT_TABLE_CAP }
+}
+
 /// Longest compiled-code residency between interrupt/device checks, in guest
 /// instructions: ~2.5ms at JIT speed. Loops yield at this bound even when the
 /// caller's budget is larger (P0 interrupt-latency contract).
@@ -580,7 +594,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
 
         // --- hot counting + compile ---
         let pc = m.cpu.pc;
-        if !jit.cache.contains_key(&pc) {
+        if !jit_table_full() && !jit.cache.contains_key(&pc) {
             let c = jit.hot.entry(pc).or_insert(0);
             *c += 1;
             if *c >= unsafe { JIT_THRESHOLD } {
@@ -946,7 +960,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
 
         // --- hot counting + compile (from physical code bytes) ---
         let pc = m.cpu.pc;
-        if !jit.cache.contains_key(&pc) {
+        if !jit_table_full() && !jit.cache.contains_key(&pc) {
             let hot = {
                 let c = jit.hot.entry(pc).or_insert(0);
                 *c += 1;
@@ -1061,6 +1075,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             if idx < 0 {
                                 return None;
                             }
+                            unsafe { JIT_TABLE_ENTRIES += 1 };
                             m.bus.jit_mark_page(pa);
                             m.cpu.clear_store_jtlb(); // this page may now hold code
                             Some(JitBlock { idx, n: blk.n_insns, pa })
@@ -1212,6 +1227,7 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
             jit.superblocked.remove(&p.vpage);
             return;
         }
+        JIT_TABLE_ENTRIES += 1;
         for &e in &p.entries {
             let epa = p.pa_page + (e - p.vpage);
             let jb = JitBlock { idx, n: 0, pa: epa };
