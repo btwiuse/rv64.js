@@ -3703,9 +3703,26 @@ pub fn discover_page_leaders(
     seeds: &[u64],
     max_leaders: usize,
 ) -> Vec<u64> {
+    discover_page_leaders_ext(code, base, page_base, page_span, seeds, max_leaders).0
+}
+
+/// As `discover_page_leaders`, plus the leaders that some BACKWARD branch
+/// targets — the only pcs that can be loop headers. Testing every leader with
+/// `is_loop_at` costs a 128-instruction walk each, which dominated superblock
+/// compile time (232 page compiles cost ~3s of a 3s tcc run); the back-edge
+/// set is typically a couple of dozen pcs out of hundreds.
+pub fn discover_page_leaders_ext(
+    code: &[u8],
+    base: u64,
+    page_base: u64,
+    page_span: u64,
+    seeds: &[u64],
+    max_leaders: usize,
+) -> (Vec<u64>, std::collections::BTreeSet<u64>) {
     let page_end = page_base + page_span;
     let in_page = |pc: u64| pc >= page_base && pc < page_end;
     let mut leaders: std::collections::BTreeSet<u64> = seeds.iter().copied().collect();
+    let mut back_targets: std::collections::BTreeSet<u64> = Default::default();
     let mut done: std::collections::BTreeSet<u64> = Default::default();
     let mut pending: Vec<u64> = seeds.to_vec();
     while let Some(start) = pending.pop() {
@@ -3728,14 +3745,22 @@ pub fn discover_page_leaders(
             match opcode(insn) {
                 // conditional branch: target + fallthrough are leaders; block ends
                 0x63 => {
-                    add(pc.wrapping_add(imm_b(insn) as u64), &mut leaders, &mut pending);
+                    let target = pc.wrapping_add(imm_b(insn) as u64);
+                    if target <= pc {
+                        back_targets.insert(target);
+                    }
+                    add(target, &mut leaders, &mut pending);
                     add(next, &mut leaders, &mut pending);
                     break;
                 }
                 // JAL: target is a leader if in page; a CALL (rd != 0) also makes
                 // the return site a leader (the callee's ret dispatches back there)
                 0x6f => {
-                    add(pc.wrapping_add(imm_j(insn) as u64), &mut leaders, &mut pending);
+                    let target = pc.wrapping_add(imm_j(insn) as u64);
+                    if target <= pc && rd(insn) == 0 {
+                        back_targets.insert(target); // backward tail jump
+                    }
+                    add(target, &mut leaders, &mut pending);
                     if rd(insn) != 0 {
                         add(next, &mut leaders, &mut pending);
                     }
@@ -3773,7 +3798,7 @@ pub fn discover_page_leaders(
             n += 1;
         }
     }
-    leaders.into_iter().collect()
+    (leaders.into_iter().collect(), back_targets)
 }
 
 /// Compile a whole page of basic blocks (v86's function-per-page) into one wasm

@@ -290,6 +290,9 @@ struct JitState {
     /// threshold's worth of uncovered hot pcs, bounded so a pathological page
     /// can't loop on it.
     sb_gen: std::collections::HashMap<(u64, u64), (usize, u32)>,
+    /// Pages that wanted a superblock while the compile budget was spent.
+    /// Drained one per quantum boundary, oldest first.
+    sb_queue: Vec<(u64, u64)>,
     /// Table index -> the (virtual page, physical page) list a MULTI-page
     /// superblock was compiled over. Entries carry their own page's pa (probed
     /// like any block at dispatch); this is the rest of the region, verified on
@@ -319,6 +322,7 @@ impl JitState {
             superblocked: Default::default(),
             regions: Default::default(),
             sb_gen: Default::default(),
+            sb_queue: Vec::new(),
         }
     }
     fn clear(&mut self) {
@@ -328,6 +332,7 @@ impl JitState {
         self.superblocked.clear();
         self.regions.clear();
         self.sb_gen.clear();
+        self.sb_queue.clear();
         for h in self.interp_hot.iter_mut() {
             *h = 0;
         }
@@ -646,6 +651,18 @@ const SB_RECOMPILE_CAP: u32 = 8;
 /// Distinct (address space, page) discovery records kept before the whole
 /// table is dropped — address spaces die and their pages go with them.
 const SB_SPACE_CAP: usize = 16384;
+/// Retired instructions that must pass between two superblock compiles.
+/// Building one costs a page-wide leader analysis, a register scan, wasm
+/// emission and — on the JS side — a module compile and instantiation, which
+/// together run into milliseconds. Amortizing them against executed work keeps
+/// the cost a fixed small fraction of runtime instead of a fixed number of
+/// pages: a long-running kernel gets thousands of compiles, while a short cold
+/// workload like `tcc -c` (340M instructions total) can't spend a third of its
+/// runtime compiling page functions it will barely execute.
+const SB_COMPILE_SPACING: u64 = 4_000_000;
+/// Deferred superblock requests kept before new ones are dropped.
+const SB_QUEUE_CAP: usize = 64;
+static mut SB_LAST_ICOUNT: u64 = 0;
 /// Leaders per superblock. Every entry into the function loads the register
 /// UNION over all its bodies and every exit stores the written union, so a
 /// function that covers more of the page pays more on each entry — worth it
@@ -980,6 +997,180 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
 /// needed. Self-modifying code and recycled pages are caught by per-page
 /// store tracking (SystemBus.jit_dirty_pages). The hot path is a
 /// direct-mapped dispatch array (one read + compare), not a HashMap.
+
+/// The JIT's view of machine state (register file, fcsr, TLB tables, budget
+/// cells) — identical for every translation of the current machine.
+fn jit_layout(m: &rv64_system::Machine) -> rv64_jit::JitLayout {
+    let (lt, lo, st, so) = m.cpu.jit_ftlb_ptrs();
+    rv64_jit::JitLayout {
+        x_base: m.cpu.x.as_ptr() as u32,
+        pc_addr: &m.cpu.pc as *const u64 as u32,
+        mem: None,
+        sys: Some(rv64_jit::SysMem {
+            ftlb_load_tag: lt as u32,
+            ftlb_load_off: lo as u32,
+            ftlb_store_tag: st as u32,
+            ftlb_store_off: so as u32,
+            tlb_mask: (rv64_core::Cpu::jit_tlb_size() - 1) as u32,
+        }),
+        retired_addr: retired_addr(),
+        f_base: m.cpu.f.as_ptr() as u32,
+        fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
+        fuel_addr: fuel_addr(),
+        mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
+        copystat_addr: copystat_addr(),
+    }
+}
+
+/// Build (asynchronously) the superblock covering `vpage` in address space
+/// `aspace`, whose current physical page is `pa_page`. Returns true if a
+/// module was issued. Called from the compile path and, when the compile
+/// budget deferred one, from the quantum boundary.
+#[allow(static_mut_refs)]
+fn build_superblock(
+    m: &mut rv64_system::Machine,
+    jit: &mut JitState,
+    aspace: u64,
+    vpage: u64,
+    pa_page: u64,
+    sb_compiles: u32,
+) -> bool {
+    let lay = jit_layout(m);
+    let mut issued = false;
+    let n_entries = jit.page_entries.get(&(aspace, vpage)).map_or(0, |e| e.len());
+                        // Enough individually-hot pcs: compile the page as
+                        // ONE function — but over the FULL statically
+                        // discovered leader set (v86's page analysis), not
+                        // just the hot seeds. That keeps intra-page control
+                        // flow inside the function (any discovered target
+                        // hits its br_table slot) without recompiling per
+                        // newly-hot entry. Loop headers are EXCLUDED: their
+                        // br_table slots fall to the exit default, so the
+                        // tight individual loop-region blocks keep owning
+                        // them.
+                        unsafe { SB_TRIGGER += 1 };
+                        // Assemble the region: the hot page plus its
+                        // virtually contiguous, RAM-backed neighbours, so
+                        // control flow that leaves the page still lands
+                        // inside the same wasm function.
+                        let ram_ok = |m: &rv64_system::Machine, pa: u64| {
+                            pa >= rv64_system::RAM_BASE
+                                && ((pa & !0xfff) - rv64_system::RAM_BASE) as usize + 0x1000
+                                    <= m.bus.ram.len()
+                        };
+                        // Extend only where the hot code actually runs off
+                        // the edge of the page: a hot block within a block's
+                        // reach of the boundary means the loop or function
+                        // continues on the neighbour. Pages whose hot code
+                        // sits in the middle stay single-page — a bigger
+                        // wasm function is slower to compile and register-
+                        // allocates worse, so growth has to pay for itself.
+                        const EDGE: u64 = 0x80;
+                        let seeds = jit.page_entries[&(aspace, vpage)].clone();
+                        let mut pages: Vec<(u64, u64)> = vec![(vpage, pa_page)];
+                        let grow = MAX_REGION_PAGES > 1;
+                        if grow && seeds.iter().any(|&e| (e & 0xfff) >= 0x1000 - EDGE) {
+                            let va = vpage + 0x1000;
+                            match m.cpu.jit_probe_fetch(&mut m.bus, va) {
+                                Some(p) if ram_ok(m, p) => pages.push((va, p & !0xfff)),
+                                _ => {}
+                            }
+                        }
+                        if grow && vpage >= 0x1000 && seeds.iter().any(|&e| (e & 0xfff) < EDGE) {
+                            let va = vpage - 0x1000;
+                            match m.cpu.jit_probe_fetch(&mut m.bus, va) {
+                                Some(p) if ram_ok(m, p) => pages.insert(0, (va, p & !0xfff)),
+                                _ => {}
+                            }
+                        }
+                        let mut start_va = pages[0].0;
+                        let mut span = (pages.len() * 0x1000) as u64;
+                        let mut code = Vec::with_capacity(span as usize);
+                        for &(_, pp) in &pages {
+                            let o = (pp - rv64_system::RAM_BASE) as usize;
+                            code.extend_from_slice(&m.bus.ram[o..o + 0x1000]);
+                        }
+                        let (mut entries, back_targets) =
+                            rv64_jit::discover_page_leaders_ext(
+                                &code, start_va, start_va, span, &seeds, MAX_LEADERS,
+                            );
+                        // A leader whose OWN page holds a complete loop
+                        // keeps its tight individual loop-region block (the
+                        // br_table body is slower for those) — the test is
+                        // page-clamped exactly like the individual compile
+                        // path, so a loop that spans pages is NOT excluded
+                        // here: the region is the only thing that can hold
+                        // it whole.
+                        entries.retain(|&e| {
+                            let po = ((e & !0xfff) - start_va) as usize;
+                            let page = &code[po..po + 0x1000];
+                            rv64_jit::emittable_at(&code, start_va, e, lay)
+                                && (!back_targets.contains(&e)
+                                    || !rv64_jit::is_loop_at(page, e & !0xfff, e, lay))
+                        });
+                        // Trim to the pages leaders actually landed on.
+                        if let (Some(&lo), Some(&hi)) =
+                            (entries.first(), entries.last())
+                        {
+                            let (lo, hi) = (lo & !0xfff, hi & !0xfff);
+                            if lo > start_va || hi + 0x1000 < start_va + span {
+                                let off = (lo - start_va) as usize;
+                                let len = (hi + 0x1000 - lo) as usize;
+                                code = code[off..off + len].to_vec();
+                                pages.retain(|&(va, _)| va >= lo && va <= hi);
+                                start_va = lo;
+                                span = len as u64;
+                            }
+                        }
+                        let sb = rv64_jit::translate_superblock(
+                            &code, start_va, start_va, span, &entries, lay,
+                        );
+                        if sb.is_none() {
+                            unsafe { SB_XLATE_FAIL += 1 };
+                        }
+                        if let Some(blk) = sb {
+                            // Large module: compile it ASYNC on V8's
+                            // background threads (ISSUES.md/perf: the sync
+                            // Module build of a page function stalls the
+                            // guest for ms — the cold-compile cost that
+                            // kept superblocks gated). Execution continues
+                            // on individual blocks; sys_sb_ready repoints
+                            // the entries once the function is in the
+                            // table, after re-validating page identity.
+                            unsafe { JIT_OUT = blk.wasm };
+                            for &(_, pp) in &pages {
+                                m.bus.jit_mark_page(pp);
+                            }
+                            // Only the page that reached the threshold is
+                            // marked done: a neighbour pulled into this
+                            // region still gets to build its own region for
+                            // the code this one didn't reach.
+                            jit.superblocked.insert((aspace, vpage)); // in flight
+                            jit.sb_gen
+                                .insert((aspace, vpage), (n_entries, sb_compiles + 1));
+                            m.cpu.clear_store_jtlb(); // pages may now hold code
+                            unsafe {
+                                let ticket = NEXT_SB_TICKET;
+                                NEXT_SB_TICKET += 1;
+                                PENDING_SB.push(PendingSb {
+                                    ticket,
+                                    boot_gen: BOOT_GEN,
+                                    aspace,
+                                    pages,
+                                    entries,
+                                });
+                                host_jit_register_async(ticket);
+                                SB_ISSUED += 1;
+                                SB_LAST_ICOUNT = m.cpu.insn_count;
+                                issued = true;
+                            }
+                            // The caller still gives this pc an individual
+                            // block right now; the superblock repoints its
+                            // entries when the module arrives.
+                        }
+    issued
+}
+
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn sys_run(max_insns: u64) -> i32 {
@@ -1193,6 +1384,25 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             }
             m.sync_devices();
             m.cpu.check_interrupts(&mut m.bus);
+            // Spend the superblock compile budget on the oldest deferred page
+            // that still resolves in the CURRENT address space.
+            if m.cpu.insn_count >= unsafe { SB_LAST_ICOUNT }.wrapping_add(SB_COMPILE_SPACING)
+                && !jit.sb_queue.is_empty()
+            {
+                let aspace = m.cpu.sys.as_ref().map_or(0, |c| c.satp);
+                if let Some(i) = jit.sb_queue.iter().position(|&(a, _)| a == aspace) {
+                    let (_, vpage) = jit.sb_queue.remove(i);
+                    let compiles = jit.sb_gen.get(&(aspace, vpage)).map_or(0, |&(_, c)| c);
+                    if let Some(pa) = m.cpu.jit_probe_fetch(&mut m.bus, vpage) {
+                        if pa >= rv64_system::RAM_BASE
+                            && ((pa & !0xfff) - rv64_system::RAM_BASE) as usize + 0x1000
+                                <= m.bus.ram.len()
+                        {
+                            build_superblock(m, jit, aspace, vpage, pa & !0xfff, compiles);
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -1276,6 +1486,8 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         // any size in a handful of compiles and is
                         // self-amortizing — each one costs at most as much as
                         // all the previous ones together.
+                        let sb_spaced = m.cpu.insn_count
+                            >= unsafe { SB_LAST_ICOUNT }.wrapping_add(SB_COMPILE_SPACING);
                         let sb_want = if jit.superblocked.contains(&(aspace, vpage)) {
                             sb_compiles < SB_RECOMPILE_CAP
                                 && n_entries >= (sb_last * 2).max(sb_last + SUPERBLOCK_THRESHOLD)
@@ -1283,135 +1495,21 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             n_entries >= SUPERBLOCK_THRESHOLD
                         };
                         if !is_loop && sb_want && pa_page_off + 0x1000 <= m.bus.ram.len() {
-                            // Enough individually-hot pcs: compile the page as
-                            // ONE function — but over the FULL statically
-                            // discovered leader set (v86's page analysis), not
-                            // just the hot seeds. That keeps intra-page control
-                            // flow inside the function (any discovered target
-                            // hits its br_table slot) without recompiling per
-                            // newly-hot entry. Loop headers are EXCLUDED: their
-                            // br_table slots fall to the exit default, so the
-                            // tight individual loop-region blocks keep owning
-                            // them.
-                            unsafe { SB_TRIGGER += 1 };
-                            // Assemble the region: the hot page plus its
-                            // virtually contiguous, RAM-backed neighbours, so
-                            // control flow that leaves the page still lands
-                            // inside the same wasm function.
-                            let ram_ok = |m: &rv64_system::Machine, pa: u64| {
-                                pa >= rv64_system::RAM_BASE
-                                    && ((pa & !0xfff) - rv64_system::RAM_BASE) as usize + 0x1000
-                                        <= m.bus.ram.len()
-                            };
-                            // Extend only where the hot code actually runs off
-                            // the edge of the page: a hot block within a block's
-                            // reach of the boundary means the loop or function
-                            // continues on the neighbour. Pages whose hot code
-                            // sits in the middle stay single-page — a bigger
-                            // wasm function is slower to compile and register-
-                            // allocates worse, so growth has to pay for itself.
-                            const EDGE: u64 = 0x80;
-                            let seeds = jit.page_entries[&(aspace, vpage)].clone();
-                            let mut pages: Vec<(u64, u64)> = vec![(vpage, pa_page)];
-                            let grow = MAX_REGION_PAGES > 1;
-                            if grow && seeds.iter().any(|&e| (e & 0xfff) >= 0x1000 - EDGE) {
-                                let va = vpage + 0x1000;
-                                match m.cpu.jit_probe_fetch(&mut m.bus, va) {
-                                    Some(p) if ram_ok(m, p) => pages.push((va, p & !0xfff)),
-                                    _ => {}
+                            if sb_spaced {
+                                build_superblock(m, jit, aspace, vpage, pa_page, sb_compiles);
+                            } else {
+                                // Budget says not yet: remember the page and
+                                // build it at a later quantum boundary rather
+                                // than dropping the request — a page whose hot
+                                // pcs all appear inside one budget window would
+                                // otherwise never be revisited (nbench IDEA
+                                // fell back to 6.4 insns/dispatch).
+                                if jit.sb_queue.len() < SB_QUEUE_CAP
+                                    && !jit.sb_queue.contains(&(aspace, vpage))
+                                {
+                                    jit.sb_queue.push((aspace, vpage));
                                 }
                             }
-                            if grow && vpage >= 0x1000 && seeds.iter().any(|&e| (e & 0xfff) < EDGE) {
-                                let va = vpage - 0x1000;
-                                match m.cpu.jit_probe_fetch(&mut m.bus, va) {
-                                    Some(p) if ram_ok(m, p) => pages.insert(0, (va, p & !0xfff)),
-                                    _ => {}
-                                }
-                            }
-                            let mut start_va = pages[0].0;
-                            let mut span = (pages.len() * 0x1000) as u64;
-                            let mut code = Vec::with_capacity(span as usize);
-                            for &(_, pp) in &pages {
-                                let o = (pp - rv64_system::RAM_BASE) as usize;
-                                code.extend_from_slice(&m.bus.ram[o..o + 0x1000]);
-                            }
-                            let mut entries = rv64_jit::discover_page_leaders(
-                                &code, start_va, start_va, span, &seeds, MAX_LEADERS,
-                            );
-                            // A leader whose OWN page holds a complete loop
-                            // keeps its tight individual loop-region block (the
-                            // br_table body is slower for those) — the test is
-                            // page-clamped exactly like the individual compile
-                            // path, so a loop that spans pages is NOT excluded
-                            // here: the region is the only thing that can hold
-                            // it whole.
-                            entries.retain(|&e| {
-                                let po = ((e & !0xfff) - start_va) as usize;
-                                let page = &code[po..po + 0x1000];
-                                rv64_jit::emittable_at(&code, start_va, e, lay)
-                                    && !rv64_jit::is_loop_at(page, e & !0xfff, e, lay)
-                            });
-                            // Trim to the pages leaders actually landed on.
-                            if let (Some(&lo), Some(&hi)) =
-                                (entries.first(), entries.last())
-                            {
-                                let (lo, hi) = (lo & !0xfff, hi & !0xfff);
-                                if lo > start_va || hi + 0x1000 < start_va + span {
-                                    let off = (lo - start_va) as usize;
-                                    let len = (hi + 0x1000 - lo) as usize;
-                                    code = code[off..off + len].to_vec();
-                                    pages.retain(|&(va, _)| va >= lo && va <= hi);
-                                    start_va = lo;
-                                    span = len as u64;
-                                }
-                            }
-                            let sb = rv64_jit::translate_superblock(
-                                &code, start_va, start_va, span, &entries, lay,
-                            );
-                            if sb.is_none() {
-                                unsafe { SB_XLATE_FAIL += 1 };
-                            }
-                            if let Some(blk) = sb {
-                                // Large module: compile it ASYNC on V8's
-                                // background threads (ISSUES.md/perf: the sync
-                                // Module build of a page function stalls the
-                                // guest for ms — the cold-compile cost that
-                                // kept superblocks gated). Execution continues
-                                // on individual blocks; sys_sb_ready repoints
-                                // the entries once the function is in the
-                                // table, after re-validating page identity.
-                                unsafe { JIT_OUT = blk.wasm };
-                                for &(_, pp) in &pages {
-                                    m.bus.jit_mark_page(pp);
-                                }
-                                // Only the page that reached the threshold is
-                                // marked done: a neighbour pulled into this
-                                // region still gets to build its own region for
-                                // the code this one didn't reach.
-                                jit.superblocked.insert((aspace, vpage)); // in flight
-                                jit.sb_gen
-                                    .insert((aspace, vpage), (n_entries, sb_compiles + 1));
-                                m.cpu.clear_store_jtlb(); // pages may now hold code
-                                unsafe {
-                                    let ticket = NEXT_SB_TICKET;
-                                    NEXT_SB_TICKET += 1;
-                                    PENDING_SB.push(PendingSb {
-                                        ticket,
-                                        boot_gen: BOOT_GEN,
-                                        aspace,
-                                        pages,
-                                        entries,
-                                    });
-                                    host_jit_register_async(ticket);
-                                    SB_ISSUED += 1;
-                                }
-                                // fall through: this pc still gets an
-                                // individual block right now.
-                            }
-                        }
-
-                        if jit.superblocked.contains(&(aspace, vpage)) {
-                            unsafe { SB_INDIV += 1 };
                         }
                         // Individual block (loop or pre-threshold non-loop).
                         let blk = rv64_jit::translate_block(&m.bus.ram[off..end], pc, pc, lay);
