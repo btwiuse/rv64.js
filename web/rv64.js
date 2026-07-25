@@ -20,6 +20,8 @@ export class RV64 {
       const text = new TextDecoder().decode(bytes);
       (fd === 2 ? console.error : console.log)(text);
     };
+    /** Called with each Ethernet frame the guest sends; set by connectNet. */
+    this.onNetSend = () => {};
   }
 
   /** Instantiate from wasm bytes (ArrayBuffer/TypedArray/Response). */
@@ -31,6 +33,12 @@ export class RV64 {
           // Copy out: the view dies if wasm memory grows.
           const bytes = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
           vm.onWrite(fd, bytes);
+        },
+        // One Ethernet frame the guest transmitted. Goes straight out the
+        // relay socket — one binary message per frame, websockproxy's protocol.
+        host_net_send: (ptr, len) => {
+          const frame = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
+          vm.onNetSend(frame);
         },
         host_now_ms: () =>
           typeof performance !== "undefined" ? performance.now() : Date.now(),
@@ -57,7 +65,11 @@ export class RV64 {
               // tlb_fill: blocks that probe the guest TLB inline call back
               // into the core to walk the page tables on a miss (wasm->wasm,
               // no JS frame) instead of bailing to the interpreter.
-              env: { memory: vm.ex.memory, tlb_fill: vm.ex.jit_tlb_fill },
+              env: {
+                memory: vm.ex.memory,
+                tlb_fill: vm.ex.jit_tlb_fill,
+                __indirect_function_table: vm.ex.__indirect_function_table,
+              },
             });
             const table = vm.ex.__indirect_function_table;
             const idx = table.grow(1);
@@ -84,7 +96,11 @@ export class RV64 {
           WebAssembly.compile(bytes)
             .then((mod) =>
               WebAssembly.instantiate(mod, {
-                env: { memory: vm.ex.memory, tlb_fill: vm.ex.jit_tlb_fill },
+                env: {
+                  memory: vm.ex.memory,
+                  tlb_fill: vm.ex.jit_tlb_fill,
+                  __indirect_function_table: vm.ex.__indirect_function_table,
+                },
               }),
             )
             .then((inst) => {
@@ -106,6 +122,28 @@ export class RV64 {
         ? await WebAssembly.instantiateStreaming(wasmSource, imports)
         : await WebAssembly.instantiate(wasmSource, imports);
     vm = new RV64(instance);
+    // Direct block chaining needs wasm tail calls (return_call_indirect,
+    // shipped by default in V8 11.2+). Feature-detect with a 1-function probe
+    // so older engines just keep the plain dispatch loop.
+    try {
+      new WebAssembly.Module(new Uint8Array([
+        0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+        1, 5, 1, 0x60, 1, 0x7f, 0,
+        2, 11, 1, 1, 0x65, 3, 0x74, 0x61, 0x62, 0x01, 0x70, 0, 0,
+        3, 2, 1, 0,
+        10, 11, 1, 9, 0, 0x20, 0, 0x41, 0, 0x13, 0, 0, 0x0b,
+      ]));
+      // Available, but DEFAULT OFF: measured on V8 11.3, a cross-instance
+      // return_call_indirect costs ~1.2us per hop (each block is its own
+      // instance, and the tail call goes through an instance-switching
+      // trampoline), which is 20-50x the plain dispatch loop's cost per
+      // block. Opt in for engines where cross-instance tail calls are cheap.
+      if (globalThis.RV64_TAILCALL || process?.env?.RV_TAILCALL === "1") {
+        vm.ex.jit_set_tailcall?.(1);
+      }
+    } catch {
+      /* no tail calls: chaining stays off */
+    }
     return vm;
   }
 
@@ -203,7 +241,26 @@ export class RV64 {
 
 // ---- full-system (boot Linux) API — appended to class via prototype ----
 
-RV64.prototype.bootLinux = function ({ bios, kernel, disk, cmdline, ramMB = 128 }) {
+/**
+ * Boot Linux.
+ *
+ * `fsTar`/`fsTag` export a tar archive as a virtio-9p filesystem the guest can
+ * mount (`mount -t 9p -o trans=virtio,version=9p2000.L <fsTag> /mnt`); there is
+ * no host filesystem in a browser, so the export is an in-memory tree.
+ * `net: true` adds a NIC — call `connectNet(url)` to give its frames somewhere
+ * to go.
+ */
+RV64.prototype.bootLinux = function ({
+  bios,
+  kernel,
+  disk,
+  cmdline,
+  ramMB = 128,
+  fsTar,
+  fsTag,
+  net = false,
+  netMac,
+}) {
   const stage = (bytes, fn) => {
     if (!bytes) return;
     const ptr = this.ex.staging_alloc(bytes.length);
@@ -214,7 +271,41 @@ RV64.prototype.bootLinux = function ({ bios, kernel, disk, cmdline, ramMB = 128 
   stage(kernel, () => this.ex.sys_stage_kernel());
   stage(disk, () => this.ex.sys_stage_disk());
   if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.sys_stage_cmdline());
+  stage(fsTar, () => this.ex.sys_stage_fs_tar());
+  if (fsTag) stage(new TextEncoder().encode(fsTag), () => this.ex.sys_stage_fs_tag());
+  if (netMac) stage(new Uint8Array(netMac), () => this.ex.sys_stage_net_mac());
+  this.ex.sys_net_enable(net ? 1 : 0);
   this.ex.sys_boot(ramMB);
+};
+
+/**
+ * Attach the guest's NIC to a WebSocket relay: one binary message per Ethernet
+ * frame (websockproxy / v86's protocol). Returns the socket.
+ *
+ * The relay is what makes guest networking possible without privileges — it
+ * holds them and does the NAT, so the emulator stays a pure layer-2 device.
+ */
+RV64.prototype.connectNet = function (url) {
+  const ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  // Frames sent before the socket opens would throw; drop them the way a NIC
+  // drops frames on a down link.
+  this.onNetSend = (frame) => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(frame);
+  };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") return; // not our protocol
+    this.netInput(new Uint8Array(ev.data));
+  };
+  this.net = ws;
+  return ws;
+};
+
+/** Deliver one inbound Ethernet frame to the guest's NIC. */
+RV64.prototype.netInput = function (frame) {
+  const ptr = this.ex.staging_alloc(frame.length);
+  new Uint8Array(this.ex.memory.buffer, ptr, frame.length).set(frame);
+  this.ex.sys_net_input();
 };
 
 /** Run a slice of the booted system. Returns true when powered off. */

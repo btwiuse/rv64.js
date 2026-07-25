@@ -1,13 +1,19 @@
 //! rv64-boot: boot a riscv64 Linux system natively (development harness).
 //!
 //! Usage: rv64-boot <bbl64.bin> [kernel.bin] [rootfs.bin] [--9p DIR]
-//!                  [--9p-tag TAG] [-- cmdline]
+//!                  [--9p-tag TAG] [--net ws://HOST:PORT] [--net-mac MAC]
+//!                  [-- cmdline]
 //! Console on stdio. Ctrl-A x to exit (screen/QEMU style).
 //!
 //! `--9p DIR` exports a host directory over virtio-9p; in the guest:
 //!   mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
+//!
+//! `--net ws://HOST:PORT` attaches a virtio-net NIC to a WebSocket relay (one
+//! binary message per Ethernet frame — websockproxy/v86's protocol). In the
+//! guest, configure it however the relay's network expects, e.g.
+//!   udhcpc -i eth0
 
-use rv64_system::{p9, p9fs, BootImages, Machine};
+use rv64_system::{p9, p9fs, ws, BootImages, Machine};
 use std::io::{Read, Write};
 
 fn main() {
@@ -19,17 +25,27 @@ fn main() {
     }
     let mut share = None;
     let mut tag = "host".to_string();
+    let mut relay_url = None;
+    let mut mac = rv64_system::virtio::DEFAULT_MAC;
     let mut positional = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--9p" => share = it.next(),
             "--9p-tag" => tag = it.next().unwrap_or(tag),
+            "--net" => relay_url = it.next(),
+            "--net-mac" => {
+                mac = it
+                    .next()
+                    .as_deref()
+                    .and_then(parse_mac)
+                    .unwrap_or_else(|| { eprintln!("bad --net-mac"); std::process::exit(2) })
+            }
             _ => positional.push(a),
         }
     }
     if positional.is_empty() {
-        eprintln!("usage: rv64-boot <bios> [kernel] [disk] [--9p DIR] [--9p-tag TAG] [-- cmdline]");
+        eprintln!("usage: rv64-boot <bios> [kernel] [disk] [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT] [--net-mac MAC] [-- cmdline]");
         std::process::exit(2);
     }
     let bios = std::fs::read(&positional[0]).expect("read bios");
@@ -43,6 +59,22 @@ fn main() {
         eprintln!("[rv64-boot] 9p: exporting {dir} as tag '{tag}'");
         p9::Server::new(tag, Box::new(p9fs::HostFs::new(dir)))
     });
+    // Connect the relay before booting: a NIC the guest can see but that has
+    // nowhere to send is worse than no NIC at all.
+    let mut relay = match &relay_url {
+        Some(url) => match ws::Relay::connect(url) {
+            Ok(r) => {
+                eprintln!("[rv64-boot] net: relay {url}, mac {}", fmt_mac(&mac));
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!("[rv64-boot] net: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+    let net = relay.is_some().then_some(mac);
 
     let mut m = Machine::new(
         128,
@@ -52,6 +84,7 @@ fn main() {
             cmdline: &cmdline,
             disk,
             fs,
+            net,
         },
     );
 
@@ -75,6 +108,20 @@ fn main() {
         if !out.is_empty() {
             std::io::stdout().write_all(&out).unwrap();
             std::io::stdout().flush().unwrap();
+        }
+
+        // Pump the relay both ways once per slice.
+        if let Some(r) = relay.as_mut() {
+            for frame in m.net_take_output() {
+                r.send(&frame);
+            }
+            for frame in r.recv() {
+                m.net_input(&frame);
+            }
+            if r.is_closed() {
+                eprintln!("\r\n[rv64-boot] net: relay closed");
+                relay = None;
+            }
         }
 
         let mut buf = [0u8; 256];
@@ -116,6 +163,23 @@ fn main() {
             return;
         }
     }
+}
+
+/// Parse `52:54:00:12:34:56`.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for byte in out.iter_mut() {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
+}
+
+fn fmt_mac(mac: &[u8; 6]) -> String {
+    mac.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// Scrape printk text out of guest RAM (development aid): find

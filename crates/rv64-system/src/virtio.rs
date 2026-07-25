@@ -1,6 +1,6 @@
 //! virtio-mmio (version 2, "modern") transport with split virtqueues, plus
-//! console, block and 9p filesystem backends. Register layout mirrors TinyEMU's
-//! virtio.c (which follows the virtio 1.0 spec).
+//! console, block, 9p filesystem and network backends. Register layout mirrors
+//! TinyEMU's virtio.c (which follows the virtio 1.0 spec).
 
 /// Device backends the transport can host.
 pub enum Backend {
@@ -11,9 +11,41 @@ pub enum Backend {
     /// virtio-9p (device id 9): host filesystem sharing. One queue, carrying
     /// 9P2000.L messages that `p9::Server` answers.
     Fs { srv: crate::p9::Server },
+    /// virtio-net (device id 1). RX = queue 0, TX = queue 1.
+    ///
+    /// The device works purely at layer 2: it moves whole Ethernet frames
+    /// between the guest's queues and these two mailboxes, and knows nothing
+    /// about ARP, IP or TCP. Where the frames actually go is the host layer's
+    /// problem — see `ws.rs` and `web/rv64.js` for the WebSocket relay.
+    Net {
+        mac: [u8; 6],
+        /// Frames from the host, awaiting an RX buffer from the guest.
+        inbox: Vec<Vec<u8>>,
+        /// Frames the guest has sent, awaiting collection by the host.
+        outbox: Vec<Vec<u8>>,
+    },
 }
 
 const MAX_QUEUES: usize = 2;
+
+/// Bytes of `struct virtio_net_hdr_v1` in front of every frame in both
+/// directions. 12 rather than 10 because we negotiate `VIRTIO_F_VERSION_1`,
+/// which makes the header carry `num_buffers` — Linux sizes `vi->hdr_len` on
+/// exactly that condition, so a 10-byte header would desynchronise every frame.
+const NET_HDR_LEN: usize = 12;
+
+/// Largest frame we will move: Ethernet MTU + header + VLAN slack.
+const NET_MAX_FRAME: usize = 1600;
+
+/// MAC handed to the guest unless the caller picks one. Locally administered
+/// (bit 1 of the first octet), unicast. Two guests sharing one relay must NOT
+/// share this — give the second a different address.
+pub const DEFAULT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+/// How many frames may queue up in either direction before we drop. A guest
+/// that stops posting RX buffers, or a host that stops collecting, must not
+/// grow our memory without bound.
+const NET_QUEUE_LIMIT: usize = 256;
 
 fn vio_dbg() -> bool {
     use std::sync::OnceLock;
@@ -66,6 +98,7 @@ impl VirtioDev {
             Backend::Console { .. } => 3,
             Backend::Block { .. } => 2,
             Backend::Fs { .. } => 9,
+            Backend::Net { .. } => 1,
         }
     }
 
@@ -78,6 +111,11 @@ impl VirtioDev {
                 // bit 0: VIRTIO_9P_MOUNT_TAG — config space carries the tag
                 // the guest mounts by. Without it the driver refuses to probe.
                 Backend::Fs { .. } => 1,
+                // bit 5: VIRTIO_NET_F_MAC — the MAC in config space is ours to
+                // give. Offering nothing else keeps the driver off checksum
+                // offload, GSO and mergeable RX buffers, none of which a
+                // frame-shuffling device benefits from.
+                Backend::Net { .. } => 1 << 5,
                 _ => 0,
             },
             _ => 0,
@@ -231,7 +269,38 @@ impl VirtioDev {
                     _ => tag.get(off as usize - 2).copied().unwrap_or(0),
                 }
             }
+            Backend::Net { mac, .. } => {
+                // struct virtio_net_config { u8 mac[6]; le16 status; ... }
+                // status stays 0: VIRTIO_NET_F_STATUS is not offered, so the
+                // driver assumes the link is up and never reads it.
+                mac.get(off as usize).copied().unwrap_or(0)
+            }
         }
+    }
+
+    /// Queue a frame from the host for delivery to the guest. Dropped if the
+    /// guest is not draining — the same thing a real NIC does when its ring
+    /// backs up.
+    pub fn net_input(&mut self, frame: &[u8]) {
+        if let Backend::Net { inbox, .. } = &mut self.backend {
+            if frame.len() <= NET_MAX_FRAME && inbox.len() < NET_QUEUE_LIMIT {
+                inbox.push(frame.to_vec());
+            }
+        }
+    }
+
+    /// Collect the frames the guest has transmitted.
+    pub fn net_take_output(&mut self) -> Vec<Vec<u8>> {
+        if let Backend::Net { outbox, .. } = &mut self.backend {
+            core::mem::take(outbox)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// True when this device has inbound frames waiting for an RX buffer.
+    pub fn net_rx_pending(&self) -> bool {
+        matches!(&self.backend, Backend::Net { inbox, .. } if !inbox.is_empty())
     }
 
     // ---- virtqueue processing ------------------------------------------
@@ -413,6 +482,68 @@ impl VirtioDev {
                     pos += n;
                 }
                 Some(pos as u32)
+            }
+            Backend::Net { inbox, outbox, .. } => {
+                if qi == 0 {
+                    // RX: hand the oldest inbound frame to the guest, prefixed
+                    // by a zeroed virtio_net_hdr_v1. No frame means we leave the
+                    // buffer on the ring for later rather than consuming it.
+                    if inbox.is_empty() {
+                        return None;
+                    }
+                    let frame = &inbox[0];
+                    let need = NET_HDR_LEN + frame.len();
+                    let capacity: usize = chain
+                        .iter()
+                        .filter(|&&(_, _, writable)| writable)
+                        .map(|&(_, len, _)| len as usize)
+                        .sum();
+                    if capacity < need {
+                        // The frame cannot fit the buffer the guest offered.
+                        // Drop it: keeping it would wedge the queue forever.
+                        inbox.remove(0);
+                        return None;
+                    }
+                    let mut hdr = [0u8; NET_HDR_LEN];
+                    // num_buffers = 1: this frame occupies exactly one chain.
+                    hdr[10] = 1;
+                    let mut written = 0usize;
+                    let mut src: Vec<u8> = hdr.to_vec();
+                    src.extend_from_slice(frame);
+                    for &(addr, len, writable) in chain {
+                        if !writable || written >= src.len() {
+                            continue;
+                        }
+                        let n = (src.len() - written).min(len as usize);
+                        match guest_slice_mut(ram, ram_base, addr, n as u32) {
+                            Some(d) => d.copy_from_slice(&src[written..written + n]),
+                            None => break,
+                        }
+                        written += n;
+                    }
+                    inbox.remove(0);
+                    Some(written as u32)
+                } else {
+                    // TX: reassemble the frame from the readable descriptors and
+                    // strip the header the guest prepended.
+                    let mut frame = Vec::new();
+                    for &(addr, len, writable) in chain {
+                        if writable {
+                            continue;
+                        }
+                        match guest_slice(ram, ram_base, addr, len) {
+                            Some(s) => frame.extend_from_slice(s),
+                            None => return Some(0),
+                        }
+                    }
+                    if frame.len() > NET_HDR_LEN
+                        && frame.len() - NET_HDR_LEN <= NET_MAX_FRAME
+                        && outbox.len() < NET_QUEUE_LIMIT
+                    {
+                        outbox.push(frame[NET_HDR_LEN..].to_vec());
+                    }
+                    Some(0)
+                }
             }
         }
     }

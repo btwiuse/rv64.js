@@ -30,6 +30,9 @@ extern "C" {
     /// jit_out_ptr/jit_out_len), append its `run` function to this module's
     /// exported function table, and return the table index (-1 on failure).
     fn host_jit_register() -> i32;
+    /// One Ethernet frame the guest transmitted, for the page to forward over
+    /// its WebSocket relay. Called at quantum granularity, like host_write.
+    fn host_net_send(ptr: *const u8, len: usize);
     /// Async variant for large modules (page superblocks): compiles on V8
     /// background threads; sys_sb_ready(ticket, idx) fires between runSystem
     /// calls when the function is in the table (idx -1 = failed).
@@ -229,6 +232,7 @@ struct JitBlock {
 /// the whole JitBlock (pa/n live in `cache` and are only needed on the rare
 /// verify path).
 #[derive(Clone, Copy)]
+#[repr(C)] // compiled blocks read lines directly: pc @0, idx @8, gen @12
 struct DispatchLine {
     pc: u64,
     /// Function-table index (JitBlock.idx; < 0 = blacklisted sentinel).
@@ -429,7 +433,7 @@ struct PendingSb {
 /// a host dispatch (measured: nbench NUMERIC SORT ran its sift loop as six
 /// 2-10 instruction blocks, 5.6 insns per dispatch, because the loop sits
 /// across a page boundary).
-const MAX_REGION_PAGES: usize = 3;
+const MAX_REGION_PAGES: usize = 8;
 static mut PENDING_SB: Vec<PendingSb> = Vec::new();
 static mut NEXT_SB_TICKET: u64 = 1;
 // Superblock lifecycle counters (diagnostic, jit_stat 10..14).
@@ -751,6 +755,10 @@ const MAX_LEADERS: usize = 512;
 #[inline]
 fn call_block(idx: i32, state_ptr: *mut u8) {
     unsafe {
+        // The retirement cell is CUMULATIVE across one host dispatch: blocks
+        // ADD what they retire (tail-call transfers keep accumulating without
+        // returning here), so it must start each chain at zero.
+        RETIRED_CELL = 0;
         let f: extern "C" fn(i32) = core::mem::transmute(idx as usize);
         f(state_ptr as i32);
     }
@@ -783,6 +791,9 @@ pub extern "C" fn sbtest() -> u64 {
             fuel_addr: 0,
             mstatus_addr: 0,
             copystat_addr: 0,
+            dispatch_base: 0,
+            dispatch_mask: 0,
+            map_gen_addr: 0,
         };
         let entries = [0x1000u64, 0x100c];
         let blk = match rv64_jit::translate_superblock(&code, base, 0x1000, 0x40, &entries, lay) {
@@ -866,6 +877,9 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     fuel_addr: fuel_addr(),
                     mstatus_addr: 0, // user mode: no privileged FP state
                     copystat_addr: 0,
+                    dispatch_base: 0,
+                    dispatch_mask: 0,
+                    map_gen_addr: 0,
                 };
                 let end = (pc as usize + 1024).min(m.mem.len());
                 let entry = rv64_jit::translate_block(&m.mem[pc as usize..end], pc, pc, lay)
@@ -976,6 +990,10 @@ static mut SYS_BIOS: Vec<u8> = Vec::new();
 static mut SYS_KERNEL: Vec<u8> = Vec::new();
 static mut SYS_DISK: Vec<u8> = Vec::new();
 static mut SYS_CMDLINE: Vec<u8> = Vec::new();
+/// Optional 6-byte MAC for the NIC; empty means use the crate default.
+static mut SYS_NET_MAC: Vec<u8> = Vec::new();
+/// Whether sys_boot should give the machine a virtio-net device.
+static mut SYS_NET_ON: bool = false;
 /// tar archive staged for the virtio-9p export (see `sys_stage_fs_tar`).
 static mut SYS_FS_TAR: Vec<u8> = Vec::new();
 /// Mount tag the 9p export answers to; the guest mounts this name.
@@ -1004,6 +1022,17 @@ stage_into!(sys_stage_cmdline, SYS_CMDLINE);
 // `mount -t 9p -o trans=virtio,version=9p2000.L <tag> /mnt`.
 stage_into!(sys_stage_fs_tar, SYS_FS_TAR);
 stage_into!(sys_stage_fs_tag, SYS_FS_TAG);
+// Optional 6-byte MAC override for the NIC.
+stage_into!(sys_stage_net_mac, SYS_NET_MAC);
+
+/// Give the next-booted machine a virtio-net NIC. Frames the guest sends arrive
+/// via the `host_net_send` import; feed inbound frames back with
+/// `sys_net_input`. The page supplies the transport (a WebSocket to a relay) —
+/// the emulator only moves layer-2 frames.
+#[no_mangle]
+pub extern "C" fn sys_net_enable(on: u32) {
+    unsafe { SYS_NET_ON = on != 0 }
+}
 
 /// Assemble and boot the machine from the staged images.
 #[no_mangle]
@@ -1025,6 +1054,10 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
             mem.load_tar(&core::mem::take(&mut SYS_FS_TAR));
             Some(rv64_system::p9::Server::new(tag, Box::new(mem)))
         };
+        let net = SYS_NET_ON.then(|| {
+            <[u8; 6]>::try_from(SYS_NET_MAC.as_slice())
+                .unwrap_or(rv64_system::virtio::DEFAULT_MAC)
+        });
         let m = rv64_system::Machine::new(
             ram_mb as usize,
             rv64_system::BootImages {
@@ -1041,6 +1074,7 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
                     Some(core::mem::take(&mut SYS_DISK))
                 },
                 fs,
+                net,
             },
         );
         SYS_BIOS = Vec::new();
@@ -1093,6 +1127,9 @@ fn jit_layout(m: &rv64_system::Machine) -> rv64_jit::JitLayout {
         fuel_addr: fuel_addr(),
         mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
         copystat_addr: copystat_addr(),
+        dispatch_base: 0,
+        dispatch_mask: 0,
+        map_gen_addr: 0,
     }
 }
 
@@ -1109,7 +1146,10 @@ fn build_superblock(
     pa_page: u64,
     sb_compiles: u32,
 ) -> bool {
-    let lay = jit_layout(m);
+    let mut lay = jit_layout(m);
+    lay.dispatch_base = jit.dispatch.as_ptr() as u32;
+    lay.dispatch_mask = (DISPATCH_SIZE - 1) as u32;
+    lay.map_gen_addr = m.cpu.jit_map_gen_ptr() as u32;
     let mut issued = false;
     let n_entries = jit.page_entries.get(&(aspace, vpage)).map_or(0, |e| e.len());
                         // Enough individually-hot pcs: compile the page as
@@ -1132,31 +1172,65 @@ fn build_superblock(
                                 && ((pa & !0xfff) - rv64_system::RAM_BASE) as usize + 0x1000
                                     <= m.bus.ram.len()
                         };
-                        // Extend only where the hot code actually runs off
-                        // the edge of the page: a hot block within a block's
-                        // reach of the boundary means the loop or function
-                        // continues on the neighbour. Pages whose hot code
-                        // sits in the middle stay single-page — a bigger
-                        // wasm function is slower to compile and register-
+                        // Grow the region where the guest's hot code says to:
+                        // a virtually contiguous neighbour joins if it has hot
+                        // pcs of its own (a statically linked binary's .text is
+                        // contiguous, so a caller and its callee a few pages
+                        // apart are exactly this case — the compile row ran at
+                        // 9 insns/dispatch because every cross-page call was a
+                        // host dispatch), or if this page's hot code sits
+                        // within a block's reach of the shared edge. Pages
+                        // whose hot code is self-contained stay single-page:
+                        // a bigger function is slower to compile and register-
                         // allocates worse, so growth has to pay for itself.
                         const EDGE: u64 = 0x80;
                         let seeds = jit.page_entries[&(aspace, vpage)].clone();
+                        let hot = |jit: &JitState, va: u64| {
+                            jit.page_entries
+                                .get(&(aspace, va))
+                                .is_some_and(|e| !e.is_empty())
+                        };
                         let mut pages: Vec<(u64, u64)> = vec![(vpage, pa_page)];
-                        let grow = MAX_REGION_PAGES > 1;
-                        if grow && seeds.iter().any(|&e| (e & 0xfff) >= 0x1000 - EDGE) {
-                            let va = vpage + 0x1000;
+                        let edge_fwd =
+                            seeds.iter().any(|&e| (e & 0xfff) >= 0x1000 - EDGE);
+                        let mut va = vpage + 0x1000;
+                        while pages.len() < MAX_REGION_PAGES
+                            && (hot(jit, va) || (va == vpage + 0x1000 && edge_fwd))
+                        {
                             match m.cpu.jit_probe_fetch(&mut m.bus, va) {
                                 Some(p) if ram_ok(m, p) => pages.push((va, p & !0xfff)),
-                                _ => {}
+                                _ => break,
                             }
+                            va += 0x1000;
                         }
-                        if grow && vpage >= 0x1000 && seeds.iter().any(|&e| (e & 0xfff) < EDGE) {
-                            let va = vpage - 0x1000;
+                        let edge_bwd = seeds.iter().any(|&e| (e & 0xfff) < EDGE);
+                        let mut va = vpage.wrapping_sub(0x1000);
+                        while va < vpage
+                            && pages.len() < MAX_REGION_PAGES
+                            && (hot(jit, va)
+                                || (va == vpage - 0x1000 && edge_bwd))
+                        {
                             match m.cpu.jit_probe_fetch(&mut m.bus, va) {
                                 Some(p) if ram_ok(m, p) => pages.insert(0, (va, p & !0xfff)),
-                                _ => {}
+                                _ => break,
                             }
+                            va = va.wrapping_sub(0x1000);
                         }
+                        // Seeds come from every page in the region, so
+                        // discovery reaches the neighbours' functions too.
+                        let seeds: Vec<u64> = {
+                            let mut v = seeds;
+                            for &(pva, _) in &pages {
+                                if pva != vpage {
+                                    if let Some(e) = jit.page_entries.get(&(aspace, pva)) {
+                                        v.extend_from_slice(e);
+                                    }
+                                }
+                            }
+                            v.sort_unstable();
+                            v.dedup();
+                            v
+                        };
                         let mut start_va = pages[0].0;
                         let mut span = (pages.len() * 0x1000) as u64;
                         let mut code = Vec::with_capacity(span as usize);
@@ -1219,10 +1293,14 @@ fn build_superblock(
                             // marked done: a neighbour pulled into this
                             // region still gets to build its own region for
                             // the code this one didn't reach.
-                            jit.superblocked.insert((aspace, vpage)); // in flight
-                            // This build answers the misses recorded so far;
-                            // only misses AFTER it argue for another rebuild.
-                            jit.sb_missed.remove(&(aspace, vpage));
+                            // Every page the region covers is superblocked,
+                            // and this build answers the misses recorded so
+                            // far on each — only misses AFTER it argue for a
+                            // rebuild.
+                            for &(pva, _) in &pages {
+                                jit.superblocked.insert((aspace, pva));
+                                jit.sb_missed.remove(&(aspace, pva));
+                            }
                             // Only a rebuild that covered nothing new counts
                             // against the allowance: a page whose hot set is
                             // still growing must be able to keep up, or code
@@ -1555,6 +1633,9 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             fuel_addr: fuel_addr(),
                             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
                             copystat_addr: copystat_addr(),
+                            dispatch_base: jit.dispatch.as_ptr() as u32,
+                            dispatch_mask: (DISPATCH_SIZE - 1) as u32,
+                            map_gen_addr: m.cpu.jit_map_gen_ptr() as u32,
                         };
                         let vpage = pc & !0xfff;
                         let pa_page = pa & !0xfff;
@@ -1785,13 +1866,30 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         if !out.is_empty() {
             unsafe { host_write(1, out.as_ptr(), out.len()) }
         }
+        for frame in m.net_take_output() {
+            unsafe { host_net_send(frame.as_ptr(), frame.len()) }
+        }
     }
 
     let out = m.console_output();
     if !out.is_empty() {
         unsafe { host_write(1, out.as_ptr(), out.len()) }
     }
+        for frame in m.net_take_output() {
+            unsafe { host_net_send(frame.as_ptr(), frame.len()) }
+        }
     m.power_off as i32
+}
+
+/// Deliver one inbound Ethernet frame (staged via staging_alloc) to the NIC.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_net_input() {
+    let m = unsafe { SYS.as_mut().expect("call sys_boot() first") };
+    unsafe {
+        let frame = core::mem::take(&mut STAGING);
+        m.net_input(&frame);
+    }
 }
 
 /// Send keyboard bytes (staged via staging_alloc) to the guest console.
@@ -1924,6 +2022,9 @@ pub extern "C" fn sb_analyze(vpage: u64, which: u32) -> u64 {
             fuel_addr: fuel_addr(),
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),
+            dispatch_base: 0,
+            dispatch_mask: 0,
+            map_gen_addr: 0,
         };
         let empty = Vec::new();
         let aspace = m.cpu.sys.as_ref().map_or(0, |c| c.satp);
@@ -1999,6 +2100,9 @@ pub extern "C" fn sb_analyze_pc(pc: u64, which: u32) -> u64 {
             fuel_addr: fuel_addr(),
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),
+            dispatch_base: 0,
+            dispatch_mask: 0,
+            map_gen_addr: 0,
         };
         let code = &m.bus.ram[off..end];
         match which {
@@ -2039,6 +2143,13 @@ pub extern "C" fn sb_debug(vpage: u64) -> u64 {
 #[no_mangle]
 pub extern "C" fn sb_trace_pc(pc: u64) {
     unsafe { TRACE_PC = pc };
+}
+
+/// Enable direct block-to-block tail-call chaining (host feature-detects
+/// wasm tail-call support first).
+#[no_mangle]
+pub extern "C" fn jit_set_tailcall(on: u32) {
+    rv64_jit::set_chain(on != 0);
 }
 
 /// Toggle host-filled TLB misses inside compiled blocks (perf A/B).

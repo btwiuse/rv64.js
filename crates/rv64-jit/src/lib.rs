@@ -49,6 +49,12 @@ const TPC: u32 = 6;
 /// Resolved fused-TLB offset for the access in flight (set on the hit path or
 /// by the host's tlb_fill call).
 const SCR2: u32 = 7;
+/// Fuel remaining for THIS call: FUEL_CELL minus the instructions already
+/// retired by earlier blocks of the same tail-call chain (see RETIRED_CELL's
+/// cumulative contract). Loop/superblock yields compare ITER against this.
+const BASE: u32 = 8;
+/// i64 scratch for the chain stub (holds the next pc while it checks the line).
+const CPC: u32 = 9;
 
 /// Host-filled TLB misses inside compiled code (see tlb_idx_tag_fill).
 /// DEFAULT OFF, measured: it removes 1.2M bails from an in-guest `tcc -c` for
@@ -57,6 +63,16 @@ const SCR2: u32 = 7;
 /// never misses. Kept switchable — a guest with a larger working set than the
 /// 4096-entry TLB is exactly where it would pay off.
 static TLB_FILL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Direct block-to-block transfer via wasm tail calls (return_call_indirect).
+/// Enabled by the host after feature-detecting tail-call support; blocks
+/// compiled while off simply return to the dispatch loop as before.
+static CHAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_chain(on: bool) {
+    CHAIN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+fn chain_enabled() -> bool {
+    CHAIN.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub fn set_tlb_fill(on: bool) {
     TLB_FILL.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -65,7 +81,7 @@ fn tlb_fill_enabled() -> bool {
 }
 /// Total i64 scratch locals to declare (register locals follow next; the
 /// i32 IDXB local follows all i64 locals, so its index is dynamic).
-const N_I64_LOCALS: u32 = 7;
+const N_I64_LOCALS: u32 = 9;
 
 /// Full-system memory access layout: emitted loads/stores probe the
 /// interpreter's own Load/Store TLBs inline; on a hit within guest RAM
@@ -113,6 +129,13 @@ pub struct JitLayout {
     /// instructions). 0 = legacy fixed LOOP_CAP (tests/tools that don't
     /// meter fuel).
     pub fuel_addr: u32,
+    /// Direct block chaining (tail calls): base address of the host's
+    /// dispatch-line array ({pc: u64, idx: i32, gen: u32} x (mask+1)), the
+    /// entry-index mask, and the address of cpu.map_gen. Zero = no chaining
+    /// (user mode, diagnostics).
+    pub dispatch_base: u32,
+    pub dispatch_mask: u32,
+    pub map_gen_addr: u32,
     /// Linear-memory offset of mstatus (system mode), or 0. When set, every
     /// compiled FP instruction bails unless mstatus.FS == Dirty — FS=Off must
     /// trap and Initial/Clean must transition to Dirty; one interpreter step
@@ -134,6 +157,9 @@ impl JitLayout {
             f_base: 0,
             fcsr_addr: 0,
             fuel_addr: 0,
+            dispatch_base: 0,
+            dispatch_mask: 0,
+            map_gen_addr: 0,
             mstatus_addr: 0,
             copystat_addr: 0,
         }
@@ -1076,10 +1102,16 @@ impl Ctx {
         m.local_get(VA).op(I32_WRAP_I64);
     }
 
-    /// Write the retired-instruction count for this block exit.
+    /// ADD this block's retired count to the retirement cell. The cell is
+    /// CUMULATIVE across one host dispatch: the host zeroes it before the
+    /// first block of a chain, every block adds what it retired, and
+    /// tail-call transfers between blocks leave it accumulating — so the
+    /// host reads the whole chain's total no matter how many blocks ran.
     fn set_retired(&self, m: &mut WasmModule, n: u32) {
-        m.i32_const(0)
-            .i64_const(n as i64)
+        m.i32_const(0);
+        m.i32_const(0).i64_load(self.lay.retired_addr as u64);
+        m.i64_const(n as i64)
+            .op(I64_ADD)
             .i64_store(self.lay.retired_addr as u64);
     }
 
@@ -1094,7 +1126,10 @@ impl Ctx {
             // segments/bodies flushed so far; `n` is the compile-time count of
             // instructions completed since that flush. Reporting ITER alone
             // undercounted, corrupting insn_count/minstret/clock/fuel.
-            m.i32_const(0).local_get(l);
+            // Cumulative-cell contract as in set_retired.
+            m.i32_const(0);
+            m.i32_const(0).i64_load(self.lay.retired_addr as u64);
+            m.local_get(l).op(I64_ADD);
             if n > 0 {
                 m.i64_const(n as i64).op(I64_ADD);
             }
@@ -1958,7 +1993,9 @@ fn build_ctx(
             None
         },
     };
-    let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp + n_fma + n_flags, 1);
+    // Two i32 locals: IDXB (TLB/dispatch index math) and IDXB+1 (the chain
+    // stub's function-table index).
+    let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp + n_fma + n_flags, 2);
     let mut t = touched;
     while t != 0 {
         let r = t.trailing_zeros() as usize;
@@ -2013,6 +2050,88 @@ fn fp_needs_round(insn: u32) -> bool {
 }
 
 /// Evaluate the FP gate's two conditions into the hoisted flag locals.
+/// BASE = fuel granted for this call = FUEL_CELL - RETIRED_CELL (clamped at
+/// zero). The subtraction matters under tail-call chaining: earlier blocks of
+/// the chain already consumed part of the grant, and their count sits in the
+/// cumulative retirement cell. Without chaining the cell is zero at entry and
+/// BASE == FUEL_CELL exactly as before.
+fn emit_fuel_base(c: &Ctx, m: &mut WasmModule) {
+    if c.lay.fuel_addr == 0 {
+        m.i64_const(LOOP_CAP as i64).local_set(BASE);
+        return;
+    }
+    m.i32_const(0).i64_load(c.lay.fuel_addr as u64);
+    m.i32_const(0).i64_load(c.lay.retired_addr as u64);
+    m.op(I64_SUB).local_set(BASE);
+    m.local_get(BASE).i64_const(0).op(I64_LT_S);
+    m.op(IF).op(VOID);
+    m.i64_const(0).local_set(BASE);
+    m.op(END);
+}
+
+/// Chain exit: after a block has stored its successor pc and ADDED its
+/// retired count, try to transfer STRAIGHT to the next compiled block with a
+/// tail call instead of returning to the host dispatch loop. The checks are
+/// exactly the host fast path's — line.pc match, non-blacklisted index,
+/// map generation, fuel — read from the same memory the host reads, so a
+/// transfer happens only where the host would have dispatched anyway. Any
+/// failed check falls back to a plain return (the host handles it). Blocks
+/// that bailed must NOT chain (the interpreter owns the next instruction);
+/// `iter_guard` additionally refuses to transfer when this call retired
+/// nothing (a fuel-exhausted or off-entry exit) — a zero-progress transfer
+/// to the same pc would tail-loop forever.
+fn emit_chain_exit(c: &Ctx, m: &mut WasmModule, iter_guard: bool) {
+    let lay = &c.lay;
+    if !chain_enabled()
+        || lay.sys.is_none()
+        || lay.dispatch_base == 0
+        || lay.fuel_addr == 0
+    {
+        return;
+    }
+    if iter_guard {
+        m.local_get(ITER).op(I64_EQZ);
+        m.op(IF).op(VOID).op(RETURN).op(END);
+    }
+    m.use_table();
+    let idx2 = c.idxb + 1;
+    // CPC = the successor pc the block just stored.
+    m.i32_const(0).i64_load(lay.pc_addr as u64).local_set(CPC);
+    // line byte offset = ((pc >> 1) & mask) << 4
+    m.local_get(CPC)
+        .i64_const(1)
+        .op(I64_SHR_U)
+        .op(I32_WRAP_I64)
+        .i32_const(lay.dispatch_mask as i32)
+        .op(I32_AND)
+        .i32_const(4)
+        .op(I32_SHL)
+        .local_set_i32(c.idxb);
+    // line.pc == pc?
+    m.local_get_i32(c.idxb).i64_load_at(lay.dispatch_base as u64);
+    m.local_get(CPC).op(I64_NE);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+    // idx >= 0 (blacklist sentinels carry -1)?
+    m.local_get_i32(c.idxb)
+        .i32_load(lay.dispatch_base as u64 + 8)
+        .local_set_i32(idx2);
+    m.local_get_i32(idx2).i32_const(0).op(I32_LT_S);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+    // line verified under the current address-space generation?
+    m.local_get_i32(c.idxb).i32_load(lay.dispatch_base as u64 + 12);
+    m.i32_const(0).i32_load(lay.map_gen_addr as u64);
+    m.op(I32_NE);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+    // fuel left in this grant?
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.i32_const(0).i64_load(lay.fuel_addr as u64);
+    m.op(I64_GE_U);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+    m.local_get(0); // the machine-state pointer parameter, passed along
+    m.local_get_i32(idx2);
+    m.return_call_indirect(0);
+}
+
 fn emit_fp_flags(c: &Ctx, m: &mut WasmModule) {
     let Some((fs_bad, round_bad)) = c.fp_flags else {
         return;
@@ -2998,19 +3117,19 @@ fn translate_copy_loop(
     let adj = cl.w0 + if cl.bwd { cl.stride } else { 0 };
 
     m.i64_const(0).local_set(ITER);
+    emit_fuel_base(&c, &mut m);
     m.op(LOOP).op(VOID); // $head
     // fuel guard (safe yield at the loop head)
     m.local_get(ITER);
-    if lay.fuel_addr != 0 {
-        m.i32_const(0).i64_load(lay.fuel_addr as u64);
-    } else {
-        m.i64_const(LOOP_CAP as i64);
-    }
+    m.local_get(BASE);
     m.op(I64_GE_U);
     m.op(IF).op(VOID);
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, start_pc);
-    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
+    m.i32_const(0);
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    emit_chain_exit(&c, &mut m, true);
     m.op(RETURN);
     m.op(END);
 
@@ -3174,7 +3293,10 @@ fn translate_copy_loop(
     m.local_get(rn).op(I64_LT_U).br_if(0);
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, cl.end_pc);
-    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
+    m.i32_const(0);
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    emit_chain_exit(&c, &mut m, true);
     m.op(RETURN);
     m.op(END); // loop
 
@@ -3332,6 +3454,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 c.flush_writes(&mut m);
                 c.set_pc_const(&mut m, target);
                 c.set_retired(&mut m, n + 1);
+                emit_chain_exit(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
                     len: next_pc - start_pc,
@@ -3357,6 +3480,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
                 c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
+                emit_chain_exit(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
                     len: next_pc - start_pc,
@@ -3385,6 +3509,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 m.op(END);
                 c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
+                emit_chain_exit(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
                     len: next_pc - start_pc,
@@ -3402,6 +3527,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, pc);
     c.set_retired(&mut m, n);
+    emit_chain_exit(&c, &mut m, false);
     Some(Block {
         wasm: m.finish(),
         len: pc - start_pc,
@@ -3426,6 +3552,7 @@ fn translate_loop(
     lay: &JitLayout,
 ) -> Option<Block> {
     m.i64_const(0).local_set(ITER); // ITER = retired-instruction accumulator
+    emit_fuel_base(c, &mut m);
     // Scope stack entry: (kind, close_pc, header). kind 0=block 1=loop 2=if.
     let mut scopes: Vec<(u8, u64, u64)> = Vec::new();
     let mut pc = start_pc;
@@ -3472,16 +3599,15 @@ fn translate_loop(
             // Fuel = min(caller budget, interrupt quantum), granted per
             // dispatch by the host (P0: budget/interrupt-latency contract).
             m.local_get(ITER);
-            if lay.fuel_addr != 0 {
-                m.i32_const(0).i64_load(lay.fuel_addr as u64);
-            } else {
-                m.i64_const(LOOP_CAP as i64);
-            }
+            m.local_get(BASE);
             m.op(I64_GE_U);
             m.op(IF).op(VOID);
             c.flush_writes(&mut m);
             c.set_pc_const(&mut m, h);
-            m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
+            m.i32_const(0);
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    emit_chain_exit(c, &mut m, true);
             m.op(RETURN);
             m.op(END);
         }
@@ -3566,7 +3692,10 @@ fn translate_loop(
     }
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, region.end_pc);
-    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
+    m.i32_const(0);
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    emit_chain_exit(c, &mut m, true);
     Some(Block {
         wasm: m.finish(),
         len: region.end_pc - start_pc,
@@ -4151,6 +4280,7 @@ pub fn translate_superblock(
     }
 
     m.i64_const(0).local_set(ITER); // retired accumulator
+    emit_fuel_base(&c, &mut m);
     m.i32_const(0).i64_load(lay.pc_addr as u64).local_set(TPC);
     emit_fp_flags(&c, &mut m);
     // Hoisted FP gate (see emit_block_fp_gate): FS == Dirty, NX sticky and
@@ -4168,11 +4298,7 @@ pub fn translate_superblock(
 
     // Fuel → yield to the host (budget + interrupt-latency contract).
     m.local_get(ITER);
-    if lay.fuel_addr != 0 {
-        m.i32_const(0).i64_load(lay.fuel_addr as u64);
-    } else {
-        m.i64_const(LOOP_CAP as i64);
-    }
+    m.local_get(BASE);
     m.op(I64_GE_U).br_if(1);
     // Bounds: offset = TPC - page_base; exit if offset >=u span (also catches
     // TPC < page_base, which wraps to a huge unsigned value).
@@ -4210,7 +4336,10 @@ pub fn translate_superblock(
     // Exit: flush registers, publish TPC + retired.
     c.flush_writes(&mut m);
     m.i32_const(0).local_get(TPC).i64_store(lay.pc_addr as u64);
-    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
+    m.i32_const(0);
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    emit_chain_exit(&c, &mut m, true);
 
     Some(Block {
         wasm: m.finish(),

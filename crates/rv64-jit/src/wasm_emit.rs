@@ -9,6 +9,9 @@ pub struct WasmModule {
     /// fused-TLB miss. It resolves to the host module's own exported function,
     /// so the call is wasm->wasm with no JS frame.
     wants_tlb_fill: bool,
+    /// Import `env.__indirect_function_table` so the block can tail-call the
+    /// next compiled block directly (see emit_chain_exit).
+    wants_table: bool,
 }
 
 // Opcodes we use.
@@ -78,6 +81,8 @@ pub const BR_IF: u8 = 0x0d;
 pub const BR_TABLE: u8 = 0x0e;
 pub const RETURN: u8 = 0x0f;
 pub const I32_SHR_U: u8 = 0x76;
+pub const I32_NE: u8 = 0x47;
+pub const I32_LT_S: u8 = 0x48;
 pub const I32_GE_U: u8 = 0x4f;
 pub const I32_SUB: u8 = 0x6b;
 pub const VOID: u8 = 0x40;
@@ -147,6 +152,7 @@ impl WasmModule {
             n_locals_i64,
             n_locals_i32: 0,
             wants_tlb_fill: false,
+            wants_table: false,
         }
     }
 
@@ -156,6 +162,7 @@ impl WasmModule {
             n_locals_i64,
             n_locals_i32,
             wants_tlb_fill: false,
+            wants_table: false,
         }
     }
 
@@ -165,6 +172,30 @@ impl WasmModule {
     /// function index 1).
     pub fn use_tlb_fill(&mut self) -> &mut Self {
         self.wants_tlb_fill = true;
+        self
+    }
+
+    pub fn use_table(&mut self) -> &mut Self {
+        self.wants_table = true;
+        self
+    }
+
+    /// return_call_indirect (tail call): pops [args..., i32 func_index] and
+    /// replaces the current frame with the callee — the transfer that lets
+    /// compiled blocks chain without growing the stack or re-entering the
+    /// host dispatch loop.
+    pub fn return_call_indirect(&mut self, type_idx: u32) -> &mut Self {
+        self.code.push(0x13);
+        uleb(&mut self.code, type_idx as u64);
+        uleb(&mut self.code, 0); // table 0 (the imported function table)
+        self
+    }
+
+    /// i32.load (align 2, constant offset).
+    pub fn i32_load(&mut self, offset: u64) -> &mut Self {
+        self.code.push(0x28);
+        uleb(&mut self.code, 2);
+        uleb(&mut self.code, offset);
         self
     }
 
@@ -291,8 +322,11 @@ impl WasmModule {
         }
         section(&mut m, 1, &sec);
 
-        // import section: env.memory (+ env.tlb_fill when the body uses it)
-        let mut sec = vec![if self.wants_tlb_fill { 2u8 } else { 1u8 }];
+        // import section: env.memory (+ env.tlb_fill and/or the function
+        // table when the body uses them)
+        let n_imports =
+            1 + u8::from(self.wants_tlb_fill) + u8::from(self.wants_table);
+        let mut sec = vec![n_imports];
         if self.wants_tlb_fill {
             // imported functions come first in the index space, so declare
             // tlb_fill (func 0) before memory; the body is then func 1.
@@ -307,6 +341,13 @@ impl WasmModule {
         sec.push(6);
         sec.extend_from_slice(b"memory");
         sec.extend_from_slice(&[0x02, 0x00, 0x01]); // memory, no-max, min 1
+        if self.wants_table {
+            sec.push(3);
+            sec.extend_from_slice(b"env");
+            sec.push(25);
+            sec.extend_from_slice(b"__indirect_function_table");
+            sec.extend_from_slice(&[0x01, 0x70, 0x00, 0x00]); // table funcref min 0
+        }
         section(&mut m, 2, &sec);
 
         // function section: 1 function of type 0
