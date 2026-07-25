@@ -49,12 +49,6 @@ const TPC: u32 = 6;
 /// Resolved fused-TLB offset for the access in flight (set on the hit path or
 /// by the host's tlb_fill call).
 const SCR2: u32 = 7;
-/// Fuel remaining for THIS call: FUEL_CELL minus the instructions already
-/// retired by earlier blocks of the same tail-call chain (see RETIRED_CELL's
-/// cumulative contract). Loop/superblock yields compare ITER against this.
-const BASE: u32 = 8;
-/// i64 scratch for the chain stub (holds the next pc while it checks the line).
-const CPC: u32 = 9;
 
 /// Host-filled TLB misses inside compiled code (see tlb_idx_tag_fill).
 /// DEFAULT OFF, measured: it removes 1.2M bails from an in-guest `tcc -c` for
@@ -63,16 +57,6 @@ const CPC: u32 = 9;
 /// never misses. Kept switchable — a guest with a larger working set than the
 /// 4096-entry TLB is exactly where it would pay off.
 static TLB_FILL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Direct block-to-block transfer via wasm tail calls (return_call_indirect).
-/// Enabled by the host after feature-detecting tail-call support; blocks
-/// compiled while off simply return to the dispatch loop as before.
-static CHAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub fn set_chain(on: bool) {
-    CHAIN.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-fn chain_enabled() -> bool {
-    CHAIN.load(std::sync::atomic::Ordering::Relaxed)
-}
 pub fn set_tlb_fill(on: bool) {
     TLB_FILL.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -81,7 +65,7 @@ fn tlb_fill_enabled() -> bool {
 }
 /// Total i64 scratch locals to declare (register locals follow next; the
 /// i32 IDXB local follows all i64 locals, so its index is dynamic).
-const N_I64_LOCALS: u32 = 9;
+const N_I64_LOCALS: u32 = 7;
 
 /// Full-system memory access layout: emitted loads/stores probe the
 /// interpreter's own Load/Store TLBs inline; on a hit within guest RAM
@@ -129,13 +113,6 @@ pub struct JitLayout {
     /// instructions). 0 = legacy fixed LOOP_CAP (tests/tools that don't
     /// meter fuel).
     pub fuel_addr: u32,
-    /// Direct block chaining (tail calls): base address of the host's
-    /// dispatch-line array ({pc: u64, idx: i32, gen: u32} x (mask+1)), the
-    /// entry-index mask, and the address of cpu.map_gen. Zero = no chaining
-    /// (user mode, diagnostics).
-    pub dispatch_base: u32,
-    pub dispatch_mask: u32,
-    pub map_gen_addr: u32,
     /// Linear-memory offset of mstatus (system mode), or 0. When set, every
     /// compiled FP instruction bails unless mstatus.FS == Dirty — FS=Off must
     /// trap and Initial/Clean must transition to Dirty; one interpreter step
@@ -157,9 +134,6 @@ impl JitLayout {
             f_base: 0,
             fcsr_addr: 0,
             fuel_addr: 0,
-            dispatch_base: 0,
-            dispatch_mask: 0,
-            map_gen_addr: 0,
             mstatus_addr: 0,
             copystat_addr: 0,
         }
@@ -1102,16 +1076,10 @@ impl Ctx {
         m.local_get(VA).op(I32_WRAP_I64);
     }
 
-    /// ADD this block's retired count to the retirement cell. The cell is
-    /// CUMULATIVE across one host dispatch: the host zeroes it before the
-    /// first block of a chain, every block adds what it retired, and
-    /// tail-call transfers between blocks leave it accumulating — so the
-    /// host reads the whole chain's total no matter how many blocks ran.
+    /// Write the retired-instruction count for this block exit.
     fn set_retired(&self, m: &mut WasmModule, n: u32) {
-        m.i32_const(0);
-        m.i32_const(0).i64_load(self.lay.retired_addr as u64);
-        m.i64_const(n as i64)
-            .op(I64_ADD)
+        m.i32_const(0)
+            .i64_const(n as i64)
             .i64_store(self.lay.retired_addr as u64);
     }
 
@@ -1126,10 +1094,7 @@ impl Ctx {
             // segments/bodies flushed so far; `n` is the compile-time count of
             // instructions completed since that flush. Reporting ITER alone
             // undercounted, corrupting insn_count/minstret/clock/fuel.
-            // Cumulative-cell contract as in set_retired.
-            m.i32_const(0);
-            m.i32_const(0).i64_load(self.lay.retired_addr as u64);
-            m.local_get(l).op(I64_ADD);
+            m.i32_const(0).local_get(l);
             if n > 0 {
                 m.i64_const(n as i64).op(I64_ADD);
             }
@@ -1993,9 +1958,7 @@ fn build_ctx(
             None
         },
     };
-    // Two i32 locals: IDXB (TLB/dispatch index math) and IDXB+1 (the chain
-    // stub's function-table index).
-    let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp + n_fma + n_flags, 2);
+    let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp + n_fma + n_flags, 1);
     let mut t = touched;
     while t != 0 {
         let r = t.trailing_zeros() as usize;
@@ -2050,88 +2013,6 @@ fn fp_needs_round(insn: u32) -> bool {
 }
 
 /// Evaluate the FP gate's two conditions into the hoisted flag locals.
-/// BASE = fuel granted for this call = FUEL_CELL - RETIRED_CELL (clamped at
-/// zero). The subtraction matters under tail-call chaining: earlier blocks of
-/// the chain already consumed part of the grant, and their count sits in the
-/// cumulative retirement cell. Without chaining the cell is zero at entry and
-/// BASE == FUEL_CELL exactly as before.
-fn emit_fuel_base(c: &Ctx, m: &mut WasmModule) {
-    if c.lay.fuel_addr == 0 {
-        m.i64_const(LOOP_CAP as i64).local_set(BASE);
-        return;
-    }
-    m.i32_const(0).i64_load(c.lay.fuel_addr as u64);
-    m.i32_const(0).i64_load(c.lay.retired_addr as u64);
-    m.op(I64_SUB).local_set(BASE);
-    m.local_get(BASE).i64_const(0).op(I64_LT_S);
-    m.op(IF).op(VOID);
-    m.i64_const(0).local_set(BASE);
-    m.op(END);
-}
-
-/// Chain exit: after a block has stored its successor pc and ADDED its
-/// retired count, try to transfer STRAIGHT to the next compiled block with a
-/// tail call instead of returning to the host dispatch loop. The checks are
-/// exactly the host fast path's — line.pc match, non-blacklisted index,
-/// map generation, fuel — read from the same memory the host reads, so a
-/// transfer happens only where the host would have dispatched anyway. Any
-/// failed check falls back to a plain return (the host handles it). Blocks
-/// that bailed must NOT chain (the interpreter owns the next instruction);
-/// `iter_guard` additionally refuses to transfer when this call retired
-/// nothing (a fuel-exhausted or off-entry exit) — a zero-progress transfer
-/// to the same pc would tail-loop forever.
-fn emit_chain_exit(c: &Ctx, m: &mut WasmModule, iter_guard: bool) {
-    let lay = &c.lay;
-    if !chain_enabled()
-        || lay.sys.is_none()
-        || lay.dispatch_base == 0
-        || lay.fuel_addr == 0
-    {
-        return;
-    }
-    if iter_guard {
-        m.local_get(ITER).op(I64_EQZ);
-        m.op(IF).op(VOID).op(RETURN).op(END);
-    }
-    m.use_table();
-    let idx2 = c.idxb + 1;
-    // CPC = the successor pc the block just stored.
-    m.i32_const(0).i64_load(lay.pc_addr as u64).local_set(CPC);
-    // line byte offset = ((pc >> 1) & mask) << 4
-    m.local_get(CPC)
-        .i64_const(1)
-        .op(I64_SHR_U)
-        .op(I32_WRAP_I64)
-        .i32_const(lay.dispatch_mask as i32)
-        .op(I32_AND)
-        .i32_const(4)
-        .op(I32_SHL)
-        .local_set_i32(c.idxb);
-    // line.pc == pc?
-    m.local_get_i32(c.idxb).i64_load_at(lay.dispatch_base as u64);
-    m.local_get(CPC).op(I64_NE);
-    m.op(IF).op(VOID).op(RETURN).op(END);
-    // idx >= 0 (blacklist sentinels carry -1)?
-    m.local_get_i32(c.idxb)
-        .i32_load(lay.dispatch_base as u64 + 8)
-        .local_set_i32(idx2);
-    m.local_get_i32(idx2).i32_const(0).op(I32_LT_S);
-    m.op(IF).op(VOID).op(RETURN).op(END);
-    // line verified under the current address-space generation?
-    m.local_get_i32(c.idxb).i32_load(lay.dispatch_base as u64 + 12);
-    m.i32_const(0).i32_load(lay.map_gen_addr as u64);
-    m.op(I32_NE);
-    m.op(IF).op(VOID).op(RETURN).op(END);
-    // fuel left in this grant?
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.i32_const(0).i64_load(lay.fuel_addr as u64);
-    m.op(I64_GE_U);
-    m.op(IF).op(VOID).op(RETURN).op(END);
-    m.local_get(0); // the machine-state pointer parameter, passed along
-    m.local_get_i32(idx2);
-    m.return_call_indirect(0);
-}
-
 fn emit_fp_flags(c: &Ctx, m: &mut WasmModule) {
     let Some((fs_bad, round_bad)) = c.fp_flags else {
         return;
@@ -3117,19 +2998,19 @@ fn translate_copy_loop(
     let adj = cl.w0 + if cl.bwd { cl.stride } else { 0 };
 
     m.i64_const(0).local_set(ITER);
-    emit_fuel_base(&c, &mut m);
     m.op(LOOP).op(VOID); // $head
     // fuel guard (safe yield at the loop head)
     m.local_get(ITER);
-    m.local_get(BASE);
+    if lay.fuel_addr != 0 {
+        m.i32_const(0).i64_load(lay.fuel_addr as u64);
+    } else {
+        m.i64_const(LOOP_CAP as i64);
+    }
     m.op(I64_GE_U);
     m.op(IF).op(VOID);
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, start_pc);
-    m.i32_const(0);
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
-    emit_chain_exit(&c, &mut m, true);
+    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
     m.op(RETURN);
     m.op(END);
 
@@ -3293,10 +3174,7 @@ fn translate_copy_loop(
     m.local_get(rn).op(I64_LT_U).br_if(0);
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, cl.end_pc);
-    m.i32_const(0);
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
-    emit_chain_exit(&c, &mut m, true);
+    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
     m.op(RETURN);
     m.op(END); // loop
 
@@ -3454,7 +3332,6 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 c.flush_writes(&mut m);
                 c.set_pc_const(&mut m, target);
                 c.set_retired(&mut m, n + 1);
-                emit_chain_exit(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
                     len: next_pc - start_pc,
@@ -3480,7 +3357,6 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
                 c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
-                emit_chain_exit(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
                     len: next_pc - start_pc,
@@ -3509,7 +3385,6 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 m.op(END);
                 c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
-                emit_chain_exit(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
                     len: next_pc - start_pc,
@@ -3527,7 +3402,6 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, pc);
     c.set_retired(&mut m, n);
-    emit_chain_exit(&c, &mut m, false);
     Some(Block {
         wasm: m.finish(),
         len: pc - start_pc,
@@ -3552,7 +3426,6 @@ fn translate_loop(
     lay: &JitLayout,
 ) -> Option<Block> {
     m.i64_const(0).local_set(ITER); // ITER = retired-instruction accumulator
-    emit_fuel_base(c, &mut m);
     // Scope stack entry: (kind, close_pc, header). kind 0=block 1=loop 2=if.
     let mut scopes: Vec<(u8, u64, u64)> = Vec::new();
     let mut pc = start_pc;
@@ -3599,15 +3472,16 @@ fn translate_loop(
             // Fuel = min(caller budget, interrupt quantum), granted per
             // dispatch by the host (P0: budget/interrupt-latency contract).
             m.local_get(ITER);
-            m.local_get(BASE);
+            if lay.fuel_addr != 0 {
+                m.i32_const(0).i64_load(lay.fuel_addr as u64);
+            } else {
+                m.i64_const(LOOP_CAP as i64);
+            }
             m.op(I64_GE_U);
             m.op(IF).op(VOID);
             c.flush_writes(&mut m);
             c.set_pc_const(&mut m, h);
-            m.i32_const(0);
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
-    emit_chain_exit(c, &mut m, true);
+            m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
             m.op(RETURN);
             m.op(END);
         }
@@ -3692,10 +3566,7 @@ fn translate_loop(
     }
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, region.end_pc);
-    m.i32_const(0);
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
-    emit_chain_exit(c, &mut m, true);
+    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
     Some(Block {
         wasm: m.finish(),
         len: region.end_pc - start_pc,
@@ -3715,14 +3586,14 @@ pub fn scan_regs_super_pub(
     entries: &[u64],
     lay: &JitLayout,
 ) -> (u32, u32, u32, u32) {
-    let _ = page_end;
-    let (r, w, fr, fw, _) = scan_regs_super(code, &[base], entries, lay);
+    let (r, w, fr, fw, _) = scan_regs_super(code, base, page_end, entries, lay);
     (r, w, fr, fw)
 }
 
 fn scan_regs_super(
     code: &[u8],
-    page_vas: &[u64],
+    base: u64,
+    page_end: u64,
     entries: &[u64],
     lay: &JitLayout,
 ) -> (u32, u32, u32, u32, bool) {
@@ -3743,21 +3614,6 @@ fn scan_regs_super(
         }
     };
     for &e in entries {
-        let Some(pi) = page_vas
-            .iter()
-            .position(|&va| e.wrapping_sub(va) < 0x1000)
-        else {
-            continue;
-        };
-        let base = page_vas[pi] - (pi as u64) * 0x1000;
-        // Same boundary rule as emission: flow across contiguous neighbours,
-        // stop at a gap.
-        let mut pj = pi;
-        while pj + 1 < page_vas.len() && page_vas[pj + 1] == page_vas[pj] + 0x1000 {
-            pj += 1;
-        }
-        let page_end = page_vas[pj] + 0x1000;
-        let code = &code[..(pj + 1) * 0x1000];
         let mut pc = e;
         let mut n = 0u32;
         while n < MAX_BLOCK as u32 && pc < page_end {
@@ -4113,27 +3969,6 @@ impl Ctx {
 /// Is `start_pc` a structured-loop header? Such blocks compile to a tight wasm
 /// loop (register-locals across iterations) and must NOT be folded into a
 /// superblock, whose per-iteration `br_table` dispatch would be far slower.
-/// Every JAL call target that leaves this page (the edges of the call
-/// graph): used to pick which pages join a sparse superblock region.
-pub fn page_call_targets(code: &[u8], base: u64) -> Vec<u64> {
-    let mut out = Vec::new();
-    let mut pc = base;
-    let end = base + code.len() as u64;
-    while pc < end {
-        let Some((insn, ilen)) = fetch(code, base, pc) else {
-            break;
-        };
-        if opcode(insn) == 0x6f && rd(insn) != 0 {
-            let t = pc.wrapping_add(imm_j(insn) as u64);
-            if t & !0xfff != base & !0xfff {
-                out.push(t);
-            }
-        }
-        pc = pc.wrapping_add(ilen);
-    }
-    out
-}
-
 /// Can the block emitter make progress at `pc`? A superblock leader whose
 /// FIRST instruction can't be emitted becomes an exit stub: every dispatch
 /// into it enters the function, reloads the hoisted registers, exits having
@@ -4287,7 +4122,6 @@ pub fn discover_page_leaders_ext(
 /// blocks with no per-block prologue/epilogue, `call_indirect` or pa-verify (the
 /// per-dispatch overhead that dominates branchy code like the CPython eval
 /// loop). `entries` are the block-start pcs discovered hot in this page.
-/// Contiguous wrapper: pages are consecutive from `page_base`.
 pub fn translate_superblock(
     code: &[u8],
     base: u64,
@@ -4296,88 +4130,57 @@ pub fn translate_superblock(
     entries: &[u64],
     lay: JitLayout,
 ) -> Option<Block> {
-    let _ = base;
-    let vas: Vec<u64> = (0..page_span / 0x1000).map(|k| page_base + k * 0x1000).collect();
-    translate_superblock_sparse(code, &vas, entries, lay)
-}
-
-/// Compile a SPARSE set of code pages as one wasm function (the call-graph
-/// region). `code` is the pages' bytes concatenated in `page_vas` order;
-/// pages need not be virtually contiguous — the dispatch prologue resolves
-/// TPC to (page index, slot) with one compare per page, so a caller and a
-/// callee any distance apart still transfer inside the function, with no
-/// call_indirect, no pa-verify, and no per-block prologue. This is what a
-/// page-contiguous region could never give tcc-like code, where the hot call
-/// graph spans a few hundred KB (measured: 9 insns per host dispatch).
-pub fn translate_superblock_sparse(
-    code: &[u8],
-    page_vas: &[u64],
-    entries: &[u64],
-    lay: JitLayout,
-) -> Option<Block> {
     let n = entries.len();
-    let np = page_vas.len();
-    if n == 0 || np == 0 || np * 0x1000 != code.len() || np > 16 {
+    if n == 0 || page_span == 0 || page_span > (1 << 16) {
         return None;
     }
-    // Page index for a pc, or None if outside every page.
-    let pidx = |pc: u64| page_vas.iter().position(|&va| pc.wrapping_sub(va) < 0x1000);
-    // fetch()-compatible base for a pc on page i: offset = pc - vbase(i).
-    let vbase = |i: usize| page_vas[i] - (i as u64) * 0x1000;
-
-    let (rm, wm, fr, fw, uses_fp) = scan_regs_super(code, page_vas, entries, &lay);
+    let page_end = page_base + page_span;
+    let (rm, wm, fr, fw, uses_fp) = scan_regs_super(code, base, page_end, entries, &lay);
     // Ask for the hoisted FP gate flags when any body will need a gate.
     let (mut c, mut m) = build_ctx(lay, rm, wm | u32::from(uses_fp), fr, fw);
     c.retired_local = Some(ITER);
 
-    // slot (= concat offset / 2) -> entry index, else n (default -> exit).
-    let mut slot_depth = vec![n as u32; np * 0x800];
+    // slot (= (pc-page_base)/2) -> entry index, else n (= default -> exit).
+    let slots = (page_span / 2) as usize;
+    let mut slot_depth = vec![n as u32; slots];
     for (i, &e) in entries.iter().enumerate() {
-        let pi = pidx(e)?;
-        slot_depth[(pi * 0x800) + ((e & 0xfff) >> 1) as usize] = i as u32;
+        if e < page_base || e >= page_end {
+            return None;
+        }
+        slot_depth[((e - page_base) / 2) as usize] = i as u32;
     }
 
     m.i64_const(0).local_set(ITER); // retired accumulator
-    emit_fuel_base(&c, &mut m);
     m.i32_const(0).i64_load(lay.pc_addr as u64).local_set(TPC);
-
+    emit_fp_flags(&c, &mut m);
+    // Hoisted FP gate (see emit_block_fp_gate): FS == Dirty, NX sticky and
+    // frm == RNE, checked once — none can change inside compiled code.
+    // Superblocks are multi-entry, so the bail restores the RUNTIME entry pc
+    // from TPC and reports zero retired (ITER is still its zero initial
+    // value).
+    // No function-wide FP gate: a page mixes integer and float routines, and
+    // one shared gate makes every entry into the integer code bail. Each body
+    // that touches the FP file emits its own (see emit_super_body), where the
+    // bail reports the instructions this entry already retired.
+    let _ = uses_fp;
     m.op(BLOCK).op(VOID); // $exit  (depth 1 from loop body)
     m.op(LOOP).op(VOID); // $L      (depth 0 from loop body)
 
-    // Fuel -> yield to the host (budget + interrupt-latency contract).
+    // Fuel → yield to the host (budget + interrupt-latency contract).
     m.local_get(ITER);
-    m.local_get(BASE);
-    m.op(I64_GE_U).br_if(1);
-    // Resolve TPC -> concat offset in SCR: one subtract+compare per
-    // CONTIGUOUS RUN of pages (a fully contiguous region pays exactly the
-    // single range check the contiguous translator had — paying per page
-    // cost FP EMULATION a third of its throughput).
-    m.op(BLOCK).op(VOID); // $resolve
-    let mut i = 0usize;
-    while i < np {
-        let mut j2 = i;
-        while j2 + 1 < np && page_vas[j2 + 1] == page_vas[j2] + 0x1000 {
-            j2 += 1;
-        }
-        let run_len = ((j2 - i + 1) as i64) << 12;
-        m.local_get(TPC)
-            .i64_const(page_vas[i] as i64)
-            .op(I64_SUB)
-            .local_set(SCR);
-        m.local_get(SCR).i64_const(run_len).op(I64_LT_U);
-        m.op(IF).op(VOID);
-        if i != 0 {
-            m.local_get(SCR)
-                .i64_const((i as i64) << 12)
-                .op(I64_ADD)
-                .local_set(SCR);
-        }
-        m.br(1); // out of $resolve, offset in SCR
-        m.op(END);
-        i = j2 + 1;
+    if lay.fuel_addr != 0 {
+        m.i32_const(0).i64_load(lay.fuel_addr as u64);
+    } else {
+        m.i64_const(LOOP_CAP as i64);
     }
-    m.br(2); // no page matched -> $exit
-    m.op(END); // $resolve
+    m.op(I64_GE_U).br_if(1);
+    // Bounds: offset = TPC - page_base; exit if offset >=u span (also catches
+    // TPC < page_base, which wraps to a huge unsigned value).
+    m.local_get(TPC)
+        .i64_const(page_base as i64)
+        .op(I64_SUB)
+        .local_set(SCR);
+    m.local_get(SCR).i64_const(page_span as i64).op(I64_GE_U).br_if(1);
 
     // Open the dispatch nest: block $default, then $e_{n-1}..$e_0 (innermost).
     m.op(BLOCK).op(VOID); // $default (br_table default depth = n)
@@ -4395,31 +4198,10 @@ pub fn translate_superblock_sparse(
     // At entry i's body the loop $L is at depth (n - i).
     for i in 0..n {
         m.op(END); // close $e_i
-        let pi = pidx(entries[i]).unwrap();
-        // The body may flow across VIRTUALLY CONTIGUOUS neighbours (their
-        // concat offsets line up with their addresses, so fetch stays
-        // correct — this is what holds a loop that straddles a page
-        // boundary), but must stop at a GAP: the next concat page there
-        // belongs to a distant address, and a 32-bit instruction on the last
-        // halfword must not complete itself from its bytes. The truncated
-        // slice makes fetch() fail at the gap and the body ends.
-        let mut pj = pi;
-        while pj + 1 < np && page_vas[pj + 1] == page_vas[pj] + 0x1000 {
-            pj += 1;
-        }
-        c.emit_super_body(
-            &mut m,
-            lay,
-            &code[..(pj + 1) * 0x1000],
-            vbase(pi),
-            entries[i],
-            page_vas[pj] + 0x1000,
-            (n - i) as u32,
-            (n - i + 1) as u32,
-        );
+        c.emit_super_body(&mut m, lay, code, base, entries[i], page_end, (n - i) as u32, (n - i + 1) as u32);
     }
     m.op(END); // close $default
-    // default: TPC wasn't a known entry in-page -> exit ($exit at depth 1).
+    // default: TPC wasn't a known entry in-page → exit ($exit at depth 1).
     m.br(1);
 
     m.op(END); // close loop $L
@@ -4428,15 +4210,12 @@ pub fn translate_superblock_sparse(
     // Exit: flush registers, publish TPC + retired.
     c.flush_writes(&mut m);
     m.i32_const(0).local_get(TPC).i64_store(lay.pc_addr as u64);
-    m.i32_const(0);
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
-    emit_chain_exit(&c, &mut m, true);
+    m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
 
     Some(Block {
         wasm: m.finish(),
-        len: (np * 0x1000) as u64,
-        n_insns: 0,
+        len: page_span,
+        n_insns: n as u32,
     })
 }
 

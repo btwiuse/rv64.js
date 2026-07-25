@@ -11,20 +11,10 @@
 //! Boots the same bbl64.bin/kernel/rootfs images TinyEMU ships.
 
 pub mod dtb;
-/// Native egress for the HTTP proxy: real sockets, so absent on wasm — the
-/// browser uses `fetch()` via `web/rv64.js` instead.
-#[cfg(not(target_arch = "wasm32"))]
-pub mod egress;
-pub mod httpproxy;
-pub mod netstack;
 pub mod p9;
 pub mod p9fs;
 pub mod virt;
 pub mod virtio;
-/// WebSocket relay transport for virtio-net. Host-side networking, so absent on
-/// wasm — the browser uses its own `WebSocket` via `web/rv64.js` instead.
-#[cfg(not(target_arch = "wasm32"))]
-pub mod ws;
 
 use rv64_core::csr::{IRQ_MEIP, IRQ_MSIP, IRQ_MTIP, IRQ_SEIP};
 use rv64_core::{Bus, Cpu, Exception, StopReason};
@@ -211,32 +201,6 @@ impl SystemBus {
                 true
             }
             _ => false,
-        }
-    }
-
-    /// The virtio-net device, if this machine has one.
-    fn net_dev(&mut self) -> Option<&mut VirtioDev> {
-        self.virtio.iter_mut().find(|d| d.device_id() == 1)
-    }
-
-    /// Deliver any inbound frames the guest now has RX buffers for.
-    ///
-    /// QueueNotify does not cover this case: frames arrive from the host
-    /// *between* notifications, so without a poll an inbound frame would wait
-    /// until the guest happened to touch the device for some other reason.
-    pub fn poll_net_rx(&mut self) {
-        let mut delivered = false;
-        for i in 0..self.virtio.len() {
-            if !self.virtio[i].net_rx_pending() {
-                continue;
-            }
-            let mut dev = self.virtio.remove(i);
-            dev.process(0, &mut self.ram, RAM_BASE);
-            self.virtio.insert(i, dev);
-            delivered = true;
-        }
-        if delivered {
-            self.refresh_plic();
         }
     }
 
@@ -447,10 +411,6 @@ pub struct BootImages<'a> {
     /// server's tag (`mount -t 9p -o trans=virtio <tag> /mnt`), or boots from
     /// it directly with `rootfstype=9p` when the tag is `/dev/root`.
     pub fs: Option<p9::Server>,
-    /// MAC address for a virtio-net device, or `None` for no networking. The
-    /// device only moves Ethernet frames; the host layer decides where they go
-    /// (see [`ws`] for the WebSocket relay).
-    pub net: Option<[u8; 6]>,
 }
 
 impl Machine {
@@ -481,13 +441,6 @@ impl Machine {
         }
         if let Some(srv) = images.fs {
             virtio.push(VirtioDev::new(Backend::Fs { srv }));
-        }
-        if let Some(mac) = images.net {
-            virtio.push(VirtioDev::new(Backend::Net {
-                mac,
-                inbox: Vec::new(),
-                outbox: Vec::new(),
-            }));
         }
         let ndevs = virtio.len();
 
@@ -568,32 +521,12 @@ impl Machine {
         out
     }
 
-    /// Deliver an inbound Ethernet frame to the guest's NIC. Silently ignored
-    /// when the machine has no network device.
-    pub fn net_input(&mut self, frame: &[u8]) {
-        if let Some(dev) = self.bus.net_dev() {
-            dev.net_input(frame);
-        }
-        self.bus.poll_net_rx();
-    }
-
-    /// Collect the Ethernet frames the guest has transmitted, for the host to
-    /// forward (to a relay, a tap device, wherever).
-    pub fn net_take_output(&mut self) -> Vec<Vec<u8>> {
-        self.bus
-            .net_dev()
-            .map(|d| d.net_take_output())
-            .unwrap_or_default()
-    }
-
     /// Run one slice; returns instructions retired.
     pub fn run_slice(&mut self, max_insns: u64) -> u64 {
         let start = self.cpu.insn_count;
 
         // Update timers + interrupt lines before entering the CPU.
         self.sync_devices();
-        // Frames the host handed us since the last slice may now have buffers.
-        self.bus.poll_net_rx();
 
         match self.cpu.run(&mut self.bus, max_insns) {
             StopReason::Wfi => {
@@ -621,7 +554,6 @@ impl Machine {
     pub fn run_slice_until(&mut self, max_insns: u64, mut compiled: impl FnMut(u64) -> bool) -> u64 {
         let start = self.cpu.insn_count;
         self.sync_devices();
-        self.bus.poll_net_rx();
         let mut i = 0u64;
         while i < max_insns {
             if let StopReason::Wfi = self.cpu.run(&mut self.bus, 1) {

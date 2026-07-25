@@ -92,7 +92,6 @@ fn guest_mounts_and_uses_a_host_directory() {
                 "hostshare",
                 Box::new(p9fs::HostFs::new(&share)),
             )),
-            net: None,
         },
     );
     let mut c = Console {
