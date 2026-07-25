@@ -590,13 +590,12 @@ Disposition of every item, with commits and covering tests:
   tests/vs-v86/README "Benchmark policy"). Micro/macro labels, all-rows
   re-validation, pinned shape tests, dispersion + provenance requirements.
   The scorecard grew python/compile/nbench macro rows this cycle.
-- **P2 cross-ISA equivalence** — LARGELY DONE (fdf25f1). Fresh builds on
-  both ISAs now fold bit-identically (i386 requires -msse2 -mfpmath=sse;
-  riscv64 -ffp-contract=off); flags documented in build-kernels.sh;
-  provenance recorded. OPEN SUB-ITEM: the `unsigned long` -> `uint64_t`
-  typedef change is deferred — it alters the workload on i386 and needs a
-  coordinated checksum-baseline rebase (first attempt collided with the
-  then-undiagnosed artifact defects and was backed out).
+- **P2 cross-ISA equivalence** — DONE (fdf25f1, 662531b). The u64 typedef
+  is now 64-bit on both ISAs, FP flags reconciled (i386 -msse2 -mfpmath=sse;
+  riscv64 -ffp-contract=off), and the Mixed checksum folds FULLY
+  bit-identically cross-ISA (0x29c0709f16c84da4 on both, enforced at full
+  64-bit equality by the scorecard); flags documented in build-kernels.sh;
+  provenance recorded.
 - **P2 untagged hot counters** — FIXED (412fd82). interp_hot slots carry a
   full-pc tag; aliasing pcs reset instead of inheriting heat.
 - **P2 sys_insn_count export** — FIXED (a5f1620).
@@ -607,7 +606,8 @@ Disposition of every item, with commits and covering tests:
   oracle comparison for invalid encodings remains an interpreter-level
   effort (the JIT now never compiles them).
 
-Performance claims are made only from the corrected harness. Scorecard at
-this addendum: 8/13 rows win-or-match (see scorecard artifacts with
-provenance); remaining losses (compile, NUMERIC SORT, FOURIER, IDEA,
-HUFFMAN) each have diagnosed mechanisms and tracked work.
+Performance claims are made only from the corrected harness. Every review
+item above is closed with a commit and a covering test. Scorecard at this
+addendum: 8/13 rows win-or-match (see scorecard artifacts with provenance);
+remaining losses (compile, NUMERIC SORT, FOURIER, IDEA, HUFFMAN) each have
+diagnosed mechanisms and tracked work.
