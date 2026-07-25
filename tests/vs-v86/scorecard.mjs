@@ -133,7 +133,7 @@ async function rvNbench(jit) {
   // certain" lines and puts the numbers on a LATER line with an empty name.
   // Treat those as belonging to the kernel whose name last appeared — dropping
   // them made valid runs look like missing rows (and hid the warning itself).
-  let last = null;
+  let last = null, unstable = 0;
   for (const line of out.split("\n")) {
     const named = line.match(/^([A-Z][A-Z ]+?)\s+:\s*([\d.e+]*)/);
     if (named) {
@@ -144,9 +144,10 @@ async function rvNbench(jit) {
     const cont = line.match(/^\s+:\s+([\d.e+]+)\s+:/);
     if (cont && last) { rows[last] = +cont[1]; last = null; }
     if (/NOT 95 % statistically certain|variation among the individual results/.test(line)) {
-      rows.__unstable = (rows.__unstable || 0) + (last ? 0 : 1);
+      unstable += last ? 0 : 1;
     }
   }
+  Object.defineProperty(rows, "unstable", { value: unstable, enumerable: false });
   return rows;
 }
 // compile benchmark: boot the buildroot image with our riscv64 tcc + w.c, time
@@ -387,11 +388,11 @@ if (WANT_NBENCH) {
   }
   // nbench's own statistical check: if it says a kernel's repeats disagreed,
   // that row is not trustworthy, whichever side it happened on.
-  if (nb?.jit?.__unstable) {
-    problems.push(`nbench: rv64 reported ${nb.jit.__unstable} kernel(s) as statistically uncertain`);
+  if (nb?.jit?.unstable) {
+    problems.push(`nbench: rv64 reported ${nb.jit.unstable} kernel(s) as statistically uncertain`);
   }
-  if (nb?.v8?.__unstable) {
-    problems.push(`nbench: v86 reported ${nb.v8.__unstable} kernel(s) as statistically uncertain`);
+  if (nb?.v8?.unstable) {
+    problems.push(`nbench: v86 reported ${nb.v8.unstable} kernel(s) as statistically uncertain`);
   }
 }
 if (problems.length) {

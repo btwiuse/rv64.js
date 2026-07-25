@@ -289,7 +289,7 @@ struct JitState {
     /// superblocked). Recompile once the page has accumulated another
     /// threshold's worth of uncovered hot pcs, bounded so a pathological page
     /// can't loop on it.
-    sb_gen: std::collections::HashMap<(u64, u64), (usize, u32)>,
+    sb_gen: std::collections::HashMap<(u64, u64), (usize, u32, u64)>,
     /// Pages that wanted a superblock while the compile budget was spent.
     /// Drained one per quantum boundary, oldest first.
     sb_queue: Vec<(u64, u64)>,
@@ -297,12 +297,6 @@ struct JitState {
     /// the page function does not cover them — the direct measure of a page
     /// function that has fallen behind the code actually running.
     sb_missed: std::collections::HashMap<(u64, u64), u32>,
-    /// Pages whose superblock module is COMPILING (issued, awaiting the async
-    /// result). A hot pc on one of them waits for the page function rather
-    /// than building its own module — a wait of one async compile. Pages that
-    /// are merely queued are NOT included: the queue drains on the compile
-    /// budget, and making cold code wait that long cost boot 2.9x.
-    sb_inflight: std::collections::HashSet<(u64, u64)>,
     /// Table index -> the (virtual page, physical page) list a MULTI-page
     /// superblock was compiled over. Entries carry their own page's pa (probed
     /// like any block at dispatch); this is the rest of the region, verified on
@@ -333,7 +327,6 @@ impl JitState {
             regions: Default::default(),
             sb_gen: Default::default(),
             sb_queue: Vec::new(),
-            sb_inflight: Default::default(),
             sb_missed: Default::default(),
         }
     }
@@ -345,7 +338,6 @@ impl JitState {
         self.regions.clear();
         self.sb_gen.clear();
         self.sb_queue.clear();
-        self.sb_inflight.clear();
         self.sb_missed.clear();
         for h in self.interp_hot.iter_mut() {
             *h = 0;
@@ -733,6 +725,9 @@ const SB_QUEUE_CAP: usize = 64;
 /// Individually-compiled hot pcs on a superblocked page before its page
 /// function is rebuilt to cover them.
 const SB_MISSED_TRIGGER: u32 = 8;
+/// Retired instructions a page must run before its FIRST rebuild; each further
+/// rebuild doubles the wait (see the cooldown comment at the trigger).
+const SB_PAGE_COOLDOWN: u64 = 8_000_000;
 static mut SB_LAST_ICOUNT: u64 = 0;
 /// Guest TLB misses served inside compiled code (jit_stat 31). In-block TLB
 /// fill is off by default: it costs register pressure in every memory-op block
@@ -1225,8 +1220,27 @@ fn build_superblock(
                             // region still gets to build its own region for
                             // the code this one didn't reach.
                             jit.superblocked.insert((aspace, vpage)); // in flight
-                            jit.sb_gen
-                                .insert((aspace, vpage), (n_entries, sb_compiles + 1));
+                            // This build answers the misses recorded so far;
+                            // only misses AFTER it argue for another rebuild.
+                            jit.sb_missed.remove(&(aspace, vpage));
+                            // Only a rebuild that covered nothing new counts
+                            // against the allowance: a page whose hot set is
+                            // still growing must be able to keep up, or code
+                            // that gets hot late is stranded on individual
+                            // blocks forever. The recorded instruction count
+                            // starts this page's rebuild cooldown.
+                            let prev = jit
+                                .sb_gen
+                                .get(&(aspace, vpage))
+                                .map_or(0, |&(e, _, _)| e);
+                            jit.sb_gen.insert(
+                                (aspace, vpage),
+                                (
+                                    n_entries,
+                                    sb_compiles + u32::from(n_entries <= prev),
+                                    m.cpu.insn_count,
+                                ),
+                            );
                             m.cpu.clear_store_jtlb(); // pages may now hold code
                             unsafe {
                                 let ticket = NEXT_SB_TICKET;
@@ -1482,7 +1496,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 let aspace = m.cpu.sys.as_ref().map_or(0, |c| c.satp);
                 if let Some(i) = jit.sb_queue.iter().position(|&(a, _)| a == aspace) {
                     let (_, vpage) = jit.sb_queue.remove(i);
-                    let compiles = jit.sb_gen.get(&(aspace, vpage)).map_or(0, |&(_, c)| c);
+                    let compiles = jit.sb_gen.get(&(aspace, vpage)).map_or(0, |&(_, c, _)| c);
                     if let Some(pa) = m.cpu.jit_probe_fetch(&mut m.bus, vpage) {
                         if pa >= rv64_system::RAM_BASE
                             && ((pa & !0xfff) - rv64_system::RAM_BASE) as usize + 0x1000
@@ -1566,8 +1580,22 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             (false, 0)
                         };
 
-                        let (sb_last, sb_compiles) =
-                            jit.sb_gen.get(&(aspace, vpage)).copied().unwrap_or((0, 0));
+                        let (sb_last, sb_compiles, sb_when) = jit
+                            .sb_gen
+                            .get(&(aspace, vpage))
+                            .copied()
+                            .unwrap_or((0, 0, 0));
+                        // Rebuilding a page function DISCARDS the optimized
+                        // code V8 built for it: the replacement module starts
+                        // in the baseline compiler again. Measured, a page that
+                        // kept rebuilding every couple of seconds ran ~3x
+                        // slower with identical coverage (nbench FP EMULATION:
+                        // 444 insns/dispatch either way, 2568 -> 820 MIPS), and
+                        // nbench itself flagged the result as statistically
+                        // uncertain. So each rebuild costs the page an
+                        // exponentially longer quiet period.
+                        let cooldown = SB_PAGE_COOLDOWN << sb_compiles.min(6);
+                        let sb_cool = m.cpu.insn_count >= sb_when.wrapping_add(cooldown);
                         // Recompile on DOUBLING, not on a fixed increment: a
                         // page discovered 6 hot pcs at a time would need 20
                         // recompiles to cover the 120 that nbench IDEA ends up
@@ -1599,7 +1627,13 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             // of 4400 iter/s depending on that race.
                             let missed =
                                 jit.sb_missed.get(&(aspace, vpage)).copied().unwrap_or(0);
-                            missed >= SB_MISSED_TRIGGER.max(sb_last as u32 / 4)
+                            // Rebuild when enough hot pcs have had to build
+                            // their own blocks, scaled to what the page
+                            // function already covers. The counter is reset by
+                            // each build, so this converges: a page only keeps
+                            // rebuilding while it keeps discovering hot code.
+                            sb_cool
+                                && missed >= SB_MISSED_TRIGGER.max(sb_last as u32 / 4)
                                 && (n_entries > sb_last || sb_compiles < SB_RECOMPILE_CAP)
                         } else {
                             n_entries >= SUPERBLOCK_THRESHOLD
@@ -1621,12 +1655,6 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                 }
                             }
                         }
-                        // A page function is queued or compiling for this page:
-                        // wait for it rather than building a module for one
-                        // block. Loop headers still compile individually — the
-                        // superblock deliberately leaves them out.
-                        let wait_for_page_fn =
-                            !is_loop && jit.sb_inflight.contains(&(aspace, vpage));
                         if pc == unsafe { TRACE_PC } {
                             unsafe { TRACE_INDIV += 1 };
                         }
@@ -1635,11 +1663,12 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             unsafe { SB_INDIV += 1 };
                         }
                         // Individual block (loop or pre-threshold non-loop).
-                        let blk = if wait_for_page_fn {
-                            None
-                        } else {
-                            rv64_jit::translate_block(&m.bus.ram[off..end], pc, pc, lay)
-                        };
+                        // Deliberately NOT deferred while a page function is on
+                        // its way: making hot pcs wait for one stalls code
+                        // behind an async compile that may never land — that
+                        // was measured as 138M retries and a 10x slowdown once
+                        // pending builds backed up.
+                        let blk = rv64_jit::translate_block(&m.bus.ram[off..end], pc, pc, lay);
                         let entry = blk.and_then(|blk| {
                             unsafe { JIT_OUT = blk.wasm };
                             let idx = unsafe { host_jit_register() };
@@ -1668,7 +1697,6 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             // different address space at the same va, and the
                             // dirty-page tracker naturally drops it if the code
                             // bytes are overwritten.
-                            None if wait_for_page_fn => {} // the page function will cover it
                             None => {
                                 m.bus.jit_mark_page(pa);
                                 m.cpu.clear_store_jtlb();
@@ -1815,9 +1843,6 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
             let ppage = (pp - rv64_system::RAM_BASE) >> 12;
             !m.bus.jit_page_marked(ppage) || m.bus.jit_dirty_pages.contains(&ppage)
         });
-        for &(va, _) in &p.pages {
-            jit.sb_inflight.remove(&(p.aspace, va));
-        }
         if stale {
             SB_STALE += 1;
             for &(va, _) in &p.pages {
@@ -2002,7 +2027,7 @@ pub extern "C" fn sb_debug(vpage: u64) -> u64 {
         }
         v |= (jit.page_entries.get(&(aspace, vpage)).map_or(0, |e| e.len()) as u64) << 8;
         // bits 24..31 = superblock compiles, 32..39 = uncovered hot pcs since
-        v |= (jit.sb_gen.get(&(aspace, vpage)).map_or(0, |&(_, c)| c) as u64 & 0xff) << 24;
+        v |= (jit.sb_gen.get(&(aspace, vpage)).map_or(0, |&(_, c, _)| c) as u64 & 0xff) << 24;
         v |= (jit.sb_missed.get(&(aspace, vpage)).copied().unwrap_or(0) as u64 & 0xff) << 32;
         v
     }

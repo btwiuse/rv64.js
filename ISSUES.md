@@ -607,7 +607,55 @@ Disposition of every item, with commits and covering tests:
   effort (the JIT now never compiles them).
 
 Performance claims are made only from the corrected harness. Every review
-item above is closed with a commit and a covering test. Scorecard at this
-addendum: 8/13 rows win-or-match (see scorecard artifacts with provenance);
-remaining losses (compile, NUMERIC SORT, FOURIER, IDEA, HUFFMAN) each have
-diagnosed mechanisms and tracked work.
+item above is closed with a commit and a covering test.
+
+## SCORECARD PROGRESS SINCE THIS ADDENDUM
+
+The scorecard stood at 8/13 rows win-or-match when the items above were
+closed. What the remaining rows turned out to be, and what fixed them:
+
+- **Superblocks were mostly not running.** `sys_sb_ready` re-probed the
+  va->pa mapping from the microtask queue — an arbitrary guest moment,
+  usually inside the kernel or another process — so 96% of finished page
+  functions were dropped (landed=4 of 127). Entries now install with their
+  recorded pa and no dispatch line; the first dispatch verifies the mapping
+  in the address space that asked for it.
+- **Regions were page-clamped**, so a loop straddling a page boundary ran as
+  six 2-10 instruction blocks (NUMERIC SORT: 5.6 insns/dispatch). Superblocks
+  now span up to 3 virtually contiguous pages, grown only where hot code sits
+  within a block's reach of the edge. NUMERIC SORT: 128 -> 790 iter/s.
+- **A page compiled its page function once**, from whatever handful of pcs
+  was hot at the threshold; code that got hot later stayed on individual
+  blocks forever. Tracing one pc showed IDEA's cipher_idea inner loop was
+  never once a seed. Rebuilds are now allowed as long as they cover new hot
+  code (only unproductive ones count against the allowance). IDEA: 1600 ->
+  4600 iter/s, and the 1600-or-4400 bimodality is gone.
+- **Missing instruction families.** FSGNJ.D (fabs/fneg/copysign/fmv — 76% of
+  everything FOURIER handed the interpreter), the whole F extension (HUFFMAN
+  is float code: 714 -> ~1900 iter/s), and AMO*. Each landed with a covering
+  differential; the F extension and FSGNJ extended the user-mode fuzzer,
+  atomics got an in-guest interpreter-vs-JIT-vs-superblock checksum test.
+- **FP eligibility was stricter than the interpreter's.** `x + 0.0` inside
+  musl's pow bailed 32M times per FOURIER run, and every FMA with a zero
+  operand bailed (79M). Both now match the interpreter's exact rules; the
+  zero-operand relaxation exposed a signed-zero bug (fma(+0,-0,-0)) that the
+  existing fast-path fuzz test caught before it shipped.
+- **The FP gate was per function**, so a page mixing integer and float code
+  made every entry into the integer half bail. Gates are per body now, split
+  into the state check (FS) and the rounding checks (frm/NX).
+- **The harness was misreading nbench**: when nbench's own repeats disagree
+  it prints a "NOT 95 % statistically certain" warning and moves the score to
+  a later line. Three kernels were being recorded as missing. The parser
+  follows the continuation, and a run nbench flags as uncertain is now
+  INVALID — an unstable number is not a result.
+
+Remaining loss: **compile (tcc -c)**, ~2.6x behind v86. Measured, not
+guessed: the row is ~100% user-mode tcc, 340M guest instructions at 9 insns
+per dispatch. It is not module-build cost (~4us each), not TLB-miss bails
+(removing all 1.2M of them is a wash), and not superblock coverage (more page
+functions cost more than the dispatches they save). It is that tcc's hot code
+is a call graph spread across many pages, and a page-contiguous region cannot
+hold a caller and a callee 16KB apart — so nearly every call and return is a
+host dispatch. The fix is a region built from the call graph rather than from
+address adjacency (a two-level dispatch over a sparse page set); that is
+designed but not built.
