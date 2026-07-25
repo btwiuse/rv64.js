@@ -11,6 +11,10 @@
 //! Boots the same bbl64.bin/kernel/rootfs images TinyEMU ships.
 
 pub mod dtb;
+/// Native egress for the HTTP proxy: real sockets, so absent on wasm — the
+/// browser uses `fetch()` via `web/rv64.js` instead.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod egress;
 pub mod httpproxy;
 pub mod netstack;
 pub mod p9;

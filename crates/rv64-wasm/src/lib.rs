@@ -33,6 +33,11 @@ extern "C" {
     /// One Ethernet frame the guest transmitted, for the page to forward over
     /// its WebSocket relay. Called at quantum granularity, like host_write.
     fn host_net_send(ptr: *const u8, len: usize);
+    /// One HTTP request the in-process proxy wants performed, encoded by
+    /// `httpproxy::Request::encode`. The page performs it with `fetch()` and
+    /// calls `sys_http_response` when it completes — asynchronously, so this
+    /// returns immediately and the guest's TCP connection stays open meanwhile.
+    fn host_http_request(id: u64, ptr: *const u8, len: usize);
     /// Async variant for large modules (page superblocks): compiles on V8
     /// background threads; sys_sb_ready(ticket, idx) fires between runSystem
     /// calls when the function is in the table (idx -1 = failed).
@@ -66,6 +71,15 @@ pub extern "C" fn staging_alloc(len: usize) -> *mut u8 {
         STAGING.resize(len, 0);
         STAGING.as_mut_ptr()
     }
+}
+
+/// Pointer to the staging buffer WITHOUT resizing or clearing it, for reading
+/// data the core placed there. `staging_alloc` is the write path and empties the
+/// buffer, so it cannot be used to read a result back out.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn staging_ptr() -> *const u8 {
+    unsafe { STAGING.as_ptr() }
 }
 
 // ---- raw CPU API ---------------------------------------------------------
@@ -437,7 +451,7 @@ struct PendingSb {
 // 2.4s -> 7s (big glued functions rebuild more and codegen worse); at 3 the
 // sparse mechanics keep loop-straddling pages together and pull in ONE hot
 // callee, which is where the measured value was.
-const MAX_REGION_PAGES: usize = 3;
+const MAX_REGION_PAGES: usize = 8;
 static mut PENDING_SB: Vec<PendingSb> = Vec::new();
 static mut NEXT_SB_TICKET: u64 = 1;
 // Superblock lifecycle counters (diagnostic, jit_stat 10..14).
@@ -994,6 +1008,36 @@ static mut SYS_BIOS: Vec<u8> = Vec::new();
 static mut SYS_KERNEL: Vec<u8> = Vec::new();
 static mut SYS_DISK: Vec<u8> = Vec::new();
 static mut SYS_CMDLINE: Vec<u8> = Vec::new();
+/// In-process HTTP proxy: the guest's NIC talks to this instead of a relay, and
+/// egress happens through the page's `fetch()`. This is the only configuration
+/// that reaches the network with no external infrastructure at all.
+static mut SYS_NETSTACK: Option<rv64_system::netstack::NetStack> = None;
+static mut SYS_PROXY: Option<rv64_system::httpproxy::Proxy> = None;
+static mut SYS_EGRESS: FetchEgress = FetchEgress { done: Vec::new() };
+
+/// Hands requests to the page and collects what `sys_http_response` delivers.
+struct FetchEgress {
+    done: Vec<(
+        rv64_system::httpproxy::ReqId,
+        Result<rv64_system::httpproxy::Response, String>,
+    )>,
+}
+
+impl rv64_system::httpproxy::Egress for FetchEgress {
+    fn submit(&mut self, id: rv64_system::httpproxy::ReqId, req: rv64_system::httpproxy::Request) {
+        let bytes = req.encode();
+        unsafe { host_http_request(id, bytes.as_ptr(), bytes.len()) }
+    }
+    fn poll(
+        &mut self,
+    ) -> Vec<(
+        rv64_system::httpproxy::ReqId,
+        Result<rv64_system::httpproxy::Response, String>,
+    )> {
+        core::mem::take(&mut self.done)
+    }
+}
+
 /// Optional 6-byte MAC for the NIC; empty means use the crate default.
 static mut SYS_NET_MAC: Vec<u8> = Vec::new();
 /// Whether sys_boot should give the machine a virtio-net device.
@@ -1036,6 +1080,61 @@ stage_into!(sys_stage_net_mac, SYS_NET_MAC);
 #[no_mangle]
 pub extern "C" fn sys_net_enable(on: u32) {
     unsafe { SYS_NET_ON = on != 0 }
+}
+
+/// Run the in-process HTTP proxy behind the NIC (implies `sys_net_enable`).
+/// Frames then go to the built-in netstack rather than out `host_net_send`.
+///
+/// `upgrade_https` rewrites the guest's `http://` targets to `https://` on
+/// egress, which a page served over https requires — it cannot fetch http:// at
+/// all. Pass 0 only when egress genuinely wants plaintext (a localhost server,
+/// or a page served over http).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_proxy_enable(on: u32, upgrade_https: u32) {
+    unsafe {
+        if on != 0 {
+            SYS_NET_ON = true;
+            SYS_NETSTACK = Some(rv64_system::netstack::NetStack::new(
+                rv64_system::netstack::NetConfig::default(),
+            ));
+            let proxy = rv64_system::httpproxy::Proxy::new();
+            SYS_PROXY = Some(if upgrade_https != 0 {
+                proxy
+            } else {
+                proxy.keep_scheme()
+            });
+        } else {
+            SYS_NETSTACK = None;
+            SYS_PROXY = None;
+        }
+    }
+}
+
+/// Deliver a completed response (staged via staging_alloc) for request `id`.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_http_response(id: u64) {
+    unsafe {
+        let bytes = core::mem::take(&mut STAGING);
+        let result = rv64_system::httpproxy::Response::decode_result(&bytes);
+        SYS_EGRESS.done.push((id, result));
+    }
+}
+
+/// The `http_proxy` URL the guest should use, written into STAGING; returns its
+/// length so the page can show it without hardcoding the address.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_proxy_url() -> u32 {
+    unsafe {
+        let url = SYS_NETSTACK
+            .as_ref()
+            .map(|s| s.proxy_url())
+            .unwrap_or_default();
+        STAGING = url.into_bytes();
+        STAGING.len() as u32
+    }
 }
 
 /// Assemble and boot the machine from the staged images.
@@ -1219,10 +1318,32 @@ fn build_superblock(
                         {
                             probe_add(m, &mut pages, vpage - 0x1000);
                         }
-                        // Breadth-first over call targets; each accepted page's
-                        // own calls extend the frontier.
+                        // Contiguous hot neighbours first (the configuration
+                        // that measured 11/13), THEN up to two call-graph
+                        // joins — cross-page calls only pay when the callee
+                        // is genuinely hot, and gluing more than a couple of
+                        // far pages regressed CPython 3x.
+                        let mut va = vpage + 0x1000;
+                        while pages.len() < MAX_REGION_PAGES && hot(jit, va) {
+                            let before = pages.len();
+                            probe_add(m, &mut pages, va);
+                            if pages.len() == before {
+                                break;
+                            }
+                            va += 0x1000;
+                        }
+                        let mut va = vpage.wrapping_sub(0x1000);
+                        while va < vpage && pages.len() < MAX_REGION_PAGES && hot(jit, va) {
+                            let before = pages.len();
+                            probe_add(m, &mut pages, va);
+                            if pages.len() == before {
+                                break;
+                            }
+                            va = va.wrapping_sub(0x1000);
+                        }
+                        let far_cap = (pages.len() + 2).min(MAX_REGION_PAGES);
                         let mut scanned = 0usize;
-                        while scanned < pages.len() && pages.len() < MAX_REGION_PAGES {
+                        while scanned < pages.len() && pages.len() < far_cap {
                             let (va, pp) = pages[scanned];
                             scanned += 1;
                             let o = (pp - rv64_system::RAM_BASE) as usize;
@@ -1246,41 +1367,59 @@ fn build_superblock(
                             code.extend_from_slice(&m.bus.ram[o..o + 0x1000]);
                         }
                         let vas: Vec<u64> = pages.iter().map(|&(va, _)| va).collect();
-                        // Leaders per page (each page's OWN hot pcs seed it),
-                        // dropping unemittable pcs and loop headers — those
-                        // keep their tight individual loop-region blocks.
+                        // Leaders per CONTIGUOUS RUN of pages: discovery over
+                        // the whole run lets branch targets and fallthroughs
+                        // that cross a page boundary become entries, exactly
+                        // as the contiguous translator had it (dropping this
+                        // to single-page discovery cost ASSIGNMENT its win).
+                        // Runs are separated by gaps; a gap is where sparse
+                        // dispatch takes over.
                         let mut entries: Vec<u64> = Vec::new();
-                        for (k, &(va, _)) in pages.iter().enumerate() {
-                            if entries.len() >= MAX_LEADERS {
-                                break;
+                        let mut k = 0usize;
+                        while k < pages.len() && entries.len() < MAX_LEADERS {
+                            let mut k2 = k;
+                            while k2 + 1 < pages.len()
+                                && pages[k2 + 1].0 == pages[k2].0 + 0x1000
+                            {
+                                k2 += 1;
                             }
-                            let slice = &code[k * 0x1000..(k + 1) * 0x1000];
-                            let pseeds: Vec<u64> = jit
-                                .page_entries
-                                .get(&(aspace, va))
-                                .map(|v| v.clone())
-                                .unwrap_or_default();
-                            let use_seeds =
-                                if va == vpage { &seeds } else { &pseeds };
-                            if use_seeds.is_empty() {
-                                continue;
+                            let run_va = pages[k].0;
+                            let run_len = (k2 - k + 1) * 0x1000;
+                            let slice = &code[k * 0x1000..k * 0x1000 + run_len];
+                            let mut rseeds: Vec<u64> = Vec::new();
+                            for &(va, _) in &pages[k..=k2] {
+                                if let Some(e) = jit.page_entries.get(&(aspace, va)) {
+                                    rseeds.extend_from_slice(e);
+                                }
                             }
-                            let (mut l, back) = rv64_jit::discover_page_leaders_ext(
-                                slice,
-                                va,
-                                va,
-                                0x1000,
-                                use_seeds,
-                                MAX_LEADERS - entries.len(),
-                            );
-                            l.retain(|&e| {
-                                rv64_jit::emittable_at(slice, va, e, lay)
-                                    && (!back.contains(&e)
-                                        || !rv64_jit::is_loop_at(slice, va, e, lay))
-                            });
-                            entries.extend(l);
+                            rseeds.sort_unstable();
+                            rseeds.dedup();
+                            if !rseeds.is_empty() {
+                                let (mut l, back) = rv64_jit::discover_page_leaders_ext(
+                                    slice,
+                                    run_va,
+                                    run_va,
+                                    run_len as u64,
+                                    &rseeds,
+                                    MAX_LEADERS - entries.len(),
+                                );
+                                l.retain(|&e| {
+                                    let po = ((e & !0xfff) - run_va) as usize;
+                                    let pg = &slice[po..po + 0x1000];
+                                    rv64_jit::emittable_at(slice, run_va, e, lay)
+                                        && (!back.contains(&e)
+                                            || !rv64_jit::is_loop_at(
+                                                pg,
+                                                e & !0xfff,
+                                                e,
+                                                lay,
+                                            ))
+                                });
+                                entries.extend(l);
+                            }
+                            k = k2 + 1;
                         }
-                        let sb = rv64_jit::translate_superblock_sparse(
+                                                let sb = rv64_jit::translate_superblock_sparse(
                             &code, &vas, &entries, lay,
                         );
                         if sb.is_none() {
@@ -1876,18 +2015,14 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         if !out.is_empty() {
             unsafe { host_write(1, out.as_ptr(), out.len()) }
         }
-        for frame in m.net_take_output() {
-            unsafe { host_net_send(frame.as_ptr(), frame.len()) }
-        }
+        pump_net(m);
     }
 
     let out = m.console_output();
     if !out.is_empty() {
         unsafe { host_write(1, out.as_ptr(), out.len()) }
     }
-        for frame in m.net_take_output() {
-            unsafe { host_net_send(frame.as_ptr(), frame.len()) }
-        }
+        pump_net(m);
     m.power_off as i32
 }
 
@@ -1899,6 +2034,32 @@ pub extern "C" fn sys_net_input() {
     unsafe {
         let frame = core::mem::take(&mut STAGING);
         m.net_input(&frame);
+    }
+}
+
+/// Move the guest's frames one step: into the in-process proxy when one is
+/// running, otherwise out to the page's relay.
+#[allow(static_mut_refs)]
+fn pump_net(m: &mut rv64_system::Machine) {
+    unsafe {
+        match SYS_NETSTACK.as_mut() {
+            Some(stack) => {
+                for frame in m.net_take_output() {
+                    stack.input(&frame);
+                }
+                if let Some(proxy) = SYS_PROXY.as_mut() {
+                    proxy.pump(stack, &mut SYS_EGRESS);
+                }
+                for frame in stack.take_output() {
+                    m.net_input(&frame);
+                }
+            }
+            None => {
+                for frame in m.net_take_output() {
+                    host_net_send(frame.as_ptr(), frame.len())
+                }
+            }
+        }
     }
 }
 

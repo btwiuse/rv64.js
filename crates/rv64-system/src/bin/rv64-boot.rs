@@ -12,7 +12,15 @@
 //! binary message per Ethernet frame — websockproxy/v86's protocol). In the
 //! guest, configure it however the relay's network expects, e.g.
 //!   udhcpc -i eth0
+//!
+//! `--proxy` instead runs an in-process HTTP proxy behind the NIC: no relay, no
+//! external anything. The guest configures the NIC (DHCP or static) and points
+//! http_proxy at the printed URL. Natively the proxy speaks plaintext http only
+//! (see egress.rs); the browser build gets https because fetch does the TLS.
 
+use rv64_system::egress::NativeEgress;
+use rv64_system::httpproxy::Proxy;
+use rv64_system::netstack::{NetConfig, NetStack};
 use rv64_system::{p9, p9fs, ws, BootImages, Machine};
 use std::io::{Read, Write};
 
@@ -26,6 +34,7 @@ fn main() {
     let mut share = None;
     let mut tag = "host".to_string();
     let mut relay_url = None;
+    let mut proxy_mode = false;
     let mut mac = rv64_system::virtio::DEFAULT_MAC;
     let mut positional = Vec::new();
     let mut it = args.into_iter();
@@ -34,6 +43,7 @@ fn main() {
             "--9p" => share = it.next(),
             "--9p-tag" => tag = it.next().unwrap_or(tag),
             "--net" => relay_url = it.next(),
+            "--proxy" => proxy_mode = true,
             "--net-mac" => {
                 mac = it
                     .next()
@@ -45,7 +55,7 @@ fn main() {
         }
     }
     if positional.is_empty() {
-        eprintln!("usage: rv64-boot <bios> [kernel] [disk] [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT] [--net-mac MAC] [-- cmdline]");
+        eprintln!("usage: rv64-boot <bios> [kernel] [disk] [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT | --proxy] [--net-mac MAC] [-- cmdline]");
         std::process::exit(2);
     }
     let bios = std::fs::read(&positional[0]).expect("read bios");
@@ -74,7 +84,22 @@ fn main() {
         },
         None => None,
     };
-    let net = relay.is_some().then_some(mac);
+    // Either transport needs the NIC; the proxy needs the host-side stack too.
+    let mut proxy_stack = proxy_mode.then(|| {
+        let stack = NetStack::new(NetConfig::default());
+        eprintln!(
+            "[rv64-boot] proxy: {} — in the guest:\n\
+             [rv64-boot]   ifconfig eth0 {} netmask {} up\n\
+             [rv64-boot]   export http_proxy={}",
+            stack.proxy_url(),
+            fmt_ip(&stack.config().guest_ip),
+            fmt_ip(&stack.config().netmask),
+            stack.proxy_url(),
+        );
+        // Native egress is plaintext-only, so leave the guest's scheme alone.
+        (stack, Proxy::new().keep_scheme(), NativeEgress::new())
+    });
+    let net = (relay.is_some() || proxy_mode).then_some(mac);
 
     let mut m = Machine::new(
         128,
@@ -108,6 +133,17 @@ fn main() {
         if !out.is_empty() {
             std::io::stdout().write_all(&out).unwrap();
             std::io::stdout().flush().unwrap();
+        }
+
+        // Pump the in-process proxy both ways once per slice.
+        if let Some((stack, proxy, egress)) = proxy_stack.as_mut() {
+            for frame in m.net_take_output() {
+                stack.input(&frame);
+            }
+            proxy.pump(stack, egress);
+            for frame in stack.take_output() {
+                m.net_input(&frame);
+            }
         }
 
         // Pump the relay both ways once per slice.
@@ -173,6 +209,10 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
         *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
     }
     parts.next().is_none().then_some(out)
+}
+
+fn fmt_ip(o: &[u8; 4]) -> String {
+    format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
 }
 
 fn fmt_mac(mac: &[u8; 6]) -> String {

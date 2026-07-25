@@ -49,6 +49,113 @@ pub struct Response {
 /// Identifies an in-flight request.
 pub type ReqId = u64;
 
+// ---- FFI wire form --------------------------------------------------------
+//
+// A request has to cross into JavaScript (where `fetch` lives) and a response
+// has to come back. Both are encoded as explicit length-prefixed fields rather
+// than JSON: no escaping questions, no dependency, and a DataView reads it in a
+// dozen lines. All lengths are little-endian u32.
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(b);
+}
+
+struct Cursor<'a> {
+    b: &'a [u8],
+    p: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn u32(&mut self) -> Option<u32> {
+        let v = u32::from_le_bytes(self.b.get(self.p..self.p + 4)?.try_into().ok()?);
+        self.p += 4;
+        Some(v)
+    }
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let n = self.u32()? as usize;
+        let s = self.b.get(self.p..self.p.checked_add(n)?)?;
+        self.p += n;
+        Some(s)
+    }
+    fn string(&mut self) -> Option<String> {
+        Some(String::from_utf8_lossy(self.bytes()?).into_owned())
+    }
+}
+
+impl Request {
+    /// `method | url | nheaders | (name, value)* | body`
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_bytes(&mut out, self.method.as_bytes());
+        put_bytes(&mut out, self.url.as_bytes());
+        out.extend_from_slice(&(self.headers.len() as u32).to_le_bytes());
+        for (name, value) in &self.headers {
+            put_bytes(&mut out, name.as_bytes());
+            put_bytes(&mut out, value.as_bytes());
+        }
+        put_bytes(&mut out, &self.body);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Request> {
+        let mut c = Cursor { b, p: 0 };
+        let method = c.string()?;
+        let url = c.string()?;
+        let n = c.u32()? as usize;
+        let mut headers = Vec::with_capacity(n);
+        for _ in 0..n {
+            headers.push((c.string()?, c.string()?));
+        }
+        Some(Request {
+            method,
+            url,
+            headers,
+            body: c.bytes()?.to_vec(),
+        })
+    }
+}
+
+impl Response {
+    /// `status | nheaders | (name, value)* | body`. A zero status carries an
+    /// error message in place of the body, which becomes a 502.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = (self.status as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(&(self.headers.len() as u32).to_le_bytes());
+        for (name, value) in &self.headers {
+            put_bytes(&mut out, name.as_bytes());
+            put_bytes(&mut out, value.as_bytes());
+        }
+        put_bytes(&mut out, &self.body);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Response> {
+        let mut c = Cursor { b, p: 0 };
+        let status = c.u32()? as u16;
+        let n = c.u32()? as usize;
+        let mut headers = Vec::with_capacity(n);
+        for _ in 0..n {
+            headers.push((c.string()?, c.string()?));
+        }
+        Some(Response {
+            status,
+            headers,
+            body: c.bytes()?.to_vec(),
+        })
+    }
+
+    /// Decode into the `Result` the proxy consumes: a zero status means the
+    /// host could not perform the request at all.
+    pub fn decode_result(b: &[u8]) -> Result<Response, String> {
+        match Response::decode(b) {
+            Some(r) if r.status == 0 => Err(String::from_utf8_lossy(&r.body).into_owned()),
+            Some(r) => Ok(r),
+            None => Err("malformed response from host".into()),
+        }
+    }
+}
+
 /// How requests actually leave the host.
 ///
 /// Deliberately submit-then-poll rather than blocking: `fetch()` is async and
@@ -487,6 +594,45 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(req.url, "https://api.example/v1");
+    }
+
+    #[test]
+    fn the_ffi_wire_form_round_trips() {
+        let req = Request {
+            method: "POST".into(),
+            url: "https://api.example/v1/chat".into(),
+            headers: vec![
+                ("Authorization".into(), "Bearer xyz".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            body: b"{\"a\":1}".to_vec(),
+        };
+        assert_eq!(Request::decode(&req.encode()).unwrap(), req);
+
+        let resp = Response {
+            status: 201,
+            headers: vec![("Location".into(), "/things/1".into())],
+            // Non-UTF-8 bodies must survive: responses are arbitrary bytes.
+            body: vec![0x00, 0xff, 0xfe, b'x'],
+        };
+        assert_eq!(Response::decode(&resp.encode()).unwrap(), resp);
+        assert_eq!(Response::decode_result(&resp.encode()).unwrap(), resp);
+
+        // A zero status is the host's channel for "could not perform this".
+        let failed = Response {
+            status: 0,
+            headers: vec![],
+            body: b"TypeError: Failed to fetch".to_vec(),
+        };
+        assert_eq!(
+            Response::decode_result(&failed.encode()),
+            Err("TypeError: Failed to fetch".into())
+        );
+        // Truncation is an error, never a panic or a half-parsed request.
+        let encoded = req.encode();
+        for cut in [0, 1, 4, 10, encoded.len() - 1] {
+            assert!(Request::decode(&encoded[..cut]).is_none(), "cut at {cut}");
+        }
     }
 
     // ---- end to end over the netstack, with no emulator ----

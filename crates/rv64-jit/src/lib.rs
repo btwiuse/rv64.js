@@ -4348,12 +4348,23 @@ pub fn translate_superblock_sparse(
     m.local_get(ITER);
     m.local_get(BASE);
     m.op(I64_GE_U).br_if(1);
-    // Resolve TPC -> concat offset in SCR: one subtract+compare per page
-    // (the trigger page is first — the hottest transfers match immediately).
+    // Resolve TPC -> concat offset in SCR: one subtract+compare per
+    // CONTIGUOUS RUN of pages (a fully contiguous region pays exactly the
+    // single range check the contiguous translator had — paying per page
+    // cost FP EMULATION a third of its throughput).
     m.op(BLOCK).op(VOID); // $resolve
-    for (i, &va) in page_vas.iter().enumerate() {
-        m.local_get(TPC).i64_const(va as i64).op(I64_SUB).local_set(SCR);
-        m.local_get(SCR).i64_const(0x1000).op(I64_LT_U);
+    let mut i = 0usize;
+    while i < np {
+        let mut j2 = i;
+        while j2 + 1 < np && page_vas[j2 + 1] == page_vas[j2] + 0x1000 {
+            j2 += 1;
+        }
+        let run_len = ((j2 - i + 1) as i64) << 12;
+        m.local_get(TPC)
+            .i64_const(page_vas[i] as i64)
+            .op(I64_SUB)
+            .local_set(SCR);
+        m.local_get(SCR).i64_const(run_len).op(I64_LT_U);
         m.op(IF).op(VOID);
         if i != 0 {
             m.local_get(SCR)
@@ -4363,6 +4374,7 @@ pub fn translate_superblock_sparse(
         }
         m.br(1); // out of $resolve, offset in SCR
         m.op(END);
+        i = j2 + 1;
     }
     m.br(2); // no page matched -> $exit
     m.op(END); // $resolve
