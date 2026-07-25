@@ -149,6 +149,10 @@ struct Ctx {
     fp_local: [u32; 32],
     /// FP registers written anywhere in the block (flushed to state on exit).
     fp_write_mask: u32,
+    /// Base index of 8 i64 scratch locals for the FMADD fast path, or 0 if
+    /// the block contains no FMADD-family instruction (locals are allocated
+    /// only when needed — V8 zero-initializes locals per call).
+    fma_scratch: u32,
     /// When a mid-block bail should report the retired count from a runtime
     /// local (the loop's ITER accumulator) rather than a compile-time constant.
     /// Set for compiled loops: an iteration count that can reach millions must
@@ -360,6 +364,196 @@ impl Ctx {
             }
         }
         m.op(I64_REINTERPRET_F64);
+        self.store_freg_post(m, d);
+    }
+
+    /// FMADD.D family, bit-exact without a host fma: the wasm emission of
+    /// fma_fastpath_ref (see its comment for the Dekker/TwoSum/round-to-odd
+    /// proof; the fuzz test proves this 1:1 twin against softfp). Bails on:
+    /// eligibility, operand/product exponent bands, t+e underflow-to-zero,
+    /// non-normal result. Scratch: 8 i64 locals at Ctx::fma_scratch.
+    #[allow(clippy::too_many_arguments)]
+    fn fp_fmadd_d(&self, m: &mut WasmModule, s1: usize, s2: usize, s3: usize, d: usize,
+                  neg_prod: bool, neg_c: bool, dyn_rm: bool, pc: u64, n: u32) {
+        debug_assert!(self.fma_scratch != 0);
+        let fs = self.fma_scratch;
+        let (fa, fb, fc, fp, f4, f5, f6, f7l) =
+            (fs, fs + 1, fs + 2, fs + 3, fs + 4, fs + 5, fs + 6, fs + 7);
+        let getf = |m: &mut WasmModule, l: u32| { m.local_get(l).op(F64_REINTERPRET_I64); };
+        let setf = |m: &mut WasmModule, l: u32| { m.op(I64_REINTERPRET_F64).local_set(l); };
+        let fconst = |m: &mut WasmModule, v: f64| {
+            m.i64_const(v.to_bits() as i64).op(F64_REINTERPRET_I64);
+        };
+        self.fp_eligibility(m, dyn_rm, pc, n);
+        // load operands (bits), applying the variant's sign flips
+        self.push_freg(m, s1);
+        if neg_prod {
+            m.i64_const(i64::MIN).op(I64_XOR);
+        }
+        m.local_set(fa);
+        self.push_freg(m, s2);
+        m.local_set(fb);
+        self.push_freg(m, s3);
+        if neg_c {
+            m.i64_const(i64::MIN).op(I64_XOR);
+        }
+        m.local_set(fc);
+        // exponent band: bail unless ((bits>>52)&0x7ff) - 0x100 <=u 0x5ff
+        for &l in &[fa, fb, fc] {
+            m.local_get(l)
+                .i64_const(52)
+                .op(I64_SHR_U)
+                .i64_const(0x7ff)
+                .op(I64_AND)
+                .i64_const(0x100)
+                .op(I64_SUB)
+                .i64_const(0x5ff)
+                .op(I64_GT_U);
+            m.op(IF).op(VOID);
+            self.bail(m, pc, n);
+            m.op(END);
+        }
+        // p = a * b, band-checked
+        getf(m, fa);
+        getf(m, fb);
+        m.op(F64_MUL);
+        setf(m, fp);
+        m.local_get(fp)
+            .i64_const(52)
+            .op(I64_SHR_U)
+            .i64_const(0x7ff)
+            .op(I64_AND)
+            .i64_const(0x100)
+            .op(I64_SUB)
+            .i64_const(0x5ff)
+            .op(I64_GT_U);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+        const CSPLIT: f64 = 134217729.0; // 2^27 + 1 (Dekker)
+        // ah = a1 - (a1 - a), al = a - ah   (a1 = a*CSPLIT, staged in f4)
+        getf(m, fa);
+        fconst(m, CSPLIT);
+        m.op(F64_MUL);
+        setf(m, f4); // a1
+        getf(m, f4);
+        getf(m, f4);
+        getf(m, fa);
+        m.op(F64_SUB).op(F64_SUB);
+        setf(m, f4); // ah
+        getf(m, fa);
+        getf(m, f4);
+        m.op(F64_SUB);
+        setf(m, f5); // al
+        // bh (f6), bl (f7l)
+        getf(m, fb);
+        fconst(m, CSPLIT);
+        m.op(F64_MUL);
+        setf(m, f6); // b1
+        getf(m, f6);
+        getf(m, f6);
+        getf(m, fb);
+        m.op(F64_SUB).op(F64_SUB);
+        setf(m, f6); // bh
+        getf(m, fb);
+        getf(m, f6);
+        m.op(F64_SUB);
+        setf(m, f7l); // bl
+        // e = ((ah*bh - p) + ah*bl + al*bh) + al*bl   -> f4 (ah dead after)
+        getf(m, f4);
+        getf(m, f6);
+        m.op(F64_MUL);
+        getf(m, fp);
+        m.op(F64_SUB);
+        getf(m, f4);
+        getf(m, f7l);
+        m.op(F64_MUL);
+        m.op(F64_ADD);
+        getf(m, f5);
+        getf(m, f6);
+        m.op(F64_MUL);
+        m.op(F64_ADD);
+        getf(m, f5);
+        getf(m, f7l);
+        m.op(F64_MUL);
+        m.op(F64_ADD);
+        setf(m, f4); // e
+        // s = p + c -> f5 ; TwoSum tail t -> f6 (z staged in VAL)
+        getf(m, fp);
+        getf(m, fc);
+        m.op(F64_ADD);
+        setf(m, f5); // s
+        getf(m, f5);
+        getf(m, fp);
+        m.op(F64_SUB);
+        setf(m, VAL); // z
+        getf(m, fp);
+        getf(m, f5);
+        getf(m, VAL);
+        m.op(F64_SUB);
+        m.op(F64_SUB); // p - (s - z)
+        getf(m, fc);
+        getf(m, VAL);
+        m.op(F64_SUB); // c - z
+        m.op(F64_ADD);
+        setf(m, f6); // t
+        // u = t + e -> f7l ; TwoSum tail d -> fp (p dead; z2 staged in VAL)
+        getf(m, f6);
+        getf(m, f4);
+        m.op(F64_ADD);
+        setf(m, f7l); // u
+        getf(m, f7l);
+        getf(m, f6);
+        m.op(F64_SUB);
+        setf(m, VAL); // z2
+        getf(m, f6);
+        getf(m, f7l);
+        getf(m, VAL);
+        m.op(F64_SUB);
+        m.op(F64_SUB); // t - (u - z2)
+        getf(m, f4);
+        getf(m, VAL);
+        m.op(F64_SUB); // e - z2
+        m.op(F64_ADD);
+        setf(m, fp); // d
+        // round-to-odd: if d != 0 { if u == 0 bail; if even(u) nudge toward d }
+        getf(m, fp);
+        fconst(m, 0.0);
+        m.op(F64_NE);
+        m.op(IF).op(VOID);
+        {
+            getf(m, f7l);
+            fconst(m, 0.0);
+            m.op(F64_EQ);
+            m.op(IF).op(VOID);
+            self.bail(m, pc, n);
+            m.op(END);
+            m.local_get(f7l).i64_const(1).op(I64_AND).op(I64_EQZ);
+            m.op(IF).op(VOID);
+            {
+                // u += ((d > 0) != (u < 0)) ? 1 : -1   (bit-domain nudge)
+                m.i64_const(1).i64_const(-1);
+                getf(m, fp);
+                fconst(m, 0.0);
+                m.op(F64_GT);
+                getf(m, f7l);
+                fconst(m, 0.0);
+                m.op(F64_LT);
+                m.op(I32_XOR);
+                m.op(SELECT);
+                m.local_get(f7l).op(I64_ADD).local_set(f7l);
+            }
+            m.op(END);
+        }
+        m.op(END);
+        // r = s + v, result-normal guard, store
+        getf(m, f5);
+        getf(m, f7l);
+        m.op(F64_ADD);
+        setf(m, VAL);
+        self.fp_result_normal_guard(m, pc, n);
+        self.store_freg_pre(m, d);
+        m.local_get(VAL);
         self.store_freg_post(m, d);
     }
 
@@ -649,6 +843,16 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                     _ => break,
                 }
             }
+            op @ (0x43 | 0x47 | 0x4b | 0x4f) if lay.f_base != 0 => {
+                if !fma_handled(op, insn) {
+                    break;
+                }
+                fmark(&mut fread, s1);
+                fmark(&mut fread, s2);
+                fmark(&mut fread, ((insn >> 27) & 31) as usize);
+                fmark(&mut fwrite, d);
+                read |= 1; // bit 0 = "block contains fma" (see build_ctx)
+            }
             _ => break,
         }
         pc = next_pc;
@@ -677,6 +881,15 @@ fn fp_handled(insn: u32) -> bool {
         (0x1a, 1, 0 | 7) => rs2(insn) <= 3, // FCVT.D.{W,WU,L,LU} (rne | dyn)
         _ => false,
     }
+}
+
+/// Is this FMADD-family (0x43/0x47/0x4b/0x4f) instruction one the JIT emits
+/// inline? Double precision (fmt bits [26:25] == 1), rm RNE or dynamic.
+/// Same single-authority contract as fp_handled/alu_handled.
+fn fma_handled(op: u32, insn: u32) -> bool {
+    matches!(op, 0x43 | 0x47 | 0x4b | 0x4f)
+        && (insn >> 25) & 3 == 1
+        && matches!(funct3(insn), 0 | 7)
 }
 
 /// Is `f7`/`f3` a supported OP / OP-32 / OP-IMM-32 encoding?
@@ -750,6 +963,11 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
             }
             0x53 if lay.f_base != 0 => {
                 if !fp_handled(insn) {
+                    return None;
+                }
+            }
+            0x43 | 0x47 | 0x4b | 0x4f if lay.f_base != 0 => {
+                if !fma_handled(op, insn) {
                     return None;
                 }
             }
@@ -936,6 +1154,13 @@ fn scan_regs_region(
                     _ => {}
                 }
             }
+            0x43 | 0x47 | 0x4b | 0x4f => {
+                fmark(&mut fread, s1);
+                fmark(&mut fread, s2);
+                fmark(&mut fread, ((insn >> 27) & 31) as usize);
+                fmark(&mut fwrite, d);
+                read |= 1; // bit 0 = "block contains fma" (see build_ctx)
+            }
             0x63 => {
                 mark(&mut read, s1);
                 mark(&mut read, s2);
@@ -957,6 +1182,13 @@ fn build_ctx(
     fp_read: u32,
     fp_write: u32,
 ) -> (Ctx, WasmModule) {
+    // read_mask bit 0 (x0 — never a real register) smuggles the "block
+    // contains FMADD-family" flag from the scanners; strip it BEFORE any mask
+    // use (a set bit 0 would make the prologue clobber local 0, the machine
+    // pointer parameter).
+    let want_fma = read_mask & 1 != 0;
+    let read_mask = read_mask & !1;
+    let write_mask = write_mask & !1;
     let touched = read_mask | write_mask;
     let fp_touched = fp_read | fp_write;
     let mut reg_local = [0u32; 32];
@@ -975,16 +1207,19 @@ fn build_ctx(
             n_fp += 1;
         }
     }
+    let n_fma = if want_fma { 8 } else { 0 };
     let c = Ctx {
         lay,
         reg_local,
         write_mask,
-        idxb: N_I64_LOCALS + n_reg + n_fp + 1, // i32 local after all i64 locals
+        // i32 local after all i64 locals (incl. the fma scratch block)
+        idxb: N_I64_LOCALS + n_reg + n_fp + n_fma + 1,
         fp_local,
         fp_write_mask: fp_write,
+        fma_scratch: if want_fma { N_I64_LOCALS + 1 + n_reg + n_fp } else { 0 },
         retired_local: None,
     };
-    let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp, 1);
+    let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp + n_fma, 1);
     let mut t = touched;
     while t != 0 {
         let r = t.trailing_zeros() as usize;
@@ -1446,6 +1681,16 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                 _ => return false,
             }
         }
+        // FMADD/FMSUB/FNMSUB/FNMADD.D — exact emulated fma (see fp_fmadd_d).
+        0x43 | 0x47 | 0x4b | 0x4f if lay.f_base != 0 => {
+            if !fma_handled(op, insn) {
+                return false;
+            }
+            let s3 = ((insn >> 27) & 31) as usize;
+            let neg_prod = op == 0x4b || op == 0x4f;
+            let neg_c = op == 0x47 || op == 0x4f;
+            c.fp_fmadd_d(m, s1, s2, s3, d, neg_prod, neg_c, funct3(insn) == 7, pc, n);
+        }
         _ => return false,
     }
     true
@@ -1454,6 +1699,73 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
 /// Translate a block starting at `start_pc`. `code` is the guest code bytes and
 /// `base` its guest address. Returns None if the first instruction isn't
 /// translatable (caller interprets it instead).
+/// Host-side twin of the FMADD.D fast path the JIT emits (fp_fmadd_d): every
+/// f64 operation here corresponds 1:1 to an emitted wasm op, and both are
+/// IEEE-754 binary64 round-to-nearest-even — so the fuzz test proving this
+/// function bit-exact against softfp::sf64::fma proves the emission.
+///
+/// Returns Some(result bits) exactly when the emitted code produces a result;
+/// None where it bails to softfloat. The algorithm: Dekker TwoProduct gives
+/// p + e == a*b EXACTLY; Knuth TwoSum gives s + t == p + c EXACTLY; therefore
+/// a*b + c == s + (t + e) as reals. If t + e is exactly representable
+/// (checked by its own TwoSum tail d == 0), the single rounded add s + u IS
+/// round(a*b + c) — no double rounding, rigorously. Anything else bails:
+/// operand/product exponents outside the band that keeps the splits and the
+/// error chain exact, d != 0, or a non-normal final result.
+pub fn fma_fastpath_ref(ab: u64, bb: u64, cb: u64) -> Option<u64> {
+    let exp = |x: u64| ((x >> 52) & 0x7ff) as i64;
+    for &x in &[ab, bb, cb] {
+        let e = exp(x);
+        if !(0x100..=0x6ff).contains(&e) {
+            return None;
+        }
+    }
+    let a = f64::from_bits(ab);
+    let b = f64::from_bits(bb);
+    let c = f64::from_bits(cb);
+    let p = a * b;
+    if !(0x100..=0x6ff).contains(&exp(p.to_bits())) {
+        return None;
+    }
+    const CSPLIT: f64 = 134217729.0; // 2^27 + 1 (Dekker)
+    let a1 = a * CSPLIT;
+    let ah = a1 - (a1 - a);
+    let al = a - ah;
+    let b1 = b * CSPLIT;
+    let bh = b1 - (b1 - b);
+    let bl = b - bh;
+    let e = ((ah * bh - p) + ah * bl + al * bh) + al * bl; // p + e == a*b exactly
+    let s = p + c;
+    let z = s - p;
+    let t = (p - (s - z)) + (c - z); // s + t == p + c exactly (Knuth TwoSum)
+    let u = t + e;
+    let z2 = u - t;
+    let d = (t - (u - z2)) + (e - z2); // u + d == t + e exactly
+    // Round-to-odd correction (Boldo-Melquiond): when t + e rounded (d != 0),
+    // replace u by its neighbor with an ODD last mantissa bit, on the side of
+    // the true value. The final RNE add of s + RO(t+e) is then provably the
+    // correctly rounded a*b + c — no double rounding, for ALL inputs in band.
+    let v = if d != 0.0 {
+        let ub = u.to_bits();
+        if u == 0.0 {
+            return None; // t + e underflowed; softfloat owns it
+        }
+        if ub & 1 == 0 {
+            let toward_larger_bits = (d > 0.0) != (u < 0.0);
+            f64::from_bits(if toward_larger_bits { ub + 1 } else { ub - 1 })
+        } else {
+            u // already odd
+        }
+    } else {
+        u
+    };
+    let r = s + v; // == round(a*b + c)
+    if !(1..=0x7fe).contains(&exp(r.to_bits())) {
+        return None;
+    }
+    Some(r.to_bits())
+}
+
 pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> Option<Block> {
     // Structured loop region (nested loops + forward if-then/break) → compile
     // the whole thing as one wasm function so register locals persist across
@@ -1859,6 +2171,16 @@ fn scan_regs_super(
                         _ => break,
                     }
                 }
+                op @ (0x43 | 0x47 | 0x4b | 0x4f) if lay.f_base != 0 => {
+                    if !fma_handled(op, insn) {
+                        break;
+                    }
+                    fmark(&mut fr, s1);
+                    fmark(&mut fr, s2);
+                    fmark(&mut fr, ((insn >> 27) & 31) as usize);
+                    fmark(&mut fw, d);
+                    r |= 1; // bit 0 = "block contains fma" (see build_ctx)
+                }
                 _ => break,
             }
             pc = pc.wrapping_add(ilen);
@@ -2082,6 +2404,7 @@ pub fn discover_page_leaders(
                         0x23 => funct3(insn) <= 3,
                         0x07 | 0x27 => funct3(insn) == 3,
                         0x53 => fp_handled(insn),
+                        0x43 | 0x47 | 0x4b | 0x4f => fma_handled(op, insn),
                         _ => false,
                     };
                     if !handled {
@@ -2186,6 +2509,76 @@ pub fn translate_superblock(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Fuzz the FMADD fast-path twin against the softfloat oracle: every
+    /// input where the fast path produces a result must be bit-identical to
+    /// sf64::fma under RNE. Also reports (via the pass counter assert) that
+    /// the fast path actually fires on a meaningful share of libm-like values.
+    #[test]
+    fn fma_fastpath_matches_softfp() {
+        use rv64_core::softfp::sf64;
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut checked = 0u64;
+        let mut passed = 0u64;
+        let mut check = |ab: u64, bb: u64, cb: u64| {
+            if let Some(r) = fma_fastpath_ref(ab, bb, cb) {
+                let mut fl = 0u32;
+                let want = sf64::fma(ab, bb, cb, 0, &mut fl);
+                assert_eq!(
+                    r, want,
+                    "fma mismatch a={ab:#x} b={bb:#x} c={cb:#x}: fast={r:#x} soft={want:#x}"
+                );
+                1u64
+            } else {
+                0
+            }
+        };
+        // libm-like: values near 1.0 (exponents 1023 +/- 40), all sign mixes
+        let mark0 = (checked, passed);
+        for _ in 0..2_000_000 {
+            let m = |r: u64| {
+                let mant = r & 0xf_ffff_ffff_ffff;
+                let e = 1023i64 + ((r >> 52) as i64 % 81) - 40;
+                let sgn = (r >> 63) << 63;
+                sgn | ((e as u64) << 52) | mant
+            };
+            let (x, y, z) = (m(rnd()), m(rnd()), m(rnd()));
+            checked += 1;
+            passed += check(x, y, z);
+        }
+        let libm_rate = (passed - mark0.1) * 100 / (checked - mark0.0);
+        // near-cancellation: c ~= -(a*b)
+        let mark1 = (checked, passed);
+        for _ in 0..500_000 {
+            let m = |r: u64| {
+                let mant = r & 0xf_ffff_ffff_ffff;
+                (1023u64 << 52) | mant
+            };
+            let (x, y) = (m(rnd()), m(rnd()));
+            let prod = f64::from_bits(x) * f64::from_bits(y);
+            let cb = (-prod).to_bits() ^ (rnd() & 3); // c near -(a*b), jiggled ulps
+            checked += 1;
+            passed += check(x, y, cb);
+        }
+        let cancel_rate = (passed - mark1.1) * 100 / (checked - mark1.0);
+        // fully random bit patterns (mostly bail; must never MIS-match)
+        for _ in 0..2_000_000 {
+            checked += 1;
+            passed += check(rnd(), rnd(), rnd());
+        }
+        println!("hit rates: libm-like {libm_rate}%, near-cancel {cancel_rate}%, total {}%", passed * 100 / checked);
+        // the fast path must be worth emitting: solid hit rate on libm-like values
+        assert!(libm_rate >= 90, "libm-like hit rate too low: {libm_rate}%");
+    }
+
+
     use super::*;
 
     // sum 1..10 program from the core tests

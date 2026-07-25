@@ -45,6 +45,7 @@ pub const I64_STORE16: u8 = 0x3d;
 pub const I64_STORE32: u8 = 0x3e;
 pub const I64_EQZ: u8 = 0x50;
 pub const I32_OR: u8 = 0x72;
+pub const I32_XOR: u8 = 0x73;
 pub const I32_EQZ: u8 = 0x45;
 // f64 arithmetic + reinterpret casts (Phase 2 FP-in-blocks).
 pub const F64_ADD: u8 = 0xa0;
@@ -85,6 +86,8 @@ pub const SELECT: u8 = 0x1b;
 // FP conversions / sqrt (FP fast path: FCVT + FSQRT inline)
 pub const F64_SQRT: u8 = 0x9f;
 pub const F64_GE: u8 = 0x66;
+pub const F64_GT: u8 = 0x64;
+pub const F64_NE: u8 = 0x62;
 pub const I64_TRUNC_F64_S: u8 = 0xb0; // traps out-of-range: range-guarded at emission
 pub const F64_CONVERT_I64_S: u8 = 0xb9;
 pub const F64_CONVERT_I64_U: u8 = 0xba;
