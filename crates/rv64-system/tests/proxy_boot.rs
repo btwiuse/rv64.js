@@ -190,16 +190,52 @@ fn guest_fetches_through_the_in_process_proxy() {
         tail(&h.out)
     );
 
-    // Static addressing keeps the test deterministic; DHCP is covered by the
-    // netstack unit tests.
-    let ifconfig = format!(
-        "ifconfig eth0 {} netmask {} up && echo UP_'O'K",
-        ip(&cfg.guest_ip),
-        ip(&cfg.netmask)
-    );
+    // Configure by DHCP rather than by hand: the netstack serves the lease, and
+    // this is the path a user (or a browser demo) actually takes.
+    //
+    // The lease has to be *applied* by a script udhcpc runs, and this guest
+    // image ships none — busybox has the default path compiled in
+    // (/usr/share/udhcpc/default.script) but the file does not exist, so
+    // udhcpc reports a lease and leaves the interface unconfigured. Supply a
+    // minimal one so the test exercises the whole path rather than just the
+    // protocol exchange.
     assert!(
-        h.run(&ifconfig, "UP_OK", 2000),
-        "bringing eth0 up failed:\n{}",
+        h.run(
+            r#"printf '#!/bin/sh\n[ "$1" = bound ] && ifconfig $interface $ip netmask $subnet\nexit 0\n' > /tmp/dh.sh; chmod +x /tmp/dh.sh; echo SCRIPT_'O'K"#,
+            "SCRIPT_OK",
+            2000
+        ),
+        "could not write the udhcpc script:\n{}",
+        tail(&h.out)
+    );
+    // `-n -q` makes udhcpc exit once it has a lease instead of daemonising.
+    assert!(
+        h.run(
+            "ifconfig eth0 up; udhcpc -i eth0 -n -q -s /tmp/dh.sh; echo DHCP_'O'K",
+            "DHCP_OK",
+            4000
+        ),
+        "udhcpc never finished:\n{}",
+        tail(&h.out)
+    );
+    // The offer itself must have come from us, with the address we serve.
+    assert!(
+        h.out.contains(&format!("Lease of {} obtained", ip(&cfg.guest_ip))),
+        "udhcpc did not take our lease:\n{}",
+        tail(&h.out)
+    );
+    // The lease must actually have been applied to the interface, not merely
+    // offered — udhcpc reports success even when its script does nothing.
+    assert!(
+        h.run(
+            &format!(
+                "ifconfig eth0 | grep -q {} && echo LEASE_'O'K",
+                ip(&cfg.guest_ip)
+            ),
+            "LEASE_OK",
+            2000
+        ),
+        "the DHCP lease was not applied to eth0:\n{}",
         tail(&h.out)
     );
 

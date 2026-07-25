@@ -220,7 +220,9 @@ lever now. Its two reverted attempts are documented in git history.
   send `*`. `deb.debian.org` and ordinary web pages do not. So `pip install` and
   `npm install` are reachable with zero infrastructure; browsing is not.
 
-  Verified (`tests/proxy_boot.rs`): the guest brings up eth0, sets `http_proxy`,
+  Verified (`tests/proxy_boot.rs`): the guest configures eth0 **by DHCP** from
+  our own server (real busybox `udhcpc` completes DISCOVER/OFFER/REQUEST/ACK and
+  reports the lease), sets `http_proxy`,
   and `wget`s through the proxy — including a 20 KB response whose md5 the guest
   computes and the test compares against the same bytes hashed on the host, a
   404 passed through, and an egress failure surfacing as a readable 502.
@@ -228,9 +230,27 @@ lever now. Its two reverted attempts are documented in git history.
   segments and the fetch fail. wasm-smoke runs the same path through the real
   `fetch()` against a loopback origin, under the JIT.
 
-  Next, in order: `CONNECT` + TLS MITM so unmodified `https://` URLs work
-  (needs a TLS server and per-host cert minting in wasm — the one dependency
-  worth prototyping before committing), then chunked request bodies, then
+  Responses **stream**: `Egress` reports head, then body chunks, then end, so an
+  SSE or long download reaches the guest as it arrives and nothing is buffered
+  whole. `content-length` and `content-encoding` are deliberately dropped from
+  the forwarded head — `fetch` decompresses transparently, so the upstream
+  length describes the *compressed* body and forwarding either would truncate
+  the response or make the guest gunzip plaintext; `Connection: close` delimits
+  it instead, which is also what lets it stream without chunked encoding.
+
+  **`CONNECT` + TLS MITM is deferred, on two independent findings** (measured
+  2026-07-25, so nobody re-derives them):
+  1. The TinyEMU guest has **no TLS client at all** — no `ssl_client`,
+     `openssl`, `wolfssl`, `mbedtls` or `curl`; busybox `wget` has no TLS
+     backend. MITM could not be tested end to end against a real client with
+     this image, whatever we built.
+  2. `rustls` does not build for `wasm32-unknown-unknown` as-is (`UnixTime::now`
+     needs `SystemTime`). It would need a custom time provider plus a
+     wasm-capable crypto provider, and would be the first external dependencies
+     in a zero-dependency repo.
+
+  So the honest order now: a guest that can speak TLS (the virt machine's Debian
+  userland has curl+openssl) before MITM; then chunked request bodies; then
   per-request routing between `fetch` and the relay.
 
 - [x] **9. Modern guest images** *(done 2026-07-23)* — a new **virt**-class
