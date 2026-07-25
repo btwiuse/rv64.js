@@ -26,8 +26,10 @@ $RVCC          $RVF -ffp-contract=off -o "$XB/rvbench.rv64" "$HERE/rvbench.c"
 # freestanding twin of rvbench.c — identical work).
 # -fno-stack-protector is REQUIRED: the nixpkgs cc-wrapper enables the
 # stack protector by default, whose %gs:0x14 canary reads fault in a
-# freestanding (no-TLS) binary. -msse2 = documented FP baseline for v86.
-I386F="-m32 -msse2 -nostdlib -static -no-pie -O2 -fno-stack-protector"
+# freestanding (no-TLS) binary. NO -msse2: v86 executes SSE2 ~13x slower
+# than x87 and the x87 build is the established cross-ISA checksum baseline
+# (mixed low-32 16c84da4 matches the riscv64 build).
+I386F="-m32 -nostdlib -static -no-pie -O2 -fno-stack-protector"
 gcc $I386F -o "$XB/alu.i386"        "$HERE/alu.c"
 gcc $I386F -o "$XB/rvbench_fs.i386" "$HERE/rvbench_fs.c"
 
