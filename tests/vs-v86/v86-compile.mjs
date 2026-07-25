@@ -11,14 +11,19 @@ const e = new V86({
   cmdline: "rdinit=/init console=ttyS0 bench=tcc", autostart: true,
   memory_size: 1024 * 1024 * 1024, disable_jit: +process.env.DISABLE_JIT, log_level: 0,
 });
-let s = "", ts = null;
+// Timed window is RUN_START -> RUN_DONE (tcc only); md5sum prints AFTER the
+// window and is captured for correctness before reporting.
+let s = "", ts = null, td = null;
 e.add_listener("serial0-output-byte", (b) => {
   const c = String.fromCharCode(b); if ((c < " " && c !== "\n") || c > "~") return; s += c;
   if (ts === null && s.includes("RUN_START")) ts = Date.now();
-  if (s.includes("RUN_DONE")) {
-    const md5 = (s.match(/([0-9a-f]{32})/) || ["?"])[0];
-    console.log(`RESULT ms=${Date.now() - ts} md5=${md5} ${jit ? "JIT" : "INTERP"}`);
-    e.destroy(); process.exit(0);
+  if (td === null && s.includes("RUN_DONE")) {
+    td = Date.now();
+    setTimeout(() => { // give md5sum up to 20s past the timed window
+      const md5 = (s.match(/RUN_DONE[\s\S]*?([0-9a-f]{32})/) || [, "?"])[1];
+      console.log(`RESULT ms=${td - ts} md5=${md5} ${jit ? "JIT" : "INTERP"}`);
+      e.destroy(); process.exit(0);
+    }, 20000);
   }
 });
 setTimeout(() => { console.log("RESULT ms= timeout"); process.exit(1); }, 400000);

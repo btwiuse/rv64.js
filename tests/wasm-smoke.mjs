@@ -48,6 +48,34 @@ for (const [name, argv, wantExit, wantOut] of guests) {
   check(`user-mode ${name}`, ok, `exit=${vm.userExitCode()} jit-blocks=${vm.jitBlocks ?? 0}`);
 }
 
+// ---- budget contract: compiled loops must honor the caller's fuel ----
+// After tier-up, a 1-instruction budget may overshoot by at most one basic
+// block / loop iteration (documented granularity, MAX_BLOCK = 128) — never
+// the old fixed LOOP_CAP (16.7M).
+{
+  const path = join(
+    root,
+    "guests/bench/target/riscv64gc-unknown-linux-musl/release/bench",
+  );
+  if (!existsSync(path)) {
+    console.log("SKIP budget contract (bench guest not built)");
+  } else {
+    const vm = await RV64.create(wasmBytes);
+    vm.onWrite = () => {};
+    vm.loadElf(new Uint8Array(await readFile(path)), ["bench", "fast"]);
+    // warm up so hot loops are compiled, then meter single-instruction budgets
+    vm.runUser(50_000_000n);
+    let worst = 0n;
+    for (let i = 0; i < 2000; i++) {
+      const before = vm.ex.user_insn_count();
+      vm.runUser(1n);
+      const d = vm.ex.user_insn_count() - before;
+      if (d > worst) worst = d;
+    }
+    check("budget contract user_run(1)", worst <= 128n, `worst overshoot=${worst}`);
+  }
+}
+
 // ---- JIT emitter: every module from arbitrary offsets must instantiate ----
 {
   const vm = await RV64.create(wasmBytes);

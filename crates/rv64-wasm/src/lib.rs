@@ -324,11 +324,24 @@ static mut SYS_JIT: Option<JitState> = None;
 // can bail mid-block, so the count is dynamic — the dispatcher reads this
 // rather than assuming full block length).
 static mut RETIRED_CELL: u64 = 0;
+/// Instruction fuel granted to the CURRENT dispatch (see JitLayout::fuel_addr):
+/// compiled loops/superblocks yield once they retire this many instructions,
+/// so caller budgets and the interrupt quantum hold to block granularity.
+static mut FUEL_CELL: u64 = 0;
 
 #[allow(static_mut_refs)]
 fn retired_addr() -> u32 {
     unsafe { &RETIRED_CELL as *const u64 as u32 }
 }
+
+fn fuel_addr() -> u32 {
+    unsafe { &FUEL_CELL as *const u64 as u32 }
+}
+
+/// Longest compiled-code residency between interrupt/device checks, in guest
+/// instructions: ~2.5ms at JIT speed. Loops yield at this bound even when the
+/// caller's budget is larger (P0 interrupt-latency contract).
+const INTERRUPT_QUANTUM: u64 = 1 << 20;
 
 // Perf instrumentation: guest instructions retired inside JIT blocks vs
 // total, and dispatch counts (block calls). Exposed via jit_stat().
@@ -444,6 +457,7 @@ pub extern "C" fn sbtest() -> u64 {
             retired_addr: sp + 264,
             f_base: 0,
             fcsr_addr: 0,
+            fuel_addr: 0,
         };
         let entries = [0x1000u64, 0x100c];
         let blk = match rv64_jit::translate_superblock(&code, base, 0x1000, 0x40, &entries, lay) {
@@ -474,7 +488,8 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
     loop {
         // --- JIT fast path: direct-mapped dispatch, chain blocks ---
         let mut chained = 0u32;
-        while chained < JIT_CHAIN_CAP {
+        while chained < JIT_CHAIN_CAP && remaining > 0 {
+            unsafe { FUEL_CELL = remaining };
             let pc = m.cpu.pc;
             let line = jit.dispatch[JitState::dslot(pc)];
             let idx = if line.pc == pc {
@@ -523,6 +538,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     retired_addr: retired_addr(),
                     f_base: m.cpu.f.as_ptr() as u32,
                     fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
+                    fuel_addr: fuel_addr(),
                 };
                 let end = (pc as usize + 1024).min(m.mem.len());
                 let entry = rv64_jit::translate_block(&m.mem[pc as usize..end], pc, pc, lay)
@@ -743,7 +759,12 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         let mptr = m as *mut rv64_system::Machine as *mut u8;
         let mut chained = 0u32;
         let mut retired_sum = 0u64;
-        while chained < JIT_CHAIN_CAP {
+        // Budget/interrupt contract: this round may retire at most
+        // min(remaining, INTERRUPT_QUANTUM) instructions (to block/iteration
+        // granularity); each dispatch is granted the leftover as loop fuel.
+        let round_budget = remaining.min(INTERRUPT_QUANTUM);
+        while chained < JIT_CHAIN_CAP && retired_sum < round_budget {
+            unsafe { FUEL_CELL = round_budget - retired_sum };
             let pc = m.cpu.pc;
             let slot = JitState::dslot(pc);
             // Fast path: line hit AND no mapping event since it verified —
@@ -807,7 +828,10 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         // JIT coverage on branchy, deeply-chained workloads (the CPython eval
         // loop). (`chained == CAP` can only be reached when every block in the
         // batch retired > 0, since a zero-retire block breaks above.)
-        if chained == JIT_CHAIN_CAP {
+        if remaining == 0 {
+            break;
+        }
+        if chained == JIT_CHAIN_CAP || retired_sum >= round_budget {
             m.sync_devices();
             m.cpu.check_interrupts(&mut m.bus);
             continue;
@@ -840,6 +864,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             retired_addr: retired_addr(),
                             f_base: m.cpu.f.as_ptr() as u32,
                             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
+                            fuel_addr: fuel_addr(),
                         };
                         let vpage = pc & !0xfff;
                         let pa_page = pa & !0xfff;
@@ -1009,6 +1034,16 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             }
             remaining = remaining.saturating_sub(ran.max(1));
         }
+
+        // Stream console output at quantum granularity, DURING execution —
+        // buffering until sys_run returns skews benchmark timing: a marker
+        // printed early in a slice would be timestamped after the whole slice
+        // (v86 timestamps serial bytes as they arrive; symmetry demands we
+        // surface output comparably; see ISSUES.md P0).
+        let out = m.console_output();
+        if !out.is_empty() {
+            unsafe { host_write(1, out.as_ptr(), out.len()) }
+        }
     }
 
     let out = m.console_output();
@@ -1029,8 +1064,6 @@ pub extern "C" fn sys_console_input() {
     }
 }
 
-#[no_mangle]
-#[allow(static_mut_refs)]
 /// Current guest pc (diagnostic: host-side pc sampling for guest profiling).
 #[no_mangle]
 #[allow(static_mut_refs)]
@@ -1038,6 +1071,8 @@ pub extern "C" fn sys_pc() -> u64 {
     unsafe { SYS.as_ref().map_or(0, |m| m.cpu.pc) }
 }
 
+#[no_mangle]
+#[allow(static_mut_refs)]
 pub extern "C" fn sys_insn_count() -> u64 {
     unsafe { SYS.as_ref().map(|m| m.cpu.insn_count).unwrap_or(0) }
 }

@@ -26,7 +26,7 @@ B=$(sed 's/ /\n/g' /proc/cmdline | grep '^bench=' | cut -d= -f2)
 echo BENCH_READY
 case "$B" in
   python) /usr/bin/python3 /fib.py ;;
-  tcc)    echo RUN_START; /tcc -c /w.c -o /w.o && md5sum /w.o; echo RUN_DONE ;;
+  tcc)    echo RUN_START; /tcc -c /w.c -o /w.o; echo RUN_DONE; md5sum /w.o ;;
   nbench) cd /; echo RUN_START; ./nbench; echo RUN_DONE ;;
   *)      echo "no bench selected (need bench=python|tcc|nbench)" ;;
 esac

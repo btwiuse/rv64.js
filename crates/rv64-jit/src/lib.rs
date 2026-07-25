@@ -83,6 +83,13 @@ pub struct JitLayout {
     /// and of the fcsr slot. Both 0 disables FP-in-block translation.
     pub f_base: u32,
     pub fcsr_addr: u32,
+    /// Cell holding the instruction FUEL granted to this dispatch: compiled
+    /// loops and superblocks yield once ITER reaches it, so a caller's
+    /// execution budget and the interrupt quantum bound compiled-code
+    /// residency (overshoot <= one loop iteration / basic block, <= MAX_BLOCK
+    /// instructions). 0 = legacy fixed LOOP_CAP (tests/tools that don't
+    /// meter fuel).
+    pub fuel_addr: u32,
 }
 
 impl JitLayout {
@@ -96,6 +103,7 @@ impl JitLayout {
             retired_addr: 264,
             f_base: 0,
             fcsr_addr: 0,
+            fuel_addr: 0,
         }
     }
 }
@@ -1953,9 +1961,17 @@ fn translate_loop(
             scopes.push((0, e, h));
             m.op(LOOP).op(VOID);
             scopes.push((1, e, h));
-            // Cap guard at the loop top — a safe yield point: resume at header
+            // Fuel guard at the loop top — a safe yield point: resume at header
             // with registers flushed (no partial iteration state to lose).
-            m.local_get(ITER).i64_const(LOOP_CAP as i64).op(I64_GE_U);
+            // Fuel = min(caller budget, interrupt quantum), granted per
+            // dispatch by the host (P0: budget/interrupt-latency contract).
+            m.local_get(ITER);
+            if lay.fuel_addr != 0 {
+                m.i32_const(0).i64_load(lay.fuel_addr as u64);
+            } else {
+                m.i64_const(LOOP_CAP as i64);
+            }
+            m.op(I64_GE_U);
             m.op(IF).op(VOID);
             c.flush_writes(&mut m);
             c.set_pc_const(&mut m, h);
@@ -2459,8 +2475,14 @@ pub fn translate_superblock(
     m.op(BLOCK).op(VOID); // $exit  (depth 1 from loop body)
     m.op(LOOP).op(VOID); // $L      (depth 0 from loop body)
 
-    // Cap → yield to the host (bound interrupt latency).
-    m.local_get(ITER).i64_const(LOOP_CAP as i64).op(I64_GE_U).br_if(1);
+    // Fuel → yield to the host (budget + interrupt-latency contract).
+    m.local_get(ITER);
+    if lay.fuel_addr != 0 {
+        m.i32_const(0).i64_load(lay.fuel_addr as u64);
+    } else {
+        m.i64_const(LOOP_CAP as i64);
+    }
+    m.op(I64_GE_U).br_if(1);
     // Bounds: offset = TPC - page_base; exit if offset >=u span (also catches
     // TPC < page_base, which wraps to a huge unsigned value).
     m.local_get(TPC)
