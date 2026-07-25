@@ -2709,6 +2709,7 @@ fn scan_regs_super(
     lay: &JitLayout,
 ) -> (u32, u32, u32, u32) {
     let (mut r, mut w, mut fr, mut fw) = (0u32, 0u32, 0u32, 0u32);
+    let mut mem_ops = 0u32;
     let fmark = |m: &mut u32, x: usize| *m |= 1 << x;
     let mark = |m: &mut u32, x: usize| {
         if x != 0 {
@@ -2756,6 +2757,7 @@ fn scan_regs_super(
                     if funct3(insn) == 7 {
                         break;
                     }
+                    mem_ops += 1;
                     mark(&mut r, s1);
                     mark(&mut w, d);
                 }
@@ -2763,6 +2765,7 @@ fn scan_regs_super(
                     if funct3(insn) > 3 {
                         break;
                     }
+                    mem_ops += 1;
                     mark(&mut r, s1);
                     mark(&mut r, s2);
                 }
@@ -2770,6 +2773,7 @@ fn scan_regs_super(
                     if funct3(insn) != 3 {
                         break;
                     }
+                    mem_ops += 1;
                     mark(&mut r, s1);
                     fmark(&mut fw, d);
                 }
@@ -2777,6 +2781,7 @@ fn scan_regs_super(
                     if funct3(insn) != 3 {
                         break;
                     }
+                    mem_ops += 1;
                     mark(&mut r, s1);
                     fmark(&mut fr, s2);
                 }
@@ -2835,6 +2840,8 @@ fn scan_regs_super(
             n += 1;
         }
     }
+    let _ = mem_ops; // super coalescing measured net-negative: multi-array
+    // superblocks thrash a 1-page cache (IDEA 1768->1670); basic/region only.
     (r, w, fr, fw)
 }
 
