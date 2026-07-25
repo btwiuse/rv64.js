@@ -390,7 +390,21 @@ const SYS_WARM_SLICE: u64 = 256;
 /// any counter so blocks are never compiled — pure interpreter baseline.
 #[no_mangle]
 pub extern "C" fn jit_set_enabled(on: u32) {
-    unsafe { JIT_THRESHOLD = if on == 0 { u32::MAX } else { JIT_ON_THRESHOLD } }
+    unsafe {
+        JIT_THRESHOLD = if on == 0 { u32::MAX } else { JIT_ON_THRESHOLD };
+        // "Disabled" means EXECUTE NO JIT CODE, not just "stop compiling":
+        // drop already-compiled blocks so A/B comparisons and the API name
+        // stay honest (ISSUES.md P2). (Wasm function-table entries are not
+        // reclaimable, but they become unreachable.)
+        if on == 0 {
+            if let Some(j) = SYS_JIT.as_mut() {
+                j.clear();
+            }
+            if let Some(j) = USER_JIT.as_mut() {
+                j.clear();
+            }
+        }
+    }
 }
 /// Opt-in: drive the guest CLINT from real host wall-clock instead of the
 /// default deterministic instruction-counted time. For benchmarks that self-
@@ -671,6 +685,16 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
         SYS_BIOS = Vec::new();
         SYS_KERNEL = Vec::new();
         SYS = Some(m);
+        // A new machine means every compiled block and stat is stale — a
+        // second boot in the same wasm instance must never execute code
+        // generated from the previous guest (ISSUES.md P2 cache lifecycle).
+        if let Some(j) = SYS_JIT.as_mut() {
+            j.clear();
+        }
+        JIT_RETIRED = 0;
+        JIT_DISPATCHES = 0;
+        SLICE_CALLS = 0;
+        SLICE_INSNS = 0;
     }
 }
 
