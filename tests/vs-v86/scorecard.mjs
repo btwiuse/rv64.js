@@ -21,7 +21,8 @@
 // vmlinuz-i386, deb-i386.cpio.gz, deb-i386-bench.cpio.gz, and a built copy/v86
 // checkout at $ARTIFACTS/v86.
 import { readFile, writeFile, copyFile, access } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -373,5 +374,12 @@ if (problems.length) {
 
 console.log("\n" + md);
 await writeFile(join(ARTIFACTS, `scorecard-${ts}.md`), md);
-await writeFile(join(ARTIFACTS, `scorecard-${ts}.json`), JSON.stringify({ ts, system_emulation: true, sb: SB, results: R, nbench: nb, pass: `${passing.length}/${scored.length}`, problems }, null, 2));
+const provenance = {
+  git: (() => { try { return execSync("git -C " + root + " rev-parse HEAD").toString().trim(); } catch { return "unknown"; } })(),
+  git_dirty: (() => { try { return execSync("git -C " + root + " status --porcelain").toString().trim().length > 0; } catch { return null; } })(),
+  wasm_sha256: createHash("sha256").update(wasm).digest("hex"),
+  node: process.version,
+  reps: REPS, sb: SB, nbench: WANT_NBENCH, full: FULL,
+};
+await writeFile(join(ARTIFACTS, `scorecard-${ts}.json`), JSON.stringify({ ts, system_emulation: true, provenance, results: R, nbench: nb, pass: `${passing.length}/${scored.length}`, problems }, null, 2));
 console.log(`saved ${join(ARTIFACTS, `scorecard-${ts}.md`)} (+ .json)`);

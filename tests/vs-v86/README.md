@@ -30,6 +30,34 @@ The checksum printed by each run confirms every build does identical work
 (integer parts match bit-for-bit across x86/riscv64; the mixed FP checksum
 differs only by 32-bit-vs-64-bit rounding, with identical operation counts).
 
+## Benchmark policy (anti-overfitting)
+
+The bar is WIN or MATCH on **every** row, which removes the temptation to
+optimize a favorite subset — but benchmark-driven tuning can still overfit.
+Rules, per the 2026-07-24 review:
+
+- **Labels.** ALU and Mixed are *microbenchmarks* (fixed-work synthetic
+  kernels; ALU is the JIT's best case). Boot, python, compile, and the eight
+  nbench kernels are *macro rows*. Never present microbenchmark wins as
+  evidence of general parity — the macro rows carry that claim.
+- **Tuning vs held-out.** An optimization motivated by row X must be
+  re-validated on ALL rows before landing (the scorecard's all-rows verdict
+  enforces this); a row that regresses is a blocker, not a footnote.
+  Workloads are never added to or removed from the scorecard in reaction to
+  a loss.
+- **Diagnose, then fix; pin what you matched.** Pattern-matching
+  optimizations (copy-loop shapes, superblock triggers) must carry unit
+  tests pinning the exact shipped code shapes they claim to match, so a
+  toolchain change that breaks the match is a visible test failure, not a
+  silent perf cliff.
+- **Report honestly.** Cold vs warm behavior, which JIT tier each row runs
+  (basic blocks / loop regions / superblocks / bulk-copy), and single-run
+  noise (this host shows double-digit variance and 2x outliers; borderline
+  rows require interleaved median-of-N, REPS=N).
+- **Provenance.** Every scorecard JSON records the git revision, wasm build
+  hash, and config, so any number can be traced to the exact code that
+  produced it.
+
 ## The scorecard (one command, full picture)
 
 `scorecard.mjs` runs the whole suite system-mode and prints **one table**, then
