@@ -745,3 +745,14 @@ cover an in-guest compression loop (HUFFMAN-shaped: bit-packing over
 data-dependent branches) so this class is caught by the battery, not by the
 scorecard. Until it lands, scorecard results from this tree should not be
 trusted for FOURIER/HUFFMAN comparisons either (FOURIER also reads unstable).
+
+
+**Confirmation + reframe (last measurement of the session):** with
+superblocks DISABLED on this tree, HUFFMAN returns to its no-SB shape
+(688 iter/s — the miscompile is superblock-resident, confirmed), and
+**FOURIER measures 8031 iter/s — ABOVE v86's 7335-7664**. FOURIER's loss was
+never an engine/FMA floor: the current tree's superblocks actively cost it
+~25%. Fixing the run-level superblock miscompile and the sparse FP
+regressions is therefore the single path to 13/13: FOURIER wins once
+superblocks stop hurting it (or bodies carry the shipped hw-FMA on a fixed
+tree), and compile keeps its planned incremental-extension route.
