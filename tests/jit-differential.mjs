@@ -53,7 +53,7 @@ function randInsn() {
   const rd = 1 + (rnd() % 30);
   const rs1 = rnd() % 31;
   const rs2 = rnd() % 31;
-  switch (rnd() % 13) {
+  switch (rnd() % 16) {
     case 0: { // OP: add/sub/sll/slt/sltu/xor/srl/sra/or/and
       const f3 = rnd() % 8;
       const f7 = (f3 === 0 || f3 === 5) && rnd() % 2 ? 0x20 : 0x00;
@@ -98,6 +98,27 @@ function randInsn() {
     }
     case 12: // FSGNJ/FSGNJN/FSGNJX.D (copysign / fneg / fabs / fmv.d)
       return R(0x53, rnd() % 3, 0x11, rnd() % 32, rnd() % 32, rnd() % 32);
+    case 13: { // F extension: FADD/FSUB/FMUL/FDIV.S, FSGNJ.S, FSQRT.S
+      const pick = rnd() % 3;
+      if (pick === 0) {
+        const f7 = [0x00, 0x04, 0x08, 0x0c][rnd() % 4]; // fmt=0 (single)
+        return R(0x53, rnd() % 2 ? 0 : 7, f7, rnd() % 32, rnd() % 32, rnd() % 32);
+      }
+      if (pick === 1) return R(0x53, rnd() % 3, 0x10, rnd() % 32, rnd() % 32, rnd() % 32);
+      return R(0x53, 0, 0x2c, rnd() % 32, rnd() % 32, 0); // fsqrt.s
+    }
+    case 14: { // F compares / moves / conversions
+      const pick = rnd() % 5;
+      if (pick === 0) return R(0x53, rnd() % 3, 0x50, rd, rnd() % 32, rnd() % 32); // fle/flt/feq.s
+      if (pick === 1) return R(0x53, 0, 0x78, rnd() % 32, rs1, 0); // fmv.w.x
+      if (pick === 2) return R(0x53, 0, 0x70, rd, rnd() % 32, 0); // fmv.x.w
+      if (pick === 3) return R(0x53, 0, 0x68, rnd() % 32, rs1, rnd() % 4); // fcvt.s.{w,wu,l,lu}
+      return R(0x53, 1, 0x60, rd, rnd() % 32, 0); // fcvt.w.s (rtz)
+    }
+    case 15: // FCVT.S.D / FCVT.D.S (narrowing rounds, widening exact)
+      return rnd() % 2
+        ? R(0x53, 0, 0x20, rnd() % 32, rnd() % 32, 1) // fcvt.s.d
+        : R(0x53, 0, 0x21, rnd() % 32, rnd() % 32, 0); // fcvt.d.s
     default: // FP compare (writes GPR) or fsqrt
       return rnd() % 2
         ? R(0x53, rnd() % 3, 0x51, rd, rnd() % 32, rnd() % 32) // fle/flt/feq.d

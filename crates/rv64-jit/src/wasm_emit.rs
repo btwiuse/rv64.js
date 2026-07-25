@@ -91,6 +91,24 @@ pub const F64_NE: u8 = 0x62;
 pub const I64_TRUNC_F64_S: u8 = 0xb0; // traps out-of-range: range-guarded at emission
 pub const F64_CONVERT_I64_S: u8 = 0xb9;
 pub const F64_CONVERT_I64_U: u8 = 0xba;
+// f32 (the F extension): values live NaN-boxed in the low 32 bits of an f
+// register, so every emitter unboxes to i32 and reinterprets.
+pub const F32_ADD: u8 = 0x92;
+pub const F32_SUB: u8 = 0x93;
+pub const F32_MUL: u8 = 0x94;
+pub const F32_DIV: u8 = 0x95;
+pub const F32_SQRT: u8 = 0x91;
+pub const F32_EQ: u8 = 0x5b;
+pub const F32_LT: u8 = 0x5d;
+pub const F32_LE: u8 = 0x5f;
+pub const F32_REINTERPRET_I32: u8 = 0xbe;
+pub const I32_REINTERPRET_F32: u8 = 0xbc;
+pub const F32_DEMOTE_F64: u8 = 0xb6;
+pub const F64_PROMOTE_F32: u8 = 0xbb;
+pub const F32_CONVERT_I64_S: u8 = 0xb4;
+pub const F32_CONVERT_I64_U: u8 = 0xb5;
+pub const I32_TRUNC_F32_S: u8 = 0xa8;
+pub const I64_NE_: u8 = 0x52;
 
 fn uleb(out: &mut Vec<u8>, mut v: u64) {
     loop {

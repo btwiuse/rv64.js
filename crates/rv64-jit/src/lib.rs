@@ -242,6 +242,244 @@ impl Ctx {
         self.store_freg_post(m, d);
     }
 
+    /// Push f[s]'s single-precision value as an f32, bailing if the register
+    /// isn't properly NaN-boxed (high 32 bits all ones). RISC-V says an
+    /// improperly boxed operand reads as a canonical NaN; that path also needs
+    /// exception flags, so it goes to the interpreter — it only arises when
+    /// code reinterprets a double as a float.
+    fn push_f32(&self, m: &mut WasmModule, s: usize, pc: u64, n: u32) {
+        self.push_freg(m, s);
+        m.i64_const(32)
+            .op(I64_SHR_U)
+            .i64_const(0xffff_ffff)
+            .op(I64_NE);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+        self.push_freg(m, s);
+        m.op(I32_WRAP_I64).op(F32_REINTERPRET_I32);
+    }
+
+    /// Bail unless f[s]'s single-precision exponent is finite (not 0xff).
+    fn f32_finite_guard(&self, m: &mut WasmModule, s: usize, pc: u64, n: u32) {
+        self.push_freg(m, s);
+        m.i64_const(23)
+            .op(I64_SHR_U)
+            .i64_const(0xff)
+            .op(I64_AND)
+            .i64_const(0xff)
+            .op(I64_EQ);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+    }
+
+    /// The f32 twin of fp_result_normal_guard: VAL holds the boxed result;
+    /// bail unless its exponent is normal (1..=0xfe), which is exactly when
+    /// wasm's f32 op is bit-exact RNE with no flags to compute beyond the
+    /// sticky NX the block gate already established.
+    fn f32_result_normal_guard(&self, m: &mut WasmModule, pc: u64, n: u32) {
+        m.local_get(VAL)
+            .i64_const(23)
+            .op(I64_SHR_U)
+            .i64_const(0xff)
+            .op(I64_AND)
+            .i64_const(1)
+            .op(I64_SUB)
+            .i64_const(0xfd)
+            .op(I64_GT_U);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+    }
+
+    /// Store an f32 bit pattern (i32 on the stack) NaN-boxed into f[d].
+    fn store_boxed32(&self, m: &mut WasmModule, d: usize) {
+        m.op(I64_EXTEND_I32_U)
+            .i64_const(0xffff_ffff_0000_0000u64 as i64)
+            .op(I64_OR)
+            .local_set(VAL);
+        self.store_freg_pre(m, d);
+        m.local_get(VAL);
+        self.store_freg_post(m, d);
+    }
+
+    /// FADD/FSUB/FMUL/FDIV.S under the same eligibility as the double path:
+    /// finite operands, no division by zero, normal result.
+    #[allow(clippy::too_many_arguments)]
+    fn fp_arith_s(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, d: usize, pc: u64, n: u32) {
+        self.f32_finite_guard(m, s1, pc, n);
+        self.f32_finite_guard(m, s2, pc, n);
+        if op == 3 {
+            self.push_freg(m, s2);
+            m.i64_const(0x7fff_ffff).op(I64_AND).op(I64_EQZ);
+            m.op(IF).op(VOID);
+            self.bail(m, pc, n);
+            m.op(END);
+        }
+        self.push_f32(m, s1, pc, n);
+        self.push_f32(m, s2, pc, n);
+        m.op(match op {
+            0 => F32_ADD,
+            1 => F32_SUB,
+            2 => F32_MUL,
+            _ => F32_DIV,
+        });
+        m.op(I32_REINTERPRET_F32)
+            .op(I64_EXTEND_I32_U)
+            .local_set(VAL);
+        self.fp_result_guard_s(m, op, s1, s2, pc, n);
+        self.store_freg_pre(m, d);
+        m.local_get(VAL)
+            .i64_const(0xffff_ffff_0000_0000u64 as i64)
+            .op(I64_OR);
+        self.store_freg_post(m, d);
+    }
+
+    /// FSQRT.S — wasm f32.sqrt is exactly rounded, same guards as arith.
+    fn fp_sqrt_s(&self, m: &mut WasmModule, s1: usize, d: usize, pc: u64, n: u32) {
+        self.f32_finite_guard(m, s1, pc, n);
+        self.push_f32(m, s1, pc, n);
+        m.op(F32_SQRT)
+            .op(I32_REINTERPRET_F32)
+            .op(I64_EXTEND_I32_U)
+            .local_set(VAL);
+        self.f32_result_normal_guard(m, pc, n);
+        self.store_freg_pre(m, d);
+        m.local_get(VAL)
+            .i64_const(0xffff_ffff_0000_0000u64 as i64)
+            .op(I64_OR);
+        self.store_freg_post(m, d);
+    }
+
+    /// FLE/FLT/FEQ.S into x[d]; inf/NaN operands bail (they carry NV).
+    #[allow(clippy::too_many_arguments)]
+    fn fp_cmp_s(&self, m: &mut WasmModule, f3: u32, s1: usize, s2: usize, d: usize, pc: u64, n: u32) {
+        self.f32_finite_guard(m, s1, pc, n);
+        self.f32_finite_guard(m, s2, pc, n);
+        if self.store_pre(m, d) {
+            self.push_f32(m, s1, pc, n);
+            self.push_f32(m, s2, pc, n);
+            m.op(match f3 {
+                0 => F32_LE,
+                1 => F32_LT,
+                _ => F32_EQ,
+            });
+            m.op(I64_EXTEND_I32_U);
+            self.store_post(m, d);
+        }
+    }
+
+    /// FSGNJ/FSGNJN/FSGNJX.S — the single-precision sign ops, on the boxed
+    /// low half (an improperly boxed operand bails, as elsewhere).
+    #[allow(clippy::too_many_arguments)]
+    fn fp_sgnj_s(&self, m: &mut WasmModule, f3: u32, s1: usize, s2: usize, d: usize, pc: u64, n: u32) {
+        const SIGN: i64 = 0x8000_0000;
+        self.push_freg(m, s1);
+        m.i64_const(32).op(I64_SHR_U).i64_const(0xffff_ffff).op(I64_NE);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+        self.store_freg_pre(m, d);
+        if s1 == s2 && f3 == 0 {
+            self.push_freg(m, s1);
+        } else if f3 == 2 {
+            self.push_freg(m, s1);
+            self.push_freg(m, s2);
+            m.i64_const(SIGN).op(I64_AND).op(I64_XOR);
+        } else {
+            self.push_freg(m, s1);
+            m.i64_const(0x7fff_ffff).op(I64_AND);
+            self.push_freg(m, s2);
+            m.i64_const(SIGN).op(I64_AND);
+            if f3 == 1 {
+                m.i64_const(SIGN).op(I64_XOR);
+            }
+            m.op(I64_OR);
+        }
+        m.i64_const(0xffff_ffff_0000_0000u64 as i64).op(I64_OR);
+        self.store_freg_post(m, d);
+    }
+
+    /// FCVT.S.D (rounds, guarded) and FCVT.D.S (exact widening).
+    fn fp_cvt_s_d(&self, m: &mut WasmModule, s1: usize, d: usize, pc: u64, n: u32) {
+        self.push_freg(m, s1);
+        m.i64_const(52).op(I64_SHR_U).i64_const(0x7ff).op(I64_AND).i64_const(0x7ff).op(I64_EQ);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+        self.push_freg(m, s1);
+        m.op(F64_REINTERPRET_I64)
+            .op(F32_DEMOTE_F64)
+            .op(I32_REINTERPRET_F32)
+            .op(I64_EXTEND_I32_U)
+            .local_set(VAL);
+        self.f32_result_normal_guard(m, pc, n);
+        self.store_freg_pre(m, d);
+        m.local_get(VAL)
+            .i64_const(0xffff_ffff_0000_0000u64 as i64)
+            .op(I64_OR);
+        self.store_freg_post(m, d);
+    }
+
+    fn fp_cvt_d_s(&self, m: &mut WasmModule, s1: usize, d: usize, pc: u64, n: u32) {
+        self.f32_finite_guard(m, s1, pc, n);
+        self.store_freg_pre(m, d);
+        self.push_f32(m, s1, pc, n);
+        m.op(F64_PROMOTE_F32).op(I64_REINTERPRET_F64);
+        self.store_freg_post(m, d);
+    }
+
+    /// FCVT.W.S (rtz) — range-guarded exactly like the double form.
+    fn fp_cvt_w_s(&self, m: &mut WasmModule, s1: usize, d: usize, pc: u64, n: u32) {
+        self.f32_finite_guard(m, s1, pc, n);
+        // -2^31 <= f < 2^31 as f32 (the f32 grid has no -2^31-1)
+        m.i32_const((-2147483648.0f32).to_bits() as i32)
+            .op(F32_REINTERPRET_I32);
+        self.push_f32(m, s1, pc, n);
+        m.op(F32_LE);
+        self.push_f32(m, s1, pc, n);
+        m.i32_const(2147483648.0f32.to_bits() as i32)
+            .op(F32_REINTERPRET_I32);
+        m.op(F32_LT);
+        m.op(I32_AND);
+        m.op(I32_EQZ);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+        if self.store_pre(m, d) {
+            self.push_f32(m, s1, pc, n);
+            m.op(I32_TRUNC_F32_S).op(I64_EXTEND_I32_S);
+            self.store_post(m, d);
+        }
+    }
+
+    /// FCVT.S.{W,WU,L,LU} — integer to float; inexact results are covered by
+    /// the block's sticky-NX gate, and no integer converts to inf or subnormal.
+    fn fp_cvt_s_int(&self, m: &mut WasmModule, s1: usize, d: usize, v: u32) {
+        self.store_freg_pre(m, d);
+        self.push_reg(m, s1);
+        match v {
+            0 => {
+                m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S).op(F32_CONVERT_I64_S);
+            }
+            1 => {
+                m.i64_const(0xffff_ffff).op(I64_AND).op(F32_CONVERT_I64_S);
+            }
+            2 => {
+                m.op(F32_CONVERT_I64_S);
+            }
+            _ => {
+                m.op(F32_CONVERT_I64_U);
+            }
+        }
+        m.op(I32_REINTERPRET_F32)
+            .op(I64_EXTEND_I32_U)
+            .i64_const(0xffff_ffff_0000_0000u64 as i64)
+            .op(I64_OR);
+        self.store_freg_post(m, d);
+    }
+
     /// Read FP register f[r] (cached local or memory).
     fn push_freg(&self, m: &mut WasmModule, r: usize) {
         if self.fp_local[r] != 0 {
@@ -346,6 +584,85 @@ impl Ctx {
     /// Bail unless the i64 in VAL, viewed as an f64, is a NORMAL number:
     /// exp in [1, 0x7fe]. Catches inf/nan (0x7ff) and subnormal/zero (0),
     /// whose flag/rounding corner cases the softfloat interpreter must own.
+    /// Push "the result in VAL is a zero that one of the operands forced"
+    /// (i32 bool): an exactly-zero product or quotient is flag-free only when
+    /// it comes from a zero operand — a zero produced by underflow is inexact.
+    fn f_zero_from_operand(&self, m: &mut WasmModule, s1: usize, s2: Option<usize>, single: bool) {
+        let shift = if single { 33 } else { 1 };
+        m.local_get(VAL).i64_const(shift).op(I64_SHL).op(I64_EQZ);
+        self.push_freg(m, s1);
+        m.i64_const(shift).op(I64_SHL).op(I64_EQZ);
+        if let Some(s2) = s2 {
+            self.push_freg(m, s2);
+            m.i64_const(shift).op(I64_SHL).op(I64_EQZ);
+            m.op(I32_OR);
+        }
+        m.op(I32_AND);
+    }
+
+    /// Result eligibility for a double-precision op, matching the
+    /// interpreter's fast path exactly (Cpu::fp_fast64):
+    ///   add/sub — any non-inf/NaN result, INCLUDING zero and subnormal: every
+    ///             double is a multiple of 2^-1074, so an exact sum below the
+    ///             normal range is representable and raises no flag.
+    ///   mul/div — a normal result, or a zero forced by a zero operand.
+    /// The old "must be normal" rule cost nbench FOURIER 32M bails per run on
+    /// a single `x + 0.0` inside musl's pow.
+    fn fp_result_guard(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, pc: u64, n: u32) {
+        if op <= 1 {
+            m.local_get(VAL)
+                .i64_const(52)
+                .op(I64_SHR_U)
+                .i64_const(0x7ff)
+                .op(I64_AND)
+                .i64_const(0x7ff)
+                .op(I64_EQ);
+        } else {
+            m.local_get(VAL)
+                .i64_const(52)
+                .op(I64_SHR_U)
+                .i64_const(0x7ff)
+                .op(I64_AND)
+                .i64_const(1)
+                .op(I64_SUB)
+                .i64_const(0x7fd)
+                .op(I64_GT_U);
+            self.f_zero_from_operand(m, s1, (op == 2).then_some(s2), false);
+            m.op(I32_EQZ).op(I32_AND);
+        }
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+    }
+
+    /// Single-precision twin of fp_result_guard (Cpu::fp_fast32).
+    fn fp_result_guard_s(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, pc: u64, n: u32) {
+        if op <= 1 {
+            m.local_get(VAL)
+                .i64_const(23)
+                .op(I64_SHR_U)
+                .i64_const(0xff)
+                .op(I64_AND)
+                .i64_const(0xff)
+                .op(I64_EQ);
+        } else {
+            m.local_get(VAL)
+                .i64_const(23)
+                .op(I64_SHR_U)
+                .i64_const(0xff)
+                .op(I64_AND)
+                .i64_const(1)
+                .op(I64_SUB)
+                .i64_const(0xfd)
+                .op(I64_GT_U);
+            self.f_zero_from_operand(m, s1, (op == 2).then_some(s2), true);
+            m.op(I32_EQZ).op(I32_AND);
+        }
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+    }
+
     fn fp_result_normal_guard(&self, m: &mut WasmModule, pc: u64, n: u32) {
         m.local_get(VAL)
             .i64_const(52)
@@ -636,7 +953,7 @@ impl Ctx {
             _ => F64_DIV,
         });
         m.op(I64_REINTERPRET_F64).local_set(VAL);
-        self.fp_result_normal_guard(m, pc, n);
+        self.fp_result_guard(m, op, s1, s2, pc, n);
         // f[d] = r
         self.store_freg_pre(m, d);
         m.local_get(VAL);
@@ -878,17 +1195,18 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 mark(&mut read, s2);
                 mem_ops += 1;
             }
-            // FLD / FSD (double, funct3==3): raw 8-byte copy mem<->f[], user-mode
+            // FLD/FSD (funct3 3, raw 8-byte copy) and FLW/FSW (funct3 2, the
+            // low half with NaN-boxing) between memory and f[], user-mode
             // direct or system inline-TLB (needs f_base for the FP file).
             0x07 if (lay.mem.is_some() || lay.sys.is_some()) && lay.f_base != 0 => {
-                if funct3(insn) != 3 {
+                if !matches!(funct3(insn), 2 | 3) {
                     break;
                 }
                 mark(&mut read, s1);
                 fmark(&mut fwrite, d);
             }
             0x27 if (lay.mem.is_some() || lay.sys.is_some()) && lay.f_base != 0 => {
-                if funct3(insn) != 3 {
+                if !matches!(funct3(insn), 2 | 3) {
                     break;
                 }
                 mark(&mut read, s1);
@@ -965,6 +1283,50 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                         mark(&mut read, s1); // FCVT.D.int: GPR -> f
                         fmark(&mut fwrite, d);
                     }
+                    (0..=3, 0, 0 | 7) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        fmark(&mut fwrite, d);
+                    }
+                    (4, 0, 0..=2) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x14, 0, 0..=2) => {
+                        // FLE/FLT/FEQ: read FP s1,s2 -> write GPR x[d]
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        mark(&mut write, d);
+                    }
+                    (0x1e, 0, 0) => {
+                        mark(&mut read, s1); // FMV.D.X: x[s1] -> f[d]
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x1c, 0, 0) => {
+                        fmark(&mut fread, s1); // FMV.X.D: f[s1] -> x[d]
+                        mark(&mut write, d);
+                    }
+                    (0x0b, 0, 0 | 7) => {
+                        fmark(&mut fread, s1); // FSQRT.D
+                        fmark(&mut fwrite, d);
+                    }
+                    (8, 0, 0 | 7) => {
+                        fmark(&mut fread, s1); // FSQRT.D
+                        fmark(&mut fwrite, d);
+                    }
+                    (8, 1, 0 | 7) => {
+                        fmark(&mut fread, s1); // FSQRT.D
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x18, 0, 1) => {
+                        fmark(&mut fread, s1); // FCVT.W.D rtz: f -> GPR
+                        mark(&mut write, d);
+                    }
+                    (0x1a, 0, 0 | 7) => {
+                        mark(&mut read, s1); // FCVT.D.int: GPR -> f
+                        fmark(&mut fwrite, d);
+                    }
                     _ => break,
                 }
             }
@@ -1004,6 +1366,17 @@ fn fp_handled(insn: u32) -> bool {
     match (f7 >> 2, f7 & 3, f3) {
         (0..=3, 1, 0 | 7) => true,        // FADD/FSUB/FMUL/FDIV.D (rne | dyn)
         (4, 1, 0..=2) => true,            // FSGNJ/FSGNJN/FSGNJX.D (bit ops)
+        // --- F extension (single precision, NaN-boxed in the low 32 bits) ---
+        (0..=3, 0, 0 | 7) => true,        // FADD/FSUB/FMUL/FDIV.S
+        (4, 0, 0..=2) => true,            // FSGNJ/FSGNJN/FSGNJX.S
+        (0x14, 0, 0..=2) => true,         // FLE/FLT/FEQ.S
+        (0x0b, 0, 0 | 7) => rs2(insn) == 0, // FSQRT.S
+        (0x1e, 0, 0) => rs2(insn) == 0,   // FMV.W.X
+        (0x1c, 0, 0) => rs2(insn) == 0,   // FMV.X.W
+        (8, 0, 0 | 7) => rs2(insn) == 1,  // FCVT.S.D
+        (8, 1, 0 | 7) => rs2(insn) == 0,  // FCVT.D.S
+        (0x18, 0, 1) => rs2(insn) == 0,   // FCVT.W.S (rtz)
+        (0x1a, 0, 0 | 7) => rs2(insn) <= 3, // FCVT.S.{W,WU,L,LU}
         (0x14, 1, 0..=2) => true,         // FLE/FLT/FEQ.D
         (0x1e, 1, 0) => rs2(insn) == 0,   // FMV.D.X (rs2 is a fixed field)
         (0x1c, 1, 0) => rs2(insn) == 0,   // FMV.X.D (rs2 is a fixed field)
@@ -1128,7 +1501,7 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
                 }
             }
             0x07 | 0x27 if lay.f_base != 0 => {
-                if funct3(insn) != 3 {
+                if !matches!(funct3(insn), 2 | 3) {
                     return None;
                 }
             }
@@ -1306,6 +1679,49 @@ fn scan_regs_region(
                         mark(&mut read, s1);
                         fmark(&mut fwrite, d);
                     }
+                    (0..=3, 0, 0 | 7) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        fmark(&mut fwrite, d);
+                    }
+                    (4, 0, 0..=2) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x14, 0, 0..=2) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fread, s2);
+                        mark(&mut write, d);
+                    }
+                    (0x1e, 0, 0) => {
+                        mark(&mut read, s1);
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x1c, 0, 0) => {
+                        fmark(&mut fread, s1);
+                        mark(&mut write, d);
+                    }
+                    (0x0b, 0, 0 | 7) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fwrite, d);
+                    }
+                    (8, 0, 0 | 7) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fwrite, d);
+                    }
+                    (8, 1, 0 | 7) => {
+                        fmark(&mut fread, s1);
+                        fmark(&mut fwrite, d);
+                    }
+                    (0x18, 0, 1) => {
+                        fmark(&mut fread, s1);
+                        mark(&mut write, d);
+                    }
+                    (0x1a, 0, 0 | 7) => {
+                        mark(&mut read, s1);
+                        fmark(&mut fwrite, d);
+                    }
                     _ => {}
                 }
             }
@@ -1416,19 +1832,36 @@ fn build_ctx(
 /// Conservative for blocks whose only FP ops are static-RNE while guest
 /// frm != RNE (they run interpreted until frm returns) — frm changes are
 /// rare and transient in real code.
-fn emit_block_fp_gate(c: &Ctx, m: &mut WasmModule, start_pc: u64) {
+/// Does this instruction's result depend on the rounding mode / set inexact?
+/// FLD/FSD/FSGNJ/FMV move bits around: they need mstatus.FS to be Dirty (they
+/// touch the FP file) but nothing from fcsr. Gating those on sticky-NX would
+/// wedge a block that never produces an inexact result.
+fn fp_needs_round(insn: u32) -> bool {
+    match opcode(insn) {
+        0x43 | 0x47 | 0x4b | 0x4f => true,
+        0x53 => {
+            let f7 = funct7(insn);
+            !matches!(f7 >> 2, 4 | 0x1c | 0x1e) // FSGNJ, FMV.X.*, FMV.*.X
+        }
+        _ => false, // FLD/FSD/FLW/FSW
+    }
+}
+
+fn emit_block_fp_gate(c: &Ctx, m: &mut WasmModule, start_pc: u64, round: bool) {
     let fcsr = c.lay.fcsr_addr as u64;
-    // bad = (fcsr & 1) == 0  ||  ((fcsr >> 5) & 7) != 0
-    m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
-    m.i32_const(0)
-        .i64_load(fcsr)
-        .i64_const(5)
-        .op(I64_SHR_U)
-        .i64_const(7)
-        .op(I64_AND)
-        .op(I64_EQZ)
-        .op(I32_EQZ);
-    m.op(I32_OR);
+    if round {
+        // bad = (fcsr & 1) == 0  ||  ((fcsr >> 5) & 7) != 0
+        m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
+        m.i32_const(0)
+            .i64_load(fcsr)
+            .i64_const(5)
+            .op(I64_SHR_U)
+            .i64_const(7)
+            .op(I64_AND)
+            .op(I64_EQZ)
+            .op(I32_EQZ);
+        m.op(I32_OR);
+    }
     if c.lay.mstatus_addr != 0 {
         m.i32_const(0)
             .i64_load(c.lay.mstatus_addr as u64)
@@ -1438,11 +1871,67 @@ fn emit_block_fp_gate(c: &Ctx, m: &mut WasmModule, start_pc: u64) {
             .op(I64_AND)
             .i64_const(3)
             .op(I64_NE);
-        m.op(I32_OR);
+        if round {
+            m.op(I32_OR);
+        }
+    } else if !round {
+        return; // nothing to check (user mode, non-rounding FP only)
     }
     m.op(IF).op(VOID);
     c.bail(m, start_pc, 0);
     m.op(END);
+}
+
+/// Scan one straight-line body from `pc` for FP work: (touches the FP file,
+/// depends on rounding). Used to gate ONLY the bodies that need it — a
+/// superblock covering a whole page mixes integer functions with float ones,
+/// and one function-wide gate makes every entry into the integer code bail
+/// (measured: nbench IDEA fell 5434 -> 1709 iter/s the moment a float routine
+/// landed on its page).
+fn body_fp_kind(
+    code: &[u8],
+    base: u64,
+    mut pc: u64,
+    page_end: u64,
+    lay: &JitLayout,
+    stop_at_branch: bool,
+) -> (bool, bool) {
+    let (mut any, mut round) = (false, false);
+    let mut n = 0u32;
+    while n < 4 * MAX_BLOCK as u32 && pc < page_end {
+        let Some((insn, ilen)) = fetch(code, base, pc) else {
+            break;
+        };
+        let op = opcode(insn);
+        match op {
+            0x63 | 0x6f | 0x67 => {
+                if stop_at_branch {
+                    break;
+                }
+            }
+            0x07 | 0x27 if lay.f_base != 0 && matches!(funct3(insn), 2 | 3) => any = true,
+            0x53 if lay.f_base != 0 && fp_handled(insn) => {
+                any = true;
+                round |= fp_needs_round(insn);
+            }
+            0x43 | 0x47 | 0x4b | 0x4f if lay.f_base != 0 && fma_handled(op, insn) => {
+                any = true;
+                round = true;
+            }
+            0x37 | 0x17 | 0x13 | 0x33 | 0x1b | 0x3b
+                if alu_handled(op, funct7(insn), funct3(insn)) => {}
+            0x03 if funct3(insn) != 7 => {}
+            0x23 if funct3(insn) <= 3 => {}
+            _ => {
+                if stop_at_branch {
+                    break;
+                }
+            }
+        }
+        pc = pc.wrapping_add(ilen);
+        n += 1;
+    }
+    (any, round)
 }
 
 /// Emit one non-control-flow guest instruction (LUI/AUIPC, OP-IMM(-32),
@@ -1825,19 +2314,27 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
         // FLD: f[d] = mem[x[s1]+imm] (double). Raw 8-byte copy, bit-exact.
         // User-mode direct access or system inline-TLB.
         0x07 if (lay.mem.is_some() || lay.sys.is_some()) && lay.f_base != 0 => {
-            if funct3(insn) != 3 {
+            let f3 = funct3(insn);
+            if f3 != 3 && f3 != 2 {
                 return false;
             }
+            let len = if f3 == 3 { 8 } else { 4 };
             c.push_reg(m, s1);
             m.i64_const(imm_i(insn)).op(I64_ADD);
             let off = if let Some((mem_base, size)) = lay.mem {
-                c.guest_addr(m, size, 8);
+                c.guest_addr(m, size, len);
                 mem_base as u64
             } else {
-                c.tlb_index(m, &lay.sys.unwrap(), 8, false, pc, n);
+                c.tlb_index(m, &lay.sys.unwrap(), len, false, pc, n);
                 0
             };
-            m.op(I64_LOAD).raw_uleb(len_align(8)).raw_uleb(off);
+            // FLW NaN-boxes into the high half; FLD is a raw 8-byte copy.
+            m.op(if f3 == 3 { I64_LOAD } else { I64_LOAD32_U })
+                .raw_uleb(len_align(len))
+                .raw_uleb(off);
+            if f3 == 2 {
+                m.i64_const(0xffff_ffff_0000_0000u64 as i64).op(I64_OR);
+            }
             m.local_set(VAL);
             c.store_freg_pre(m, d);
             m.local_get(VAL);
@@ -1845,19 +2342,23 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
         }
         // FSD: mem[x[s1]+imm] = f[s2] (double). Raw 8-byte copy.
         0x27 if (lay.mem.is_some() || lay.sys.is_some()) && lay.f_base != 0 => {
-            if funct3(insn) != 3 {
+            let f3 = funct3(insn);
+            if f3 != 3 && f3 != 2 {
                 return false;
             }
+            let len = if f3 == 3 { 8 } else { 4 };
+            // FSW writes the low 32 bits (the boxed single) untouched.
+            let st = if f3 == 3 { I64_STORE } else { I64_STORE32 };
             c.push_reg(m, s1);
             m.i64_const(imm_s(insn)).op(I64_ADD);
             if let Some((mem_base, size)) = lay.mem {
-                c.guest_addr(m, size, 8);
+                c.guest_addr(m, size, len);
                 c.push_freg(m, s2);
-                m.op(I64_STORE).raw_uleb(len_align(8)).raw_uleb(mem_base as u64);
+                m.op(st).raw_uleb(len_align(len)).raw_uleb(mem_base as u64);
             } else {
-                c.tlb_index(m, &lay.sys.unwrap(), 8, true, pc, n);
+                c.tlb_index(m, &lay.sys.unwrap(), len, true, pc, n);
                 c.push_freg(m, s2);
-                m.op(I64_STORE).raw_uleb(len_align(8)).raw_uleb(0);
+                m.op(st).raw_uleb(len_align(len)).raw_uleb(0);
             }
         }
         // OP-FP: double add/sub/mul/div + compares + FMV.D.X/FMV.X.D inline.
@@ -1870,6 +2371,28 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
             match (fpop, fmt, f3) {
                 (0..=3, 1, 0 | 7) => c.fp_arith_d(m, fpop, s1, s2, d, f3 == 7, pc, n),
                 (4, 1, 0..=2) => c.fp_sgnj_d(m, f3, s1, s2, d),
+                (0..=3, 0, 0 | 7) => c.fp_arith_s(m, fpop, s1, s2, d, pc, n),
+                (4, 0, 0..=2) => c.fp_sgnj_s(m, f3, s1, s2, d, pc, n),
+                (0x14, 0, 0..=2) => c.fp_cmp_s(m, f3, s1, s2, d, pc, n),
+                (0x0b, 0, 0 | 7) => c.fp_sqrt_s(m, s1, d, pc, n),
+                (0x1e, 0, 0) => {
+                    c.store_freg_pre(m, d);
+                    c.push_reg(m, s1);
+                    m.i64_const(0xffff_ffff).op(I64_AND);
+                    m.i64_const(0xffff_ffff_0000_0000u64 as i64).op(I64_OR);
+                    c.store_freg_post(m, d);
+                }
+                (0x1c, 0, 0) => {
+                    if c.store_pre(m, d) {
+                        c.push_freg(m, s1);
+                        m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S);
+                        c.store_post(m, d);
+                    }
+                }
+                (8, 0, 0 | 7) => c.fp_cvt_s_d(m, s1, d, pc, n),
+                (8, 1, 0 | 7) => c.fp_cvt_d_s(m, s1, d, pc, n),
+                (0x18, 0, 1) => c.fp_cvt_w_s(m, s1, d, pc, n),
+                (0x1a, 0, 0 | 7) => c.fp_cvt_s_int(m, s1, d, s2 as u32),
                 (0x14, 1, 0..=2) => c.fp_cmp_d(m, f3, s1, s2, d, pc, n),
                 (0x1e, 1, 0) => {
                             c.store_freg_pre(m, d);
@@ -2450,8 +2973,11 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
             c.retired_local = Some(ITER);
             if fr | fw != 0 {
                 // ITER is a zero-initialized wasm local here, so the bail
-                // correctly reports zero retired before the loop starts.
-                emit_block_fp_gate(&c, &mut m, start_pc);
+                // correctly reports zero retired before the loop starts. The
+                // region is a closed loop, so scanning to its end covers every
+                // instruction that can run inside it.
+                let (_, round) = body_fp_kind(code, base, start_pc, region.end_pc, &lay, false);
+                emit_block_fp_gate(&c, &mut m, start_pc, round);
             }
             if let Some(b) = translate_loop(m, &c, code, base, start_pc, &region, &lay) {
                 return Some(b);
@@ -2464,7 +2990,8 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     let (read_mask, write_mask, fp_read, fp_write) = scan_regs(code, base, start_pc, &lay);
     let (c, mut m) = build_ctx(lay, read_mask, write_mask, fp_read, fp_write);
     if fp_read | fp_write != 0 {
-        emit_block_fp_gate(&c, &mut m, start_pc);
+        let (_, round) = body_fp_kind(code, base, start_pc, u64::MAX, &lay, true);
+        emit_block_fp_gate(&c, &mut m, start_pc, round);
     }
 
     let mut pc = start_pc;
@@ -2836,7 +3363,7 @@ fn scan_regs_super(
                     mark(&mut r, &mut uses, s2);
                 }
                 0x07 if lay.f_base != 0 => {
-                    if funct3(insn) != 3 {
+                    if !matches!(funct3(insn), 2 | 3) {
                         break;
                     }
                     mem_ops += 1;
@@ -2844,7 +3371,7 @@ fn scan_regs_super(
                     fmark(&mut fw, &mut fuses, d);
                 }
                 0x27 if lay.f_base != 0 => {
-                    if funct3(insn) != 3 {
+                    if !matches!(funct3(insn), 2 | 3) {
                         break;
                     }
                     mem_ops += 1;
@@ -2889,6 +3416,49 @@ fn scan_regs_super(
                             mark(&mut w, &mut uses, d);
                         }
                         (0x1a, 1, 0 | 7) => {
+                            mark(&mut r, &mut uses, s1);
+                            fmark(&mut fw, &mut fuses, d);
+                        }
+                        (0..=3, 0, 0 | 7) => {
+                            fmark(&mut fr, &mut fuses, s1);
+                            fmark(&mut fr, &mut fuses, s2);
+                            fmark(&mut fw, &mut fuses, d);
+                        }
+                        (4, 0, 0..=2) => {
+                            fmark(&mut fr, &mut fuses, s1);
+                            fmark(&mut fr, &mut fuses, s2);
+                            fmark(&mut fw, &mut fuses, d);
+                        }
+                        (0x14, 0, 0..=2) => {
+                            fmark(&mut fr, &mut fuses, s1);
+                            fmark(&mut fr, &mut fuses, s2);
+                            mark(&mut w, &mut uses, d);
+                        }
+                        (0x1e, 0, 0) => {
+                            mark(&mut r, &mut uses, s1);
+                            fmark(&mut fw, &mut fuses, d);
+                        }
+                        (0x1c, 0, 0) => {
+                            fmark(&mut fr, &mut fuses, s1);
+                            mark(&mut w, &mut uses, d);
+                        }
+                        (0x0b, 0, 0 | 7) => {
+                            fmark(&mut fr, &mut fuses, s1);
+                            fmark(&mut fw, &mut fuses, d);
+                        }
+                        (8, 0, 0 | 7) => {
+                            fmark(&mut fr, &mut fuses, s1);
+                            fmark(&mut fw, &mut fuses, d);
+                        }
+                        (8, 1, 0 | 7) => {
+                            fmark(&mut fr, &mut fuses, s1);
+                            fmark(&mut fw, &mut fuses, d);
+                        }
+                        (0x18, 0, 1) => {
+                            fmark(&mut fr, &mut fuses, s1);
+                            mark(&mut w, &mut uses, d);
+                        }
+                        (0x1a, 0, 0 | 7) => {
                             mark(&mut r, &mut uses, s1);
                             fmark(&mut fw, &mut fuses, d);
                         }
@@ -2993,6 +3563,12 @@ impl Ctx {
     ) {
         let mut pc = entry_pc;
         let mut len = 0u32;
+        if lay.f_base != 0 {
+            let (any, round) = body_fp_kind(code, base, entry_pc, page_end, &lay, true);
+            if any {
+                emit_block_fp_gate(self, m, entry_pc, round);
+            }
+        }
         loop {
             if pc >= page_end || len >= MAX_BLOCK as u32 {
                 self.super_end(m, pc, len, depth_l, depth_exit);
@@ -3097,7 +3673,7 @@ pub fn emittable_at(code: &[u8], base: u64, pc: u64, lay: JitLayout) -> bool {
         0x37 | 0x17 | 0x13 | 0x33 | 0x1b | 0x3b => alu_handled(op, funct7(insn), funct3(insn)),
         0x03 => funct3(insn) != 7,
         0x23 => funct3(insn) <= 3,
-        0x07 | 0x27 => lay.f_base != 0 && funct3(insn) == 3,
+        0x07 | 0x27 => lay.f_base != 0 && matches!(funct3(insn), 2 | 3),
         0x53 => lay.f_base != 0 && fp_handled(insn),
         0x43 | 0x47 | 0x4b | 0x4f => lay.f_base != 0 && fma_handled(op, insn),
         _ => false,
@@ -3182,7 +3758,7 @@ pub fn discover_page_leaders(
                         }
                         0x03 => funct3(insn) != 7,
                         0x23 => funct3(insn) <= 3,
-                        0x07 | 0x27 => funct3(insn) == 3,
+                        0x07 | 0x27 => matches!(funct3(insn), 2 | 3),
                         0x53 => fp_handled(insn),
                         0x43 | 0x47 | 0x4b | 0x4f => fma_handled(op, insn),
                         _ => false,
@@ -3240,37 +3816,11 @@ pub fn translate_superblock(
     // Superblocks are multi-entry, so the bail restores the RUNTIME entry pc
     // from TPC and reports zero retired (ITER is still its zero initial
     // value).
-    if uses_fp {
-        let fcsr = lay.fcsr_addr as u64;
-        m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
-        m.i32_const(0)
-            .i64_load(fcsr)
-            .i64_const(5)
-            .op(I64_SHR_U)
-            .i64_const(7)
-            .op(I64_AND)
-            .op(I64_EQZ)
-            .op(I32_EQZ);
-        m.op(I32_OR);
-        if lay.mstatus_addr != 0 {
-            m.i32_const(0)
-                .i64_load(lay.mstatus_addr as u64)
-                .i64_const(13)
-                .op(I64_SHR_U)
-                .i64_const(3)
-                .op(I64_AND)
-                .i64_const(3)
-                .op(I64_NE);
-            m.op(I32_OR);
-        }
-        m.op(IF).op(VOID);
-        c.flush_writes(&mut m);
-        m.i32_const(0).local_get(TPC).i64_store(lay.pc_addr as u64);
-        m.i32_const(0).local_get(ITER).i64_store(lay.retired_addr as u64);
-        m.op(RETURN);
-        m.op(END);
-    }
-
+    // No function-wide FP gate: a page mixes integer and float routines, and
+    // one shared gate makes every entry into the integer code bail. Each body
+    // that touches the FP file emits its own (see emit_super_body), where the
+    // bail reports the instructions this entry already retired.
+    let _ = uses_fp;
     m.op(BLOCK).op(VOID); // $exit  (depth 1 from loop body)
     m.op(LOOP).op(VOID); // $L      (depth 0 from loop body)
 

@@ -257,7 +257,7 @@ struct JitState {
     /// pcs discovered in each guest code page (keyed by virtual page base). When
     /// a new entry appears the page's superblock is recompiled to cover it, and
     /// every entry's `cache`/`dispatch` slot points at the one superblock.
-    page_entries: std::collections::HashMap<u64, Vec<u64>>,
+    page_entries: std::collections::HashMap<(u64, u64), Vec<u64>>,
     /// Cheap direct-mapped hot counter for the interpreter-fallback path: an
     /// interpreted stretch's interior blocks never reach the fast-path hot map
     /// (run_slice_until never returns to the fast path inside a stretch), so
@@ -279,7 +279,7 @@ struct JitState {
     /// (with whatever entries were hot then); later hot pcs in the page get
     /// individual blocks. Recompiling the page's big br_table function on every
     /// new entry was a 2x regression on short workloads (the recompile storm).
-    superblocked: std::collections::HashSet<u64>,
+    superblocked: std::collections::HashSet<(u64, u64)>,
     /// Virtual page -> (hot entries at its last superblock compile, number of
     /// compiles). A page's first superblock is built from whatever handful of
     /// pcs was hot at the threshold; code discovered later — a second function
@@ -289,7 +289,7 @@ struct JitState {
     /// superblocked). Recompile once the page has accumulated another
     /// threshold's worth of uncovered hot pcs, bounded so a pathological page
     /// can't loop on it.
-    sb_gen: std::collections::HashMap<u64, (usize, u32)>,
+    sb_gen: std::collections::HashMap<(u64, u64), (usize, u32)>,
     /// Table index -> the (virtual page, physical page) list a MULTI-page
     /// superblock was compiled over. Entries carry their own page's pa (probed
     /// like any block at dispatch); this is the rest of the region, verified on
@@ -405,6 +405,8 @@ const INTERRUPT_QUANTUM: u64 = 1 << 20;
 struct PendingSb {
     ticket: u64,
     boot_gen: u64,
+    /// satp of the address space the region was discovered in.
+    aspace: u64,
     /// (virtual page, physical page) of every page in the compiled region,
     /// ascending and virtually contiguous.
     pages: Vec<(u64, u64)>,
@@ -429,6 +431,15 @@ static mut SB_STALE: u64 = 0;
 /// FP gate, first-instruction TLB miss, or a br_table slot the function
 /// doesn't own). Each one costs a call plus a single interpreted instruction.
 static mut ZERO_RETIRE: u64 = 0;
+/// Individual blocks compiled for a pc on a page that is already superblocked
+/// (i.e. code the page's superblock does not cover), and superblock compiles
+/// still awaiting their async module.
+static mut SB_INDIV: u64 = 0;
+/// Why an entry retired nothing (sampled under DPROF_ON): the FP gate's three
+/// conditions, checked host-side at the moment of the bail.
+static mut ZR_NX: u64 = 0;
+static mut ZR_FRM: u64 = 0;
+static mut ZR_FS: u64 = 0;
 /// Bumped by sys_boot: async results from a previous machine must be dropped.
 static mut BOOT_GEN: u64 = 0;
 
@@ -553,6 +564,11 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             13 => SB_LANDED,
             14 => SB_STALE,
             15 => ZERO_RETIRE,
+            16 => SB_INDIV,
+            17 => PENDING_SB.len() as u64,
+            18 => ZR_NX,
+            19 => ZR_FRM,
+            20 => ZR_FS,
             _ => 0,
         }
     }
@@ -627,6 +643,9 @@ const SUPERBLOCK_THRESHOLD: usize = 6;
 /// How many times one page may be recompiled as a superblock as more of it
 /// turns out to be hot (see JitState::sb_gen).
 const SB_RECOMPILE_CAP: u32 = 8;
+/// Distinct (address space, page) discovery records kept before the whole
+/// table is dropped — address spaces die and their pages go with them.
+const SB_SPACE_CAP: usize = 16384;
 /// Leaders per superblock. Every entry into the function loads the register
 /// UNION over all its bodies and every exit stores the written union, so a
 /// function that covers more of the page pays more on each entry — worth it
@@ -1003,18 +1022,30 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         // arbitrary byte offsets in B).
         if m.cpu.jit_flush_gen != jit.flush_gen {
             jit.flush_gen = m.cpu.jit_flush_gen;
-            jit.page_entries.clear();
-            jit.superblocked.clear();
-            jit.sb_gen.clear();
+            // Superblock discovery state is keyed by (satp, virtual page), so a
+            // context switch no longer throws it away. It used to: every satp
+            // write cleared every page's hot-pc list, and since those pcs were
+            // by then compiled (and so never re-registered), a page could never
+            // grow its superblock again — whether a page ended up covered came
+            // down to how many switches happened while it was warming up, which
+            // is why nbench IDEA measured 1538 or 4594 iter/s from identical
+            // runs. Bound the map instead: address spaces come and go.
+            if jit.page_entries.len() > SB_SPACE_CAP {
+                jit.page_entries.clear();
+                jit.superblocked.clear();
+                jit.sb_gen.clear();
+            }
         }
         // Per-page invalidation: drop only blocks whose physical code page
         // was written (self-modifying code / recycled pages), and clear only
         // their dispatch lines (a full dispatch memset is megabytes per event).
         if !m.bus.jit_dirty_pages.is_empty() {
             let dirty = m.bus.jit_take_dirty();
+            let mut dirty_vpages: std::collections::HashSet<u64> = Default::default();
             for &ppage in &dirty {
                 if let Some(pcs) = jit.page_blocks.remove(&ppage) {
                     for pc in pcs {
+                        dirty_vpages.insert(pc & !0xfff);
                         jit.cache.remove(&pc);
                         let slot = JitState::dslot(pc);
                         if jit.dispatch[slot].pc == pc {
@@ -1024,9 +1055,13 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 }
                 m.bus.jit_unmark_page(ppage);
             }
-            jit.page_entries.clear(); // re-discover superblock entries
-            jit.superblocked.clear();
-            jit.sb_gen.clear();
+            // Re-discover superblock entries for the pages whose code bytes
+            // changed (any address space that mapped them), not globally.
+            if !dirty_vpages.is_empty() {
+                jit.page_entries.retain(|&(_, vp), _| !dirty_vpages.contains(&vp));
+                jit.superblocked.retain(|&(_, vp)| !dirty_vpages.contains(&vp));
+                jit.sb_gen.retain(|&(_, vp), _| !dirty_vpages.contains(&vp));
+            }
         }
         // --- JIT fast path: direct-mapped dispatch + cheap pa-verify ---
         // Per-dispatch bookkeeping accumulates in LOCALS and flushes once after
@@ -1110,6 +1145,21 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             // spin re-calling it.
             if retired == 0 {
                 unsafe { ZERO_RETIRE += 1 };
+                if unsafe { DPROF_ON } {
+                    let fcsr = m.cpu.fcsr;
+                    let fs = m.cpu.sys.as_ref().map_or(3, |c| (c.mstatus >> 13) & 3);
+                    unsafe {
+                        if fcsr & 1 == 0 {
+                            ZR_NX += 1;
+                        }
+                        if (fcsr >> 5) & 7 != 0 {
+                            ZR_FRM += 1;
+                        }
+                        if fs != 3 {
+                            ZR_FS += 1;
+                        }
+                    }
+                }
                 break;
             }
         }
@@ -1148,6 +1198,8 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
 
         // --- hot counting + compile (from physical code bytes) ---
         let pc = m.cpu.pc;
+        // Address space this discovery belongs to (satp; 0 in bare mode).
+        let aspace = m.cpu.sys.as_ref().map_or(0, |c| c.satp);
         if unsafe { DPROF_ON } {
             if let Some(pa) = m.cpu.jit_probe_fetch(&mut m.bus, pc) {
                 let o = (pa.wrapping_sub(rv64_system::RAM_BASE)) as usize;
@@ -1203,7 +1255,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             let ne = if il {
                                 0
                             } else {
-                                let e = jit.page_entries.entry(vpage).or_default();
+                                let e = jit.page_entries.entry((aspace, vpage)).or_default();
                                 if let Err(i) = e.binary_search(&pc) {
                                     e.insert(i, pc);
                                 }
@@ -1215,7 +1267,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         };
 
                         let (sb_last, sb_compiles) =
-                            jit.sb_gen.get(&vpage).copied().unwrap_or((0, 0));
+                            jit.sb_gen.get(&(aspace, vpage)).copied().unwrap_or((0, 0));
                         // Recompile on DOUBLING, not on a fixed increment: a
                         // page discovered 6 hot pcs at a time would need 20
                         // recompiles to cover the 120 that nbench IDEA ends up
@@ -1224,7 +1276,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         // any size in a handful of compiles and is
                         // self-amortizing — each one costs at most as much as
                         // all the previous ones together.
-                        let sb_want = if jit.superblocked.contains(&vpage) {
+                        let sb_want = if jit.superblocked.contains(&(aspace, vpage)) {
                             sb_compiles < SB_RECOMPILE_CAP
                                 && n_entries >= (sb_last * 2).max(sb_last + SUPERBLOCK_THRESHOLD)
                         } else {
@@ -1259,7 +1311,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             // wasm function is slower to compile and register-
                             // allocates worse, so growth has to pay for itself.
                             const EDGE: u64 = 0x80;
-                            let seeds = jit.page_entries[&vpage].clone();
+                            let seeds = jit.page_entries[&(aspace, vpage)].clone();
                             let mut pages: Vec<(u64, u64)> = vec![(vpage, pa_page)];
                             let grow = MAX_REGION_PAGES > 1;
                             if grow && seeds.iter().any(|&e| (e & 0xfff) >= 0x1000 - EDGE) {
@@ -1336,8 +1388,9 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                 // marked done: a neighbour pulled into this
                                 // region still gets to build its own region for
                                 // the code this one didn't reach.
-                                jit.superblocked.insert(vpage); // in flight
-                                jit.sb_gen.insert(vpage, (n_entries, sb_compiles + 1));
+                                jit.superblocked.insert((aspace, vpage)); // in flight
+                                jit.sb_gen
+                                    .insert((aspace, vpage), (n_entries, sb_compiles + 1));
                                 m.cpu.clear_store_jtlb(); // pages may now hold code
                                 unsafe {
                                     let ticket = NEXT_SB_TICKET;
@@ -1345,6 +1398,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                     PENDING_SB.push(PendingSb {
                                         ticket,
                                         boot_gen: BOOT_GEN,
+                                        aspace,
                                         pages,
                                         entries,
                                     });
@@ -1356,6 +1410,9 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             }
                         }
 
+                        if jit.superblocked.contains(&(aspace, vpage)) {
+                            unsafe { SB_INDIV += 1 };
+                        }
                         // Individual block (loop or pre-threshold non-loop).
                         let blk = rv64_jit::translate_block(&m.bus.ram[off..end], pc, pc, lay);
                         let entry = blk.and_then(|blk| {
@@ -1527,7 +1584,7 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
         if stale {
             SB_STALE += 1;
             for &(va, _) in &p.pages {
-                jit.superblocked.remove(&va);
+                jit.superblocked.remove(&(p.aspace, va));
             }
 
             return;
@@ -1599,7 +1656,8 @@ pub extern "C" fn sb_analyze(vpage: u64, which: u32) -> u64 {
             copystat_addr: copystat_addr(),
         };
         let empty = Vec::new();
-        let seeds = jit.page_entries.get(&vpage).unwrap_or(&empty);
+        let aspace = m.cpu.sys.as_ref().map_or(0, |c| c.satp);
+        let seeds = jit.page_entries.get(&(aspace, vpage)).unwrap_or(&empty);
         let leaders = rv64_jit::discover_page_leaders(code, vpage, vpage, 0x1000, seeds, 512);
         let is_loop = |e: u64| rv64_jit::is_loop_at(code, vpage, e, lay);
         if which >= 5 {
@@ -1688,14 +1746,16 @@ pub extern "C" fn sb_analyze_pc(pc: u64, which: u32) -> u64 {
 pub extern "C" fn sb_debug(vpage: u64) -> u64 {
     unsafe {
         let Some(jit) = SYS_JIT.as_ref() else { return 0 };
+        let Some(mm) = SYS.as_ref() else { return 0 };
         let mut v = 0u64;
-        if jit.superblocked.contains(&vpage) {
+        let aspace = mm.cpu.sys.as_ref().map_or(0, |c| c.satp);
+        if jit.superblocked.contains(&(aspace, vpage)) {
             v |= 1;
         }
         if PENDING_SB.iter().any(|p| p.pages.iter().any(|&(va, _)| va == vpage)) {
             v |= 2;
         }
-        v |= (jit.page_entries.get(&vpage).map_or(0, |e| e.len()) as u64) << 8;
+        v |= (jit.page_entries.get(&(aspace, vpage)).map_or(0, |e| e.len()) as u64) << 8;
         v
     }
 }
