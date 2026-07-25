@@ -33,6 +33,11 @@ const FULL = !!+process.env.FULL;
 const WANT_NBENCH = !!+process.env.NBENCH;
 const WANT_V86 = !+process.env.SKIP_V86;
 const SB = !!+process.env.SB; // run rv64 with page superblocks (single config for ALL rows)
+// REPS>1 repeats the wall-clock main rows and reports the MEDIAN (ISSUES.md
+// P1: single fixed-order samples are not trustworthy on a noisy shared host).
+// nbench self-times in-guest over MINIMUM_SECONDS and needs no repetition.
+const REPS = Math.max(1, +(process.env.REPS || 1));
+const median = (a) => { const v = a.filter((x) => x != null).sort((x, y) => x - y); return v.length ? v[(v.length / 2) | 0] : null; };
 
 const { RV64 } = await import(join(root, "web/rv64.js"));
 const wasm = await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"));
@@ -197,9 +202,21 @@ for (const jit of FULL ? [false, true] : [true]) {
   { const r = rvRunBench(st); const row = (R.Mixed ??= {}); row[jit ? "rvj" : "rvi"] = r?.ms ?? null; row[jit ? "rvj_chk" : "rvi_chk"] = r?.chk ?? null; } log(" mixed\n");
 }
 // boot time
-for (const jit of FULL ? [false, true] : [true]) { log(`[rv64 boot jit=${+jit}]…`); (R.Boot ??= {})[jit ? "rvj" : "rvi"] = await rvBootTime(jit); log(" ok\n"); }
+for (const jit of FULL ? [false, true] : [true]) {
+  log(`[rv64 boot jit=${+jit}]…`);
+  const ms = [];
+  for (let r = 0; r < REPS; r++) ms.push(await rvBootTime(jit));
+  (R.Boot ??= {})[jit ? "rvj" : "rvi"] = median(ms);
+  log(" ok\n");
+}
 // python (needs the debian image)
-if (await has(join(ARTIFACTS, "deb-riscv64.ext4"))) for (const jit of FULL ? [false, true] : [true]) { log(`[rv64 python jit=${+jit}]…`); (R["python fib(30)"] ??= {})[jit ? "rvj" : "rvi"] = await rvPython(jit); log(" ok\n"); }
+if (await has(join(ARTIFACTS, "deb-riscv64.ext4"))) for (const jit of FULL ? [false, true] : [true]) {
+  log(`[rv64 python jit=${+jit}]…`);
+  const ms = [];
+  for (let r = 0; r < REPS; r++) ms.push(await rvPython(jit));
+  (R["python fib(30)"] ??= {})[jit ? "rvj" : "rvi"] = median(ms);
+  log(" ok\n");
+}
 // compile (needs the cc-bench image; same w.c + tcc commit as v86)
 if (await has(join(ARTIFACTS, "cc-bench.img"))) for (const jit of FULL ? [false, true] : [true]) {
   log(`[rv64 compile jit=${+jit}]…`);
