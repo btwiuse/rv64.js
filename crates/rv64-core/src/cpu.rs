@@ -144,6 +144,14 @@ impl Cpu {
     /// Fused JIT-TLB rows (load tag, load off, store tag, store off), for JIT
     /// blocks that probe it inline: `tag[(va>>12)&(size-1)] == va>>12` means hit
     /// and `linear_index = va + off[idx]` (no range or compiled-page check).
+    /// Address of mstatus for the JIT's FP-state guard (0 in user mode):
+    /// compiled FP instructions bail unless mstatus.FS == Dirty, so FS=Off
+    /// traps and Initial/Clean transition through the interpreter exactly
+    /// like fp_check/fp_dirty.
+    pub fn jit_mstatus_ptr(&self) -> usize {
+        self.sys.as_ref().map_or(0, |s| &s.mstatus as *const u64 as usize)
+    }
+
     pub fn jit_ftlb_ptrs(&self) -> (usize, usize, usize, usize) {
         (
             self.jtlb_tag[0].as_ptr() as usize,

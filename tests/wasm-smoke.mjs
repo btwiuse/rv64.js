@@ -76,6 +76,36 @@ for (const [name, argv, wantExit, wantOut] of guests) {
   }
 }
 
+// ---- retirement accounting: JIT and interpreter must agree EXACTLY ----
+// User mode is deterministic (no interrupts), so insn_count at exit must be
+// bit-identical with the JIT on and off. Mid-block bails (FP eligibility,
+// budget yields) that under- or over-report retirement break this (ISSUES.md
+// P1 — exact bailout retirement).
+{
+  const path = join(
+    root,
+    "guests/bench/target/riscv64gc-unknown-linux-musl/release/bench",
+  );
+  if (!existsSync(path)) {
+    console.log("SKIP retirement differential (bench guest not built)");
+  } else {
+    const counts = [];
+    for (const jit of [0, 1]) {
+      const vm = await RV64.create(wasmBytes);
+      vm.ex.jit_set_enabled(jit);
+      vm.onWrite = () => {};
+      vm.loadElf(new Uint8Array(await readFile(path)), ["bench", "fast"]);
+      const stop = vm.runUser(2_000_000_000n);
+      counts.push(stop === Stop.EXITED ? vm.ex.user_insn_count() : -1n);
+    }
+    check(
+      "retirement differential (jit == interp insn_count)",
+      counts[0] === counts[1] && counts[0] > 0n,
+      `interp=${counts[0]} jit=${counts[1]}`,
+    );
+  }
+}
+
 // ---- JIT emitter: every module from arbitrary offsets must instantiate ----
 {
   const vm = await RV64.create(wasmBytes);

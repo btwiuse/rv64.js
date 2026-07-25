@@ -458,6 +458,7 @@ pub extern "C" fn sbtest() -> u64 {
             f_base: 0,
             fcsr_addr: 0,
             fuel_addr: 0,
+            mstatus_addr: 0,
         };
         let entries = [0x1000u64, 0x100c];
         let blk = match rv64_jit::translate_superblock(&code, base, 0x1000, 0x40, &entries, lay) {
@@ -539,6 +540,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     f_base: m.cpu.f.as_ptr() as u32,
                     fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
                     fuel_addr: fuel_addr(),
+                    mstatus_addr: 0, // user mode: no privileged FP state
                 };
                 let end = (pc as usize + 1024).min(m.mem.len());
                 let entry = rv64_jit::translate_block(&m.mem[pc as usize..end], pc, pc, lay)
@@ -865,6 +867,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             f_base: m.cpu.f.as_ptr() as u32,
                             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
                             fuel_addr: fuel_addr(),
+                            mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
                         };
                         let vpage = pc & !0xfff;
                         let pa_page = pa & !0xfff;

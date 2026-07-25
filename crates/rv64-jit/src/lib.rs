@@ -90,6 +90,11 @@ pub struct JitLayout {
     /// instructions). 0 = legacy fixed LOOP_CAP (tests/tools that don't
     /// meter fuel).
     pub fuel_addr: u32,
+    /// Linear-memory offset of mstatus (system mode), or 0. When set, every
+    /// compiled FP instruction bails unless mstatus.FS == Dirty — FS=Off must
+    /// trap and Initial/Clean must transition to Dirty; one interpreter step
+    /// does both exactly (fp_check/fp_dirty).
+    pub mstatus_addr: u32,
 }
 
 impl JitLayout {
@@ -104,6 +109,7 @@ impl JitLayout {
             f_base: 0,
             fcsr_addr: 0,
             fuel_addr: 0,
+            mstatus_addr: 0,
         }
     }
 }
@@ -282,6 +288,27 @@ impl Ctx {
         m.op(END);
     }
 
+    /// System-mode FP-state guard: bail unless mstatus.FS == Dirty (0b11).
+    /// FS=Off must trap (illegal instruction) and Initial/Clean must become
+    /// Dirty — one interpreter step does both exactly, and once Dirty the
+    /// fast path needs no writeback at all. No-op in user mode.
+    fn fp_fs_guard(&self, m: &mut WasmModule, pc: u64, n: u32) {
+        if self.lay.mstatus_addr == 0 {
+            return;
+        }
+        m.i32_const(0)
+            .i64_load(self.lay.mstatus_addr as u64)
+            .i64_const(13)
+            .op(I64_SHR_U)
+            .i64_const(3)
+            .op(I64_AND)
+            .i64_const(3)
+            .op(I64_NE);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
+    }
+
     /// Bail unless the i64 in VAL, viewed as an f64, is a NORMAL number:
     /// exp in [1, 0x7fe]. Catches inf/nan (0x7ff) and subnormal/zero (0),
     /// whose flag/rounding corner cases the softfloat interpreter must own.
@@ -304,6 +331,7 @@ impl Ctx {
     /// eligibility as arith it is bit-exact; negative/inf/zero inputs produce
     /// non-normal results and fall to the result guard.
     fn fp_sqrt_d(&self, m: &mut WasmModule, s1: usize, d: usize, dyn_rm: bool, pc: u64, n: u32) {
+        self.fp_fs_guard(m, pc, n);
         self.fp_eligibility(m, dyn_rm, pc, n);
         self.push_freg(m, s1);
         m.op(F64_REINTERPRET_I64).op(F64_SQRT);
@@ -319,6 +347,7 @@ impl Ctx {
     /// riscv clamps + flags) bail to softfloat; NX (non-integral input) is
     /// covered by the sticky-NX eligibility.
     fn fp_cvt_w_d(&self, m: &mut WasmModule, s1: usize, d: usize, pc: u64, n: u32) {
+        self.fp_fs_guard(m, pc, n);
         self.fp_eligibility(m, false, pc, n);
         // in-range: -2^31-1 < f  &&  f < 2^31  (NaN fails both -> bail)
         m.i64_const((-2147483649.0f64).to_bits() as i64)
@@ -350,6 +379,7 @@ impl Ctx {
     /// all; the 64-bit ones round (NX for |v| > 2^53) — wasm's converts are
     /// exactly rounded RNE, so sticky-NX eligibility makes them bit-exact.
     fn fp_cvt_d_int(&self, m: &mut WasmModule, s1: usize, d: usize, v: u32, dyn_rm: bool, pc: u64, n: u32) {
+        self.fp_fs_guard(m, pc, n);
         if v >= 2 {
             self.fp_eligibility(m, dyn_rm, pc, n);
         }
@@ -383,6 +413,7 @@ impl Ctx {
     #[allow(clippy::too_many_arguments)]
     fn fp_fmadd_d(&self, m: &mut WasmModule, s1: usize, s2: usize, s3: usize, d: usize,
                   neg_prod: bool, neg_c: bool, dyn_rm: bool, pc: u64, n: u32) {
+        self.fp_fs_guard(m, pc, n);
         debug_assert!(self.fma_scratch != 0);
         let fs = self.fma_scratch;
         let (fa, fb, fc, fp, f4, f5, f6, f7l) =
@@ -566,6 +597,7 @@ impl Ctx {
     }
 
     fn fp_arith_d(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, d: usize, dyn_rm: bool, pc: u64, n: u32) {
+        self.fp_fs_guard(m, pc, n);
         self.fp_eligibility(m, dyn_rm, pc, n);
         // r = f[s1] <op> f[s2]  (as f64), reinterpreted back to i64 bits.
         self.push_freg(m, s1);
@@ -591,6 +623,7 @@ impl Ctx {
     /// interpreter if either operand is inf/nan (the exact-flag/NV cases);
     /// finite operands compare exactly with no flag change.
     fn fp_cmp_d(&self, m: &mut WasmModule, f3: u32, s1: usize, s2: usize, d: usize, pc: u64, n: u32) {
+        self.fp_fs_guard(m, pc, n);
         for &s in &[s1, s2] {
             self.push_freg(m, s);
             m.i64_const(52)
@@ -649,7 +682,15 @@ impl Ctx {
         self.flush_writes(m);
         self.set_pc_const(m, pc);
         if let Some(l) = self.retired_local {
-            m.i32_const(0).local_get(l).i64_store(self.lay.retired_addr as u64);
+            // Exact mid-segment retirement (ISSUES.md P1): ITER holds only the
+            // segments/bodies flushed so far; `n` is the compile-time count of
+            // instructions completed since that flush. Reporting ITER alone
+            // undercounted, corrupting insn_count/minstret/clock/fuel.
+            m.i32_const(0).local_get(l);
+            if n > 0 {
+                m.i64_const(n as i64).op(I64_ADD);
+            }
+            m.i64_store(self.lay.retired_addr as u64);
         } else {
             self.set_retired(m, n);
         }
@@ -1630,6 +1671,7 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
             if funct3(insn) != 3 {
                 return false;
             }
+            c.fp_fs_guard(m, pc, n);
             c.push_reg(m, s1);
             m.i64_const(imm_i(insn)).op(I64_ADD);
             let off = if let Some((mem_base, size)) = lay.mem {
@@ -1650,6 +1692,7 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
             if funct3(insn) != 3 {
                 return false;
             }
+            c.fp_fs_guard(m, pc, n);
             c.push_reg(m, s1);
             m.i64_const(imm_s(insn)).op(I64_ADD);
             if let Some((mem_base, size)) = lay.mem {
@@ -1673,11 +1716,13 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                 (0..=3, 1, 0 | 7) => c.fp_arith_d(m, fpop, s1, s2, d, f3 == 7, pc, n),
                 (0x14, 1, 0..=2) => c.fp_cmp_d(m, f3, s1, s2, d, pc, n),
                 (0x1e, 1, 0) => {
+                    c.fp_fs_guard(m, pc, n);
                     c.store_freg_pre(m, d);
                     c.push_reg(m, s1);
                     c.store_freg_post(m, d);
                 }
                 (0x1c, 1, 0) => {
+                    c.fp_fs_guard(m, pc, n);
                     if c.store_pre(m, d) {
                         c.push_freg(m, s1);
                         c.store_post(m, d);
@@ -1985,7 +2030,9 @@ fn translate_loop(
         let (insn, ilen) = fetch(code, base, pc)?;
         let next = pc.wrapping_add(ilen);
         if opcode(insn) != 0x63 {
-            if !emit_simple(&mut m, c, *lay, insn, pc, static_n) {
+            // Pass the SEGMENT-relative completed count: a mid-block bail
+            // reports ITER (flushed segments) + this (see Ctx::bail).
+            if !emit_simple(&mut m, c, *lay, insn, pc, seg as u32) {
                 return None;
             }
             seg += 1;
