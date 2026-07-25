@@ -1341,7 +1341,22 @@ fn build_superblock(
                             }
                             va = va.wrapping_sub(0x1000);
                         }
-                        let far_cap = (pages.len() + 2).min(MAX_REGION_PAGES);
+                        // Far (call-graph) pages join only under MEASURED
+                        // pressure: a first build stays contiguous — exactly
+                        // the configuration that held 11/13 — and rebuilds
+                        // pull in call targets once this page's misses prove
+                        // cross-page traffic. Reachability alone glued cold
+                        // callees into hot regions and regressed the FP rows.
+                        let missed_now = jit
+                            .sb_missed
+                            .get(&(aspace, vpage))
+                            .copied()
+                            .unwrap_or(0);
+                        let far_cap = if sb_compiles > 0 || missed_now >= 16 {
+                            (pages.len() + 2).min(MAX_REGION_PAGES)
+                        } else {
+                            pages.len()
+                        };
                         let mut scanned = 0usize;
                         while scanned < pages.len() && pages.len() < far_cap {
                             let (va, pp) = pages[scanned];
