@@ -24,7 +24,9 @@
 //!   later step. Until then the guest addresses `http://` URLs and [`Egress`]
 //!   decides the wire scheme.
 //! - One request per connection: every response says `Connection: close`. A
-//!   proxy is allowed to do this, and it keeps request framing trivial.
+//!   proxy is allowed to do this, it keeps request framing trivial, and it makes
+//!   the response body EOF-delimited — which is exactly what lets responses
+//!   stream without chunked encoding.
 
 use crate::netstack::{ConnId, Event, NetStack};
 use std::collections::HashMap;
@@ -116,42 +118,57 @@ impl Request {
     }
 }
 
-impl Response {
-    /// `status | nheaders | (name, value)* | body`. A zero status carries an
-    /// error message in place of the body, which becomes a 502.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = (self.status as u32).to_le_bytes().to_vec();
-        out.extend_from_slice(&(self.headers.len() as u32).to_le_bytes());
-        for (name, value) in &self.headers {
-            put_bytes(&mut out, name.as_bytes());
-            put_bytes(&mut out, value.as_bytes());
-        }
-        put_bytes(&mut out, &self.body);
-        out
+/// Encode a response head for the FFI: `status | nheaders | (name, value)*`.
+/// Bodies cross separately as raw chunks, so they need no framing.
+pub fn encode_head(status: u16, headers: &[(String, String)]) -> Vec<u8> {
+    let mut out = (status as u32).to_le_bytes().to_vec();
+    out.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+    for (name, value) in headers {
+        put_bytes(&mut out, name.as_bytes());
+        put_bytes(&mut out, value.as_bytes());
     }
+    out
+}
 
-    pub fn decode(b: &[u8]) -> Option<Response> {
-        let mut c = Cursor { b, p: 0 };
-        let status = c.u32()? as u16;
-        let n = c.u32()? as usize;
-        let mut headers = Vec::with_capacity(n);
-        for _ in 0..n {
-            headers.push((c.string()?, c.string()?));
-        }
-        Some(Response {
-            status,
-            headers,
-            body: c.bytes()?.to_vec(),
-        })
+pub fn decode_head(b: &[u8]) -> Option<(u16, Vec<(String, String)>)> {
+    let mut c = Cursor { b, p: 0 };
+    let status = c.u32()? as u16;
+    let n = c.u32()? as usize;
+    let mut headers = Vec::with_capacity(n);
+    for _ in 0..n {
+        headers.push((c.string()?, c.string()?));
     }
+    Some((status, headers))
+}
 
-    /// Decode into the `Result` the proxy consumes: a zero status means the
-    /// host could not perform the request at all.
-    pub fn decode_result(b: &[u8]) -> Result<Response, String> {
-        match Response::decode(b) {
-            Some(r) if r.status == 0 => Err(String::from_utf8_lossy(&r.body).into_owned()),
-            Some(r) => Ok(r),
-            None => Err("malformed response from host".into()),
+/// What egress reports back about an in-flight request.
+///
+/// Responses are **streamed**, not delivered whole: an SSE or chunked API
+/// response must reach the guest as it arrives rather than after the upstream
+/// finishes, and a large body must never be buffered in full on the way past.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Completion {
+    /// Status and headers. Exactly one per request, before any `Body`.
+    Head {
+        id: ReqId,
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
+    /// A run of body bytes.
+    Body { id: ReqId, bytes: Vec<u8> },
+    /// The response is complete.
+    End { id: ReqId },
+    /// The request could not be performed, or failed part way through.
+    Failed { id: ReqId, error: String },
+}
+
+impl Completion {
+    pub fn id(&self) -> ReqId {
+        match self {
+            Completion::Head { id, .. }
+            | Completion::Body { id, .. }
+            | Completion::End { id }
+            | Completion::Failed { id, .. } => *id,
         }
     }
 }
@@ -163,8 +180,8 @@ impl Response {
 /// be a return value. Native implementations can complete immediately.
 pub trait Egress {
     fn submit(&mut self, id: ReqId, req: Request);
-    /// Requests that have finished since the last call. `Err` becomes a 502.
-    fn poll(&mut self) -> Vec<(ReqId, Result<Response, String>)>;
+    /// Progress since the last call, in order per request.
+    fn poll(&mut self) -> Vec<Completion>;
 }
 
 /// Largest request head and body we will buffer from the guest, so a hostile or
@@ -196,6 +213,9 @@ struct ConnBuf {
     /// Set once the request has been submitted, so later bytes are ignored
     /// rather than parsed as a second pipelined request.
     submitted: bool,
+    /// Set once the response head has gone out. After that the status is
+    /// committed: a mid-stream failure can only truncate, not become a 502.
+    head_sent: bool,
 }
 
 pub struct Proxy {
@@ -258,13 +278,36 @@ impl Proxy {
                 }
             }
         }
-        for (req_id, result) in egress.poll() {
-            let Some(conn) = self.inflight.remove(&req_id) else {
+        for completion in egress.poll() {
+            // The guest may have gone away mid-response; its entry is dropped
+            // and anything still arriving for it is discarded.
+            let Some(&conn) = self.inflight.get(&completion.id()) else {
                 continue;
             };
-            match result {
-                Ok(response) => self.write_response(conn, &response, stack),
-                Err(err) => self.write_error(conn, 502, "Bad Gateway", &err, stack),
+            match completion {
+                Completion::Head {
+                    status, headers, ..
+                } => self.write_head(conn, status, &headers, stack),
+                Completion::Body { bytes, .. } => stack.send(conn, &bytes),
+                Completion::End { id } => {
+                    self.inflight.remove(&id);
+                    stack.close(conn);
+                    self.conns.remove(&conn);
+                }
+                Completion::Failed { id, error } => {
+                    self.inflight.remove(&id);
+                    let head_sent = self.conns.get(&conn).is_some_and(|c| c.head_sent);
+                    if head_sent {
+                        // The status line is already committed upstream of us,
+                        // so all we can do is cut the body short; the guest
+                        // sees a truncated response, which is what a real
+                        // connection failure looks like.
+                        stack.close(conn);
+                        self.conns.remove(&conn);
+                    } else {
+                        self.write_error(conn, 502, "Bad Gateway", &error, stack);
+                    }
+                }
             }
         }
     }
@@ -297,27 +340,35 @@ impl Proxy {
         }
     }
 
-    fn write_response(&mut self, conn: ConnId, response: &Response, stack: &mut NetStack) {
-        let mut out = format!(
-            "HTTP/1.1 {} {}\r\n",
-            response.status,
-            reason_phrase(response.status)
-        )
-        .into_bytes();
-        for (name, value) in &response.headers {
-            if HOP_BY_HOP.contains(&name.to_ascii_lowercase().as_str())
-                || name.eq_ignore_ascii_case("content-length")
+    fn write_head(
+        &mut self,
+        conn: ConnId,
+        status: u16,
+        headers: &[(String, String)],
+        stack: &mut NetStack,
+    ) {
+        let mut out = format!("HTTP/1.1 {} {}\r\n", status, reason_phrase(status)).into_bytes();
+        for (name, value) in headers {
+            let lower = name.to_ascii_lowercase();
+            // `content-length` and `content-encoding` are deliberately dropped.
+            // `fetch()` decompresses transparently, so the bytes we forward are
+            // already decoded while the upstream length still describes the
+            // *compressed* body — forwarding either would truncate the response
+            // or make the guest try to gunzip plaintext. The body is instead
+            // delimited by the close below, which is always correct.
+            if HOP_BY_HOP.contains(&lower.as_str())
+                || lower == "content-length"
+                || lower == "content-encoding"
             {
-                continue; // length is authoritative below
+                continue;
             }
             out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
-        out.extend_from_slice(format!("Content-Length: {}\r\n", response.body.len()).as_bytes());
         out.extend_from_slice(b"Connection: close\r\n\r\n");
-        out.extend_from_slice(&response.body);
         stack.send(conn, &out);
-        stack.close(conn);
-        self.conns.remove(&conn);
+        if let Some(state) = self.conns.get_mut(&conn) {
+            state.head_sent = true;
+        }
     }
 
     fn write_error(
@@ -609,25 +660,13 @@ mod tests {
         };
         assert_eq!(Request::decode(&req.encode()).unwrap(), req);
 
-        let resp = Response {
-            status: 201,
-            headers: vec![("Location".into(), "/things/1".into())],
-            // Non-UTF-8 bodies must survive: responses are arbitrary bytes.
-            body: vec![0x00, 0xff, 0xfe, b'x'],
-        };
-        assert_eq!(Response::decode(&resp.encode()).unwrap(), resp);
-        assert_eq!(Response::decode_result(&resp.encode()).unwrap(), resp);
-
-        // A zero status is the host's channel for "could not perform this".
-        let failed = Response {
-            status: 0,
-            headers: vec![],
-            body: b"TypeError: Failed to fetch".to_vec(),
-        };
-        assert_eq!(
-            Response::decode_result(&failed.encode()),
-            Err("TypeError: Failed to fetch".into())
-        );
+        let headers = vec![
+            ("Location".to_string(), "/things/1".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        let encoded = encode_head(201, &headers);
+        assert_eq!(decode_head(&encoded).unwrap(), (201, headers));
+        assert!(decode_head(&encoded[..3]).is_none(), "truncation is an error");
         // Truncation is an error, never a panic or a half-parsed request.
         let encoded = req.encode();
         for cut in [0, 1, 4, 10, encoded.len() - 1] {
@@ -639,29 +678,41 @@ mod tests {
 
     use crate::netstack::{NetConfig, NetStack};
 
-    /// Egress that answers every request from a canned table.
+    /// Egress that answers every request from a canned table, in the streamed
+    /// form real egress uses: head, then body chunks, then end.
     #[derive(Default)]
     struct FakeEgress {
         seen: Vec<Request>,
-        done: Vec<(ReqId, Result<Response, String>)>,
+        done: Vec<Completion>,
         /// When set, fail instead of answering.
         fail: Option<String>,
+        /// Split the body across this many Body completions.
+        chunks: usize,
     }
 
     impl Egress for FakeEgress {
         fn submit(&mut self, id: ReqId, req: Request) {
             self.seen.push(req);
-            let result = match &self.fail {
-                Some(err) => Err(err.clone()),
-                None => Ok(Response {
-                    status: 200,
-                    headers: vec![("Content-Type".into(), "text/plain".into())],
-                    body: b"canned body".to_vec(),
-                }),
-            };
-            self.done.push((id, result));
+            if let Some(error) = self.fail.clone() {
+                self.done.push(Completion::Failed { id, error });
+                return;
+            }
+            self.done.push(Completion::Head {
+                id,
+                status: 200,
+                headers: vec![("Content-Type".into(), "text/plain".into())],
+            });
+            let body = b"canned body";
+            let chunks = self.chunks.max(1);
+            for part in body.chunks(body.len().div_ceil(chunks)) {
+                self.done.push(Completion::Body {
+                    id,
+                    bytes: part.to_vec(),
+                });
+            }
+            self.done.push(Completion::End { id });
         }
-        fn poll(&mut self) -> Vec<(ReqId, Result<Response, String>)> {
+        fn poll(&mut self) -> Vec<Completion> {
             core::mem::take(&mut self.done)
         }
     }
@@ -747,8 +798,10 @@ mod tests {
         assert_eq!(egress.seen.len(), 1, "the request reached egress");
         assert_eq!(egress.seen[0].url, "http://example.test/hello");
         assert!(written.starts_with("HTTP/1.1 200 OK\r\n"), "got: {written}");
-        assert!(written.contains("Content-Length: 11\r\n"), "got: {written}");
-        assert!(written.contains("Connection: close\r\n"));
+        assert!(written.contains("Connection: close\r\n"), "got: {written}");
+        // No Content-Length: the body is delimited by the close, because fetch
+        // decompresses transparently and the upstream length would be wrong.
+        assert!(!written.contains("Content-Length"), "got: {written}");
         assert!(written.ends_with("canned body"), "got: {written}");
     }
 

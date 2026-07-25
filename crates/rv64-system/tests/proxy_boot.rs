@@ -9,7 +9,7 @@
 //!
 //! Guest is the TinyEMU image set (`web/get-images.sh`). Skips when absent.
 
-use rv64_system::httpproxy::{Egress, Proxy, ReqId, Request, Response};
+use rv64_system::httpproxy::{Completion, Egress, Proxy, ReqId, Request};
 use rv64_system::netstack::{NetConfig, NetStack};
 use rv64_system::{virtio, BootImages, Machine};
 use std::path::PathBuf;
@@ -30,42 +30,75 @@ fn images() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
 #[derive(Default)]
 struct CannedEgress {
     seen: Vec<Request>,
-    done: Vec<(ReqId, Result<Response, String>)>,
+    done: Vec<Completion>,
+    /// Body chunks released one per `poll`, to exercise a response that arrives
+    /// over time rather than all at once.
+    trickle: Vec<(ReqId, Vec<u8>)>,
+}
+
+fn body_for(url: &str, req: &Request) -> Option<Vec<u8>> {
+    match url {
+        "http://example.test/hello" => Some(b"PROXY-BODY-OK\n".to_vec()),
+        // Big enough to span many TCP segments and many body chunks.
+        "http://example.test/big" | "http://example.test/slow" => {
+            Some((0..20000u32).map(|i| b'a' + (i % 26) as u8).collect())
+        }
+        "http://example.test/echo" => Some(
+            format!(
+                "METHOD={} BODY={}\n",
+                req.method,
+                String::from_utf8_lossy(&req.body)
+            )
+            .into_bytes(),
+        ),
+        "http://example.test/missing" => Some(b"nope\n".to_vec()),
+        _ => None,
+    }
 }
 
 impl Egress for CannedEgress {
     fn submit(&mut self, id: ReqId, req: Request) {
-        let result = match req.url.as_str() {
-            "http://example.test/hello" => Ok(Response {
-                status: 200,
-                headers: vec![("Content-Type".into(), "text/plain".into())],
-                body: b"PROXY-BODY-OK\n".to_vec(),
-            }),
-            // Big enough to span many TCP segments, so the response path is
-            // exercised beyond a single frame.
-            "http://example.test/big" => Ok(Response {
-                status: 200,
-                headers: vec![],
-                body: (0..20000u32).map(|i| b'a' + (i % 26) as u8).collect(),
-            }),
-            "http://example.test/echo" => Ok(Response {
-                status: 200,
-                headers: vec![],
-                body: format!("METHOD={} BODY={}\n", req.method, String::from_utf8_lossy(&req.body))
-                    .into_bytes(),
-            }),
-            "http://example.test/missing" => Ok(Response {
-                status: 404,
-                headers: vec![],
-                body: b"nope\n".to_vec(),
-            }),
-            _ => Err("no route to host in canned egress".into()),
+        let url = req.url.clone();
+        let Some(body) = body_for(&url, &req) else {
+            self.seen.push(req);
+            self.done.push(Completion::Failed {
+                id,
+                error: "no route to host in canned egress".into(),
+            });
+            return;
         };
+        let status = if url.ends_with("/missing") { 404 } else { 200 };
+        self.done.push(Completion::Head {
+            id,
+            status,
+            headers: vec![("Content-Type".into(), "text/plain".into())],
+        });
+        if url.ends_with("/slow") {
+            // Release one chunk per poll: the guest must assemble a response
+            // that arrives across many slices, which is what an SSE stream or a
+            // slow download looks like.
+            for chunk in body.chunks(1000) {
+                self.trickle.push((id, chunk.to_vec()));
+            }
+            self.trickle.push((id, Vec::new())); // sentinel: end
+        } else {
+            self.done.push(Completion::Body { id, bytes: body });
+            self.done.push(Completion::End { id });
+        }
         self.seen.push(req);
-        self.done.push((id, result));
     }
-    fn poll(&mut self) -> Vec<(ReqId, Result<Response, String>)> {
-        core::mem::take(&mut self.done)
+
+    fn poll(&mut self) -> Vec<Completion> {
+        let mut out = core::mem::take(&mut self.done);
+        if !self.trickle.is_empty() {
+            let (id, bytes) = self.trickle.remove(0);
+            out.push(if bytes.is_empty() {
+                Completion::End { id }
+            } else {
+                Completion::Body { id, bytes }
+            });
+        }
+        out
     }
 }
 
@@ -227,6 +260,24 @@ fn guest_fetches_through_the_in_process_proxy() {
     assert!(
         h.out.contains(&want[..8]),
         "guest md5 does not match host md5 ({}):\n{}",
+        &want[..8],
+        tail(&h.out)
+    );
+
+    // A response that arrives in pieces across many slices must reassemble
+    // identically — the streaming path, as an SSE or slow download would use it.
+    assert!(
+        h.run(
+            "wget -q -O- http://example.test/slow | md5sum | cut -c1-8; echo SL'O'W",
+            "SLOW",
+            8000
+        ),
+        "a trickled response never completed:\n{}",
+        tail(&h.out)
+    );
+    assert!(
+        h.out.matches(&want[..8]).count() >= 2,
+        "the trickled response does not hash the same as the buffered one ({}):\n{}",
         &want[..8],
         tail(&h.out)
     );

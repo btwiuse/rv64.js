@@ -152,14 +152,86 @@ lever now. Its two reverted attempts are documented in git history.
 
 ## Features (TinyEMU parity and beyond)
 
-- [ ] **7. virtio-9p** — host filesystem sharing into the guest (TinyEMU's
-  `fs.c`/9P2000.L is the reference; browser backend via fetch/IndexedDB).
-  This is jslinux's killer feature and what makes browser Linux genuinely
-  useful. Medium-large effort.
+- [x] **7. virtio-9p** *(done 2026-07-25)* — host filesystem sharing. A
+  9P2000.L server (`p9.rs`) behind a small `FsBackend` trait, with two backends
+  (`p9fs.rs`): **HostFs** exports a real host directory, **MemFs** an in-memory
+  tree loadable from a tar archive (the browser's only option — no host
+  filesystem there). The transport gained `Backend::Fs`, per-device feature bits
+  and ring depth, and **byte/half-width config-space reads** — not optional,
+  since Linux reads the mount tag one byte at a time (`virtio_cread_bytes`), so
+  a 32-bit-only config space never gets mounted. `--9p DIR [--9p-tag TAG]` on
+  both runners; `sys_stage_fs_tar` in the wasm ABI.
 
-- [ ] **8. virtio-net** — guest networking. Browser needs a WebSocket
-  relay (v86's approach); native can use a tun/tap or slirp port. Large
-  effort, needs infrastructure.
+  Verified end to end (`tests/p9_boot.rs`): the guest mounts the export, reads
+  host files including nested ones, lists directories, creates and appends files
+  that land on the host, mkdir/rmdir, and sees host-side changes made after
+  mount. wasm-smoke covers the tar-backed browser path under the JIT.
+
+  Two notes for next time. The path-addressed backend is deliberate: 9P read and
+  write both carry explicit offsets, so no per-fid seek state is needed; the one
+  stateful spot is `Treaddir`, which snapshots per fid. And `mv` cannot be
+  tested through the TinyEMU guest — rename(2) fails with ENOSYS there for
+  *every* filesystem, tmpfs included — so `Trenameat` is covered in the HostFs
+  backend tests instead. Still open: async completion, which a
+  fetch/IndexedDB-backed browser export would need.
+
+- [x] **8. virtio-net** *(done 2026-07-25)* — a layer-2 NIC and two ways for its
+  frames to leave. `Backend::Net` (device id 1) is RX queue 0, TX queue 1,
+  `VIRTIO_NET_F_MAC`, and two bounded mailboxes; it knows no ARP, IP or TCP.
+  The per-frame header is **12 bytes** (`virtio_net_hdr_v1`), not 10, because we
+  negotiate `VIRTIO_F_VERSION_1` and Linux sizes `vi->hdr_len` on exactly that
+  condition — a 10-byte header shifts every frame and nothing parses.
+
+  Transport A, **WebSocket relay** (`ws.rs`): an RFC 6455 client in ~330 lines
+  with no dependencies, one binary message per Ethernet frame (websockproxy /
+  v86's wire format). `--net ws://HOST:PORT` natively; `connectNet(url)` in the
+  browser. Full fidelity — any protocol, any port, TLS end-to-end from the guest
+  so the relay is a dumb pipe — but it requires a relay to exist.
+
+  Verified (`tests/net_boot.rs`): the guest pings a host implemented *in the
+  test* — a ~60-line ARP + ICMP responder, the smallest peer that proves frames
+  cross intact both ways and that the guest's own stack accepts them. Confirmed
+  by mutation: shifting RX by two bytes fails it with 100% loss while frames
+  still flow.
+
+- [x] **8b. In-browser HTTP proxy** *(done 2026-07-25 — the one that needs no
+  infrastructure)* — the relay above is full-fidelity but useless without a
+  relay to point at, and in a browser a page cannot open a socket at all. Its
+  only egress primitive is `fetch()`, which is request/response shaped. So the
+  guest gets an **HTTP proxy** instead of a route: it sets `http_proxy`, hands us
+  a hostname and a complete request, and we perform it.
+
+  Moving up a layer deletes most of a slirp: no DNS (the guest never resolves
+  anything — it passes the name to us), no NAT, no per-destination tracking, no
+  UDP beyond DHCP. What remains is `netstack.rs` — ARP, DHCP, ICMP echo, and TCP
+  terminated to exactly one address:port — and `httpproxy.rs`, which parses
+  absolute-URI requests and hands them to an `Egress` trait. Compare TinyEMU's
+  `slirp/` at ~8.5k lines.
+
+  Both are pure logic driven by the host loop, so the same code serves native
+  (`egress.rs`, real sockets, plaintext only) and browser (`fetch`, which brings
+  HTTPS for free). `--proxy` on `rv64-boot`; `proxy: true` in `bootLinux`.
+
+  **Reach is bounded by CORS, and the boundary is better than it sounds.** Only
+  hosts sending `Access-Control-Allow-Origin` can be read — but measured, that
+  is specifically the API and package web: `api.github.com`,
+  `raw.githubusercontent.com`, `api.openai.com`, `registry.npmjs.org` and
+  `files.pythonhosted.org` (metadata *and* artifacts), `static.crates.io` all
+  send `*`. `deb.debian.org` and ordinary web pages do not. So `pip install` and
+  `npm install` are reachable with zero infrastructure; browsing is not.
+
+  Verified (`tests/proxy_boot.rs`): the guest brings up eth0, sets `http_proxy`,
+  and `wget`s through the proxy — including a 20 KB response whose md5 the guest
+  computes and the test compares against the same bytes hashed on the host, a
+  404 passed through, and an egress failure surfacing as a readable 502.
+  Confirmed by mutation: a corrupted TCP checksum makes the guest drop our
+  segments and the fetch fail. wasm-smoke runs the same path through the real
+  `fetch()` against a loopback origin, under the JIT.
+
+  Next, in order: `CONNECT` + TLS MITM so unmodified `https://` URLs work
+  (needs a TLS server and per-host cert minting in wasm — the one dependency
+  worth prototyping before committing), then chunked request bodies, then
+  per-request routing between `fetch` and the relay.
 
 - [x] **9. Modern guest images** *(done 2026-07-23)* — a new **virt**-class
   machine (`crates/rv64-system/src/virt.rs`, runner `bin/rv64-vboot`) boots a
@@ -186,7 +258,9 @@ lever now. Its two reverted attempts are documented in git history.
 
 ## Recommended sequencing
 
-1 → 2 → 3 (the perf trilogy — they compound; inline-TLB is what makes the
-other two matter in system mode), then 7 (the feature that changes what
-the project *is*). 8–10 as interest dictates. 11/12 any time.
-Validation items 5–6 are done and run as suite stages 5–6.
+1 → 2 → 3 (the perf trilogy) → 7 → 8/8b. All done. Next: **10** (snapshots),
+where two device-state wrinkles now apply — a 9p export carries live fid state
+pointing at host paths that may not exist on restore, and a relay socket cannot
+be serialized at all; both want an explicit reattach-on-restore step rather than
+being captured verbatim. 11/12 any time. Validation items 5–6 run as suite
+stages 5–6.

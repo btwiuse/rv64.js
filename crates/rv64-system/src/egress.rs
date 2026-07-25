@@ -11,8 +11,13 @@
 //! Requests run on their own threads and complete through a channel, matching
 //! [`Egress`]'s submit-then-poll contract rather than stalling the emulator for
 //! the duration of a request.
+//!
+//! This backend reads a whole response before emitting it as `Head`/`Body`/`End`
+//! rather than streaming incrementally. Incremental de-chunking would be the
+//! only added value, and streaming matters where responses are large or
+//! long-lived — which is the browser, where `fetch` streams natively.
 
-use crate::httpproxy::{Egress, ReqId, Request, Response};
+use crate::httpproxy::{Completion, Egress, ReqId, Request, Response};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -22,8 +27,8 @@ use std::time::Duration;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct NativeEgress {
-    tx: Sender<(ReqId, Result<Response, String>)>,
-    rx: Receiver<(ReqId, Result<Response, String>)>,
+    tx: Sender<Completion>,
+    rx: Receiver<Completion>,
 }
 
 impl Default for NativeEgress {
@@ -42,12 +47,28 @@ impl NativeEgress {
 impl Egress for NativeEgress {
     fn submit(&mut self, id: ReqId, req: Request) {
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send((id, perform(&req)));
+        std::thread::spawn(move || match perform(&req) {
+            Ok(response) => {
+                let _ = tx.send(Completion::Head {
+                    id,
+                    status: response.status,
+                    headers: response.headers,
+                });
+                if !response.body.is_empty() {
+                    let _ = tx.send(Completion::Body {
+                        id,
+                        bytes: response.body,
+                    });
+                }
+                let _ = tx.send(Completion::End { id });
+            }
+            Err(error) => {
+                let _ = tx.send(Completion::Failed { id, error });
+            }
         });
     }
 
-    fn poll(&mut self) -> Vec<(ReqId, Result<Response, String>)> {
+    fn poll(&mut self) -> Vec<Completion> {
         let mut out = Vec::new();
         while let Ok(done) = self.rx.try_recv() {
             out.push(done);
@@ -260,18 +281,23 @@ mod tests {
             },
         );
         // submit is asynchronous, so poll until the thread reports back.
+        let mut got = Vec::new();
         for _ in 0..2000 {
-            let done = egress.poll();
-            if let Some((id, result)) = done.into_iter().next() {
-                assert_eq!(id, 7);
-                let response = result.expect("request should succeed");
-                assert_eq!(response.status, 200);
-                assert_eq!(response.body, b"hi");
-                return;
+            got.extend(egress.poll());
+            if got.iter().any(|c| matches!(c, Completion::End { .. })) {
+                break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        panic!("request never completed");
+        assert!(
+            matches!(got.first(), Some(Completion::Head { id: 7, status: 200, .. })),
+            "expected a 200 head first, got {got:?}"
+        );
+        assert!(
+            got.iter().any(|c| matches!(c, Completion::Body { bytes, .. } if bytes == b"hi")),
+            "expected the body, got {got:?}"
+        );
+        assert!(matches!(got.last(), Some(Completion::End { id: 7 })), "got {got:?}");
     }
 
     #[test]
@@ -288,8 +314,11 @@ mod tests {
             },
         );
         for _ in 0..5000 {
-            if let Some((_, result)) = egress.poll().into_iter().next() {
-                assert!(result.is_err(), "expected a connect error");
+            if let Some(c) = egress.poll().into_iter().next() {
+                assert!(
+                    matches!(c, Completion::Failed { .. }),
+                    "expected a connect failure, got {c:?}"
+                );
                 return;
             }
             std::thread::sleep(Duration::from_millis(1));

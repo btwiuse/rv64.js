@@ -3,6 +3,7 @@
 // Run via tests/run-all.sh, or directly:
 //   node tests/wasm-smoke.mjs
 import { readFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -284,6 +285,84 @@ for (const [name, argv, wantExit, wantOut] of guests) {
       r.set(senderIp, 38);
       return r;
     }
+  }
+}
+
+// ---- in-process HTTP proxy over fetch egress (needs web/get-images.sh) ----
+//
+// A separate boot from the relay test above: with the proxy enabled the guest's
+// frames go to the built-in netstack, so host_net_send never fires and the two
+// paths cannot share one machine.
+{
+  const img = (f) => join(root, "web/images", f);
+  if (!existsSync(img("bbl64.bin"))) {
+    console.log("SKIP http proxy (run web/get-images.sh)");
+  } else {
+    // A real origin on loopback, reached by the same fetch() a browser uses.
+    // Nothing external is involved, but the entire egress path runs.
+    const origin = createServer((req, res) => {
+      if (req.url === "/hello") {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("FETCH-EGRESS-OK\n");
+      } else if (req.url === "/big") {
+        // Written in pieces so the response reaches the guest as a stream of
+        // body chunks rather than one buffered blob.
+        res.writeHead(200);
+        for (let i = 0; i < 20; i++) res.write("x".repeat(1000));
+        res.end();
+      } else {
+        res.writeHead(404);
+        res.end("nope\n");
+      }
+    });
+    await new Promise((r) => origin.listen(0, "127.0.0.1", r));
+    const port = origin.address().port;
+
+    const vm = await RV64.create(wasmBytes);
+    let out = "";
+    vm.onWrite = (fd, b) => {
+      out += new TextDecoder().decode(b);
+    };
+    vm.bootLinux({
+      bios: new Uint8Array(await readFile(img("bbl64.bin"))),
+      kernel: new Uint8Array(await readFile(img("kernel-riscv64.bin"))),
+      disk: new Uint8Array(await readFile(img("root-riscv64.bin"))),
+      proxy: true,
+      // The canned origin is plaintext; a real page served over https needs the
+      // default (upgrade), since https pages cannot fetch http:// at all.
+      proxyUpgradeHttps: false,
+    });
+
+    // fetch() completes on the microtask queue, so the wait loop must yield to
+    // the event loop between slices; a synchronous spin would never see it.
+    const step = async (marker, rounds) => {
+      for (let i = 0; i < rounds && !out.includes(marker); i++) {
+        vm.runSystem(10_000_000n);
+        await new Promise((r) => setImmediate(r));
+      }
+      return out.includes(marker);
+    };
+    const run = async (cmd, marker, rounds = 600) => {
+      if (cmd.includes(marker)) throw new Error(`marker ${marker} matches the echo`);
+      vm.consoleInput(new TextEncoder().encode(cmd + "\n"));
+      return step(marker, rounds);
+    };
+
+    const gotShell = await step("~ #", 20000);
+    const url = gotShell ? vm.proxyURL() : "";
+    check("proxy URL is reported", url.startsWith("http://10.0.2.2:"), url);
+    let ok = false;
+    let big = false;
+    if (gotShell) {
+      await run("ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up && echo NET_'O'K", "NET_OK");
+      await run(`export http_proxy=${url}; echo ENV_'O'K`, "ENV_OK");
+      ok = await run(`wget -q -O- http://127.0.0.1:${port}/hello`, "FETCH-EGRESS-OK");
+      // Proves the streamed body reassembles: the origin writes 20 chunks.
+      big = await run(`wget -q -O- http://127.0.0.1:${port}/big | wc -c`, "20000");
+    }
+    check("http proxy over fetch egress (wasm)", ok, `shell=${gotShell}`);
+    check("streamed response through the proxy (wasm)", big);
+    origin.close();
   }
 }
 

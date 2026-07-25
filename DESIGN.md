@@ -78,10 +78,11 @@ multiple VMs = multiple instantiations.
    step (`Bus::irq_lines`) — level-triggered like real hardware, which is
    what makes timer reprogramming race-free.
 5. ✅ **Devices + boot** (`rv64-system`): CLINT, TinyEMU-minimal PLIC, HTIF,
-   virtio-mmio v2 (console + blk), DTB builder, BBL trampoline. **Boots
-   TinyEMU's stock Linux 4.15 + buildroot image to an interactive shell**,
-   natively (~50 Minsn/s interpreted) and in the browser (web/system.html,
-   ~0.9 s to shell in Node). Not yet ported from TinyEMU: virtio-net, 9p.
+   virtio-mmio v2 (console + blk + 9p + net), DTB builder, BBL trampoline.
+   **Boots TinyEMU's stock Linux 4.15 + buildroot image to an interactive
+   shell**, natively (~50 Minsn/s interpreted) and in the browser
+   (web/system.html, ~0.9 s to shell in Node). TinyEMU's device set is now fully
+   covered; 9p and net landed later as roadmap items 7 and 8.
 6. ✅ **JIT** (`rv64-jit`): integrated and live in both run loops. Hot pcs
    (threshold 16 at dispatch points) are translated by the Rust core into
    wasm modules; the JS host instantiates each module and registers its
@@ -113,9 +114,13 @@ FP-heavy code in wasm, verified by 600k-iteration differential fuzz.
 
 The post-1.0 roadmap lives in [ROADMAP.md](../ROADMAP.md) (perf: inline-TLB
 JIT memory ops, block chaining, FP-in-blocks; validation: RISCOF, Spike
-lockstep; features: virtio-9p/net, modern images, snapshots). virtio-net/9p
-were intentionally descoped from phase 5 — the boot target was console +
-blk, which is what "Linux shell in the browser" requires.
+lockstep; features: snapshots). virtio-net/9p were intentionally descoped from
+phase 5 — the boot target was console + blk, which is what "Linux shell in the
+browser" requires. Both landed later: **virtio-9p** (`p9.rs`/`p9fs.rs`) exports a
+host directory or an in-memory tree, and **virtio-net** (`virtio.rs`) carries
+frames either to a WebSocket relay (`ws.rs`) or to an **in-browser HTTP proxy**
+(`netstack.rs` + `httpproxy.rs`) whose egress is `fetch()` — the only design that
+reaches the network from a page with no external infrastructure.
 
 ## Testing strategy
 

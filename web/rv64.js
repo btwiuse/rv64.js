@@ -40,18 +40,14 @@ export class RV64 {
           const frame = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
           vm.onNetSend(frame);
         },
-        // HTTP egress: the core hands an encoded request; the page performs
-        // it (fetch in a browser, vm.onHttpRequest override elsewhere) and
-        // answers via sys_http_response. Default: hand to the hook if the
-        // embedder installed one, otherwise report the request as failed so
-        // the guest sees a clean error instead of a hang.
+        // HTTP egress for the guest's in-process proxy. Performed with fetch(),
+        // the browser's only egress primitive — and the reason the proxy design
+        // reaches the network with no external infrastructure. An embedder can
+        // intercept instead by setting `onHttpRequest`.
         host_http_request: (id, ptr, len) => {
-          const req = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
-          if (vm.onHttpRequest) {
-            vm.onHttpRequest(id, req);
-          } else {
-            queueMicrotask(() => vm.ex.sys_http_response?.(id));
-          }
+          const bytes = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
+          if (vm.onHttpRequest) vm.onHttpRequest(id, bytes);
+          else vm.performHttp(id, decodeRequest(bytes));
         },
         host_now_ms: () =>
           typeof performance !== "undefined" ? performance.now() : Date.now(),
@@ -298,6 +294,8 @@ RV64.prototype.bootLinux = function ({
   fsTag,
   net = false,
   netMac,
+  proxy = false,
+  proxyUpgradeHttps = true,
 }) {
   const stage = (bytes, fn) => {
     if (!bytes) return;
@@ -313,6 +311,8 @@ RV64.prototype.bootLinux = function ({
   if (fsTag) stage(new TextEncoder().encode(fsTag), () => this.ex.sys_stage_fs_tag());
   if (netMac) stage(new Uint8Array(netMac), () => this.ex.sys_stage_net_mac());
   this.ex.sys_net_enable(net ? 1 : 0);
+  // The proxy implies a NIC: the guest reaches it over ordinary TCP.
+  if (proxy) this.ex.sys_proxy_enable(1, proxyUpgradeHttps ? 1 : 0);
   this.ex.sys_boot(ramMB);
 };
 
@@ -361,3 +361,128 @@ RV64.prototype.consoleInput = function (bytes) {
 RV64.prototype.sysInsnCount = function () {
   return this.ex.sys_insn_count();
 };
+
+// ---- in-process HTTP proxy ------------------------------------------------
+//
+// The guest points http_proxy at the emulated network's gateway and speaks
+// ordinary HTTP to it; the Rust side terminates TCP and parses the request, and
+// this performs it with fetch(). Nothing external is involved.
+//
+// Reachability is bounded by CORS: only hosts sending Access-Control-Allow-Origin
+// can be read. In practice that is most API and package-registry traffic
+// (api.github.com, registry.npmjs.org, files.pythonhosted.org, api.openai.com
+// all send `*`, artifacts included) and not ordinary web pages.
+
+/** The http_proxy URL to set in the guest, or "" when the proxy is off. */
+RV64.prototype.proxyURL = function () {
+  const len = this.ex.sys_proxy_url();
+  if (!len) return "";
+  // staging_ptr, not staging_alloc: the latter is the write path and clears the
+  // buffer, which would wipe the value we are trying to read.
+  return new TextDecoder().decode(
+    new Uint8Array(this.ex.memory.buffer, this.ex.staging_ptr(), len),
+  );
+};
+
+/** Headers fetch() refuses to let a page set; forwarding them throws or is ignored. */
+const FORBIDDEN_HEADERS = new Set([
+  "host", "content-length", "connection", "keep-alive", "transfer-encoding",
+  "upgrade", "te", "trailer", "expect", "date", "origin", "referer", "via",
+  "cookie", "cookie2", "accept-charset", "accept-encoding", "dnt",
+  // Not CORS-safelisted: forwarding the guest's User-Agent would force a
+  // preflight on every otherwise-simple request, so drop it and let the browser
+  // send its own.
+  "user-agent",
+]);
+
+/** Perform one guest request, streaming the response back as it arrives. */
+RV64.prototype.performHttp = async function (id, req) {
+  try {
+    const headers = {};
+    for (const [name, value] of req.headers) {
+      if (!FORBIDDEN_HEADERS.has(name.toLowerCase())) headers[name] = value;
+    }
+    const init = { method: req.method, headers, redirect: "follow" };
+    if (req.body.length) init.body = req.body;
+    const resp = await fetch(req.url, init);
+
+    this.stageFor(encodeHead(resp.status, [...resp.headers]));
+    this.ex.sys_http_head(BigInt(id));
+
+    // Stream rather than await the whole body: an SSE response or a long
+    // download must reach the guest as it arrives, and nothing is buffered
+    // whole on the way past.
+    const reader = resp.body?.getReader();
+    if (reader) {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value?.length) {
+          this.stageFor(value);
+          this.ex.sys_http_body(BigInt(id));
+        }
+      }
+    }
+    this.ex.sys_http_end(BigInt(id));
+  } catch (e) {
+    // The proxy turns this into a 502 the guest can read, rather than a silent
+    // hang. A CORS rejection lands here.
+    this.stageFor(new TextEncoder().encode(String(e?.message ?? e)));
+    this.ex.sys_http_fail(BigInt(id));
+  }
+};
+
+/** Copy bytes into the wasm staging buffer for the next sys_http_* call. */
+RV64.prototype.stageFor = function (bytes) {
+  const ptr = this.ex.staging_alloc(bytes.length);
+  new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
+};
+
+/** Mirror of httpproxy::Request::encode. */
+function decodeRequest(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let p = 0;
+  const u32 = () => {
+    const v = dv.getUint32(p, true);
+    p += 4;
+    return v;
+  };
+  const buf = () => {
+    const n = u32();
+    const b = bytes.subarray(p, p + n);
+    p += n;
+    return b;
+  };
+  const str = () => new TextDecoder().decode(buf());
+  const method = str();
+  const url = str();
+  const n = u32();
+  const headers = [];
+  for (let i = 0; i < n; i++) headers.push([str(), str()]);
+  return { method, url, headers, body: buf() };
+}
+
+/** Mirror of httpproxy::decode_head. Bodies cross as raw bytes, unframed. */
+function encodeHead(status, headers) {
+  const enc = new TextEncoder();
+  const parts = [];
+  const u32 = (v) => {
+    const b = new Uint8Array(4);
+    new DataView(b.buffer).setUint32(0, v, true);
+    return b;
+  };
+  parts.push(u32(status), u32(headers.length));
+  for (const [name, value] of headers) {
+    const nb = enc.encode(name);
+    const vb = enc.encode(value);
+    parts.push(u32(nb.length), nb, u32(vb.length), vb);
+  }
+  const total = parts.reduce((n, b) => n + b.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const b of parts) {
+    out.set(b, off);
+    off += b.length;
+  }
+  return out;
+}

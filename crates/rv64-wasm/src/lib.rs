@@ -451,7 +451,7 @@ struct PendingSb {
 // 2.4s -> 7s (big glued functions rebuild more and codegen worse); at 3 the
 // sparse mechanics keep loop-straddling pages together and pull in ONE hot
 // callee, which is where the measured value was.
-const MAX_REGION_PAGES: usize = 8;
+const MAX_REGION_PAGES: usize = 3;
 static mut PENDING_SB: Vec<PendingSb> = Vec::new();
 static mut NEXT_SB_TICKET: u64 = 1;
 // Superblock lifecycle counters (diagnostic, jit_stat 10..14).
@@ -1015,12 +1015,11 @@ static mut SYS_NETSTACK: Option<rv64_system::netstack::NetStack> = None;
 static mut SYS_PROXY: Option<rv64_system::httpproxy::Proxy> = None;
 static mut SYS_EGRESS: FetchEgress = FetchEgress { done: Vec::new() };
 
-/// Hands requests to the page and collects what `sys_http_response` delivers.
+/// Hands requests to the page and collects what the `sys_http_*` exports
+/// deliver. Responses arrive as a head then body chunks, so a streaming
+/// response (SSE, a long download) reaches the guest as it arrives.
 struct FetchEgress {
-    done: Vec<(
-        rv64_system::httpproxy::ReqId,
-        Result<rv64_system::httpproxy::Response, String>,
-    )>,
+    done: Vec<rv64_system::httpproxy::Completion>,
 }
 
 impl rv64_system::httpproxy::Egress for FetchEgress {
@@ -1028,12 +1027,7 @@ impl rv64_system::httpproxy::Egress for FetchEgress {
         let bytes = req.encode();
         unsafe { host_http_request(id, bytes.as_ptr(), bytes.len()) }
     }
-    fn poll(
-        &mut self,
-    ) -> Vec<(
-        rv64_system::httpproxy::ReqId,
-        Result<rv64_system::httpproxy::Response, String>,
-    )> {
+    fn poll(&mut self) -> Vec<rv64_system::httpproxy::Completion> {
         core::mem::take(&mut self.done)
     }
 }
@@ -1111,14 +1105,63 @@ pub extern "C" fn sys_proxy_enable(on: u32, upgrade_https: u32) {
     }
 }
 
-/// Deliver a completed response (staged via staging_alloc) for request `id`.
+/// Deliver a response head (staged via staging_alloc) for request `id`.
 #[no_mangle]
 #[allow(static_mut_refs)]
-pub extern "C" fn sys_http_response(id: u64) {
+pub extern "C" fn sys_http_head(id: u64) {
     unsafe {
         let bytes = core::mem::take(&mut STAGING);
-        let result = rv64_system::httpproxy::Response::decode_result(&bytes);
-        SYS_EGRESS.done.push((id, result));
+        match rv64_system::httpproxy::decode_head(&bytes) {
+            Some((status, headers)) => SYS_EGRESS.done.push(
+                rv64_system::httpproxy::Completion::Head {
+                    id,
+                    status,
+                    headers,
+                },
+            ),
+            None => SYS_EGRESS.done.push(rv64_system::httpproxy::Completion::Failed {
+                id,
+                error: "malformed response head from host".into(),
+            }),
+        }
+    }
+}
+
+/// Deliver a chunk of response body (staged via staging_alloc) for `id`.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_http_body(id: u64) {
+    unsafe {
+        let bytes = core::mem::take(&mut STAGING);
+        SYS_EGRESS
+            .done
+            .push(rv64_system::httpproxy::Completion::Body { id, bytes });
+    }
+}
+
+/// The response for `id` is complete.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_http_end(id: u64) {
+    unsafe {
+        SYS_EGRESS
+            .done
+            .push(rv64_system::httpproxy::Completion::End { id });
+    }
+}
+
+/// The request `id` could not be performed; STAGING holds why.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_http_fail(id: u64) {
+    unsafe {
+        let bytes = core::mem::take(&mut STAGING);
+        SYS_EGRESS
+            .done
+            .push(rv64_system::httpproxy::Completion::Failed {
+                id,
+                error: String::from_utf8_lossy(&bytes).into_owned(),
+            });
     }
 }
 
@@ -1352,11 +1395,11 @@ fn build_superblock(
                             .get(&(aspace, vpage))
                             .copied()
                             .unwrap_or(0);
-                        let far_cap = if sb_compiles > 0 || missed_now >= 16 {
-                            (pages.len() + 2).min(MAX_REGION_PAGES)
-                        } else {
-                            pages.len()
-                        };
+                        // With regions capped at 3 pages the far joins are
+                        // cheap and a19ea3b-measured; the miss gate was
+                        // compensating for the (now reverted) 8-page growth.
+                        let _ = missed_now;
+                        let far_cap = (pages.len() + 2).min(MAX_REGION_PAGES);
                         let mut scanned = 0usize;
                         while scanned < pages.len() && pages.len() < far_cap {
                             let (va, pp) = pages[scanned];
@@ -1382,57 +1425,32 @@ fn build_superblock(
                             code.extend_from_slice(&m.bus.ram[o..o + 0x1000]);
                         }
                         let vas: Vec<u64> = pages.iter().map(|&(va, _)| va).collect();
-                        // Leaders per CONTIGUOUS RUN of pages: discovery over
-                        // the whole run lets branch targets and fallthroughs
-                        // that cross a page boundary become entries, exactly
-                        // as the contiguous translator had it (dropping this
-                        // to single-page discovery cost ASSIGNMENT its win).
-                        // Runs are separated by gaps; a gap is where sparse
-                        // dispatch takes over.
+                        // SUB-BISECT(i): per-page discovery, as at a19ea3b.
                         let mut entries: Vec<u64> = Vec::new();
-                        let mut k = 0usize;
-                        while k < pages.len() && entries.len() < MAX_LEADERS {
-                            let mut k2 = k;
-                            while k2 + 1 < pages.len()
-                                && pages[k2 + 1].0 == pages[k2].0 + 0x1000
-                            {
-                                k2 += 1;
+                        for (k, &(va, _)) in pages.iter().enumerate() {
+                            if entries.len() >= MAX_LEADERS {
+                                break;
                             }
-                            let run_va = pages[k].0;
-                            let run_len = (k2 - k + 1) * 0x1000;
-                            let slice = &code[k * 0x1000..k * 0x1000 + run_len];
-                            let mut rseeds: Vec<u64> = Vec::new();
-                            for &(va, _) in &pages[k..=k2] {
-                                if let Some(e) = jit.page_entries.get(&(aspace, va)) {
-                                    rseeds.extend_from_slice(e);
-                                }
+                            let slice = &code[k * 0x1000..(k + 1) * 0x1000];
+                            let pseeds: Vec<u64> = jit
+                                .page_entries
+                                .get(&(aspace, va))
+                                .map(|v| v.clone())
+                                .unwrap_or_default();
+                            let use_seeds = if va == vpage { &seeds } else { &pseeds };
+                            if use_seeds.is_empty() {
+                                continue;
                             }
-                            rseeds.sort_unstable();
-                            rseeds.dedup();
-                            if !rseeds.is_empty() {
-                                let (mut l, back) = rv64_jit::discover_page_leaders_ext(
-                                    slice,
-                                    run_va,
-                                    run_va,
-                                    run_len as u64,
-                                    &rseeds,
-                                    MAX_LEADERS - entries.len(),
-                                );
-                                l.retain(|&e| {
-                                    let po = ((e & !0xfff) - run_va) as usize;
-                                    let pg = &slice[po..po + 0x1000];
-                                    rv64_jit::emittable_at(slice, run_va, e, lay)
-                                        && (!back.contains(&e)
-                                            || !rv64_jit::is_loop_at(
-                                                pg,
-                                                e & !0xfff,
-                                                e,
-                                                lay,
-                                            ))
-                                });
-                                entries.extend(l);
-                            }
-                            k = k2 + 1;
+                            let (mut l, back) = rv64_jit::discover_page_leaders_ext(
+                                slice, va, va, 0x1000, use_seeds,
+                                MAX_LEADERS - entries.len(),
+                            );
+                            l.retain(|&e| {
+                                rv64_jit::emittable_at(slice, va, e, lay)
+                                    && (!back.contains(&e)
+                                        || !rv64_jit::is_loop_at(slice, va, e, lay))
+                            });
+                            entries.extend(l);
                         }
                                                 let sb = rv64_jit::translate_superblock_sparse(
                             &code, &vas, &entries, lay,

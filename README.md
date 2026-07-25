@@ -9,6 +9,10 @@ privileged arch with sv39/sv48 MMU) boots TinyEMU's stock Linux 4.15 +
 buildroot image to an interactive busybox shell — natively (~50 Minsn/s)
 and in the browser. User-mode emulation (qemu-user style) runs static
 riscv64 musl binaries. The JIT is live in both run loops: hot blocks compile to wasm modules dispatched via call_indirect (~3x on hot code, with safe invalidation).
+Devices are virtio-mmio: console, block, **9p** for sharing a host directory (or
+an in-memory tree, in the browser) into the guest, and **net** — either over a
+WebSocket relay, or through an in-browser HTTP proxy that needs no external
+infrastructure at all (egress is the page's own `fetch`).
 See [DESIGN.md](DESIGN.md) for architecture and [ROADMAP.md](ROADMAP.md) for what comes next.
 
 ```sh
@@ -20,6 +24,15 @@ python3 -m http.server -d . 8000    # open http://localhost:8000/web/system.html
 # boot Linux natively
 cargo build --release -p rv64-system
 target/release/rv64-boot web/images/bbl64.bin web/images/kernel-riscv64.bin web/images/root-riscv64.bin
+
+# ...sharing a host directory over virtio-9p; in the guest:
+#   mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
+target/release/rv64-boot web/images/*.bin --9p ~/src
+
+# ...with networking through the in-process HTTP proxy; in the guest:
+#   ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
+#   export http_proxy=http://10.0.2.2:8080 && wget -O- http://example.com/
+target/release/rv64-boot web/images/*.bin --proxy
 
 # run a static riscv64 Linux binary (qemu-user style)
 cargo run --release -p rv64-run -- <static-elf> [args...]
