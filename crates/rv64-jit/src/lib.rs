@@ -199,6 +199,11 @@ struct Ctx {
     /// be reported accurately or the system-mode kernel clock (derived from
     /// insn_count) stalls. `None` for basic blocks (retired == static index).
     retired_local: Option<u32>,
+    /// (fs_bad, round_bad) i64 locals holding the FP gate's two conditions,
+    /// evaluated ONCE at function entry. Nothing a compiled block executes can
+    /// change mstatus.FS, frm or the sticky NX flag, so each FP body only has
+    /// to test the flag instead of re-deriving it from fcsr/mstatus.
+    fp_flags: Option<(u32, u32)>,
 }
 
 impl Ctx {
@@ -809,7 +814,11 @@ impl Ctx {
         // leaving the exact IEEE result. Zeros used to bail: 79M times per
         // nbench FOURIER run, each one a wasted block entry plus a softfloat
         // fma in the interpreter.
-        for &l in &[fa, fb, fc] {
+        // All three operands are checked into ONE branch: a bail sequence is a
+        // register flush plus a pc/retired store, so three of them inline is a
+        // lot of code for V8 to carry through the hot path of an instruction
+        // this dense.
+        for (i, &l) in [fa, fb, fc].iter().enumerate() {
             m.local_get(l)
                 .i64_const(52)
                 .op(I64_SHR_U)
@@ -821,10 +830,13 @@ impl Ctx {
                 .op(I64_GT_U);
             m.local_get(l).i64_const(1).op(I64_SHL).op(I64_EQZ).op(I32_EQZ);
             m.op(I32_AND);
-            m.op(IF).op(VOID);
-            self.bail(m, pc, n);
-            m.op(END);
+            if i > 0 {
+                m.op(I32_OR);
+            }
         }
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
         // p = a * b, band-checked
         getf(m, fa);
         getf(m, fb);
@@ -1905,6 +1917,8 @@ fn build_ctx(
     // use (a set bit 0 would make the prologue clobber local 0, the machine
     // pointer parameter).
     let want_fma = read_mask & 1 != 0;
+    // write_mask bit 0 (x0 is never written) asks for the hoisted FP gate flags.
+    let want_flags = write_mask & 1 != 0;
     let read_mask = read_mask & !1;
     let write_mask = write_mask & !1;
     let touched = read_mask | write_mask;
@@ -1926,18 +1940,25 @@ fn build_ctx(
         }
     }
     let n_fma = if want_fma { 12 } else { 0 };
+    let n_flags = if want_flags { 2 } else { 0 };
     let c = Ctx {
         lay,
         reg_local,
         write_mask,
         // i32 local after all i64 locals (incl. the fma scratch block)
-        idxb: N_I64_LOCALS + n_reg + n_fp + n_fma + 1,
+        idxb: N_I64_LOCALS + n_reg + n_fp + n_fma + n_flags + 1,
         fp_local,
         fp_write_mask: fp_write,
         fma_scratch: if want_fma { N_I64_LOCALS + 1 + n_reg + n_fp } else { 0 },
         retired_local: None,
+        fp_flags: if want_flags {
+            let b = N_I64_LOCALS + 1 + n_reg + n_fp + n_fma;
+            Some((b, b + 1))
+        } else {
+            None
+        },
     };
-    let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp + n_fma, 1);
+    let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp + n_fma + n_flags, 1);
     let mut t = touched;
     while t != 0 {
         let r = t.trailing_zeros() as usize;
@@ -1991,7 +2012,53 @@ fn fp_needs_round(insn: u32) -> bool {
     }
 }
 
+/// Evaluate the FP gate's two conditions into the hoisted flag locals.
+fn emit_fp_flags(c: &Ctx, m: &mut WasmModule) {
+    let Some((fs_bad, round_bad)) = c.fp_flags else {
+        return;
+    };
+    let fcsr = c.lay.fcsr_addr as u64;
+    // round_bad = NX not sticky || frm != RNE
+    m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
+    m.i32_const(0)
+        .i64_load(fcsr)
+        .i64_const(5)
+        .op(I64_SHR_U)
+        .i64_const(7)
+        .op(I64_AND)
+        .op(I64_EQZ)
+        .op(I32_EQZ);
+    m.op(I32_OR).op(I64_EXTEND_I32_U).local_set(round_bad);
+    // fs_bad = mstatus.FS != Dirty (system mode only)
+    if c.lay.mstatus_addr != 0 {
+        m.i32_const(0)
+            .i64_load(c.lay.mstatus_addr as u64)
+            .i64_const(13)
+            .op(I64_SHR_U)
+            .i64_const(3)
+            .op(I64_AND)
+            .i64_const(3)
+            .op(I64_NE)
+            .op(I64_EXTEND_I32_U)
+            .local_set(fs_bad);
+    } else {
+        m.i64_const(0).local_set(fs_bad);
+    }
+}
+
 fn emit_block_fp_gate(c: &Ctx, m: &mut WasmModule, start_pc: u64, round: bool) {
+    // With hoisted flags (superblocks), a body's gate is a flag test.
+    if let Some((fs_bad, round_bad)) = c.fp_flags {
+        m.local_get(fs_bad);
+        if round {
+            m.local_get(round_bad).op(I64_OR);
+        }
+        m.op(I64_EQZ).op(I32_EQZ);
+        m.op(IF).op(VOID);
+        c.bail(m, start_pc, 0);
+        m.op(END);
+        return;
+    }
     let fcsr = c.lay.fcsr_addr as u64;
     if round {
         // bad = (fcsr & 1) == 0  ||  ((fcsr >> 5) & 7) != 0
@@ -4069,7 +4136,8 @@ pub fn translate_superblock(
     }
     let page_end = page_base + page_span;
     let (rm, wm, fr, fw, uses_fp) = scan_regs_super(code, base, page_end, entries, &lay);
-    let (mut c, mut m) = build_ctx(lay, rm, wm, fr, fw);
+    // Ask for the hoisted FP gate flags when any body will need a gate.
+    let (mut c, mut m) = build_ctx(lay, rm, wm | u32::from(uses_fp), fr, fw);
     c.retired_local = Some(ITER);
 
     // slot (= (pc-page_base)/2) -> entry index, else n (= default -> exit).
@@ -4084,6 +4152,7 @@ pub fn translate_superblock(
 
     m.i64_const(0).local_set(ITER); // retired accumulator
     m.i32_const(0).i64_load(lay.pc_addr as u64).local_set(TPC);
+    emit_fp_flags(&c, &mut m);
     // Hoisted FP gate (see emit_block_fp_gate): FS == Dirty, NX sticky and
     // frm == RNE, checked once — none can change inside compiled code.
     // Superblocks are multi-entry, so the bail restores the RUNTIME entry pc
