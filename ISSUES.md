@@ -756,3 +756,15 @@ never an engine/FMA floor: the current tree's superblocks actively cost it
 regressions is therefore the single path to 13/13: FOURIER wins once
 superblocks stop hurting it (or bodies carry the shipped hw-FMA on a fixed
 tree), and compile keeps its planned incremental-extension route.
+
+
+**Bisect note:** SB-on + wallclock-off reads ALL kernels lower (guest time
+becomes insn-derived; not comparable across configs) — that experiment does
+NOT discriminate miscompile vs build-time-in-guest-clock. Two live theories,
+in test order: (a) run-level sparse body/discovery miscompile — bisect
+a19ea3b -> HEAD with SBFORCE=1 wallclock-ON HUFFMAN rows; (b) superblock
+BUILD TIME (translate + leader analysis at quantum boundaries, several ms per
+8-page region) charged to guest wall-time, compounding on rebuild-heavy
+kernels — test by timing build_superblock host-side (add a jit_stat of
+cumulative build ms) and correlating with the HUFFMAN deficit. If (b), the
+fix is cheaper/incremental builds — the same incremental-extension project.
