@@ -350,8 +350,8 @@ if (R.ALU?.rvj_chk || R.ALU?.v8j_chk)
   need(R.ALU?.rvj_chk && R.ALU?.rvj_chk === R.ALU?.v8j_chk,
        `ALU checksum mismatch (rv=${R.ALU?.rvj_chk} v86=${R.ALU?.v8j_chk})`);
 if (R.Mixed?.rvj_chk && R.Mixed?.v8j_chk)
-  need(R.Mixed.rvj_chk.slice(-8) === R.Mixed.v8j_chk.slice(-8),
-       `Mixed checksum low-32 mismatch (rv=${R.Mixed.rvj_chk} v86=${R.Mixed.v8j_chk})`);
+  need(R.Mixed.rvj_chk === R.Mixed.v8j_chk,
+       `Mixed checksum mismatch (rv=${R.Mixed.rvj_chk} v86=${R.Mixed.v8j_chk})`);
 {
   const r = R["compile (tcc -c)"];
   if (r) {
