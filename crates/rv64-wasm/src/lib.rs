@@ -261,6 +261,11 @@ struct JitState {
     /// HashMap per interpreted instruction taxes cold boot, so count in a u16
     /// array here and only touch `hot` when a slot actually gets hot.
     interp_hot: Vec<u16>,
+    /// Full-pc tag for each interp_hot slot (low 32 bits of pc>>1). Untagged
+    /// direct-mapped counters let unrelated pcs (or another address space)
+    /// inherit a slot's heat and get compiled on their first execution —
+    /// compile storms that depend on address layout (ISSUES.md P2).
+    interp_hot_tag: Vec<u32>,
     /// Physical page -> pcs of cache entries whose code lives there (blocks
     /// AND pa-stamped blacklist sentinels). Lets dirty-page invalidation drop
     /// exactly the affected entries instead of scanning the whole cache per
@@ -289,6 +294,7 @@ impl JitState {
             flush_gen: 0,
             page_entries: Default::default(),
             interp_hot: vec![0; DISPATCH_SIZE],
+            interp_hot_tag: vec![0; DISPATCH_SIZE],
             page_blocks: Default::default(),
             superblocked: Default::default(),
         }
@@ -300,6 +306,9 @@ impl JitState {
         self.superblocked.clear();
         for h in self.interp_hot.iter_mut() {
             *h = 0;
+        }
+        for t in self.interp_hot_tag.iter_mut() {
+            *t = 0;
         }
         self.page_blocks.clear();
         self.clear_dispatch();
@@ -1045,6 +1054,12 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                     return true;
                 }
                 let slot = JitState::dslot(pc);
+                let tag = (pc >> 1) as u32;
+                if jit.interp_hot_tag[slot] != tag {
+                    // different pc aliased here: heat belongs to someone else
+                    jit.interp_hot_tag[slot] = tag;
+                    jit.interp_hot[slot] = 0;
+                }
                 let cnt = &mut jit.interp_hot[slot];
                 *cnt = cnt.saturating_add(1);
                 if *cnt < INTERP_HOT_THRESHOLD {

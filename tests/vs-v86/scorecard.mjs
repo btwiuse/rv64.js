@@ -32,6 +32,7 @@ const V86DIR = process.env.V86DIR || join(ARTIFACTS, "v86");
 const FULL = !!+process.env.FULL;
 const WANT_NBENCH = !!+process.env.NBENCH;
 const WANT_V86 = !+process.env.SKIP_V86;
+const SB = !!+process.env.SB; // run rv64 with page superblocks (single config for ALL rows)
 
 const { RV64 } = await import(join(root, "web/rv64.js"));
 const wasm = await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"));
@@ -55,7 +56,7 @@ function watchMarkers(vm, st) {
 }
 async function rvComputeBoot(jit, binPath) {
   const vm = await RV64.create(wasm);
-  vm.ex.jit_set_enabled(jit ? 1 : 0);
+  vm.ex.jit_set_enabled(jit ? 1 : 0); if (SB && jit) vm.ex.sys_set_superblock(1);
   const st = { vm, out: "", start: null, done: null, ts: null, td: null };
   watchMarkers(vm, st);
   vm.bootLinux({ bios: bbl, kernel: kern, disk: (new Uint8Array(await readFile(join(root, "web/images/root-riscv64.bin")))).slice() });
@@ -75,10 +76,12 @@ function rvRunBench(st) {
     st.vm.runSystem(5_000_000n);
     if (performance.now() - t0 > 200000) break;
   }
-  return st.ts !== null && st.td !== null ? st.td - st.ts : null;
+  if (st.ts === null || st.td === null) return null;
+  const chk = (st.out.match(/checksum=(0x[0-9a-f]+)/) || [, null])[1];
+  return { ms: st.td - st.ts, chk };
 }
 async function rvBootTime(jit) {
-  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0);
+  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); if (SB && jit) vm.ex.sys_set_superblock(1);
   let out = ""; vm.onWrite = (fd, b) => (out += new TextDecoder().decode(b));
   const t = performance.now();
   vm.bootLinux({ bios: bbl, kernel: kern, disk: (new Uint8Array(await readFile(join(root, "web/images/root-riscv64.bin")))).slice() });
@@ -87,7 +90,7 @@ async function rvBootTime(jit) {
 }
 async function rvPython(jit) {
   const disk = new Uint8Array(await readFile(join(ARTIFACTS, "deb-riscv64.ext4")));
-  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); vm.ex.sys_set_wallclock(1);
+  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); if (SB && jit) vm.ex.sys_set_superblock(1); vm.ex.sys_set_wallclock(1);
   const st = { vm, out: "", start: null, done: null, ts: null, td: null };
   watchMarkers(vm, st);
   vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice(), cmdline: "console=hvc0 root=/dev/vda rw init=/binit.sh", ramMB: 512 });
@@ -103,7 +106,7 @@ async function rvPython(jit) {
 }
 async function rvNbench(jit) {
   const disk = new Uint8Array(await readFile(join(ARTIFACTS, "root-nbench.bin")));
-  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); vm.ex.sys_set_wallclock(1);
+  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); if (SB && jit) vm.ex.sys_set_superblock(1); vm.ex.sys_set_wallclock(1);
   let out = ""; vm.onWrite = (fd, b) => (out += new TextDecoder().decode(b));
   vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice() });
   for (let i = 0; i < 60000 && !out.includes("~ #"); i++) vm.runSystem(2_000_000n);
@@ -120,7 +123,7 @@ async function rvNbench(jit) {
 // tcc commit as the v86 side.
 async function rvCompile(jit) {
   const disk = new Uint8Array(await readFile(join(ARTIFACTS, "cc-bench.img")));
-  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0);
+  const vm = await RV64.create(wasm); vm.ex.jit_set_enabled(jit ? 1 : 0); if (SB && jit) vm.ex.sys_set_superblock(1);
   const st = { vm, out: "", start: null, done: null, ts: null, td: null };
   watchMarkers(vm, st);
   vm.bootLinux({ bios: bbl, kernel: kern, disk: disk.slice() });
@@ -148,7 +151,8 @@ function v86Spawn(script, env) {
     p.on("close", () => {
       const m = buf.match(/RESULT ms=(\d+)/);
       const md5 = (buf.match(/md5=([0-9a-f]{32})/) || [, null])[1];
-      resolve(m ? { ms: +m[1], md5 } : null);
+      const chk = (buf.match(/chk=checksum=(0x[0-9a-f]+)/) || [, null])[1];
+      resolve(m ? { ms: +m[1], md5, chk } : null);
     });
   });
 }
@@ -184,13 +188,13 @@ const log = (m) => process.stderr.write(m);
 for (const jit of FULL ? [false, true] : [true]) {
   log(`[rv64 compute jit=${+jit}] boot…`);
   const st = await rvComputeBoot(jit, join(ARTIFACTS, "xbench", "alu.rv64"));
-  (R.ALU ??= {})[jit ? "rvj" : "rvi"] = rvRunBench(st); log(" alu");
+  { const r = rvRunBench(st); const row = (R.ALU ??= {}); row[jit ? "rvj" : "rvi"] = r?.ms ?? null; row[jit ? "rvj_chk" : "rvi_chk"] = r?.chk ?? null; } log(" alu");
   // reuse boot: swap /tmp/c to the mixed binary
   const b64 = Buffer.from(await readFile(join(ARTIFACTS, "xbench", "rvbench_fs.rv64"))).toString("base64");
   st.vm.consoleInput(enc.encode(": > /tmp/b\n")); step(st.vm, 1500);
   for (let o = 0; o < b64.length; o += 512) { st.vm.consoleInput(enc.encode(`printf %s '${b64.slice(o, o + 512)}' >> /tmp/b\n`)); step(st.vm, 3000); }
   st.vm.consoleInput(enc.encode("base64 -d /tmp/b > /tmp/c && chmod 755 /tmp/c\n")); step(st.vm, 12000);
-  (R.Mixed ??= {})[jit ? "rvj" : "rvi"] = rvRunBench(st); log(" mixed\n");
+  { const r = rvRunBench(st); const row = (R.Mixed ??= {}); row[jit ? "rvj" : "rvi"] = r?.ms ?? null; row[jit ? "rvj_chk" : "rvi_chk"] = r?.chk ?? null; } log(" mixed\n");
 }
 // boot time
 for (const jit of FULL ? [false, true] : [true]) { log(`[rv64 boot jit=${+jit}]…`); (R.Boot ??= {})[jit ? "rvj" : "rvi"] = await rvBootTime(jit); log(" ok\n"); }
@@ -209,8 +213,10 @@ if (await has(join(ARTIFACTS, "cc-bench.img"))) for (const jit of FULL ? [false,
 // v86 side
 if (haveV86) {
   for (const jit of FULL ? [false, true] : [true]) {
-    log(`[v86 jit=${+jit}] alu`); (R.ALU ??= {})[jit ? "v8j" : "v8i"] = (await v86Compute("alu.i386", jit))?.ms ?? null;
-    log(" mixed"); (R.Mixed ??= {})[jit ? "v8j" : "v8i"] = (await v86Compute("rvbench_fs.i386", jit))?.ms ?? null;
+    log(`[v86 jit=${+jit}] alu`);
+    { const r = await v86Compute("alu.i386", jit); const row = (R.ALU ??= {}); row[jit ? "v8j" : "v8i"] = r?.ms ?? null; row[jit ? "v8j_chk" : "v8i_chk"] = r?.chk ?? null; }
+    log(" mixed");
+    { const r = await v86Compute("rvbench_fs.i386", jit); const row = (R.Mixed ??= {}); row[jit ? "v8j" : "v8i"] = r?.ms ?? null; row[jit ? "v8j_chk" : "v8i_chk"] = r?.chk ?? null; }
     log(" boot"); (R.Boot ??= {})[jit ? "v8j" : "v8i"] = (await v86Boot(jit))?.ms ?? null;
     if (await has(join(ARTIFACTS, "vmlinuz-i386"))) { log(" python"); (R["python fib(30)"] ??= {})[jit ? "v8j" : "v8i"] = (await v86Python(jit))?.ms ?? null; }
     if (await has(join(ARTIFACTS, "deb-i386-bench.cpio.gz"))) {
@@ -285,7 +291,45 @@ if (FULL) {
   for (const k of order) { const r = R[k]; if (!r) continue; md += `| ${k} | ${ms(r.rvi)} | ${ms(r.v8i)} | ${speedup(r)} |\n`; }
   md += `\n</details>\n`;
 }
+// ---------- enforcement (ISSUES.md P1: manifest, correctness, exit code) ----------
+// Every required row must have produced numbers on both sides; ALU checksums
+// must be bit-identical cross-ISA; Mixed low-32 must match; compile must
+// yield an object md5 on both sides. Any violation = nonzero exit — the
+// scorecard cannot silently shrink its scope or report a win on wrong output.
+const problems = [];
+const need = (cond, what) => { if (!cond) problems.push(what); };
+for (const k of order) {
+  const r = R[k];
+  need(r && r.rvj != null, `${k}: rv64 row missing/failed`);
+  if (haveV86) need(r && r.v8j != null, `${k}: v86 row missing/failed`);
+}
+if (R.ALU?.rvj_chk || R.ALU?.v8j_chk)
+  need(R.ALU?.rvj_chk && R.ALU?.rvj_chk === R.ALU?.v8j_chk,
+       `ALU checksum mismatch (rv=${R.ALU?.rvj_chk} v86=${R.ALU?.v8j_chk})`);
+if (R.Mixed?.rvj_chk && R.Mixed?.v8j_chk)
+  need(R.Mixed.rvj_chk.slice(-8) === R.Mixed.v8j_chk.slice(-8),
+       `Mixed checksum low-32 mismatch (rv=${R.Mixed.rvj_chk} v86=${R.Mixed.v8j_chk})`);
+{
+  const r = R["compile (tcc -c)"];
+  if (r) {
+    need(!r.rvj || r.rvj_md5, "compile: rv64 object md5 missing");
+    if (haveV86) need(!r.v8j || r.v8j_md5, "compile: v86 object md5 missing");
+  }
+}
+if (WANT_NBENCH) {
+  const KERNELS = ["NUMERIC SORT", "STRING SORT", "BITFIELD", "FP EMULATION",
+                   "FOURIER", "ASSIGNMENT", "IDEA", "HUFFMAN"];
+  for (const k of KERNELS) {
+    need(nb?.jit?.[k] != null, `nbench ${k}: rv64 kernel missing`);
+    if (haveV86) need(nb?.v8?.[k] != null, `nbench ${k}: v86 kernel missing`);
+  }
+}
+if (problems.length) {
+  md += `\n**SCORECARD INVALID — ${problems.length} problem(s):** ${problems.join("; ")}\n`;
+  process.exitCode = 1;
+}
+
 console.log("\n" + md);
 await writeFile(join(ARTIFACTS, `scorecard-${ts}.md`), md);
-await writeFile(join(ARTIFACTS, `scorecard-${ts}.json`), JSON.stringify({ ts, system_emulation: true, results: R, nbench: nb, pass: `${passing.length}/${scored.length}` }, null, 2));
+await writeFile(join(ARTIFACTS, `scorecard-${ts}.json`), JSON.stringify({ ts, system_emulation: true, sb: SB, results: R, nbench: nb, pass: `${passing.length}/${scored.length}`, problems }, null, 2));
 console.log(`saved ${join(ARTIFACTS, `scorecard-${ts}.md`)} (+ .json)`);
