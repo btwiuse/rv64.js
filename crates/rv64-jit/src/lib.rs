@@ -831,6 +831,9 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 break;
             }
             0x67 => {
+                if funct3(insn) != 0 {
+                    break;
+                }
                 mark(&mut read, s1);
                 mark(&mut write, d);
                 break;
@@ -916,9 +919,9 @@ fn fp_handled(insn: u32) -> bool {
     match (f7 >> 2, f7 & 3, f3) {
         (0..=3, 1, 0 | 7) => true,        // FADD/FSUB/FMUL/FDIV.D (rne | dyn)
         (0x14, 1, 0..=2) => true,         // FLE/FLT/FEQ.D
-        (0x1e, 1, 0) => true,             // FMV.D.X
-        (0x1c, 1, 0) => true,             // FMV.X.D
-        (0x0b, 1, 0 | 7) => true,         // FSQRT.D (rne | dyn)
+        (0x1e, 1, 0) => rs2(insn) == 0,   // FMV.D.X (rs2 is a fixed field)
+        (0x1c, 1, 0) => rs2(insn) == 0,   // FMV.X.D (rs2 is a fixed field)
+        (0x0b, 1, 0 | 7) => rs2(insn) == 0, // FSQRT.D (rs2 is a fixed field)
         (0x18, 1, 1) => rs2(insn) == 0,   // FCVT.W.D rtz only (signed 32)
         (0x1a, 1, 0 | 7) => rs2(insn) <= 3, // FCVT.D.{W,WU,L,LU} (rne | dyn)
         _ => false,
@@ -944,12 +947,27 @@ fn fma_handled(op: u32, insn: u32) -> bool {
 /// wasm has no 64x64->high-64 multiply; emulating it costs ~20 ops.
 fn alu_handled(op: u32, f7: u32, f3: u32) -> bool {
     match op {
-        0x37 | 0x17 | 0x13 => true,
+        0x37 | 0x17 => true,
+        // OP-IMM: shift encodings have RESERVED upper immediate bits — SLLI
+        // funct6 must be 000000 (f7 in {0,1}: bit 0 is shamt[5]), SRLI/SRAI
+        // 000000/010000. Reserved patterns must NOT compile (the interpreter
+        // owns the illegal-instruction trap; ISSUES.md P3 hardening).
+        0x13 => match f3 {
+            1 => matches!(f7, 0x00 | 0x01),
+            5 => matches!(f7, 0x00 | 0x01 | 0x20 | 0x21),
+            _ => true,
+        },
         0x33 => matches!(
             (f7, f3),
             (0x00, _) | (0x20, 0) | (0x20, 5) | (0x01, 0) | (0x01, 4..=7)
         ),
-        0x1b => matches!(f3, 0 | 1 | 5),
+        // OP-IMM-32 shifts: shamt is 5 bits — imm[5] (f7 bit 0) is reserved.
+        0x1b => match f3 {
+            0 => true,
+            1 => f7 == 0x00,
+            5 => matches!(f7, 0x00 | 0x20),
+            _ => false,
+        },
         0x3b => matches!(
             (f7, f3),
             (0x00, 0)
@@ -2383,8 +2401,12 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                     n_insns: n + 1,
                 });
             }
-            // JALR: dynamic target; block ends.
+            // JALR: dynamic target; block ends. funct3 != 0 is a reserved
+            // encoding — don't compile it (interpreter owns the trap).
             0x67 => {
+                if funct3(insn) != 0 {
+                    break;
+                }
                 c.push_reg(&mut m, s1);
                 m.i64_const(imm_i(insn))
                     .op(I64_ADD)
@@ -3116,6 +3138,31 @@ pub fn translate_superblock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reserved encodings must not compile (ISSUES.md P3): shift immediates
+    /// with reserved upper bits, OP-IMM-32 shamt[5], FMV/FSQRT fixed rs2.
+    #[test]
+    fn reserved_encodings_rejected() {
+        // SLLI with funct7 = 0x10 (reserved)
+        assert!(!alu_handled(0x13, 0x10, 1));
+        assert!(alu_handled(0x13, 0x00, 1));
+        assert!(alu_handled(0x13, 0x01, 1)); // shamt[5]=1 is VALID on rv64
+        // SRxI reserved funct7
+        assert!(!alu_handled(0x13, 0x10, 5));
+        assert!(alu_handled(0x13, 0x21, 5));
+        // SLLIW/SRLIW/SRAIW: imm[5] reserved
+        assert!(!alu_handled(0x1b, 0x01, 1));
+        assert!(!alu_handled(0x1b, 0x21, 5));
+        assert!(alu_handled(0x1b, 0x20, 5));
+        // FMV.D.X with rs2 != 0 (fixed field violated): f7=0x79, f3=0, rs2=1
+        let bad_fmv = 0x53 | (0 << 12) | (0x79 << 25) | (1 << 20);
+        assert!(!fp_handled(bad_fmv));
+        let good_fmv = 0x53 | (0 << 12) | (0x79 << 25);
+        assert!(fp_handled(good_fmv));
+        // FSQRT.D with rs2 != 0: f7=0x2d
+        let bad_sqrt = 0x53 | (0 << 12) | (0x2d << 25) | (2 << 20);
+        assert!(!fp_handled(bad_sqrt));
+    }
 
     /// The backward copy-loop detector must match musl memmove's descending
     /// loop VERBATIM (encodings lifted from the nbench musl binary's disasm).
