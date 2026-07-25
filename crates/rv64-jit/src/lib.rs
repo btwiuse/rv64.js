@@ -801,7 +801,14 @@ impl Ctx {
             m.i64_const(i64::MIN).op(I64_XOR);
         }
         m.local_set(fc);
-        // exponent band: bail unless ((bits>>52)&0x7ff) - 0x100 <=u 0x5ff
+        // Exponent band: bail unless ((bits>>52)&0x7ff) - 0x100 <=u 0x5ff, so
+        // the Dekker split and its products can't overflow or lose bits — but
+        // an operand that is EXACTLY zero is fine and common (a zeroed
+        // accumulator, or the `fma(x, y, 0)` a compiler emits for a bare
+        // product). Its split is all zeros and the correction term vanishes,
+        // leaving the exact IEEE result. Zeros used to bail: 79M times per
+        // nbench FOURIER run, each one a wasted block entry plus a softfloat
+        // fma in the interpreter.
         for &l in &[fa, fb, fc] {
             m.local_get(l)
                 .i64_const(52)
@@ -812,6 +819,8 @@ impl Ctx {
                 .op(I64_SUB)
                 .i64_const(0x5ff)
                 .op(I64_GT_U);
+            m.local_get(l).i64_const(1).op(I64_SHL).op(I64_EQZ).op(I32_EQZ);
+            m.op(I32_AND);
             m.op(IF).op(VOID);
             self.bail(m, pc, n);
             m.op(END);
@@ -830,6 +839,10 @@ impl Ctx {
             .op(I64_SUB)
             .i64_const(0x5ff)
             .op(I64_GT_U);
+        // ...unless the product is exactly zero, which only a zero operand can
+        // produce here (both operands are in-band, so no underflow).
+        m.local_get(fp).i64_const(1).op(I64_SHL).op(I64_EQZ).op(I32_EQZ);
+        m.op(I32_AND);
         m.op(IF).op(VOID);
         self.bail(m, pc, n);
         m.op(END);
@@ -949,12 +962,34 @@ impl Ctx {
             m.op(END);
         }
         m.op(END);
-        // r = s + v, result-normal guard, store
+        // r = s + v — except when the correction is exactly zero, where the
+        // result IS s: adding +0 to a -0 sum would flip its sign (IEEE says
+        // fma(+0, -0, -0) is -0, and -0 + +0 is +0).
         getf(m, f5);
         getf(m, f7l);
         m.op(F64_ADD);
         setf(m, VAL);
-        self.fp_result_normal_guard(m, pc, n);
+        m.local_get(f7l).i64_const(1).op(I64_SHL).op(I64_EQZ);
+        m.op(IF).op(VOID);
+        m.local_get(f5).local_set(VAL);
+        m.op(END);
+        // Result guard, with the same zero allowance: every operand and the
+        // product were in band or exactly zero, so a zero result is exact
+        // cancellation (or a zero product plus a zero addend), never underflow.
+        m.local_get(VAL)
+            .i64_const(52)
+            .op(I64_SHR_U)
+            .i64_const(0x7ff)
+            .op(I64_AND)
+            .i64_const(1)
+            .op(I64_SUB)
+            .i64_const(0x7fd)
+            .op(I64_GT_U);
+        m.local_get(VAL).i64_const(1).op(I64_SHL).op(I64_EQZ).op(I32_EQZ);
+        m.op(I32_AND);
+        m.op(IF).op(VOID);
+        self.bail(m, pc, n);
+        m.op(END);
         self.store_freg_pre(m, d);
         m.local_get(VAL);
         self.store_freg_post(m, d);
@@ -2980,9 +3015,10 @@ fn translate_copy_loop(
 /// error chain exact, d != 0, or a non-normal final result.
 pub fn fma_fastpath_ref(ab: u64, bb: u64, cb: u64) -> Option<u64> {
     let exp = |x: u64| ((x >> 52) & 0x7ff) as i64;
+    let is_zero = |x: u64| x << 1 == 0;
     for &x in &[ab, bb, cb] {
         let e = exp(x);
-        if !(0x100..=0x6ff).contains(&e) {
+        if !(0x100..=0x6ff).contains(&e) && !is_zero(x) {
             return None;
         }
     }
@@ -2990,7 +3026,7 @@ pub fn fma_fastpath_ref(ab: u64, bb: u64, cb: u64) -> Option<u64> {
     let b = f64::from_bits(bb);
     let c = f64::from_bits(cb);
     let p = a * b;
-    if !(0x100..=0x6ff).contains(&exp(p.to_bits())) {
+    if !(0x100..=0x6ff).contains(&exp(p.to_bits())) && !is_zero(p.to_bits()) {
         return None;
     }
     const CSPLIT: f64 = 134217729.0; // 2^27 + 1 (Dekker)
@@ -3025,8 +3061,10 @@ pub fn fma_fastpath_ref(ab: u64, bb: u64, cb: u64) -> Option<u64> {
     } else {
         u
     };
-    let r = s + v; // == round(a*b + c)
-    if !(1..=0x7fe).contains(&exp(r.to_bits())) {
+    // == round(a*b + c). A zero correction leaves the result AS s: adding +0
+    // to a -0 sum would flip its sign (fma(+0, -0, -0) is -0).
+    let r = if v.to_bits() << 1 == 0 { s } else { s + v };
+    if !(1..=0x7fe).contains(&exp(r.to_bits())) && !is_zero(r.to_bits()) {
         return None;
     }
     Some(r.to_bits())
@@ -4140,6 +4178,31 @@ mod tests {
                 0
             }
         };
+        // zeros in every position, against normal and zero partners — the
+        // fast path accepts exact zeros (see the band check), and IEEE's
+        // signed-zero rules for a*b+c are exactly where a wrong allowance
+        // would show up.
+        {
+            let zeros = [0u64, 1u64 << 63];
+            let vals = [
+                0u64,
+                1u64 << 63,
+                1.0f64.to_bits(),
+                (-1.0f64).to_bits(),
+                2.5f64.to_bits(),
+                (-0.75f64).to_bits(),
+            ];
+            for &z in &zeros {
+                for &x in &vals {
+                    for &y in &vals {
+                        checked += 3;
+                        passed += check(z, x, y);
+                        passed += check(x, z, y);
+                        passed += check(x, y, z);
+                    }
+                }
+            }
+        }
         // libm-like: values near 1.0 (exponents 1023 +/- 40), all sign mixes
         let mark0 = (checked, passed);
         for _ in 0..2_000_000 {

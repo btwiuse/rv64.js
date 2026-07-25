@@ -281,7 +281,7 @@ struct JitState {
     /// new entry was a 2x regression on short workloads (the recompile storm).
     superblocked: std::collections::HashSet<(u64, u64)>,
     /// Virtual page -> (hot entries at its last superblock compile, number of
-    /// compiles). A page's first superblock is built from whatever handful of
+    /// UNPRODUCTIVE compiles — rebuilds that covered no new hot pcs). A page's first superblock is built from whatever handful of
     /// pcs was hot at the threshold; code discovered later — a second function
     /// in the page, a callee reached only by an indirect call — would stay on
     /// individual blocks forever (measured: nbench IDEA ran cipher_idea as 1-15
@@ -293,6 +293,10 @@ struct JitState {
     /// Pages that wanted a superblock while the compile budget was spent.
     /// Drained one per quantum boundary, oldest first.
     sb_queue: Vec<(u64, u64)>,
+    /// Hot pcs on a superblocked page that had to get their own block because
+    /// the page function does not cover them — the direct measure of a page
+    /// function that has fallen behind the code actually running.
+    sb_missed: std::collections::HashMap<(u64, u64), u32>,
     /// Pages whose superblock module is COMPILING (issued, awaiting the async
     /// result). A hot pc on one of them waits for the page function rather
     /// than building its own module — a wait of one async compile. Pages that
@@ -330,6 +334,7 @@ impl JitState {
             sb_gen: Default::default(),
             sb_queue: Vec::new(),
             sb_inflight: Default::default(),
+            sb_missed: Default::default(),
         }
     }
     fn clear(&mut self) {
@@ -341,6 +346,7 @@ impl JitState {
         self.sb_gen.clear();
         self.sb_queue.clear();
         self.sb_inflight.clear();
+        self.sb_missed.clear();
         for h in self.interp_hot.iter_mut() {
             *h = 0;
         }
@@ -453,6 +459,23 @@ static mut SB_INDIV: u64 = 0;
 static mut ZR_NX: u64 = 0;
 static mut ZR_FRM: u64 = 0;
 static mut ZR_FS: u64 = 0;
+/// Compiled entries evicted at dispatch because their code page no longer maps
+/// where it did (split: the entry's own page vs another page of its region).
+static mut DROP_SELF: u64 = 0;
+static mut DROP_REGION: u64 = 0;
+/// Dirty-code-page events and the compiled entries they dropped.
+static mut DIRTY_EVENTS: u64 = 0;
+static mut DIRTY_DROPPED: u64 = 0;
+/// Entries installed by landed superblocks, and how many of those installs
+/// replaced an individual block (i.e. code that had already fallen back).
+static mut SB_ENTRIES_IN: u64 = 0;
+static mut SB_REPLACED: u64 = 0;
+/// Trace one pc through the compile pipeline (diagnostic).
+static mut TRACE_PC: u64 = 0;
+static mut TRACE_SB_INSTALL: u64 = 0;
+static mut TRACE_INDIV: u64 = 0;
+static mut TRACE_SEED: u64 = 0;
+static mut TRACE_ENTRY: u64 = 0;
 /// Bumped by sys_boot: async results from a previous machine must be dropped.
 static mut BOOT_GEN: u64 = 0;
 
@@ -603,6 +626,16 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             18 => ZR_NX,
             19 => ZR_FRM,
             20 => ZR_FS,
+            21 => DROP_SELF,
+            22 => DROP_REGION,
+            23 => DIRTY_EVENTS,
+            24 => DIRTY_DROPPED,
+            25 => SB_ENTRIES_IN,
+            26 => SB_REPLACED,
+            27 => TRACE_SB_INSTALL,
+            28 => TRACE_INDIV,
+            29 => TRACE_SEED,
+            30 => TRACE_ENTRY,
             _ => 0,
         }
     }
@@ -681,7 +714,7 @@ const JIT_CHAIN_CAP: u32 = 1024;
 const SUPERBLOCK_THRESHOLD: usize = 6;
 /// How many times one page may be recompiled as a superblock as more of it
 /// turns out to be hot (see JitState::sb_gen).
-const SB_RECOMPILE_CAP: u32 = 8;
+const SB_RECOMPILE_CAP: u32 = 16;
 /// Distinct (address space, page) discovery records kept before the whole
 /// table is dropped — address spaces die and their pages go with them.
 const SB_SPACE_CAP: usize = 16384;
@@ -696,6 +729,9 @@ const SB_SPACE_CAP: usize = 16384;
 const SB_COMPILE_SPACING: u64 = 4_000_000;
 /// Deferred superblock requests kept before new ones are dropped.
 const SB_QUEUE_CAP: usize = 64;
+/// Individually-compiled hot pcs on a superblocked page before its page
+/// function is rebuilt to cover them.
+const SB_MISSED_TRIGGER: u32 = 8;
 static mut SB_LAST_ICOUNT: u64 = 0;
 /// Leaders per superblock. Every entry into the function loads the register
 /// UNION over all its bodies and every exit stores the written union, so a
@@ -1267,9 +1303,11 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         if !m.bus.jit_dirty_pages.is_empty() {
             let dirty = m.bus.jit_take_dirty();
             let mut dirty_vpages: std::collections::HashSet<u64> = Default::default();
+            unsafe { DIRTY_EVENTS += dirty.len() as u64 };
             for &ppage in &dirty {
                 if let Some(pcs) = jit.page_blocks.remove(&ppage) {
                     for pc in pcs {
+                        unsafe { DIRTY_DROPPED += 1 };
                         dirty_vpages.insert(pc & !0xfff);
                         jit.cache.remove(&pc);
                         let slot = JitState::dslot(pc);
@@ -1331,9 +1369,10 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         } else {
                             None
                         };
-                        let mapped = matches!(
+                        let self_ok = matches!(
                             m.cpu.jit_probe_fetch(&mut m.bus, pc), Some(pa) if pa == b.pa
-                        ) && region.map_or(true, |pgs| {
+                        );
+                        let region_ok = region.map_or(true, |pgs| {
                             pgs.iter().all(|&(va, pp)| {
                                 matches!(
                                     m.cpu.jit_probe_fetch(&mut m.bus, va),
@@ -1341,7 +1380,15 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                 )
                             })
                         });
+                        let mapped = self_ok && region_ok;
                         if !mapped {
+                            unsafe {
+                                if !self_ok {
+                                    DROP_SELF += 1;
+                                } else {
+                                    DROP_REGION += 1;
+                                }
+                            }
                             jit.cache.remove(&pc);
                             jit.dispatch[slot].pc = NO_PC;
                             break;
@@ -1523,8 +1570,28 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         let sb_spaced = m.cpu.insn_count
                             >= unsafe { SB_LAST_ICOUNT }.wrapping_add(SB_COMPILE_SPACING);
                         let sb_want = if jit.superblocked.contains(&(aspace, vpage)) {
-                            sb_compiles < SB_RECOMPILE_CAP
-                                && n_entries >= (sb_last * 2).max(sb_last + SUPERBLOCK_THRESHOLD)
+                            // Recompile when the page has grown by half again,
+                            // OR as soon as the page function has visibly
+                            // fallen behind: SB_MISSED_TRIGGER hot pcs on it
+                            // needed their own blocks. Growth alone raced —
+                            // a page that ends at 120 hot pcs after compiling
+                            // at 96 never doubles again, and which of its
+                            // functions the page function happened to cover
+                            // decided whether nbench IDEA scored 1600 or 4400
+                            // iter/s from identical runs.
+                            // Rebuild when the page function has visibly
+                            // fallen behind: enough hot pcs needed their own
+                            // blocks, scaled to what it already covers. A flat
+                            // trigger burned the whole recompile allowance
+                            // during warmup (16 rebuilds while barely a handful
+                            // of pcs were hot), after which the bulk of
+                            // cipher_idea — which only gets hot later — could
+                            // never be covered: nbench IDEA scored 1600 instead
+                            // of 4400 iter/s depending on that race.
+                            let missed =
+                                jit.sb_missed.get(&(aspace, vpage)).copied().unwrap_or(0);
+                            missed >= SB_MISSED_TRIGGER.max(sb_last as u32 / 4)
+                                && (n_entries > sb_last || sb_compiles < SB_RECOMPILE_CAP)
                         } else {
                             n_entries >= SUPERBLOCK_THRESHOLD
                         };
@@ -1551,6 +1618,13 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         // superblock deliberately leaves them out.
                         let wait_for_page_fn =
                             !is_loop && jit.sb_inflight.contains(&(aspace, vpage));
+                        if pc == unsafe { TRACE_PC } {
+                            unsafe { TRACE_INDIV += 1 };
+                        }
+                        if !is_loop && jit.superblocked.contains(&(aspace, vpage)) {
+                            *jit.sb_missed.entry((aspace, vpage)).or_insert(0) += 1;
+                            unsafe { SB_INDIV += 1 };
+                        }
                         // Individual block (loop or pre-threshold non-loop).
                         let blk = if wait_for_page_fn {
                             None
@@ -1753,7 +1827,15 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
             let pi = ((e & !0xfff) - start_va) as usize >> 12;
             let epa = p.pages[pi].1 + (e & 0xfff);
             let jb = JitBlock { idx, n: 0, pa: epa };
-            let fresh = jit.cache.insert(e, Some(jb)).is_none();
+            let prev = jit.cache.insert(e, Some(jb));
+            SB_ENTRIES_IN += 1;
+            if e == TRACE_PC {
+                TRACE_SB_INSTALL += 1;
+            }
+            if matches!(prev, Some(Some(b)) if b.n != 0) {
+                SB_REPLACED += 1;
+            }
+            let fresh = prev.is_none();
             for (k, &(_, pp)) in p.pages.iter().enumerate() {
                 if k == pi && !fresh {
                     continue; // already registered under its own page
@@ -1910,8 +1992,19 @@ pub extern "C" fn sb_debug(vpage: u64) -> u64 {
             v |= 2;
         }
         v |= (jit.page_entries.get(&(aspace, vpage)).map_or(0, |e| e.len()) as u64) << 8;
+        // bits 24..31 = superblock compiles, 32..39 = uncovered hot pcs since
+        v |= (jit.sb_gen.get(&(aspace, vpage)).map_or(0, |&(_, c)| c) as u64 & 0xff) << 24;
+        v |= (jit.sb_missed.get(&(aspace, vpage)).copied().unwrap_or(0) as u64 & 0xff) << 32;
         v
     }
+}
+
+/// Trace one guest pc through the compile pipeline: jit_stat 27 = times it was
+/// installed as a superblock entry, 28 = individual blocks built for it,
+/// 29 = times it was a superblock seed, 30 = times it survived leader retain.
+#[no_mangle]
+pub extern "C" fn sb_trace_pc(pc: u64) {
+    unsafe { TRACE_PC = pc };
 }
 
 /// Toggle host-filled TLB misses inside compiled blocks (perf A/B).
