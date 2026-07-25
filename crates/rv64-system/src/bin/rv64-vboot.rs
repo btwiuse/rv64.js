@@ -4,9 +4,15 @@
 //!
 //! Usage:
 //!   rv64-vboot <opensbi.bin> <kernel-Image> [--initrd FILE] [--disk FILE]
-//!              [--ram GB] [-- <cmdline...>]
+//!              [--9p DIR] [--9p-tag TAG] [--ram GB] [-- <cmdline...>]
+//!
+//! `--9p DIR` exports a host directory over virtio-9p. Note that the stock
+//! Debian/nixpkgs riscv64 kernels ship 9p as modules (`9pnet_virtio`, `9p`),
+//! so the guest must load them (or use a kernel with them built in) before:
+//!   mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
 
 use rv64_system::virt::{VirtImages, VirtMachine};
+use rv64_system::{p9, p9fs};
 use std::io::{Read, Write};
 
 fn main() {
@@ -18,6 +24,8 @@ fn main() {
     }
     let mut initrd_path = None;
     let mut disk_path = None;
+    let mut share = None;
+    let mut tag = "host".to_string();
     let mut ram_gb = 2.0f64;
     let mut positional = Vec::new();
     let mut it = args.into_iter();
@@ -25,18 +33,24 @@ fn main() {
         match a.as_str() {
             "--initrd" => initrd_path = it.next(),
             "--disk" => disk_path = it.next(),
+            "--9p" => share = it.next(),
+            "--9p-tag" => tag = it.next().unwrap_or(tag),
             "--ram" => ram_gb = it.next().and_then(|v| v.parse().ok()).unwrap_or(2.0),
             _ => positional.push(a),
         }
     }
     if positional.len() < 2 {
-        eprintln!("usage: rv64-vboot <opensbi.bin> <kernel> [--initrd F] [--disk F] [--ram GB] [-- cmdline]");
+        eprintln!("usage: rv64-vboot <opensbi.bin> <kernel> [--initrd F] [--disk F] [--9p DIR] [--9p-tag TAG] [--ram GB] [-- cmdline]");
         std::process::exit(2);
     }
     let opensbi = std::fs::read(&positional[0]).expect("read opensbi");
     let kernel = std::fs::read(&positional[1]).expect("read kernel");
     let initrd = initrd_path.map(|p| std::fs::read(p).expect("read initrd"));
     let disk = disk_path.map(|p| std::fs::read(p).expect("read disk"));
+    let fs = share.map(|dir| {
+        eprintln!("[vboot] 9p: exporting {dir} as tag '{tag}'");
+        p9::Server::new(tag, Box::new(p9fs::HostFs::new(dir)))
+    });
 
     let ram_bytes = (ram_gb * (1u64 << 30) as f64) as u64;
     eprintln!(
@@ -49,7 +63,7 @@ fn main() {
 
     let mut m = VirtMachine::new(
         ram_bytes,
-        VirtImages { opensbi: &opensbi, kernel: &kernel, cmdline: &cmdline, initrd: initrd.as_deref(), disk },
+        VirtImages { opensbi: &opensbi, kernel: &kernel, cmdline: &cmdline, initrd: initrd.as_deref(), disk, fs },
     );
 
     let _raw = RawTerm::enable();

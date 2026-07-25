@@ -355,12 +355,13 @@ impl VirtBus {
             _ if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_COUNT * VIRTIO_SIZE).contains(&addr) => {
                 let i = ((addr - VIRTIO_BASE) / VIRTIO_SIZE) as usize;
                 let off = (addr - VIRTIO_BASE) % VIRTIO_SIZE;
-                self.virtio.get_mut(i).map(|d| d.read(off) as u64)
+                // Width matters in config space: Linux reads a 9p mount tag one
+                // byte at a time (`virtio_cread_bytes`).
+                self.virtio
+                    .get_mut(i)
+                    .map(|d| d.read_sized(off, size) as u64)
             }
-            _ => {
-                let _ = size;
-                None
-            }
+            _ => None,
         }
     }
 
@@ -478,6 +479,8 @@ pub struct VirtImages<'a> {
     pub cmdline: &'a str,
     pub initrd: Option<&'a [u8]>,
     pub disk: Option<Vec<u8>>,
+    /// Host filesystem exported over virtio-9p; see [`crate::BootImages::fs`].
+    pub fs: Option<crate::p9::Server>,
 }
 
 pub struct VirtMachine {
@@ -505,18 +508,14 @@ impl VirtMachine {
         let kend = kbase + images.kernel.len();
 
         let _ = kend;
+        // One mmio slot per device we will instantiate below, in the same order.
+        let n_virtio = images.disk.is_some() as usize + images.fs.is_some() as usize;
         // Place initrd + DTB near the TOP of RAM (as QEMU/U-Boot do) so the
         // kernel's early allocations near the Image don't clobber them.
         // Layout from the top down: [DTB][initrd][fw_dynamic_info], each
         // aligned, leaving a small margin below the very top.
         let ram_top = ram_size as usize;
-        let dtb = build_virt_fdt(ram_size, images.cmdline, 0, 0, {
-            let mut n = 0;
-            if images.disk.is_some() {
-                n += 1;
-            }
-            n
-        });
+        let dtb = build_virt_fdt(ram_size, images.cmdline, 0, 0, n_virtio);
         // Reserve DTB just below the top (2 MiB margin, page aligned).
         let dtb_off = ((ram_top - 0x20_0000).saturating_sub(dtb.len())) & !0xfff;
 
@@ -536,20 +535,18 @@ impl VirtMachine {
         let dyn_off = (below.saturating_sub(0x1000)) & !0xfff;
 
         // Rebuild the DTB now that initrd addresses are known, then place it.
-        let dtb = build_virt_fdt(
-            ram_size,
-            images.cmdline,
-            initrd_start,
-            initrd_end,
-            if images.disk.is_some() { 1 } else { 0 },
-        );
+        let dtb = build_virt_fdt(ram_size, images.cmdline, initrd_start, initrd_end, n_virtio);
         ram[dtb_off..dtb_off + dtb.len()].copy_from_slice(&dtb);
         let dtb_addr = RAM_BASE + dtb_off as u64;
 
-        // Virtio: one blk device if a disk is given (source 1).
+        // Virtio: blk if a disk is given, then 9p if a filesystem is exported.
+        // Slot i takes PLIC source VIRTIO_IRQ_BASE + i, matching the DTB above.
         let mut virtio = Vec::new();
         if let Some(disk) = images.disk {
             virtio.push(VirtioDev::new(Backend::Block { disk }));
+        }
+        if let Some(srv) = images.fs {
+            virtio.push(VirtioDev::new(Backend::Fs { srv }));
         }
 
         // fw_dynamic_info struct (OpenSBI reads it from a2). fw_jump.bin bakes

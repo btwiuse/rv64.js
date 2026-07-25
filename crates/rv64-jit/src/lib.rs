@@ -24,6 +24,9 @@ use rv64_core::decode::*;
 use wasm_emit::*;
 
 const MAX_BLOCK: usize = 128;
+/// Uses (across all bodies) a register needs before a superblock caches it in
+/// a wasm local instead of leaving it in the machine's register file memory.
+const SB_HOIST_MIN: u32 = 8;
 /// Max iterations a compiled self-loop runs per block call before yielding to
 /// the dispatcher (so an infinite guest loop still honours budget/interrupts).
 const LOOP_CAP: u64 = 1 << 24;
@@ -2701,19 +2704,40 @@ fn translate_loop(
 /// Scan the touched GP/FP registers across every entry block of a page-
 /// superblock (each block walked to its terminating control-flow / unhandled
 /// instruction). Over-approximating is safe (an unused local just gets loaded).
-fn scan_regs_super(
+/// Diagnostic wrapper: the register union a superblock over `entries` would
+/// load at every entry and store at every exit.
+pub fn scan_regs_super_pub(
     code: &[u8],
     base: u64,
     page_end: u64,
     entries: &[u64],
     lay: &JitLayout,
 ) -> (u32, u32, u32, u32) {
+    let (r, w, fr, fw, _) = scan_regs_super(code, base, page_end, entries, lay);
+    (r, w, fr, fw)
+}
+
+fn scan_regs_super(
+    code: &[u8],
+    base: u64,
+    page_end: u64,
+    entries: &[u64],
+    lay: &JitLayout,
+) -> (u32, u32, u32, u32, bool) {
     let (mut r, mut w, mut fr, mut fw) = (0u32, 0u32, 0u32, 0u32);
     let mut mem_ops = 0u32;
-    let fmark = |m: &mut u32, x: usize| *m |= 1 << x;
-    let mark = |m: &mut u32, x: usize| {
+    // Uses per register across every body, so rarely-touched registers can be
+    // left in memory (see SB_HOIST_MIN below).
+    let mut uses = [0u32; 32];
+    let mut fuses = [0u32; 32];
+    let fmark = |m: &mut u32, u: &mut [u32; 32], x: usize| {
+        *m |= 1 << x;
+        u[x] += 1;
+    };
+    let mark = |m: &mut u32, u: &mut [u32; 32], x: usize| {
         if x != 0 {
             *m |= 1 << x;
+            u[x] += 1;
         }
     };
     for &e in entries {
@@ -2727,63 +2751,63 @@ fn scan_regs_super(
             let op = opcode(insn);
             match op {
                 0x63 => {
-                    mark(&mut r, s1);
-                    mark(&mut r, s2);
+                    mark(&mut r, &mut uses, s1);
+                    mark(&mut r, &mut uses, s2);
                     break;
                 }
                 0x6f => {
-                    mark(&mut w, d);
+                    mark(&mut w, &mut uses, d);
                     break;
                 }
                 0x67 => {
-                    mark(&mut r, s1);
-                    mark(&mut w, d);
+                    mark(&mut r, &mut uses, s1);
+                    mark(&mut w, &mut uses, d);
                     break;
                 }
-                0x37 | 0x17 => mark(&mut w, d),
+                0x37 | 0x17 => mark(&mut w, &mut uses, d),
                 0x13 | 0x1b => {
-                    mark(&mut r, s1);
-                    mark(&mut w, d);
+                    mark(&mut r, &mut uses, s1);
+                    mark(&mut w, &mut uses, d);
                 }
                 0x33 | 0x3b => {
                     if !alu_handled(op, funct7(insn), funct3(insn)) {
                         break;
                     }
-                    mark(&mut r, s1);
-                    mark(&mut r, s2);
-                    mark(&mut w, d);
+                    mark(&mut r, &mut uses, s1);
+                    mark(&mut r, &mut uses, s2);
+                    mark(&mut w, &mut uses, d);
                 }
                 0x03 => {
                     if funct3(insn) == 7 {
                         break;
                     }
                     mem_ops += 1;
-                    mark(&mut r, s1);
-                    mark(&mut w, d);
+                    mark(&mut r, &mut uses, s1);
+                    mark(&mut w, &mut uses, d);
                 }
                 0x23 => {
                     if funct3(insn) > 3 {
                         break;
                     }
                     mem_ops += 1;
-                    mark(&mut r, s1);
-                    mark(&mut r, s2);
+                    mark(&mut r, &mut uses, s1);
+                    mark(&mut r, &mut uses, s2);
                 }
                 0x07 if lay.f_base != 0 => {
                     if funct3(insn) != 3 {
                         break;
                     }
                     mem_ops += 1;
-                    mark(&mut r, s1);
-                    fmark(&mut fw, d);
+                    mark(&mut r, &mut uses, s1);
+                    fmark(&mut fw, &mut fuses, d);
                 }
                 0x27 if lay.f_base != 0 => {
                     if funct3(insn) != 3 {
                         break;
                     }
                     mem_ops += 1;
-                    mark(&mut r, s1);
-                    fmark(&mut fr, s2);
+                    mark(&mut r, &mut uses, s1);
+                    fmark(&mut fr, &mut fuses, s2);
                 }
                 0x53 if lay.f_base != 0 => {
                     if !fp_handled(insn) {
@@ -2792,34 +2816,34 @@ fn scan_regs_super(
                     let f7 = funct7(insn);
                     match (f7 >> 2, f7 & 3, funct3(insn)) {
                         (0..=3, 1, 0 | 7) => {
-                            fmark(&mut fr, s1);
-                            fmark(&mut fr, s2);
-                            fmark(&mut fw, d);
+                            fmark(&mut fr, &mut fuses, s1);
+                            fmark(&mut fr, &mut fuses, s2);
+                            fmark(&mut fw, &mut fuses, d);
                         }
                         (0x14, 1, 0..=2) => {
-                            fmark(&mut fr, s1);
-                            fmark(&mut fr, s2);
-                            mark(&mut w, d);
+                            fmark(&mut fr, &mut fuses, s1);
+                            fmark(&mut fr, &mut fuses, s2);
+                            mark(&mut w, &mut uses, d);
                         }
                         (0x1e, 1, 0) => {
-                            mark(&mut r, s1);
-                            fmark(&mut fw, d);
+                            mark(&mut r, &mut uses, s1);
+                            fmark(&mut fw, &mut fuses, d);
                         }
                         (0x1c, 1, 0) => {
-                            fmark(&mut fr, s1);
-                            mark(&mut w, d);
+                            fmark(&mut fr, &mut fuses, s1);
+                            mark(&mut w, &mut uses, d);
                         }
                         (0x0b, 1, 0 | 7) => {
-                            fmark(&mut fr, s1);
-                            fmark(&mut fw, d);
+                            fmark(&mut fr, &mut fuses, s1);
+                            fmark(&mut fw, &mut fuses, d);
                         }
                         (0x18, 1, 1) => {
-                            fmark(&mut fr, s1);
-                            mark(&mut w, d);
+                            fmark(&mut fr, &mut fuses, s1);
+                            mark(&mut w, &mut uses, d);
                         }
                         (0x1a, 1, 0 | 7) => {
-                            mark(&mut r, s1);
-                            fmark(&mut fw, d);
+                            mark(&mut r, &mut uses, s1);
+                            fmark(&mut fw, &mut fuses, d);
                         }
                         _ => break,
                     }
@@ -2828,10 +2852,10 @@ fn scan_regs_super(
                     if !fma_handled(op, insn) {
                         break;
                     }
-                    fmark(&mut fr, s1);
-                    fmark(&mut fr, s2);
-                    fmark(&mut fr, ((insn >> 27) & 31) as usize);
-                    fmark(&mut fw, d);
+                    fmark(&mut fr, &mut fuses, s1);
+                    fmark(&mut fr, &mut fuses, s2);
+                    fmark(&mut fr, &mut fuses, ((insn >> 27) & 31) as usize);
+                    fmark(&mut fw, &mut fuses, d);
                     r |= 1; // bit 0 = "block contains fma" (see build_ctx)
                 }
                 _ => break,
@@ -2842,7 +2866,37 @@ fn scan_regs_super(
     }
     let _ = mem_ops; // super coalescing measured net-negative: multi-array
     // superblocks thrash a 1-page cache (IDEA 1768->1670); basic/region only.
-    (r, w, fr, fw)
+    //
+    // Hoist only registers the function actually leans on. EVERY entry into a
+    // superblock loads the hoisted read set and every exit stores the hoisted
+    // write set, so a register touched twice in one cold body costs two memory
+    // ops on every single entry and saves at most one. Leaving it in memory
+    // (the emitter reads/writes x_base directly when a register has no local)
+    // makes entry/exit proportional to the hot core instead of to the size of
+    // the page. Measured on nbench: superblock pages carried unions of 25 GPRs
+    // + 15 FP registers — 60 memory ops per entry against ~15 retired
+    // instructions on FOURIER's cross-page libm calls, which is why whole-page
+    // superblocks were LOSING to individual blocks there.
+    // The FP gate must key off whether the region CONTAINS FP work, never off
+    // the hoisted mask — filtering every FP register into memory would
+    // otherwise silently drop the gate and run FP without its FS/frm/NX
+    // checks.
+    let uses_fp = (fr | fw) != 0;
+    for x in 1..32 {
+        if uses[x] < SB_HOIST_MIN {
+            r &= !(1 << x);
+            w &= !(1 << x);
+        }
+        if fuses[x] < SB_HOIST_MIN {
+            fr &= !(1 << x);
+            fw &= !(1 << x);
+        }
+    }
+    if fuses[0] < SB_HOIST_MIN {
+        fr &= !1;
+        fw &= !1;
+    }
+    (r, w, fr, fw, uses_fp)
 }
 
 impl Ctx {
@@ -2979,6 +3033,30 @@ impl Ctx {
 /// Is `start_pc` a structured-loop header? Such blocks compile to a tight wasm
 /// loop (register-locals across iterations) and must NOT be folded into a
 /// superblock, whose per-iteration `br_table` dispatch would be far slower.
+/// Can the block emitter make progress at `pc`? A superblock leader whose
+/// FIRST instruction can't be emitted becomes an exit stub: every dispatch
+/// into it enters the function, reloads the hoisted registers, exits having
+/// retired nothing, and leaves the interpreter to step ONE instruction —
+/// strictly worse than not knowing the pc at all, where the dispatcher hands
+/// the interpreter a full slice. Measured on nbench FOURIER: 60M zero-retire
+/// dispatches into two such stubs inside musl's pow.
+pub fn emittable_at(code: &[u8], base: u64, pc: u64, lay: JitLayout) -> bool {
+    let Some((insn, _)) = fetch(code, base, pc) else {
+        return false;
+    };
+    let op = opcode(insn);
+    match op {
+        0x63 | 0x6f | 0x67 => true, // control flow: always emittable
+        0x37 | 0x17 | 0x13 | 0x33 | 0x1b | 0x3b => alu_handled(op, funct7(insn), funct3(insn)),
+        0x03 => funct3(insn) != 7,
+        0x23 => funct3(insn) <= 3,
+        0x07 | 0x27 => lay.f_base != 0 && funct3(insn) == 3,
+        0x53 => lay.f_base != 0 && fp_handled(insn),
+        0x43 | 0x47 | 0x4b | 0x4f => lay.f_base != 0 && fma_handled(op, insn),
+        _ => false,
+    }
+}
+
 pub fn is_loop_at(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> bool {
     loop_region(code, base, start_pc, &lay).is_some()
 }
@@ -3094,7 +3172,7 @@ pub fn translate_superblock(
         return None;
     }
     let page_end = page_base + page_span;
-    let (rm, wm, fr, fw) = scan_regs_super(code, base, page_end, entries, &lay);
+    let (rm, wm, fr, fw, uses_fp) = scan_regs_super(code, base, page_end, entries, &lay);
     let (mut c, mut m) = build_ctx(lay, rm, wm, fr, fw);
     c.retired_local = Some(ITER);
 
@@ -3115,7 +3193,7 @@ pub fn translate_superblock(
     // Superblocks are multi-entry, so the bail restores the RUNTIME entry pc
     // from TPC and reports zero retired (ITER is still its zero initial
     // value).
-    if (fr | fw) != 0 {
+    if uses_fp {
         let fcsr = lay.fcsr_addr as u64;
         m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
         m.i32_const(0)

@@ -1,9 +1,13 @@
 //! rv64-boot: boot a riscv64 Linux system natively (development harness).
 //!
-//! Usage: rv64-boot <bbl64.bin> [kernel.bin] [rootfs.bin] [-- cmdline]
+//! Usage: rv64-boot <bbl64.bin> [kernel.bin] [rootfs.bin] [--9p DIR]
+//!                  [--9p-tag TAG] [-- cmdline]
 //! Console on stdio. Ctrl-A x to exit (screen/QEMU style).
+//!
+//! `--9p DIR` exports a host directory over virtio-9p; in the guest:
+//!   mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
 
-use rv64_system::{BootImages, Machine};
+use rv64_system::{p9, p9fs, BootImages, Machine};
 use std::io::{Read, Write};
 
 fn main() {
@@ -13,13 +17,32 @@ fn main() {
         cmdline = args.split_off(pos + 1).join(" ");
         args.pop();
     }
-    if args.is_empty() {
-        eprintln!("usage: rv64-boot <bios> [kernel] [disk] [-- cmdline]");
+    let mut share = None;
+    let mut tag = "host".to_string();
+    let mut positional = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--9p" => share = it.next(),
+            "--9p-tag" => tag = it.next().unwrap_or(tag),
+            _ => positional.push(a),
+        }
+    }
+    if positional.is_empty() {
+        eprintln!("usage: rv64-boot <bios> [kernel] [disk] [--9p DIR] [--9p-tag TAG] [-- cmdline]");
         std::process::exit(2);
     }
-    let bios = std::fs::read(&args[0]).expect("read bios");
-    let kernel = args.get(1).map(|p| std::fs::read(p).expect("read kernel"));
-    let disk = args.get(2).map(|p| std::fs::read(p).expect("read disk"));
+    let bios = std::fs::read(&positional[0]).expect("read bios");
+    let kernel = positional
+        .get(1)
+        .map(|p| std::fs::read(p).expect("read kernel"));
+    let disk = positional
+        .get(2)
+        .map(|p| std::fs::read(p).expect("read disk"));
+    let fs = share.map(|dir| {
+        eprintln!("[rv64-boot] 9p: exporting {dir} as tag '{tag}'");
+        p9::Server::new(tag, Box::new(p9fs::HostFs::new(dir)))
+    });
 
     let mut m = Machine::new(
         128,
@@ -28,6 +51,7 @@ fn main() {
             kernel: kernel.as_deref(),
             cmdline: &cmdline,
             disk,
+            fs,
         },
     );
 

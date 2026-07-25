@@ -87,15 +87,12 @@ const AT_REMOVEDIR: u32 = 0x200;
 
 // Errnos. 9P2000.L carries Linux errno values verbatim, and both sides here
 // *are* Linux, so host errnos pass straight through.
-pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
 pub const EIO: i32 = 5;
 pub const EEXIST: i32 = 17;
 pub const ENOTDIR: i32 = 20;
 pub const EISDIR: i32 = 21;
 pub const EINVAL: i32 = 22;
-pub const ENOSPC: i32 = 28;
-pub const EROFS: i32 = 30;
 pub const ENOTEMPTY: i32 = 39;
 pub const EPROTO: i32 = 71;
 pub const EOPNOTSUPP: i32 = 95;
@@ -138,7 +135,7 @@ pub fn qid_kind(mode: u32) -> u8 {
 }
 
 /// Everything `Tgetattr` can report about a file.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attr {
     pub qid: Qid,
     pub mode: u32,
@@ -155,32 +152,8 @@ pub struct Attr {
     pub ctime: (u64, u64),
 }
 
-impl Attr {
-    /// A plausible attr for `mode`/`size`, for backends without real metadata.
-    pub fn simple(ino: u64, mode: u32, size: u64) -> Attr {
-        Attr {
-            qid: Qid::from_mode(mode, ino),
-            mode,
-            uid: 0,
-            gid: 0,
-            nlink: if mode & S_IFMT == S_IFDIR { 2 } else { 1 },
-            rdev: 0,
-            size,
-            blksize: 4096,
-            blocks: size.div_ceil(512),
-            atime: (0, 0),
-            mtime: (0, 0),
-            ctime: (0, 0),
-        }
-    }
-
-    pub fn is_dir(&self) -> bool {
-        self.mode & S_IFMT == S_IFDIR
-    }
-}
-
 /// One directory entry, as `Treaddir` reports it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirEntry {
     pub name: String,
     pub ino: u64,
@@ -296,7 +269,14 @@ impl Server {
             (Some(_), Some(id), Some(tag)) => (id, tag),
             _ => return reply(R_LERROR, 0, &err_body(EPROTO)),
         };
-        match self.dispatch(id, &mut r) {
+        let res = self.dispatch(id, &mut r);
+        if p9_dbg() {
+            match &res {
+                Ok(b) => eprintln!("[9p] {} -> {} bytes", op_name(id), b.len()),
+                Err(e) => eprintln!("[9p] {} -> error {e}", op_name(id)),
+            }
+        }
+        match res {
             Ok(body) => reply(id + 1, tag, &body),
             Err(e) => reply(R_LERROR, tag, &err_body(e)),
         }
@@ -692,6 +672,46 @@ impl Server {
     }
 }
 
+/// `RV_9P_DEBUG=1` traces every message and its result — the equivalent of
+/// TinyEMU's `VIRTIO_DEBUG_9P`, and the fastest way to see which op a guest
+/// tripped over.
+fn p9_dbg() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RV_9P_DEBUG").is_ok())
+}
+
+fn op_name(id: u8) -> String {
+    let name = match id {
+        T_STATFS => "statfs",
+        T_LOPEN => "lopen",
+        T_LCREATE => "lcreate",
+        T_SYMLINK => "symlink",
+        T_MKNOD => "mknod",
+        T_READLINK => "readlink",
+        T_GETATTR => "getattr",
+        T_SETATTR => "setattr",
+        T_XATTRWALK => "xattrwalk",
+        T_READDIR => "readdir",
+        T_FSYNC => "fsync",
+        T_LOCK => "lock",
+        T_GETLOCK => "getlock",
+        T_LINK => "link",
+        T_MKDIR => "mkdir",
+        T_RENAMEAT => "renameat",
+        T_UNLINKAT => "unlinkat",
+        T_VERSION => "version",
+        T_ATTACH => "attach",
+        T_FLUSH => "flush",
+        T_WALK => "walk",
+        T_READ => "read",
+        T_WRITE => "write",
+        T_CLUNK => "clunk",
+        _ => return format!("op{id}"),
+    };
+    name.to_string()
+}
+
 // ---- path handling --------------------------------------------------------
 
 /// Append one path component, returning `None` for anything a server must not
@@ -801,6 +821,305 @@ impl Wr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::p9fs::MemFs;
+
+    /// Drives the server the way `9pnet_virtio` does: one T-message in, one
+    /// R-message out, with the wire framing checked on every call.
+    struct Client {
+        srv: Server,
+    }
+
+    impl Client {
+        fn new() -> Client {
+            let mut fs = MemFs::new();
+            fs.add_file("/hello.txt", b"9p-works-42\n", 0o644);
+            fs.add_dir("/sub");
+            fs.add_file("/sub/inner", b"deep", 0o600);
+            fs.add_symlink("/link", "hello.txt");
+            let mut c = Client {
+                srv: Server::new("host", Box::new(fs)),
+            };
+            // Every session opens with version negotiation + attach on fid 0.
+            let mut b = Wr::default();
+            b.u32(8192);
+            b.str("9P2000.L");
+            let r = c.call(T_VERSION, &b.0).expect("Rversion");
+            let mut rd = Rd::new(&r);
+            assert_eq!(rd.u32(), Some(8192));
+            assert_eq!(rd.str().as_deref(), Some("9P2000.L"));
+            c.attach(0);
+            c
+        }
+
+        fn call(&mut self, id: u8, body: &[u8]) -> Result<Vec<u8>, i32> {
+            let mut msg = Vec::new();
+            msg.extend_from_slice(&((body.len() + 7) as u32).to_le_bytes());
+            msg.push(id);
+            msg.extend_from_slice(&7u16.to_le_bytes()); // tag
+            msg.extend_from_slice(body);
+            let r = self.srv.handle(&msg);
+            // The header must describe the buffer we actually got back.
+            assert_eq!(
+                u32::from_le_bytes(r[0..4].try_into().unwrap()) as usize,
+                r.len()
+            );
+            assert_eq!(u16::from_le_bytes(r[5..7].try_into().unwrap()), 7);
+            if r[4] == R_LERROR {
+                return Err(u32::from_le_bytes(r[7..11].try_into().unwrap()) as i32);
+            }
+            assert_eq!(r[4], id + 1, "reply id for request {id}");
+            Ok(r[7..].to_vec())
+        }
+
+        fn attach(&mut self, fid: u32) {
+            let mut b = Wr::default();
+            b.u32(fid);
+            b.u32(!0); // afid: NOFID
+            b.str("root");
+            b.str("");
+            b.u32(0);
+            self.call(T_ATTACH, &b.0).expect("Rattach");
+        }
+
+        /// Walk `names` from `fid` into `newfid`; returns the qids reported.
+        fn walk(&mut self, fid: u32, newfid: u32, names: &[&str]) -> Result<Vec<Qid>, i32> {
+            let mut b = Wr::default();
+            b.u32(fid);
+            b.u32(newfid);
+            b.u16(names.len() as u16);
+            for n in names {
+                b.str(n);
+            }
+            let r = self.call(T_WALK, &b.0)?;
+            let mut rd = Rd::new(&r);
+            let n = rd.u16().unwrap() as usize;
+            Ok((0..n)
+                .map(|_| Qid {
+                    kind: rd.u8().unwrap(),
+                    version: rd.u32().unwrap(),
+                    path: rd.u64().unwrap(),
+                })
+                .collect())
+        }
+
+        fn lopen(&mut self, fid: u32, flags: u32) -> Result<Qid, i32> {
+            let mut b = Wr::default();
+            b.u32(fid);
+            b.u32(flags);
+            let r = self.call(T_LOPEN, &b.0)?;
+            let mut rd = Rd::new(&r);
+            Ok(Qid {
+                kind: rd.u8().unwrap(),
+                version: rd.u32().unwrap(),
+                path: rd.u64().unwrap(),
+            })
+        }
+
+        fn read(&mut self, fid: u32, offset: u64, count: u32) -> Result<Vec<u8>, i32> {
+            let mut b = Wr::default();
+            b.u32(fid);
+            b.u64(offset);
+            b.u32(count);
+            let r = self.call(T_READ, &b.0)?;
+            let n = u32::from_le_bytes(r[0..4].try_into().unwrap()) as usize;
+            Ok(r[4..4 + n].to_vec())
+        }
+
+        fn write(&mut self, fid: u32, offset: u64, data: &[u8]) -> Result<u32, i32> {
+            let mut b = Wr::default();
+            b.u32(fid);
+            b.u64(offset);
+            b.u32(data.len() as u32);
+            b.bytes(data);
+            let r = self.call(T_WRITE, &b.0)?;
+            Ok(u32::from_le_bytes(r[0..4].try_into().unwrap()))
+        }
+
+        /// (size, mode) from Tgetattr.
+        fn getattr(&mut self, fid: u32) -> Result<(u64, u32), i32> {
+            let mut b = Wr::default();
+            b.u32(fid);
+            b.u64(0x7ff); // P9_STATS_BASIC
+            let r = self.call(T_GETATTR, &b.0)?;
+            let mut rd = Rd::new(&r);
+            rd.u64(); // valid
+            rd.take(13); // qid
+            let mode = rd.u32().unwrap();
+            rd.u32();
+            rd.u32(); // uid, gid
+            rd.u64();
+            rd.u64(); // nlink, rdev
+            Ok((rd.u64().unwrap(), mode))
+        }
+
+        /// Decoded Treaddir: (name, resume offset, d_type) per entry.
+        fn readdir(&mut self, fid: u32, offset: u64) -> Result<Vec<(String, u64, u8)>, i32> {
+            let mut b = Wr::default();
+            b.u32(fid);
+            b.u64(offset);
+            b.u32(4096);
+            let r = self.call(T_READDIR, &b.0)?;
+            let n = u32::from_le_bytes(r[0..4].try_into().unwrap()) as usize;
+            let mut rd = Rd::new(&r[4..4 + n]);
+            let mut out = Vec::new();
+            while rd.p < n {
+                rd.take(13); // qid
+                let off = rd.u64().unwrap();
+                let kind = rd.u8().unwrap();
+                out.push((rd.str().unwrap(), off, kind));
+            }
+            Ok(out)
+        }
+
+        fn clunk(&mut self, fid: u32) {
+            let mut b = Wr::default();
+            b.u32(fid);
+            self.call(T_CLUNK, &b.0).expect("Rclunk");
+        }
+    }
+
+    #[test]
+    fn walks_and_reads_a_file() {
+        let mut c = Client::new();
+        let qids = c.walk(0, 1, &["hello.txt"]).unwrap();
+        assert_eq!(qids.len(), 1);
+        assert_eq!(qids[0].kind, QT_FILE);
+        assert_eq!(c.getattr(1).unwrap().0, 12); // "9p-works-42\n"
+        c.lopen(1, 0).unwrap();
+        assert_eq!(c.read(1, 0, 4096).unwrap(), b"9p-works-42\n");
+        // Reads carry their own offset, so a partial read needs no seek.
+        assert_eq!(c.read(1, 3, 5).unwrap(), b"works");
+        // Reading past EOF is a short read, not an error.
+        assert_eq!(c.read(1, 99, 10).unwrap(), b"");
+    }
+
+    #[test]
+    fn walks_nested_paths_and_reports_short_walks() {
+        let mut c = Client::new();
+        assert_eq!(c.walk(0, 1, &["sub", "inner"]).unwrap().len(), 2);
+        // A walk that fails partway reports how far it got; the client turns
+        // that into ENOENT itself, so this must NOT be an Rlerror.
+        let qids = c.walk(0, 2, &["sub", "nope"]).unwrap();
+        assert_eq!(qids.len(), 1);
+        assert!(c.walk(0, 3, &["nope"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn readdir_synthesises_dot_entries_and_resumes() {
+        let mut c = Client::new();
+        c.lopen(0, O_DIRECTORY).unwrap();
+        let entries = c.readdir(0, 0).unwrap();
+        let names: Vec<&str> = entries.iter().map(|(n, ..)| n.as_str()).collect();
+        // "." and ".." are not in a backend listing but getdents needs them.
+        assert_eq!(&names[..2], &[".", ".."]);
+        assert!(names.contains(&"hello.txt"));
+        assert!(names.contains(&"sub"));
+        // d_type is the mode's file-type nibble: 4 = DT_DIR, 8 = DT_REG.
+        let sub = entries.iter().find(|(n, ..)| n == "sub").unwrap();
+        assert_eq!(sub.2, 4);
+        let hello = entries.iter().find(|(n, ..)| n == "hello.txt").unwrap();
+        assert_eq!(hello.2, 8);
+        // Resuming from an entry's stamped offset returns the rest, once.
+        let rest = c.readdir(0, entries[1].1).unwrap();
+        assert_eq!(rest.len(), entries.len() - 2);
+        assert!(c.readdir(0, entries.last().unwrap().1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn creates_writes_and_removes() {
+        let mut c = Client::new();
+        // Tlcreate moves the directory fid onto the new file.
+        c.walk(0, 1, &[]).unwrap();
+        let mut b = Wr::default();
+        b.u32(1);
+        b.str("new.txt");
+        b.u32(O_RDWR);
+        b.u32(0o644);
+        b.u32(0);
+        c.call(T_LCREATE, &b.0).unwrap();
+        assert_eq!(c.write(1, 0, b"written").unwrap(), 7);
+        assert_eq!(c.read(1, 0, 100).unwrap(), b"written");
+        // A fresh walk sees it, with the size the write produced.
+        c.walk(0, 2, &["new.txt"]).unwrap();
+        assert_eq!(c.getattr(2).unwrap().0, 7);
+        // Tunlinkat removes it from the parent.
+        let mut b = Wr::default();
+        b.u32(0);
+        b.str("new.txt");
+        b.u32(0);
+        c.call(T_UNLINKAT, &b.0).unwrap();
+        assert!(c.walk(0, 3, &["new.txt"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mkdir_symlink_and_readlink() {
+        let mut c = Client::new();
+        let mut b = Wr::default();
+        b.u32(0);
+        b.str("made");
+        b.u32(0o755);
+        b.u32(0);
+        c.call(T_MKDIR, &b.0).unwrap();
+        let qids = c.walk(0, 1, &["made"]).unwrap();
+        assert_eq!(qids[0].kind, QT_DIR);
+
+        // The client resolves symlinks itself, so the server only reports the
+        // target — the qid says QTSYMLINK and readlink returns the text.
+        let qids = c.walk(0, 2, &["link"]).unwrap();
+        assert_eq!(qids[0].kind, QT_SYMLINK);
+        let mut b = Wr::default();
+        b.u32(2);
+        let r = c.call(T_READLINK, &b.0).unwrap();
+        assert_eq!(Rd::new(&r).str().as_deref(), Some("hello.txt"));
+    }
+
+    #[test]
+    fn walk_cannot_escape_the_export() {
+        let mut c = Client::new();
+        // `..` at the root stays at the root rather than reaching the host.
+        c.walk(0, 1, &["..", "..", ".."]).unwrap();
+        assert_eq!(c.getattr(1).unwrap().1 & S_IFMT, S_IFDIR);
+        assert!(c.walk(0, 2, &["sub", "..", "hello.txt"]).unwrap().len() == 3);
+        // A separator inside a component is rejected outright.
+        assert!(c.walk(0, 3, &["../etc"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn protocol_errors_come_back_as_rlerror() {
+        let mut c = Client::new();
+        // Unknown fid.
+        assert_eq!(c.getattr(42), Err(EPROTO));
+        // Read before open.
+        c.walk(0, 1, &["hello.txt"]).unwrap();
+        assert_eq!(c.read(1, 0, 10), Err(EPROTO));
+        // Truncated request body.
+        let mut msg = 11u32.to_le_bytes().to_vec();
+        msg.push(T_GETATTR);
+        msg.extend_from_slice(&0u16.to_le_bytes());
+        msg.extend_from_slice(&[0, 0]); // fid cut short
+        let r = c.srv.handle(&msg);
+        assert_eq!(r[4], R_LERROR);
+        assert_eq!(u32::from_le_bytes(r[7..11].try_into().unwrap()) as i32, EPROTO);
+        // xattrwalk is answered, but as "unsupported" — v9fs probes it on
+        // mount and must get an errno userspace can map (not TinyEMU's 524).
+        let mut b = Wr::default();
+        b.u32(0);
+        b.u32(9);
+        b.str("system.posix_acl_access");
+        assert_eq!(c.call(T_XATTRWALK, &b.0), Err(EOPNOTSUPP));
+    }
+
+    #[test]
+    fn clunk_forgets_the_fid() {
+        let mut c = Client::new();
+        c.walk(0, 1, &["hello.txt"]).unwrap();
+        c.lopen(1, 0).unwrap();
+        c.clunk(1);
+        assert_eq!(c.read(1, 0, 10), Err(EPROTO));
+        // The number is free for reuse afterwards.
+        c.walk(0, 1, &["sub"]).unwrap();
+        assert_eq!(c.getattr(1).unwrap().1 & S_IFMT, S_IFDIR);
+    }
 
     #[test]
     fn join_keeps_the_guest_inside_the_export() {

@@ -11,6 +11,8 @@
 //! Boots the same bbl64.bin/kernel/rootfs images TinyEMU ships.
 
 pub mod dtb;
+pub mod p9;
+pub mod p9fs;
 pub mod virt;
 pub mod virtio;
 
@@ -108,6 +110,21 @@ impl SystemBus {
             }
             _ => None,
         }
+    }
+
+    /// Sub-word MMIO read. Only the virtio config window answers below 32 bits,
+    /// and only because it must: Linux reads a 9p mount tag one byte at a time
+    /// (`virtio_cread_bytes`), so refusing narrow reads means never mounting.
+    fn mmio_read_narrow(&mut self, addr: u64, size: usize) -> Option<u32> {
+        if (VIRTIO_BASE..VIRTIO_BASE + 8 * VIRTIO_SIZE).contains(&addr) {
+            let i = ((addr - VIRTIO_BASE) / VIRTIO_SIZE) as usize;
+            let off = (addr - VIRTIO_BASE) % VIRTIO_SIZE;
+            return self
+                .virtio
+                .get_mut(i)
+                .map(|d| d.read_sized(off, size as u32));
+        }
+        None
     }
 
     fn htif_handle_cmd(&mut self) {
@@ -279,7 +296,13 @@ macro_rules! sys_rw {
                     return Ok(<$ty>::from_le_bytes(b));
                 }
             }
-            // MMIO: only aligned 32-bit accesses are meaningful.
+            // Sub-word MMIO (virtio config space only).
+            if $n == 1 || $n == 2 {
+                if let Some(v) = self.mmio_read_narrow(addr, $n) {
+                    return Ok(v as $ty);
+                }
+            }
+            // MMIO: otherwise only aligned 32-bit accesses are meaningful.
             if $n == 4 {
                 if let Some(v) = self.mmio_read32(addr) {
                     return Ok(v as $ty);
@@ -384,6 +407,10 @@ pub struct BootImages<'a> {
     pub kernel: Option<&'a [u8]>,
     pub cmdline: &'a str,
     pub disk: Option<Vec<u8>>,
+    /// Host filesystem to export over virtio-9p. The guest mounts it by the
+    /// server's tag (`mount -t 9p -o trans=virtio <tag> /mnt`), or boots from
+    /// it directly with `rootfstype=9p` when the tag is `/dev/root`.
+    pub fs: Option<p9::Server>,
 }
 
 impl Machine {
@@ -403,13 +430,17 @@ impl Machine {
             kernel_len = k.len();
         }
 
-        // Devices: console is virtio slot 0 (irq 1), blk slot 1 (irq 2).
+        // Devices: console is virtio slot 0 (irq 1), then blk, then 9p — each
+        // slot's irq is its index + 1.
         let mut virtio = vec![VirtioDev::new(Backend::Console {
             rx_buf: Vec::new(),
             tx_out: Vec::new(),
         })];
         if let Some(disk) = images.disk {
             virtio.push(VirtioDev::new(Backend::Block { disk }));
+        }
+        if let Some(srv) = images.fs {
+            virtio.push(VirtioDev::new(Backend::Fs { srv }));
         }
         let ndevs = virtio.len();
 
