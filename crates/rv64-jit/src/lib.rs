@@ -91,6 +91,20 @@ pub fn set_chain(on: bool) {
 fn chain_enabled() -> bool {
     CHAIN.load(std::sync::atomic::Ordering::Relaxed)
 }
+/// Rotated-nest acceptance in loop_region (backward exit branches).
+/// DEFAULT OFF: a 6-boot parallel screen showed it net-negative on every
+/// nbench kernel (NUMERIC SORT 392 -> 343, HUFFMAN 989 -> 904, ASSIGNMENT
+/// 8.3 -> 7.9 medians) — the small regions it forms displace better
+/// coverage. Kept behind jit_set_rotated_nests for future work on the
+/// rotated-scan-nest shape it was built for.
+static ROTATED_NESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_rotated_nests(on: bool) {
+    ROTATED_NESTS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+fn rotated_nests() -> bool {
+    ROTATED_NESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Trace (extended-basic-block) aggressiveness for translate_block:
 /// 0 = classic basic blocks (end at every branch); 1 = side-exit conditional
 /// branches and keep going; 2 = also follow direct calls (jal with link);
@@ -1979,7 +1993,7 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
         // jumps backward out (nbench ASSIGNMENT's scan nests — one host
         // dispatch per 11-insn iteration while this shape was rejected).
         // translate_loop emits it as a conditional bail with exact counts.
-        if t < bpc && t >= start_pc {
+        if t < bpc && (t >= start_pc || !rotated_nests()) {
             if let Some(e) = loops.iter_mut().find(|(h, _)| *h == t) {
                 if bnext > e.1 {
                     e.1 = bnext;

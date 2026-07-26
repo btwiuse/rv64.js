@@ -3144,6 +3144,11 @@ pub extern "C" fn jit_set_hw_fma(on: u32) {
 pub extern "C" fn jit_set_tailcall(on: u32) {
     rv64_jit::set_chain(on != 0);
 }
+/// A/B: rotated-nest loop regions (see rv64_jit::set_rotated_nests).
+#[no_mangle]
+pub extern "C" fn jit_set_rotated_nests(on: u32) {
+    rv64_jit::set_rotated_nests(on != 0);
+}
 /// Live chain kill switch (see JitLayout::chain_off_addr): nonzero disables
 /// every emitted chain transfer. Driven by CODE-CHURN RATE at quantum
 /// boundaries: a workload still compiling new blocks (tcc churns ~7.5k
