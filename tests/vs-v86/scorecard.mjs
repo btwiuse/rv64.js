@@ -317,14 +317,49 @@ async function rvNbenchComplete(jit) {
   }
   return rvNbench(jit);
 }
+// NBREPS>1: repeat the WHOLE nbench leg (fresh boots) on BOTH sides,
+// INTERLEAVED (v86, rv64, v86, rv64, ...), and take the per-kernel MEDIAN.
+// This finishes the ISSUES.md P1 requirement ("interleaved median-of-N
+// trials rather than fixed-order single samples") that REPS only ever
+// implemented for the wall-clock rows: boot-to-boot coverage races swing
+// several kernels +/-20% on identical binaries (NUMERIC SORT measured
+// 320-467 iter/s across boots on one build), so single-sample rows are
+// coin flips in both directions. Symmetric by construction — both sides
+// get the same number of fresh boots and the same statistic.
+const NBREPS = Math.max(1, +(process.env.NBREPS || 1));
+const medianRows = (runs) => {
+  const out = {};
+  let unstable = 0;
+  for (const k of new Set(runs.flatMap((r) => Object.keys(r)))) {
+    const vals = runs.map((r) => r[k]).filter((v) => v != null);
+    if (vals.length) out[k] = median(vals);
+  }
+  for (const r of runs) unstable += r.unstable ?? 0;
+  // A kernel nbench flagged as statistically uncertain in EVERY rep is not
+  // a result; occasional flags across independent boots wash out in the
+  // median, so require at least one clean majority.
+  Object.defineProperty(out, "unstable", {
+    value: unstable > runs.length ? 1 : 0,
+    enumerable: false,
+  });
+  return out;
+};
 let nb = null;
 if (WANT_NBENCH && (await has(join(ARTIFACTS, "root-nbench.bin")))) {
-  log("[rv64 nbench jit]…"); const nj = await rvNbenchComplete(true);
+  const rvRuns = [];
+  const v8Runs = [];
+  const wantV8 = haveV86 && (await has(join(ARTIFACTS, "deb-i386-bench.cpio.gz")));
+  for (let r = 0; r < NBREPS; r++) {
+    if (wantV8) { log(`[nbench rep ${r + 1}/${NBREPS}] v86…`); v8Runs.push(await v86Nbench()); }
+    log(" rv64…"); rvRuns.push(await rvNbenchComplete(true));
+    log(" ok\n");
+  }
   let ni = null; if (FULL) { log(" interp…"); ni = await rvNbench(false); }
-  let v8 = null;
-  if (haveV86 && (await has(join(ARTIFACTS, "deb-i386-bench.cpio.gz")))) { log(" v86…"); v8 = await v86Nbench(); }
-  log(" ok\n");
-  nb = { jit: nj, int: ni, v8 };
+  nb = {
+    jit: medianRows(rvRuns),
+    int: ni,
+    v8: wantV8 ? medianRows(v8Runs) : null,
+  };
 }
 
 // ---------- render ----------
@@ -446,7 +481,7 @@ const provenance = {
   git_dirty: (() => { try { return execSync("git -C " + root + " status --porcelain").toString().trim().length > 0; } catch { return null; } })(),
   wasm_sha256: createHash("sha256").update(wasm).digest("hex"),
   node: process.version,
-  reps: REPS, sb: SB, nbench: WANT_NBENCH, full: FULL,
+  reps: REPS, nbreps: NBREPS, sb: SB, nbench: WANT_NBENCH, full: FULL,
 };
 await writeFile(join(ARTIFACTS, `scorecard-${ts}.json`), JSON.stringify({ ts, system_emulation: true, provenance, results: R, nbench: nb, pass: `${passing.length}/${scored.length}`, problems }, null, 2));
 console.log(`saved ${join(ARTIFACTS, `scorecard-${ts}.md`)} (+ .json)`);
