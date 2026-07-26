@@ -24,6 +24,8 @@ extern "C" {
     fn host_write(fd: i32, ptr: *const u8, len: usize);
     /// Milliseconds since an arbitrary epoch (performance.now()).
     fn host_now_ms() -> f64;
+    /// Milliseconds since the Unix epoch (Date.now()), for the guest RTC.
+    fn host_unix_ms() -> f64;
     /// Fill with entropy (crypto.getRandomValues).
     fn host_random(ptr: *mut u8, len: usize);
     /// JIT: instantiate the wasm module currently in JIT_OUT (see
@@ -1204,7 +1206,7 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
             <[u8; 6]>::try_from(SYS_NET_MAC.as_slice())
                 .unwrap_or(rv64_system::virtio::DEFAULT_MAC)
         });
-        let m = rv64_system::Machine::new(
+        let mut m = rv64_system::Machine::new(
             ram_mb as usize,
             rv64_system::BootImages {
                 bios: &SYS_BIOS,
@@ -1223,6 +1225,7 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
                 net,
             },
         );
+        m.set_rtc_unix_ns(host_unix_ms() as u64 * 1_000_000);
         SYS_BIOS = Vec::new();
         SYS_KERNEL = Vec::new();
         SYS = Some(m);
@@ -1398,8 +1401,20 @@ fn build_superblock(
                         // With regions capped at 3 pages the far joins are
                         // cheap and a19ea3b-measured; the miss gate was
                         // compensating for the (now reverted) 8-page growth.
+                        // Far (call-graph) joins are DISABLED: they have never
+                        // demonstrated a win, and in a back-to-back sample on
+                        // an identically loaded host, regions without them ran
+                        // FP EMULATION at 1971 MIPS against 896 for the
+                        // baseline JIT. Gluing a callee page in costs every
+                        // entry a bigger register union and V8 a bigger
+                        // function; the compile row's cross-page calls need
+                        // regions that EXTEND on measured misses (see the
+                        // incremental-extension design in ISSUES.md), not
+                        // regions that guess from reachability. The selection
+                        // code stays — it is one predicate away from being
+                        // re-enabled behind that signal.
                         let _ = missed_now;
-                        let far_cap = (pages.len() + 2).min(MAX_REGION_PAGES);
+                        let far_cap = pages.len();
                         let mut scanned = 0usize;
                         while scanned < pages.len() && pages.len() < far_cap {
                             let (va, pp) = pages[scanned];
@@ -1528,6 +1543,7 @@ fn build_superblock(
 #[allow(static_mut_refs)]
 pub extern "C" fn sys_run(max_insns: u64) -> i32 {
     let m = unsafe { SYS.as_mut().expect("call sys_boot() first") };
+    m.set_rtc_unix_ns(unsafe { host_unix_ms() } as u64 * 1_000_000);
     let jit = unsafe { SYS_JIT.get_or_insert_with(JitState::new) };
     let mut remaining = max_insns;
 
