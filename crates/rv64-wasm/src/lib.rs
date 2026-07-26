@@ -267,7 +267,10 @@ struct DispatchLine {
 }
 
 const NO_PC: u64 = u64::MAX;
-const DISPATCH_BITS: u32 = 17; // 131072 lines (sys block count can exceed 16k)
+// 262144 lines: CPython's ~20k hot pcs collided at ~7% in 131072 under
+// guest ASLR — per-boot slot-eviction churn is one suspected source of the
+// python row's 3.3-6.7s bimodality. Doubling costs 2MB and no hot-path work.
+const DISPATCH_BITS: u32 = 18;
 const DISPATCH_SIZE: usize = 1 << DISPATCH_BITS;
 
 struct JitState {
@@ -579,12 +582,13 @@ struct TraceWin {
 const TRACE_WIN_CACHE: usize = 8;
 static mut TRACE_WIN: Vec<TraceWin> = Vec::new();
 /// A landed region function does NOT claim a pc whose individual block is a
-/// trace at least this long. 0 = functions claim everything: with whole-
-/// region leader discovery restored, mixed claiming (some pcs on traces,
-/// some in the function) FRAGMENTED execution into function/trace ping-pong
-/// — claim-all measured best on every row (compile 3880 -> 3282ms, HUFFMAN
-/// 955 -> 1010, ASSIGNMENT 7.8 -> 8.4; the middle values 24/48 were worse
-/// on both compile and NUMERIC SORT). Runtime-settable for A/B.
+/// trace at least this long. 0 = functions claim everything: mixed claiming
+/// fragments execution into function/trace ping-pong. Measured medians favor
+/// claim-all (compile 3.3s vs 3.6-4.0s, HUFFMAN ~1010 vs ~920), but note the
+/// boot-to-boot coverage races swing NUMERIC/HUFFMAN/ASSIGNMENT +/-20% in
+/// EVERY configuration — single draws cannot distinguish 0 from 24 (both
+/// were sampled at NUMERIC ~320 and ~445 on identical binaries). Runtime-
+/// settable for A/B.
 static mut TRACE_KEEP_MIN: u32 = 0;
 #[no_mangle]
 pub extern "C" fn jit_set_trace_keep_min(v: u32) {
@@ -962,9 +966,10 @@ const MAX_LEADERS: usize = 512;
 #[inline]
 fn call_block(idx: i32, state_ptr: *mut u8) {
     unsafe {
-        // The retirement cell is OVERWRITTEN by every block exit (the old
-        // cumulative-with-host-zeroing contract served tail-call chaining,
-        // which is dead) — no per-dispatch zero-store here.
+        // The retirement cell is CUMULATIVE across one host dispatch: blocks
+        // ADD what they retire (tail-call transfers keep accumulating without
+        // returning here), so it must start each chain at zero.
+        RETIRED_CELL = 0;
         let f: extern "C" fn(i32) = core::mem::transmute(idx as usize);
         f(state_ptr as i32);
     }
@@ -997,6 +1002,7 @@ pub extern "C" fn sbtest() -> u64 {
             fuel_addr: 0,
             mstatus_addr: 0,
             copystat_addr: 0,
+            chain_off_addr: 0,
             dispatch_base: 0,
             dispatch_mask: 0,
             map_gen_addr: 0,
@@ -1083,6 +1089,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     fuel_addr: fuel_addr(),
                     mstatus_addr: 0, // user mode: no privileged FP state
                     copystat_addr: 0,
+            chain_off_addr: 0,
                     dispatch_base: 0,
                     dispatch_mask: 0,
                     map_gen_addr: 0,
@@ -1472,6 +1479,7 @@ fn jit_layout(m: &rv64_system::Machine) -> rv64_jit::JitLayout {
         fuel_addr: fuel_addr(),
         mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
         copystat_addr: copystat_addr(),
+        chain_off_addr: chain_off_addr(),
         dispatch_base: 0,
         dispatch_mask: 0,
         map_gen_addr: 0,
@@ -2259,6 +2267,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             }
             m.sync_devices();
             m.cpu.check_interrupts(&mut m.bus);
+            chain_ctl_boundary(m.cpu.insn_count);
             // Extension FIRST: a landed region whose measured exits keep
             // leaving it grows along that traffic. Extensions outrank fresh
             // page builds for the build budget — a fresh 3-page function
@@ -2338,6 +2347,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             fuel_addr: fuel_addr(),
                             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
                             copystat_addr: copystat_addr(),
+                            chain_off_addr: chain_off_addr(),
                             dispatch_base: jit.dispatch.as_ptr() as u32,
                             dispatch_mask: (DISPATCH_SIZE - 1) as u32,
                             map_gen_addr: m.cpu.jit_map_gen_ptr() as u32,
@@ -2525,6 +2535,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         };
                         let w = &wins[wi];
                         let winpages = &w.pages;
+                        unsafe { COMPILES_TICK += 1 };
                         let blk = {
                             // Hotness oracle for branch-direction bias: a
                             // compiled (non-blacklisted) target is proven-hot.
@@ -2931,6 +2942,7 @@ pub extern "C" fn sb_analyze(vpage: u64, which: u32) -> u64 {
             fuel_addr: fuel_addr(),
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),
+        chain_off_addr: chain_off_addr(),
             dispatch_base: 0,
             dispatch_mask: 0,
             map_gen_addr: 0,
@@ -3014,6 +3026,7 @@ pub extern "C" fn sb_analyze_pc(pc: u64, which: u32) -> u64 {
             fuel_addr: fuel_addr(),
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),
+        chain_off_addr: chain_off_addr(),
             dispatch_base: 0,
             dispatch_mask: 0,
             map_gen_addr: 0,
@@ -3075,10 +3088,93 @@ pub extern "C" fn jit_set_hw_fma(on: u32) {
 }
 
 /// Enable direct block-to-block tail-call chaining (host feature-detects
-/// wasm tail-call support first).
+/// wasm tail-call support first). Loop/region chain sites follow this
+/// directly (their successor sets are cyclic and stay monomorphic); trace
+/// exits additionally require a small block population — flipped per
+/// compile from the live cache size (see CHAIN_POP_CAP).
 #[no_mangle]
 pub extern "C" fn jit_set_tailcall(on: u32) {
     rv64_jit::set_chain(on != 0);
+}
+/// Live chain kill switch (see JitLayout::chain_off_addr): nonzero disables
+/// every emitted chain transfer. Driven by CODE-CHURN RATE at quantum
+/// boundaries: a workload still compiling new blocks (tcc churns ~7.5k
+/// blocks across its entire run; CPython warms for seconds) has an
+/// unstable, megamorphic chain graph that V8's ICs cannot serve — measured
+/// 2-2.9x slower chained. A warmed workload (nbench kernels self-time for
+/// minutes after a burst of compiles) has a stable graph where chained
+/// hops cost ~2ns and measured up to +23%. Population caps cannot separate
+/// the two (cumulative counts overlap); churn does.
+static mut CHAIN_OFF_CELL: u32 = 0;
+static mut COMPILES_TICK: u64 = 0;
+fn chain_off_addr() -> u32 {
+    unsafe { &CHAIN_OFF_CELL as *const u32 as u32 }
+}
+
+/// Online chain controller: no static rule separates workloads whose chain
+/// graph V8 serves at ~2ns/hop (warm nbench kernels: +23% and an
+/// ASSIGNMENT row that flips to a WIN) from those it cannot (tcc's 7.5k-
+/// block soup: 2-2.9x slower; population, churn and per-site target-kind
+/// gates all failed to split them). So MEASURE: alternate ON/OFF probe
+/// windows of PROBE_QUANTA boundaries, compare wall-ns per retired
+/// instruction, lock the faster setting for LOCK_QUANTA, then re-probe
+/// (workloads change phases). Compiling a new block unlocks immediately.
+struct ChainCtl {
+    state: u8, // 0 = probing ON, 1 = probing OFF, 2 = locked
+    quanta: u32,
+    t0_ms: f64,
+    retired0: u64,
+    ns_per_insn: [f64; 2],
+    locked_off: u32,
+}
+static mut CHAIN_CTL: ChainCtl = ChainCtl {
+    state: 0,
+    quanta: 0,
+    t0_ms: 0.0,
+    retired0: 0,
+    ns_per_insn: [0.0; 2],
+    locked_off: 0,
+};
+const PROBE_QUANTA: u32 = 8;
+const LOCK_QUANTA: u32 = 256;
+
+#[allow(static_mut_refs)]
+fn chain_ctl_boundary(retired_total: u64) {
+    unsafe {
+        let ctl = &mut CHAIN_CTL;
+        ctl.quanta += 1;
+        let now = host_now_ms();
+        match ctl.state {
+            0 | 1 => {
+                if ctl.quanta >= PROBE_QUANTA {
+                    let insns = retired_total.wrapping_sub(ctl.retired0).max(1);
+                    ctl.ns_per_insn[ctl.state as usize] =
+                        (now - ctl.t0_ms) * 1e6 / insns as f64;
+                    if ctl.state == 0 {
+                        ctl.state = 1;
+                        CHAIN_OFF_CELL = 1;
+                    } else {
+                        // Verdict: lock the faster setting.
+                        ctl.locked_off = (ctl.ns_per_insn[1] < ctl.ns_per_insn[0]) as u32;
+                        CHAIN_OFF_CELL = ctl.locked_off;
+                        ctl.state = 2;
+                    }
+                    ctl.quanta = 0;
+                    ctl.t0_ms = now;
+                    ctl.retired0 = retired_total;
+                }
+            }
+            _ => {
+                if ctl.quanta >= LOCK_QUANTA {
+                    ctl.state = 0;
+                    CHAIN_OFF_CELL = 0;
+                    ctl.quanta = 0;
+                    ctl.t0_ms = now;
+                    ctl.retired0 = retired_total;
+                }
+            }
+        }
+    }
 }
 
 /// Trace aggressiveness for individual blocks (see rv64_jit::set_trace_level):

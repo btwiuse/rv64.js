@@ -287,6 +287,12 @@ pub struct JitLayout {
     pub mstatus_addr: u32,
     /// Diagnostic cell the copy-loop fast path bumps per bulk chunk (0 = off).
     pub copystat_addr: u32,
+    /// i32 cell: nonzero = chain transfers disabled RIGHT NOW. Emitted chain
+    /// exits load it first, so the host can kill chaining live when the
+    /// block population goes megamorphic (tcc compiles 7.5k blocks and ran
+    /// 2-2.9x slower with chains than without; nbench's small kernels win
+    /// up to +23% chained). 0 = no cell, chains ungated.
+    pub chain_off_addr: u32,
 }
 
 impl JitLayout {
@@ -306,6 +312,7 @@ impl JitLayout {
             map_gen_addr: 0,
             mstatus_addr: 0,
             copystat_addr: 0,
+            chain_off_addr: 0,
         }
     }
 }
@@ -1294,15 +1301,20 @@ impl Ctx {
         m.local_get(VA).op(I32_WRAP_I64);
     }
 
-    /// Publish this block's retired count: a plain OVERWRITE of the cell.
-    /// The host reads it after every dispatch and no longer zeroes it
-    /// between calls (the old cumulative contract existed for tail-call
-    /// chaining, which measured 1.2us per cross-instance hop and is dead) —
-    /// dropping the zero-store plus the load+add here removes three memory
-    /// round-trips from every dispatch of every block.
+    /// ADD this block's retired count to the retirement cell. The cell is
+    /// CUMULATIVE across one host dispatch: the host zeroes it before the
+    /// first block of a chain, every block adds what it retired, and
+    /// tail-call transfers between blocks leave it accumulating — so the
+    /// host reads the whole chain's total no matter how many blocks ran.
+    /// (An overwrite contract was briefly tried while chaining looked dead;
+    /// a fresh probe on node 20.18.1 measured cross-instance
+    /// return_call_indirect at 1.9ns/hop — chaining is back.)
     fn set_retired(&self, m: &mut WasmModule, n: u32) {
         m.i32_const(0);
-        m.i64_const(n as i64).i64_store(self.lay.retired_addr as u64);
+        m.i32_const(0).i64_load(self.lay.retired_addr as u64);
+        m.i64_const(n as i64)
+            .op(I64_ADD)
+            .i64_store(self.lay.retired_addr as u64);
     }
 
     /// Bail out of the block at instruction index `n` (retired so far),
@@ -1316,9 +1328,10 @@ impl Ctx {
             // segments/bodies flushed so far; `n` is the compile-time count of
             // instructions completed since that flush. Reporting ITER alone
             // undercounted, corrupting insn_count/minstret/clock/fuel.
-            // Overwrite contract as in set_retired.
+            // Cumulative-cell contract as in set_retired.
             m.i32_const(0);
-            m.local_get(l);
+            m.i32_const(0).i64_load(self.lay.retired_addr as u64);
+            m.local_get(l).op(I64_ADD);
             if n > 0 {
                 m.i64_const(n as i64).op(I64_ADD);
             }
@@ -1960,7 +1973,13 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
     // exit is the instruction after the last back-edge that targets it.
     let mut loops: Vec<(u64, u64)> = Vec::new();
     for &(bpc, t, bnext) in &branches {
-        if t < bpc {
+        // A backward branch that leaves the region ([target < start_pc]) is
+        // an EXIT, not a back-edge: rotated bottom-tested nests place the
+        // outer increment BEFORE the inner header, so the inner loop's exit
+        // jumps backward out (nbench ASSIGNMENT's scan nests — one host
+        // dispatch per 11-insn iteration while this shape was rejected).
+        // translate_loop emits it as a conditional bail with exact counts.
+        if t < bpc && t >= start_pc {
             if let Some(e) = loops.iter_mut().find(|(h, _)| *h == t) {
                 if bnext > e.1 {
                     e.1 = bnext;
@@ -2308,9 +2327,13 @@ fn emit_fuel_base(c: &Ctx, m: &mut WasmModule) {
         m.i64_const(LOOP_CAP as i64).local_set(BASE);
         return;
     }
-    // The retirement cell holds the PREVIOUS dispatch's count now (the
-    // host stopped zeroing it), so the grant is the fuel cell alone.
-    m.i32_const(0).i64_load(c.lay.fuel_addr as u64).local_set(BASE);
+    m.i32_const(0).i64_load(c.lay.fuel_addr as u64);
+    m.i32_const(0).i64_load(c.lay.retired_addr as u64);
+    m.op(I64_SUB).local_set(BASE);
+    m.local_get(BASE).i64_const(0).op(I64_LT_S);
+    m.op(IF).op(VOID);
+    m.i64_const(0).local_set(BASE);
+    m.op(END);
 }
 
 /// Chain exit: after a block has stored its successor pc and ADDED its
@@ -2324,6 +2347,86 @@ fn emit_fuel_base(c: &Ctx, m: &mut WasmModule) {
 /// `iter_guard` additionally refuses to transfer when this call retired
 /// nothing (a fuel-exhausted or off-entry exit) — a zero-progress transfer
 /// to the same pc would tail-loop forever.
+/// Build the shared chain-check helper body for `lay` (WasmModule::set_helper):
+/// kill-cell, dispatch-line probe (pc match, blacklist, map generation),
+/// fuel — the host fast path's exact conditions — returning the verified,
+/// SB_IDX_BIT-stripped table index, or -1 to fall back to the host. One copy
+/// per MODULE instead of ~80 bytes inlined at every trace side exit, which
+/// bloated large block populations past V8's tiering appetite (tcc: 2.4x
+/// slower with the inline form emitted, even unexecuted).
+/// Helper locals (no params): 0 = i64 cpc, 1 = i32 line offset, 2 = i32 idx.
+fn build_chain_helper(lay: &JitLayout) -> Vec<u8> {
+    let mut h = WasmModule::with_locals(0, 0);
+    if lay.chain_off_addr != 0 {
+        h.i32_const(0).i32_load(lay.chain_off_addr as u64);
+        h.op(IF).op(VOID).i32_const(-1).op(RETURN).op(END);
+    }
+    h.i32_const(0).i64_load(lay.pc_addr as u64).local_set(0);
+    h.local_get(0)
+        .i64_const(1)
+        .op(I64_SHR_U)
+        .op(I32_WRAP_I64)
+        .i32_const(lay.dispatch_mask as i32)
+        .op(I32_AND)
+        .i32_const(4)
+        .op(I32_SHL)
+        .local_set(1);
+    h.local_get(1).i64_load_at(lay.dispatch_base as u64);
+    h.local_get(0).op(I64_NE);
+    h.op(IF).op(VOID).i32_const(-1).op(RETURN).op(END);
+    h.local_get(1).i32_load(lay.dispatch_base as u64 + 8).local_set(2);
+    h.local_get(2).i32_const(0).op(I32_LT_S);
+    h.op(IF).op(VOID).i32_const(-1).op(RETURN).op(END);
+    h.local_get(2).i32_const(!SB_IDX_BIT).op(I32_AND).local_set(2);
+    h.local_get(1).i32_load(lay.dispatch_base as u64 + 12);
+    h.i32_const(0).i32_load(lay.map_gen_addr as u64);
+    h.op(I32_NE);
+    h.op(IF).op(VOID).i32_const(-1).op(RETURN).op(END);
+    h.i32_const(0).i64_load(lay.retired_addr as u64);
+    h.i32_const(0).i64_load(lay.fuel_addr as u64);
+    h.op(I64_GE_U);
+    h.op(IF).op(VOID).i32_const(-1).op(RETURN).op(END);
+    h.local_get(2);
+    h.into_code()
+}
+
+/// Trace-exit chain transfer through the shared helper (~15 bytes/site).
+/// CURRENTLY UNCALLED: any module that imports the shared function table
+/// makes every subsequent table.set O(importing instances) in V8 (per-
+/// instance call_indirect dispatch caches), so thousands of chain-bearing
+/// trace modules turn block registration quadratic — tcc measured 2.4-3x
+/// slower with chain code merely EMITTED. Loop/region blocks (few) still
+/// chain. Next design: a second, chain-only table, or routing transfers
+/// through a host-module chain_run export so traces never import the
+/// table. Kept (with build_chain_helper) for that work.
+#[allow(dead_code)]
+fn emit_chain_exit_helper(c: &Ctx, m: &mut WasmModule) {
+    let lay = &c.lay;
+    if !chain_enabled()
+        || lay.sys.is_none()
+        || lay.dispatch_base == 0
+        || lay.fuel_addr == 0
+        || lay.map_gen_addr == 0
+    {
+        return;
+    }
+    m.use_tlb_fill();
+    m.use_table();
+    let hidx = m.set_helper(build_chain_helper(lay));
+    let t = c.idxb + 1;
+    m.call(hidx).local_set_i32(t);
+    m.local_get_i32(t).i32_const(0).op(I32_LT_S);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+    m.local_get(0); // machine-state pointer parameter
+    m.local_get_i32(t);
+    m.return_call_indirect(0);
+}
+
+/// Emitted ONLY at loop-region / copy-loop / region-function exits: those
+/// blocks re-dispatch to a small cyclic successor set, so the tail-call
+/// site stays monomorphic and costs ~2ns (probe, node 20.18.1). Trace
+/// blocks deliberately do NOT chain — tcc's 7.5k-block soup made every
+/// site megamorphic and ran 2.9x slower chained than host-dispatched.
 fn emit_chain_exit(c: &Ctx, m: &mut WasmModule, iter_guard: bool) {
     let lay = &c.lay;
     if !chain_enabled()
@@ -2332,6 +2435,11 @@ fn emit_chain_exit(c: &Ctx, m: &mut WasmModule, iter_guard: bool) {
         || lay.fuel_addr == 0
     {
         return;
+    }
+    // Live kill switch: one i32 load per chain attempt.
+    if lay.chain_off_addr != 0 {
+        m.i32_const(0).i32_load(lay.chain_off_addr as u64);
+        m.op(IF).op(VOID).op(RETURN).op(END);
     }
     if iter_guard {
         m.local_get(ITER).op(I64_EQZ);
@@ -3376,7 +3484,8 @@ fn translate_copy_loop(
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, start_pc);
     m.i32_const(0);
-    m.local_get(ITER).i64_store(lay.retired_addr as u64);
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
     emit_chain_exit(&c, &mut m, true);
     m.op(RETURN);
     m.op(END);
@@ -3542,7 +3651,8 @@ fn translate_copy_loop(
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, cl.end_pc);
     m.i32_const(0);
-    m.local_get(ITER).i64_store(lay.retired_addr as u64);
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
     emit_chain_exit(&c, &mut m, true);
     m.op(RETURN);
     m.op(END); // loop
@@ -3694,13 +3804,7 @@ pub fn translate_block_hot(
     if scan_n > FUEL_GUARD_MIN && lay.fuel_addr != 0 {
         m.i32_const(0).i64_load(lay.fuel_addr as u64);
         m.i64_const(scan_n as i64).op(I64_LT_U);
-        m.op(IF).op(VOID);
-        // Overwrite contract: every exit must publish its count — the host
-        // no longer zeroes the cell between dispatches.
-        m.i32_const(0);
-        m.i64_const(0).i64_store(lay.retired_addr as u64);
-        m.op(RETURN);
-        m.op(END);
+        m.op(IF).op(VOID).op(RETURN).op(END);
     }
     // The FP gate is emitted AT the first FP instruction (see the loop),
     // not at entry: a long trace whose integer prefix always runs must make
@@ -3787,7 +3891,6 @@ pub fn translate_block_hot(
                 c.flush_writes(&mut m);
                 c.set_pc_const(&mut m, target);
                 c.set_retired(&mut m, n + 1);
-                emit_chain_exit(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
                     span: (lo, hi),
@@ -3835,8 +3938,7 @@ pub fn translate_block_hot(
                                     .i64_store(lay.pc_addr as u64);
                                 c.flush_writes(&mut m);
                                 c.set_retired(&mut m, n + 1);
-                                emit_chain_exit(&c, &mut m, false);
-                                m.op(RETURN);
+                                                m.op(RETURN);
                                 m.op(END);
                             }
                             tf.step(insn, pc);
@@ -3859,7 +3961,8 @@ pub fn translate_block_hot(
                 m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
                 c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
-                emit_chain_exit(&c, &mut m, false);
+                // Dynamic target (return/indirect): the chain call site
+                // would be megamorphic — dispatch through the host.
                 return Some(Block {
                     wasm: m.finish(),
                     span: (lo, hi),
@@ -3905,8 +4008,7 @@ pub fn translate_block_hot(
                     c.set_pc_const(&mut m, exit_pc);
                     c.flush_writes(&mut m);
                     c.set_retired(&mut m, n + 1);
-                    emit_chain_exit(&c, &mut m, false);
-                    m.op(RETURN);
+                        m.op(RETURN);
                     m.op(END);
                     pc = follow_pc;
                     n += 1;
@@ -3920,7 +4022,6 @@ pub fn translate_block_hot(
                 m.op(END);
                 c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
-                emit_chain_exit(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
                     span: (lo, hi),
@@ -3940,7 +4041,6 @@ pub fn translate_block_hot(
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, pc);
     c.set_retired(&mut m, n);
-    emit_chain_exit(&c, &mut m, false);
     Some(Block {
         wasm: m.finish(),
         span: (lo, hi),
@@ -4020,7 +4120,8 @@ fn translate_loop(
             c.flush_writes(&mut m);
             c.set_pc_const(&mut m, h);
             m.i32_const(0);
-    m.local_get(ITER).i64_store(lay.retired_addr as u64);
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
     emit_chain_exit(c, &mut m, true);
             m.op(RETURN);
             m.op(END);
@@ -4061,6 +4162,20 @@ fn translate_loop(
             .op(I64_ADD)
             .local_set(ITER);
         seg = 0;
+        if target < start_pc {
+            // Backward EXIT (rotated nest): leave the region with pc =
+            // target. The branch instruction was already flushed into ITER
+            // above, so bail(target, 0) publishes the exact count.
+            c.push_reg(&mut m, s1);
+            c.push_reg(&mut m, s2);
+            m.op(cmp);
+            m.op(IF).op(VOID);
+            c.bail(&mut m, target, 0);
+            m.op(END);
+            pc = next;
+            static_n += 1;
+            continue;
+        }
         if target < pc {
             // back-edge → continue the loop whose header == target.
             let li = scopes.iter().rposition(|&(k, _, h)| k == 1 && h == target)?;
@@ -4107,7 +4222,8 @@ fn translate_loop(
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, region.end_pc);
     m.i32_const(0);
-    m.local_get(ITER).i64_store(lay.retired_addr as u64);
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
     emit_chain_exit(c, &mut m, true);
     Some(Block {
         wasm: m.finish(),
@@ -4860,7 +4976,8 @@ pub fn translate_superblock_sparse(
     c.flush_writes(&mut m);
     m.i32_const(0).local_get(TPC).i64_store(lay.pc_addr as u64);
     m.i32_const(0);
-    m.local_get(ITER).i64_store(lay.retired_addr as u64);
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
     emit_chain_exit(&c, &mut m, true);
 
     Some(Block {

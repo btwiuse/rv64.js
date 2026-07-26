@@ -92,7 +92,15 @@ export class RV64 {
               },
             });
             const table = vm.ex.__indirect_function_table;
-            const idx = table.grow(1);
+            // Bulk pre-growth: growing a shared table forces V8 to rewire
+            // EVERY instance that imports it, so one grow(1) per block was
+            // O(instances) each — quadratic across a workload like tcc
+            // (7.5k chain-bearing modules), and the reason every chaining
+            // configuration measured 2-3x slower there. Grow in 4096-slot
+            // steps and hand out indices from a cursor instead.
+            vm.tableNext ??= table.length;
+            if (vm.tableNext >= table.length) table.grow(4096);
+            const idx = vm.tableNext++;
             table.set(idx, inst.exports.run);
             vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
             return idx;
@@ -125,7 +133,9 @@ export class RV64 {
             )
             .then((inst) => {
               const table = vm.ex.__indirect_function_table;
-              const idx = table.grow(1);
+              vm.tableNext ??= table.length;
+              if (vm.tableNext >= table.length) table.grow(4096);
+              const idx = vm.tableNext++;
               table.set(idx, inst.exports.run);
               vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
               vm.ex.sys_sb_ready(ticket, idx);
@@ -178,12 +188,21 @@ export class RV64 {
         3, 2, 1, 0,
         10, 11, 1, 9, 0, 0x20, 0, 0x41, 0, 0x13, 0, 0, 0x0b,
       ]));
-      // Available, but DEFAULT OFF: measured on V8 11.3, a cross-instance
-      // return_call_indirect costs ~1.2us per hop (each block is its own
-      // instance, and the tail call goes through an instance-switching
-      // trampoline), which is 20-50x the plain dispatch loop's cost per
-      // block. Opt in for engines where cross-instance tail calls are cheap.
-      if (globalThis.RV64_TAILCALL || process?.env?.RV_TAILCALL === "1") {
+      // DEFAULT OFF — but for a NEW reason (the old "~1.2us trampoline"
+      // figure is obsolete: a fresh probe on node 20.18.1 measured
+      // return_call_indirect at ~2ns/hop, same- or cross-instance). The
+      // real cost on this V8 is that any module IMPORTING the shared
+      // function table makes every later table.set O(importing instances)
+      // — per-instance call_indirect dispatch caches — so thousands of
+      // chain-bearing block modules turn registration quadratic (tcc:
+      // 2.4-3x slower with chain code merely emitted, never executed,
+      // in every gating variant tried: population caps, churn detection,
+      // an online A/B controller, and a shared per-module helper).
+      // Chained nbench kernels measured big wins (ASSIGNMENT 8.4 -> 11.2
+      // iter/s), so the machinery stays behind RV_TAILCALL=1 until blocks
+      // can chain without importing the table (second chain-only table, or
+      // transfers routed through a host-module chain_run export).
+      if (process?.env?.RV_TAILCALL === "1") {
         vm.ex.jit_set_tailcall?.(1);
       }
     } catch {

@@ -12,6 +12,13 @@ pub struct WasmModule {
     /// Import `env.__indirect_function_table` so the block can tail-call the
     /// next compiled block directly (see emit_chain_exit).
     wants_table: bool,
+    /// Optional SECOND function: the shared chain-check helper (() -> i32,
+    /// returns the verified table index to tail-call or -1). Emitting the
+    /// full chain machinery inline at every trace side exit bloated modules
+    /// ~2-3x and kept V8's per-function tiering from ever optimizing large
+    /// block populations (tcc ran 2.4x slower with the code EMITTED even
+    /// when a kill cell prevented it from ever executing).
+    helper: Option<Vec<u8>>,
 }
 
 // Opcodes we use.
@@ -153,6 +160,7 @@ impl WasmModule {
             n_locals_i32: 0,
             wants_tlb_fill: false,
             wants_table: false,
+            helper: None,
         }
     }
 
@@ -163,7 +171,36 @@ impl WasmModule {
             n_locals_i32,
             wants_tlb_fill: false,
             wants_table: false,
+            helper: None,
         }
+    }
+
+    /// Install the chain-check helper body (locals: 1 i64 then 2 i32; no
+    /// params) and return its call index in this module's function index
+    /// space. Idempotent.
+    pub fn set_helper(&mut self, body: Vec<u8>) -> u32 {
+        if self.helper.is_none() {
+            self.helper = Some(body);
+        }
+        // imported funcs (tlb_fill?) then the main body, then the helper.
+        u32::from(self.wants_tlb_fill) + 1
+    }
+
+    pub fn has_helper(&self) -> bool {
+        self.helper.is_some()
+    }
+
+    /// Steal the raw instruction stream (for building helper bodies with the
+    /// same emission API).
+    pub fn into_code(self) -> Vec<u8> {
+        self.code
+    }
+
+    /// call a function by index.
+    pub fn call(&mut self, idx: u32) -> &mut Self {
+        self.code.push(0x10);
+        uleb(&mut self.code, idx as u64);
+        self
     }
 
     // -- instruction stream helpers --
@@ -335,11 +372,17 @@ impl WasmModule {
         // The parameter is the emulator-state pointer: the host passes it so
         // the pointer visibly escapes into the generated code, which stops
         // LLVM from caching CPU state in registers across block calls.
-        let mut sec = vec![if self.wants_tlb_fill { 2u8 } else { 1u8 }]; // count
+        let n_types =
+            1 + u8::from(self.wants_tlb_fill) + u8::from(self.helper.is_some());
+        let mut sec = vec![n_types]; // count
         sec.extend_from_slice(&[0x60, 1, 0x7f, 0]);
         if self.wants_tlb_fill {
             // type 1: (i64, i32) -> i64
             sec.extend_from_slice(&[0x60, 2, 0x7e, 0x7f, 1, 0x7e]);
+        }
+        if self.helper.is_some() {
+            // helper type: () -> i32 (last type index)
+            sec.extend_from_slice(&[0x60, 0, 1, 0x7f]);
         }
         section(&mut m, 1, &sec);
 
@@ -371,8 +414,13 @@ impl WasmModule {
         }
         section(&mut m, 2, &sec);
 
-        // function section: 1 function of type 0
-        section(&mut m, 3, &[1, 0]);
+        // function section: the body (type 0) + the helper when present.
+        if self.helper.is_some() {
+            let helper_ty = 1 + u8::from(self.wants_tlb_fill);
+            section(&mut m, 3, &[2, 0, helper_ty]);
+        } else {
+            section(&mut m, 3, &[1, 0]);
+        }
 
         // export section: "run" -> the body function
         let mut sec = vec![1u8];
@@ -398,9 +446,22 @@ impl WasmModule {
         }
         body.extend_from_slice(&self.code);
         body.push(END);
-        let mut sec = vec![1u8];
+        let mut sec = vec![if self.helper.is_some() { 2u8 } else { 1u8 }];
         uleb(&mut sec, body.len() as u64);
         sec.extend_from_slice(&body);
+        if let Some(h) = &self.helper {
+            // helper body: locals 1 x i64 then 2 x i32.
+            let mut hb = Vec::new();
+            uleb(&mut hb, 2);
+            uleb(&mut hb, 1);
+            hb.push(0x7e);
+            uleb(&mut hb, 2);
+            hb.push(0x7f);
+            hb.extend_from_slice(h);
+            hb.push(END);
+            uleb(&mut sec, hb.len() as u64);
+            sec.extend_from_slice(&hb);
+        }
         section(&mut m, 10, &sec);
 
         m
