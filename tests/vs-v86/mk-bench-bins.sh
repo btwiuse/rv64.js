@@ -19,7 +19,7 @@ TCC_COMMIT="${TCC_COMMIT:-d9d02c5}"                 # 0.9.28rc mob@d9d02c5
 NBENCH_URL="${NBENCH_URL:-https://www.math.utah.edu/~mayer/linux/nbench-byte-2.2.3.tar.gz}"
 
 # zig is our portable cross-compiler; pull it from the flake-pinned nixpkgs.
-ZIG="$(nix shell --inputs-from "$HERE/../.." nixpkgs#zig -c command -v zig)"
+ZIG="$(nix shell --inputs-from "$HERE/../.." nixpkgs#zig -c sh -c 'command -v zig')"
 i386cc() { "$ZIG" cc -target x86-linux-musl "$@"; }
 rv64cc() { "$ZIG" cc -target riscv64-linux-musl "$@"; }
 

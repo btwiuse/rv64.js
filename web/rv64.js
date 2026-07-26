@@ -22,6 +22,10 @@ export class RV64 {
     };
     /** Called with each Ethernet frame the guest sends; set by connectNet. */
     this.onNetSend = () => {};
+    /** Optional request-level WebSocket fallback configured by connectHttpRelay. */
+    this.httpRelay = null;
+    /** Origins known to require the relay, avoiding a failed fetch every time. */
+    this.httpRelayOrigins = new Set();
   }
 
   /** Instantiate from wasm bytes (ArrayBuffer/TypedArray/Response). */
@@ -47,16 +51,19 @@ export class RV64 {
         host_http_request: (id, ptr, len) => {
           const bytes = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
           if (vm.onHttpRequest) vm.onHttpRequest(id, bytes);
-          else vm.performHttp(id, decodeRequest(bytes));
+          else vm.performHttp(id, decodeRequest(bytes), bytes);
         },
         host_now_ms: () =>
           typeof performance !== "undefined" ? performance.now() : Date.now(),
+        host_unix_ms: () => Date.now(),
         host_random: (ptr, len) => {
           const buf = new Uint8Array(vm.ex.memory.buffer, ptr, len);
-          if (globalThis.crypto?.getRandomValues && len <= 65536) {
-            crypto.getRandomValues(buf);
-          } else {
-            for (let i = 0; i < len; i++) buf[i] = (Math.random() * 256) | 0;
+          if (!globalThis.crypto?.getRandomValues) {
+            throw new Error("cryptographic randomness is unavailable");
+          }
+          // Web Crypto caps one getRandomValues call at 65536 bytes.
+          for (let off = 0; off < len; off += 65536) {
+            crypto.getRandomValues(buf.subarray(off, Math.min(off + 65536, len)));
           }
         },
         // JIT: instantiate the module the core just emitted (JIT_OUT),
@@ -64,12 +71,16 @@ export class RV64 {
         // return the table index for call_indirect dispatch.
         host_jit_register: () => {
           try {
+            const t0 = performance.now();
             const bytes = new Uint8Array(
               vm.ex.memory.buffer,
               vm.ex.jit_out_ptr(),
               vm.ex.jit_out_len(),
             ).slice();
+            vm.jitRegCount = (vm.jitRegCount ?? 0) + 1;
+            vm.jitRegBytes = (vm.jitRegBytes ?? 0) + bytes.length;
             const mod = new WebAssembly.Module(bytes);
+            vm.jitRegMs = (vm.jitRegMs ?? 0) + (performance.now() - t0);
             const inst = new WebAssembly.Instance(mod, {
               // tlb_fill: blocks that probe the guest TLB inline call back
               // into the core to walk the page tables on a miss (wasm->wasm,
@@ -297,6 +308,9 @@ RV64.prototype.bootLinux = function ({
   proxy = false,
   proxyUpgradeHttps = true,
 }) {
+  if (proxy && fsTar && (fsTag || "host") === "rv64-proxy") {
+    throw new Error("fsTag 'rv64-proxy' is reserved for the proxy CA");
+  }
   const stage = (bytes, fn) => {
     if (!bytes) return;
     const ptr = this.ex.staging_alloc(bytes.length);
@@ -346,6 +360,214 @@ RV64.prototype.netInput = function (frame) {
   this.ex.sys_net_input();
 };
 
+// ---- request-level WebSocket relay ---------------------------------------
+//
+// This is deliberately separate from connectNet's Ethernet-frame relay. Once
+// the in-process proxy has terminated a guest connection, its parsed HTTP
+// request cannot be handed to a layer-2 websockproxy socket. The protocol here
+// preserves the request-shaped boundary and lets a small host relay perform
+// requests that browser fetch() cannot read because of CORS.
+
+const HTTP_RELAY_MAGIC = [0x52, 0x48, 0x52, 0x31]; // "RHR1"
+const HTTP_RELAY_REQUEST = 1;
+const HTTP_RELAY_HEAD = 2;
+const HTTP_RELAY_BODY = 3;
+const HTTP_RELAY_END = 4;
+const HTTP_RELAY_ERROR = 5;
+const HTTP_RELAY_SAFE_FALLBACK = new Set(["GET", "HEAD"]);
+
+function httpRelayFrame(type, id, payload = new Uint8Array()) {
+  const body =
+    payload instanceof Uint8Array
+      ? payload
+      : new Uint8Array(payload.buffer ?? payload);
+  const out = new Uint8Array(16 + body.length);
+  out.set(HTTP_RELAY_MAGIC, 0);
+  out[4] = type;
+  new DataView(out.buffer).setBigUint64(8, BigInt(id), true);
+  out.set(body, 16);
+  return out;
+}
+
+function decodeHttpRelayFrame(bytes) {
+  if (
+    bytes.length < 16 ||
+    HTTP_RELAY_MAGIC.some((byte, index) => bytes[index] !== byte)
+  ) {
+    throw new Error("malformed HTTP relay frame");
+  }
+  return {
+    type: bytes[4],
+    id: new DataView(
+      bytes.buffer,
+      bytes.byteOffset,
+      bytes.byteLength,
+    ).getBigUint64(8, true),
+    payload: bytes.subarray(16),
+  };
+}
+
+function requestOrigin(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Attach an optional request-level WebSocket relay used when fetch() is
+ * rejected before a response head (normally CORS or mixed-content policy).
+ *
+ * Automatic retry is limited to GET/HEAD because a rejected fetch may still
+ * have delivered a non-idempotent request. Once a safe request proves an
+ * origin needs the relay, later requests to that origin route there directly.
+ * Call routeHttpViaRelay(origin) to opt an origin in before its first request.
+ */
+RV64.prototype.connectHttpRelay = function (url, options = {}) {
+  const WebSocketImpl = options.WebSocket ?? globalThis.WebSocket;
+  if (!WebSocketImpl) throw new Error("WebSocket is unavailable");
+  this.disconnectHttpRelay();
+
+  const ws = new WebSocketImpl(url);
+  ws.binaryType = "arraybuffer";
+  const pending = new Set();
+  let opened = false;
+  let resolveReady;
+  let rejectReady;
+  const ready = new Promise((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  // performHttp awaits this, but suppress an unhandled rejection when an
+  // embedder connects a relay before it has any proxy traffic.
+  ready.catch(() => {});
+
+  const relay = {
+    ws,
+    pending,
+    ready,
+    receive: Promise.resolve(),
+  };
+  this.httpRelay = relay;
+  for (const origin of options.origins ?? []) {
+    this.routeHttpViaRelay(origin);
+  }
+
+  const timeout = setTimeout(() => {
+    if (!opened) {
+      rejectReady(new Error(`HTTP relay connection timed out: ${url}`));
+      try {
+        ws.close();
+      } catch {
+        // A custom WebSocket implementation may already be closed.
+      }
+    }
+  }, options.timeoutMs ?? 10_000);
+
+  const failPending = (reason) => {
+    for (const id of pending) {
+      this.stageFor(new TextEncoder().encode(reason));
+      this.ex.sys_http_fail(id);
+    }
+    pending.clear();
+  };
+  ws.onopen = () => {
+    opened = true;
+    clearTimeout(timeout);
+    resolveReady(ws);
+  };
+  ws.onerror = () => {
+    if (!opened) {
+      clearTimeout(timeout);
+      rejectReady(new Error(`HTTP relay connection failed: ${url}`));
+    }
+  };
+  ws.onclose = () => {
+    clearTimeout(timeout);
+    if (!opened) rejectReady(new Error(`HTTP relay closed before opening: ${url}`));
+    failPending("HTTP relay connection closed");
+    if (this.httpRelay === relay) this.httpRelay = null;
+  };
+  ws.onmessage = (event) => {
+    // Preserve WebSocket message order even when a browser supplies Blob data.
+    relay.receive = relay.receive
+      .then(async () => {
+        const data =
+          typeof Blob !== "undefined" && event.data instanceof Blob
+            ? await event.data.arrayBuffer()
+            : event.data;
+        const message = decodeHttpRelayFrame(
+          data instanceof Uint8Array ? data : new Uint8Array(data),
+        );
+        if (!pending.has(message.id)) return;
+        switch (message.type) {
+          case HTTP_RELAY_HEAD:
+            this.stageFor(message.payload);
+            this.ex.sys_http_head(message.id);
+            break;
+          case HTTP_RELAY_BODY:
+            this.stageFor(message.payload);
+            this.ex.sys_http_body(message.id);
+            break;
+          case HTTP_RELAY_END:
+            pending.delete(message.id);
+            this.ex.sys_http_end(message.id);
+            break;
+          case HTTP_RELAY_ERROR:
+            pending.delete(message.id);
+            this.stageFor(message.payload);
+            this.ex.sys_http_fail(message.id);
+            break;
+          default:
+            throw new Error(`unknown HTTP relay message type ${message.type}`);
+        }
+      })
+      .catch((error) => {
+        failPending(`HTTP relay protocol error: ${error.message}`);
+        try {
+          ws.close(1002, "protocol error");
+        } catch {
+          // Already closed.
+        }
+      });
+  };
+  return ws;
+};
+
+RV64.prototype.disconnectHttpRelay = function () {
+  const relay = this.httpRelay;
+  this.httpRelay = null;
+  if (relay) {
+    try {
+      relay.ws.close();
+    } catch {
+      // Already closed.
+    }
+  }
+};
+
+/** Route an origin directly through the request relay, or remove that choice. */
+RV64.prototype.routeHttpViaRelay = function (origin, enabled = true) {
+  const normalized = requestOrigin(origin) || origin.replace(/\/+$/, "");
+  if (enabled) this.httpRelayOrigins.add(normalized);
+  else this.httpRelayOrigins.delete(normalized);
+};
+
+RV64.prototype.performHttpViaRelay = async function (id, encodedRequest) {
+  const relay = this.httpRelay;
+  if (!relay) throw new Error("HTTP relay is not connected");
+  await relay.ready;
+  if (relay.ws.readyState !== 1) throw new Error("HTTP relay is not open");
+  relay.pending.add(BigInt(id));
+  try {
+    relay.ws.send(httpRelayFrame(HTTP_RELAY_REQUEST, id, encodedRequest));
+  } catch (error) {
+    relay.pending.delete(BigInt(id));
+    throw error;
+  }
+};
+
 /** Run a slice of the booted system. Returns true when powered off. */
 RV64.prototype.runSystem = function (maxInsns = 10_000_000n) {
   return this.ex.sys_run(BigInt(maxInsns)) === 1;
@@ -368,10 +590,8 @@ RV64.prototype.sysInsnCount = function () {
 // ordinary HTTP to it; the Rust side terminates TCP and parses the request, and
 // this performs it with fetch(). Nothing external is involved.
 //
-// Reachability is bounded by CORS: only hosts sending Access-Control-Allow-Origin
-// can be read. In practice that is most API and package-registry traffic
-// (api.github.com, registry.npmjs.org, files.pythonhosted.org, api.openai.com
-// all send `*`, artifacts included) and not ordinary web pages.
+// Reachability is bounded by CORS unless connectHttpRelay() has attached the
+// optional request relay. fetch remains the zero-infrastructure fast path.
 
 /** The http_proxy URL to set in the guest, or "" when the proxy is off. */
 RV64.prototype.proxyURL = function () {
@@ -396,7 +616,23 @@ const FORBIDDEN_HEADERS = new Set([
 ]);
 
 /** Perform one guest request, streaming the response back as it arrives. */
-RV64.prototype.performHttp = async function (id, req) {
+RV64.prototype.performHttp = async function (id, req, encodedRequest) {
+  const origin = requestOrigin(req.url);
+  if (
+    encodedRequest &&
+    this.httpRelay &&
+    this.httpRelayOrigins.has(origin)
+  ) {
+    try {
+      await this.performHttpViaRelay(id, encodedRequest);
+    } catch (error) {
+      this.stageFor(new TextEncoder().encode(String(error?.message ?? error)));
+      this.ex.sys_http_fail(BigInt(id));
+    }
+    return;
+  }
+
+  let headSent = false;
   try {
     const headers = {};
     for (const [name, value] of req.headers) {
@@ -408,6 +644,7 @@ RV64.prototype.performHttp = async function (id, req) {
 
     this.stageFor(encodeHead(resp.status, [...resp.headers]));
     this.ex.sys_http_head(BigInt(id));
+    headSent = true;
 
     // Stream rather than await the whole body: an SSE response or a long
     // download must reach the guest as it arrives, and nothing is buffered
@@ -425,6 +662,27 @@ RV64.prototype.performHttp = async function (id, req) {
     }
     this.ex.sys_http_end(BigInt(id));
   } catch (e) {
+    // A CORS rejection occurs before fetch exposes a response head. GET and
+    // HEAD are safe to retry; retrying POST could duplicate a request that the
+    // origin received even though the browser hid its response.
+    if (
+      !headSent &&
+      encodedRequest &&
+      this.httpRelay &&
+      HTTP_RELAY_SAFE_FALLBACK.has(req.method.toUpperCase())
+    ) {
+      try {
+        if (origin) this.httpRelayOrigins.add(origin);
+        await this.performHttpViaRelay(id, encodedRequest);
+        return;
+      } catch (relayError) {
+        if (origin) this.httpRelayOrigins.delete(origin);
+        e = new Error(
+          `fetch failed (${String(e?.message ?? e)}); ` +
+            `HTTP relay failed (${String(relayError?.message ?? relayError)})`,
+        );
+      }
+    }
     // The proxy turns this into a 502 the guest can read, rather than a silent
     // hang. A CORS rejection lands here.
     this.stageFor(new TextEncoder().encode(String(e?.message ?? e)));

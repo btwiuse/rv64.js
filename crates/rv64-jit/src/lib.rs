@@ -24,6 +24,13 @@ use rv64_core::decode::*;
 use wasm_emit::*;
 
 const MAX_BLOCK: usize = 128;
+/// Instruction cap for the trace (extended-basic-block) path specifically —
+/// scan_regs and translate_block's basic-block loop. The loop and superblock
+/// walkers keep MAX_BLOCK: their reach is tuned independently.
+const MAX_TRACE: usize = 256;
+/// Traces longer than this get an entry fuel guard (see translate_block):
+/// short blocks' bounded overshoot is cheaper than a guard per dispatch.
+const FUEL_GUARD_MIN: u32 = 48;
 /// Uses (across all bodies) a register needs before a superblock caches it in
 /// a wasm local instead of leaving it in the machine's register file memory.
 const SB_HOIST_MIN: u32 = 8;
@@ -83,6 +90,132 @@ pub fn set_chain(on: bool) {
 }
 fn chain_enabled() -> bool {
     CHAIN.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Trace (extended-basic-block) aggressiveness for translate_block:
+/// 0 = classic basic blocks (end at every branch); 1 = side-exit conditional
+/// branches and keep going; 2 = also follow direct calls (jal with link);
+/// 3 = also follow proven/predicted returns (jalr on a traced constant).
+static TRACE_LEVEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(3);
+pub fn set_trace_level(l: u32) {
+    TRACE_LEVEL.store(l, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn trace_level() -> u32 {
+    TRACE_LEVEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Dispatch-line idx bit the HOST uses to mark region functions (for exit
+/// attribution without a cache probe). Table indices stay far below it.
+/// Emitted chain transfers must mask it off before call_indirect; the host
+/// masks it before its own table call.
+pub const SB_IDX_BIT: i32 = 1 << 30;
+
+/// Linear-trace register value facts (see translate_block). `Proven` values
+/// are set by the trace's own emitted code (jal link, lui, auipc) with no
+/// later write — following them needs no runtime check. `Predicted` values
+/// come from store-to-load forwarding through the stack (a non-leaf
+/// prologue's `sd ra, N(sp)` reloaded by the epilogue's `ld ra, N(sp)`):
+/// an aliasing store could have changed the slot, so a followed `ret` on a
+/// prediction carries a one-compare runtime guard that side-exits with the
+/// real target when the prediction misses.
+#[derive(Copy, Clone, PartialEq)]
+enum Known {
+    No,
+    Proven(u64),
+    Predicted(u64),
+}
+
+/// Per-trace abstract state for return following: constant register facts,
+/// the running sp displacement, and constant-valued stack slots keyed by
+/// that displacement. Both walkers (scan_regs, translate_block) must step
+/// this identically or their paths desync.
+struct TraceFacts {
+    known: [Known; 32],
+    /// x2 displacement from trace entry, while provably constant.
+    sp_delta: Option<i64>,
+    /// sp-relative slots (key = sp_delta + store offset) holding a value
+    /// that was Known at store time.
+    slots: Vec<(i64, Known)>,
+}
+
+impl TraceFacts {
+    fn new() -> TraceFacts {
+        TraceFacts {
+            known: [Known::No; 32],
+            sp_delta: Some(0),
+            slots: Vec::new(),
+        }
+    }
+    /// Step the facts across one instruction. Call AFTER capturing any
+    /// source-register facts the caller needs, with the instruction's
+    /// decoded fields. Handles: rd clobber, lui/auipc constants, sp
+    /// adjustment, sp-slot stores and loads. `jal` link values are the
+    /// caller's job (it knows whether the jump was followed).
+    fn step(&mut self, insn: u32, pc: u64) {
+        let op = opcode(insn);
+        let (d, s1, s2) = (rd(insn), rs1(insn), rs2(insn));
+        let f3 = funct3(insn);
+        // Loads first: an sp-slot reload may target its own base register.
+        let loaded = if op == 0x03 && f3 == 3 && s1 == 2 {
+            match self.sp_delta {
+                Some(dl) => {
+                    let key = dl + imm_i(insn);
+                    self.slots
+                        .iter()
+                        .rev()
+                        .find(|&&(k, _)| k == key)
+                        .map(|&(_, v)| v)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        // sp-slot stores record the stored register's fact (or clobber the
+        // slot when the value is unknown).
+        if op == 0x23 && f3 == 3 && s1 == 2 {
+            if let Some(dl) = self.sp_delta {
+                let key = dl + imm_s(insn);
+                self.slots.retain(|&(k, _)| k != key);
+                let v = self.known[s2];
+                if v != Known::No {
+                    self.slots.push((key, v));
+                }
+            }
+        }
+        if d != 0 {
+            // Every GPR write lands in rd.
+            self.known[d] = Known::No;
+            if d == 2 {
+                // sp rewritten: addi sp, sp, imm keeps the displacement,
+                // anything else loses it (and every slot with it).
+                if op == 0x13 && f3 == 0 && s1 == 2 {
+                    self.sp_delta = self.sp_delta.map(|dl| dl + imm_i(insn));
+                } else {
+                    self.sp_delta = None;
+                    self.slots.clear();
+                }
+            }
+            match op {
+                0x37 => self.known[d] = Known::Proven((insn & 0xffff_f000) as i32 as i64 as u64),
+                0x17 => {
+                    self.known[d] = Known::Proven(
+                        pc.wrapping_add((insn & 0xffff_f000) as i32 as i64 as u64),
+                    )
+                }
+                0x03 => {
+                    if let Some(v) = loaded {
+                        // A reload of a slot that held a Known value: only
+                        // ever a PREDICTION (aliasing stores can't be ruled
+                        // out) — usable behind a runtime guard.
+                        self.known[d] = match v {
+                            Known::No => Known::No,
+                            Known::Proven(x) | Known::Predicted(x) => Known::Predicted(x),
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 pub fn set_tlb_fill(on: bool) {
     TLB_FILL.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -184,6 +317,20 @@ pub struct Block {
     pub len: u64,
     /// Number of instructions translated.
     pub n_insns: u32,
+    /// Guest va range [lo, hi) of every instruction the block was compiled
+    /// from. A trace that follows calls can span pages in either direction;
+    /// the host must dirty-track and map-verify each spanned page, exactly
+    /// as it does for multi-page regions. (0, 0) = the producer's code is
+    /// wholly inside [start_pc, start_pc + len).
+    pub span: (u64, u64),
+    /// Exit-target pcs of a trace (side-exited branch arms, unfollowed jump
+    /// targets, the fall-out continuation): demonstrably-on-the-hot-path
+    /// block leaders the host should seed superblock discovery with. Trace
+    /// compilation otherwise STARVES that discovery — interior pcs never
+    /// tier up on their own, page functions get built from a handful of
+    /// seeds, cover fragments, and measure catastrophically (nbench FP
+    /// EMULATION 165 -> 32 iter/s without the demotion safety valve).
+    pub seeds: Vec<u64>,
 }
 
 /// wasm memarg alignment hint (log2 of the natural access size).
@@ -1331,7 +1478,13 @@ impl Ctx {
 /// — to collect which guest registers it reads and writes, as 32-bit bitmaps.
 /// Used to decide which registers to cache in wasm locals.
 /// Returns (gpr_read, gpr_write, fp_read, fp_write) register bitmaps.
-fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u32, u32, u32) {
+fn scan_regs(
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    lay: &JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+) -> (u32, u32, u32, u32, u32) {
     let (mut read, mut write) = (0u32, 0u32);
     // Uses per register: hoisting one into a wasm local costs a load in the
     // prologue and a store in the epilogue, paid on EVERY dispatch of the
@@ -1350,12 +1503,19 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
             uses[r] += 1;
         }
     };
-    while n < MAX_BLOCK as u32 {
+    // Linear-trace fact tracking — MUST mirror translate_block exactly
+    // (see TraceFacts): constant registers and stack slots let the walk
+    // follow calls and (guarded) returns along the same path the emitter
+    // will take.
+    let mut tf = TraceFacts::new();
+    let tl = trace_level();
+    while n < MAX_TRACE as u32 {
         let Some((insn, ilen)) = fetch(code, base, pc) else {
             break;
         };
         let next_pc = pc.wrapping_add(ilen);
         let (d, s1, s2) = (rd(insn), rs1(insn), rs2(insn));
+        let s1_known = tf.known[s1];
         match opcode(insn) {
             0x37 | 0x17 => mark(&mut write, d),
             0x13 => {
@@ -1430,8 +1590,22 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
             0x6f => {
                 mark(&mut write, d);
                 let target = pc.wrapping_add(imm_j(insn) as u64);
-                let in_window = target > pc && target >= base && target < base + code.len() as u64;
-                if d == 0 && in_window {
+                let bounded = target >= base && target < base + code.len() as u64;
+                // Follow forward jumps, and calls in EITHER direction (the
+                // link register is the constant next_pc): caller and callee
+                // merge into one trace. Backward plain jumps are loop
+                // back-edges — the loop machinery owns those. Must mirror
+                // translate_block exactly.
+                let follow = if d == 0 {
+                    target > pc && bounded
+                } else {
+                    tl >= 2 && target != pc && bounded
+                };
+                if follow {
+                    tf.step(insn, pc);
+                    if d != 0 {
+                        tf.known[d] = Known::Proven(next_pc);
+                    }
                     pc = target;
                     n += 1;
                     continue;
@@ -1441,6 +1615,25 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
             0x67 => {
                 if funct3(insn) != 0 {
                     break;
+                }
+                if d == 0 && tl >= 3 {
+                    let target = match s1_known {
+                        Known::Proven(v) | Known::Predicted(v) => {
+                            Some(v.wrapping_add(imm_i(insn) as u64) & !1)
+                        }
+                        Known::No => None,
+                    };
+                    if let Some(target) = target {
+                        if target != pc && target >= base && target < base + code.len() as u64 {
+                            if let Known::Predicted(_) = s1_known {
+                                mark(&mut read, s1); // the guard reads it
+                            }
+                            tf.step(insn, pc);
+                            pc = target;
+                            n += 1;
+                            continue;
+                        }
+                    }
                 }
                 mark(&mut read, s1);
                 mark(&mut write, d);
@@ -1452,7 +1645,19 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
                 }
                 mark(&mut read, s1);
                 mark(&mut read, s2);
-                break;
+                if tl == 0 {
+                    break;
+                }
+                // Direction decision must mirror translate_block exactly.
+                let target = pc.wrapping_add(imm_b(insn) as u64);
+                let t_in = target >= base && target < base + code.len() as u64;
+                pc = if t_in && target > pc && hot(target) && !hot(next_pc) {
+                    target
+                } else {
+                    next_pc
+                };
+                n += 1;
+                continue;
             }
             // OP-FP (mirror translate_block): FP arith touches no GPRs;
             // FMV.D.X reads a GPR, FMV.X.D writes one; others end the block.
@@ -1557,6 +1762,7 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
             }
             _ => break,
         }
+        tf.step(insn, pc);
         pc = next_pc;
         n += 1;
     }
@@ -1565,7 +1771,7 @@ fn scan_regs(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> (u32, u3
     if mem_ops >= 3 {
         read |= 1; // bit 0: allocate scratch (memory page-cache; see build_ctx)
     }
-    (read, write, fread, fwrite)
+    (read, write, fread, fwrite, n)
 }
 
 /// Is this OP-FP (0x53) instruction one the JIT emits inline?
@@ -2162,6 +2368,11 @@ fn emit_chain_exit(c: &Ctx, m: &mut WasmModule, iter_guard: bool) {
         .local_set_i32(idx2);
     m.local_get_i32(idx2).i32_const(0).op(I32_LT_S);
     m.op(IF).op(VOID).op(RETURN).op(END);
+    // Strip the host's region marker before using the index as a table slot.
+    m.local_get_i32(idx2)
+        .i32_const(!SB_IDX_BIT)
+        .op(I32_AND)
+        .local_set_i32(idx2);
     // line verified under the current address-space generation?
     m.local_get_i32(c.idxb).i32_load(lay.dispatch_base as u64 + 12);
     m.i32_const(0).i32_load(lay.map_gen_addr as u64);
@@ -2210,7 +2421,7 @@ fn emit_fp_flags(c: &Ctx, m: &mut WasmModule) {
     }
 }
 
-fn emit_block_fp_gate(c: &Ctx, m: &mut WasmModule, start_pc: u64, round: bool) {
+fn emit_block_fp_gate(c: &Ctx, m: &mut WasmModule, start_pc: u64, n: u32, round: bool) {
     // With hoisted flags (superblocks), a body's gate is a flag test.
     if let Some((fs_bad, round_bad)) = c.fp_flags {
         m.local_get(fs_bad);
@@ -2219,7 +2430,7 @@ fn emit_block_fp_gate(c: &Ctx, m: &mut WasmModule, start_pc: u64, round: bool) {
         }
         m.op(I64_EQZ).op(I32_EQZ);
         m.op(IF).op(VOID);
-        c.bail(m, start_pc, 0);
+        c.bail(m, start_pc, n);
         m.op(END);
         return;
     }
@@ -2253,7 +2464,7 @@ fn emit_block_fp_gate(c: &Ctx, m: &mut WasmModule, start_pc: u64, round: bool) {
         return; // nothing to check (user mode, non-rounding FP only)
     }
     m.op(IF).op(VOID);
-    c.bail(m, start_pc, 0);
+    c.bail(m, start_pc, n);
     m.op(END);
 }
 
@@ -3347,6 +3558,8 @@ fn translate_copy_loop(
 
     Some(Block {
         wasm: m.finish(),
+        span: (0, 0),
+        seeds: Vec::new(),
         len: cl.end_pc - start_pc,
         n_insns: cl.body_n,
     })
@@ -3423,6 +3636,26 @@ pub fn fma_fastpath_ref(ab: u64, bb: u64, cb: u64) -> Option<u64> {
 }
 
 pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) -> Option<Block> {
+    translate_block_hot(code, base, start_pc, lay, &|_| false)
+}
+
+/// translate_block with a hotness oracle: at a conditional branch whose
+/// TAKEN target the caller knows to be hot compiled code while the
+/// fall-through is not, the trace follows the taken arm (side-exiting on
+/// not-taken). Forward targets only — backward taken arms are loop
+/// back-edges and belong to the loop machinery.
+pub fn translate_block_hot(
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+) -> Option<Block> {
+    // The loop/copy detectors see the FULL trace window: a loop that
+    // straddles a page boundary can now close into a loop region (span
+    // registration handles the multi-page dirty/map bookkeeping) — with
+    // page-clamped windows, nbench NUMERIC SORT's straddling sift loop fell
+    // back to per-iteration trace dispatches (568 -> 448 iter/s).
     // Bulk-copyable self-loop (memcpy/memmove word loops): one wasm
     // memory.copy per page-bounded chunk — see translate_copy_loop.
     if lay.sys.is_some() {
@@ -3448,7 +3681,7 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 // region is a closed loop, so scanning to its end covers every
                 // instruction that can run inside it.
                 let (_, round) = body_fp_kind(code, base, start_pc, region.end_pc, &lay, false);
-                emit_block_fp_gate(&c, &mut m, start_pc, round);
+                emit_block_fp_gate(&c, &mut m, start_pc, 0, round);
             }
             if let Some(b) = translate_loop(m, &c, code, base, start_pc, &region, &lay) {
                 return Some(b);
@@ -3456,61 +3689,165 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
         }
     }
 
-    // Basic-block path: a straight-line run to the first branch/jump/unhandled
-    // op. Registers the block touches live in wasm locals for its lifetime.
-    let (read_mask, write_mask, fp_read, fp_write) = scan_regs(code, base, start_pc, &lay);
+    // Trace path: an extended basic block — straight-line through side-exited
+    // conditional branches and followed direct jumps/calls, to the first
+    // indirect transfer or unhandled op. Registers the trace touches live in
+    // wasm locals for its lifetime.
+    let (read_mask, write_mask, fp_read, fp_write, scan_n) =
+        scan_regs(code, base, start_pc, &lay, hot);
     let (c, mut m) = build_ctx(lay, read_mask, write_mask, fp_read, fp_write);
-    if fp_read | fp_write != 0 {
-        let (_, round) = body_fp_kind(code, base, start_pc, u64::MAX, &lay, true);
-        emit_block_fp_gate(&c, &mut m, start_pc, round);
+    // Budget guard: a long trace retires its whole length once dispatched,
+    // which would overshoot small fuel grants (the user_run(1) contract).
+    // Bail with zero retired when the grant can't cover the trace — the
+    // dispatcher hands the pc to the interpreter, which meters exactly.
+    if scan_n > FUEL_GUARD_MIN && lay.fuel_addr != 0 {
+        m.i32_const(0).i64_load(lay.fuel_addr as u64);
+        m.i64_const(scan_n as i64).op(I64_LT_U);
+        m.op(IF).op(VOID).op(RETURN).op(END);
     }
+    // The FP gate is emitted AT the first FP instruction (see the loop),
+    // not at entry: a long trace whose integer prefix always runs must make
+    // progress even when FS is off, or it zero-retire-thrashes.
+    let mut fp_gated = false;
 
     let mut pc = start_pc;
     let mut n = 0u32;
-    while n < MAX_BLOCK as u32 {
+    // Linear-trace constant tracking: registers whose value is a proven
+    // compile-time constant along THIS trace — jal links (next_pc), lui,
+    // auipc. Any write clears the fact. Sound because the trace is straight-
+    // line: the emitted code itself set the value and nothing since wrote it.
+    // A `jalr` whose base register carries a known constant is a followable
+    // jump — which is how a leaf callee's `ret` continues the caller's trace.
+    let mut tf = TraceFacts::new();
+    let tl = trace_level();
+    // Actual va range consumed (a trace can run backward through a followed
+    // call) — the host dirty-tracks and map-verifies every page in it.
+    let (mut lo, mut hi) = (start_pc, start_pc);
+    // Exit targets = hot-path block leaders (see Block::seeds).
+    let mut seeds: Vec<u64> = Vec::new();
+    let mut seed = |seeds: &mut Vec<u64>, t: u64| {
+        if seeds.len() < 48 && !seeds.contains(&t) {
+            seeds.push(t);
+        }
+    };
+    while n < MAX_TRACE as u32 {
         let Some((insn, ilen)) = fetch(code, base, pc) else {
             break;
         };
         let next_pc = pc.wrapping_add(ilen);
+        lo = lo.min(pc);
+        hi = hi.max(next_pc);
         let op = opcode(insn);
         let (d, s1, s2) = (rd(insn), rs1(insn), rs2(insn));
+        let s1_known = tf.known[s1];
+
+        if !fp_gated
+            && (fp_read | fp_write) != 0
+            && (matches!(op, 0x53 | 0x43 | 0x47 | 0x4b | 0x4f)
+                || (matches!(op, 0x07 | 0x27) && lay.f_base != 0))
+        {
+            let (_, round) = body_fp_kind(code, base, pc, u64::MAX, &lay, true);
+            emit_block_fp_gate(&c, &mut m, pc, n, round);
+            fp_gated = true;
+        }
 
         if emit_simple(&mut m, &c, lay, insn, pc, n) {
+            tf.step(insn, pc);
             pc = next_pc;
             n += 1;
             continue;
         }
 
         match op {
-            // JAL: link; follow plain forward jumps (superblock chaining),
-            // otherwise end the block with a constant pc.
+            // JAL: link; follow forward jumps AND forward calls — the link
+            // register is the compile-time constant next_pc, so the trace
+            // continues straight into the callee (caller+callee prefix as
+            // one block; the callee's own entry still gets its own block
+            // when it is hot in its own right). Backward or out-of-window
+            // targets end the block with a constant pc.
             0x6f => {
                 let target = pc.wrapping_add(imm_j(insn) as u64);
                 if c.store_pre(&mut m, d) {
                     m.i64_const(next_pc as i64);
                     c.store_post(&mut m, d);
                 }
-                let in_window = target > pc && target >= base && target < base + code.len() as u64;
-                if d == 0 && in_window {
+                let bounded = target >= base && target < base + code.len() as u64;
+                let follow = if d == 0 {
+                    target > pc && bounded
+                } else {
+                    tl >= 2 && target != pc && bounded
+                };
+                if follow {
+                    tf.step(insn, pc);
+                    if d != 0 {
+                        tf.known[d] = Known::Proven(next_pc);
+                    }
                     pc = target;
                     n += 1;
                     continue;
                 }
+                seed(&mut seeds, target);
                 c.flush_writes(&mut m);
                 c.set_pc_const(&mut m, target);
                 c.set_retired(&mut m, n + 1);
                 emit_chain_exit(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
-                    len: next_pc - start_pc,
+                    span: (lo, hi),
+                    seeds: core::mem::take(&mut seeds),
+                    len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
             }
-            // JALR: dynamic target; block ends. funct3 != 0 is a reserved
+            // JALR: dynamic target — unless the base register carries a
+            // constant proven along this trace (a jal link, lui or auipc),
+            // in which case the target is compile-time known and the trace
+            // FOLLOWS it: a leaf callee's `ret` continues the caller's
+            // trace, so call+body+return become one straight line. No code
+            // is emitted for a followed ret (pc-only effect); it still
+            // counts one retired instruction. funct3 != 0 is a reserved
             // encoding — don't compile it (interpreter owns the trap).
             0x67 => {
                 if funct3(insn) != 0 {
                     break;
+                }
+                if d == 0 && tl >= 3 {
+                    let target = match s1_known {
+                        Known::Proven(v) | Known::Predicted(v) => {
+                            Some(v.wrapping_add(imm_i(insn) as u64) & !1)
+                        }
+                        Known::No => None,
+                    };
+                    if let Some(target) = target {
+                        if target != pc && target >= base && target < base + code.len() as u64 {
+                            if let Known::Predicted(_) = s1_known {
+                                // The prediction came through the stack; an
+                                // aliasing store could have changed it. One
+                                // compare guards it: on a miss, publish the
+                                // REAL target and side-exit.
+                                c.push_reg(&mut m, s1);
+                                m.i64_const(imm_i(insn))
+                                    .op(I64_ADD)
+                                    .i64_const(!1)
+                                    .op(I64_AND)
+                                    .local_set(SCR);
+                                m.local_get(SCR).i64_const(target as i64).op(I64_NE);
+                                m.op(IF).op(VOID);
+                                m.i32_const(0)
+                                    .local_get(SCR)
+                                    .i64_store(lay.pc_addr as u64);
+                                c.flush_writes(&mut m);
+                                c.set_retired(&mut m, n + 1);
+                                emit_chain_exit(&c, &mut m, false);
+                                m.op(RETURN);
+                                m.op(END);
+                            }
+                            tf.step(insn, pc);
+                            pc = target;
+                            n += 1;
+                            continue;
+                        }
+                    }
                 }
                 c.push_reg(&mut m, s1);
                 m.i64_const(imm_i(insn))
@@ -3528,24 +3865,56 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 emit_chain_exit(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
-                    len: next_pc - start_pc,
+                    span: (lo, hi),
+                    seeds: core::mem::take(&mut seeds),
+                    len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
             }
-            // BRANCH: conditional pc select; block ends.
+            // BRANCH: side-exit on taken, trace continues on the fall-through
+            // (extended basic block). The taken arm publishes its target pc
+            // and exact retired count and returns; the block keeps going —
+            // branchy call-shaped code (tcc, CPython) otherwise fragments
+            // into ~8-insn blocks whose per-dispatch overhead dominates.
             0x63 => {
                 let target = pc.wrapping_add(imm_b(insn) as u64);
-                let cmp = match funct3(insn) {
-                    0 => I64_EQ,
-                    1 => I64_NE,
-                    4 => I64_LT_S,
-                    5 => I64_GE_S,
-                    6 => I64_LT_U,
-                    7 => I64_GE_U,
+                let (cmp, cmp_inv) = match funct3(insn) {
+                    0 => (I64_EQ, I64_NE),
+                    1 => (I64_NE, I64_EQ),
+                    4 => (I64_LT_S, I64_GE_S),
+                    5 => (I64_GE_S, I64_LT_S),
+                    6 => (I64_LT_U, I64_GE_U),
+                    7 => (I64_GE_U, I64_LT_U),
                     _ => break,
                 };
                 c.push_reg(&mut m, s1);
                 c.push_reg(&mut m, s2);
+                if tl >= 1 {
+                    // Hot-biased direction (must mirror scan_regs): follow
+                    // the taken arm when the cache proves it hot and the
+                    // fall-through cold. (Backward-branch unrolling was tried
+                    // here — self-back-edge only and detector-gated variants
+                    // both measured net-negative: displaced loop regions cost
+                    // more than the saved dispatches.)
+                    let t_in = target >= base && target < base + code.len() as u64;
+                    let (follow_pc, exit_pc, op) = if t_in && target > pc && hot(target) && !hot(next_pc) {
+                        (target, next_pc, cmp_inv)
+                    } else {
+                        (next_pc, target, cmp)
+                    };
+                    seed(&mut seeds, exit_pc);
+                    m.op(op);
+                    m.op(IF).op(VOID);
+                    c.set_pc_const(&mut m, exit_pc);
+                    c.flush_writes(&mut m);
+                    c.set_retired(&mut m, n + 1);
+                    emit_chain_exit(&c, &mut m, false);
+                    m.op(RETURN);
+                    m.op(END);
+                    pc = follow_pc;
+                    n += 1;
+                    continue;
+                }
                 m.op(cmp);
                 m.op(IF).op(VOID);
                 c.set_pc_const(&mut m, target);
@@ -3557,7 +3926,9 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
                 emit_chain_exit(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
-                    len: next_pc - start_pc,
+                    span: (lo, hi),
+                    seeds: core::mem::take(&mut seeds),
+                    len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
             }
@@ -3575,7 +3946,9 @@ pub fn translate_block(code: &[u8], base: u64, start_pc: u64, lay: JitLayout) ->
     emit_chain_exit(&c, &mut m, false);
     Some(Block {
         wasm: m.finish(),
-        len: pc - start_pc,
+        span: (lo, hi),
+                    seeds: core::mem::take(&mut seeds),
+        len: pc.saturating_sub(start_pc),
         n_insns: n,
     })
 }
@@ -3743,6 +4116,8 @@ fn translate_loop(
     emit_chain_exit(c, &mut m, true);
     Some(Block {
         wasm: m.finish(),
+        span: (0, 0),
+        seeds: Vec::new(),
         len: region.end_pc - start_pc,
         n_insns: static_n.max(1),
     })
@@ -4068,7 +4443,7 @@ impl Ctx {
         if lay.f_base != 0 {
             let (any, round) = body_fp_kind(code, base, entry_pc, page_end, &lay, true);
             if any {
-                emit_block_fp_gate(self, m, entry_pc, round);
+                emit_block_fp_gate(self, m, entry_pc, 0, round);
             }
         }
         loop {
@@ -4343,7 +4718,7 @@ pub fn translate_superblock(
 ) -> Option<Block> {
     let _ = base;
     let vas: Vec<u64> = (0..page_span / 0x1000).map(|k| page_base + k * 0x1000).collect();
-    translate_superblock_sparse(code, &vas, entries, lay)
+    translate_superblock_sparse(code, &vas, entries, lay, false)
 }
 
 /// Compile a SPARSE set of code pages as one wasm function (the call-graph
@@ -4359,6 +4734,7 @@ pub fn translate_superblock_sparse(
     page_vas: &[u64],
     entries: &[u64],
     lay: JitLayout,
+    regs_in_memory: bool,
 ) -> Option<Block> {
     let n = entries.len();
     let np = page_vas.len();
@@ -4372,7 +4748,17 @@ pub fn translate_superblock_sparse(
 
     let (rm, wm, fr, fw, uses_fp) = scan_regs_super(code, page_vas, entries, &lay);
     // Ask for the hoisted FP gate flags when any body will need a gate.
-    let (mut c, mut m) = build_ctx(lay, rm, wm | u32::from(uses_fp), fr, fw);
+    // `regs_in_memory` drops every register local (the emitters fall back to
+    // direct state loads/stores): a function whose stays are short pays the
+    // full register-UNION load at every entry and the written union at every
+    // exit — for call-shaped code (tcc: ~8-insn stays) that overhead is
+    // larger than the work, and measured stay length picks the mode. Bit 0
+    // of rm (the scanners' FMADD flag) and the gate-flag request survive.
+    let (mut c, mut m) = if regs_in_memory {
+        build_ctx(lay, rm & 1, u32::from(uses_fp), 0, 0)
+    } else {
+        build_ctx(lay, rm, wm | u32::from(uses_fp), fr, fw)
+    };
     c.retired_local = Some(ITER);
 
     // slot (= concat offset / 2) -> entry index, else n (default -> exit).
@@ -4385,6 +4771,11 @@ pub fn translate_superblock_sparse(
     m.i64_const(0).local_set(ITER); // retired accumulator
     emit_fuel_base(&c, &mut m);
     m.i32_const(0).i64_load(lay.pc_addr as u64).local_set(TPC);
+    // Evaluate the hoisted FP gate flags ONCE at entry — the per-body gates
+    // test these locals. The sparse rewrite dropped this call, leaving the
+    // flag locals zero-initialized, so every body gate silently passed: FP
+    // bodies ran unguarded under non-RNE rounding and FS != Dirty.
+    emit_fp_flags(&c, &mut m);
 
     m.op(BLOCK).op(VOID); // $exit  (depth 1 from loop body)
     m.op(LOOP).op(VOID); // $L      (depth 0 from loop body)
@@ -4480,6 +4871,8 @@ pub fn translate_superblock_sparse(
 
     Some(Block {
         wasm: m.finish(),
+        span: (0, 0),
+        seeds: Vec::new(),
         len: (np * 0x1000) as u64,
         n_insns: 0,
     })
