@@ -768,3 +768,44 @@ BUILD TIME (translate + leader analysis at quantum boundaries, several ms per
 kernels — test by timing build_superblock host-side (add a jit_stat of
 cumulative build ms) and correlating with the HUFFMAN deficit. If (b), the
 fix is cheaper/incremental builds — the same incremental-extension project.
+
+
+## MEASUREMENT INVALIDATION NOTICE (2026-07-25 late session)
+
+Everything measured in the late session — the "HUFFMAN 9x collapse", the
+"FP EMULATION 6x collapse", the FOURIER swings (2611 / 5107 / 6485 / 8031),
+the IDEA bimodality — was taken while this shared host ran a concurrent
+toolchain build (load average 29 on 24 cores). Proof: the KNOWN-GOOD JIT
+(46736c3) re-measured in that window reads FP EMULATION 896 MIPS, against
+2708 MIPS for the same commit that morning. A 3x host swing swamps every
+effect being chased.
+
+Consequences, in order of importance:
+
+1. **The scorecard now guards against this** (commit 2c56094): a fixed CPU
+   probe runs before the v86 legs, before the rv64 legs and at the end; the
+   spread is printed and the run is marked INVALID above 1.25x. Because the
+   harness runs all v86 legs before all rv64 legs, drift previously landed as
+   a systematic bias against whichever side ran later.
+2. **The "superblock miscompile" hypothesis is unproven and probably wrong.**
+   The evidence for it (HUFFMAN 131 with SB on, 688 with SB off) came from
+   that window. Before doing anything else, re-run the SB-on/SB-off pair
+   BACK-TO-BACK on a quiet host.
+3. **The bisect conclusions are unreliable** for the same reason, though the
+   two settings they produced (3-page region cap, per-page discovery) match
+   the configuration that independently measured well earlier.
+
+### First actions next session (quiet host: `uptime` load < 4)
+
+    # worktrees left in place for a back-to-back A/B:
+    #   /tmp/good46  = 46736c3 (the JIT behind both 11/13 runs)
+    #   /tmp/jitlab  = sparse HEAD
+    ARTIFACTS=<sc> SBFORCE=1 node <sc>/nb-good-stats.mjs   # alternate
+    ARTIFACTS=<sc> SBFORCE=1 node <sc>/nb-lab-stats.mjs    # these two
+    # then, whichever wins, the authoritative run:
+    ARTIFACTS=<sc> NBENCH=1 SB=1 REPS=3 node tests/vs-v86/scorecard.mjs
+    # and CHECK the printed host-probe spread before believing any row.
+
+Only after that does it make sense to resume the two open engineering items
+(incremental region extension for compile; FOURIER's fmadd sites reaching
+superblock bodies where the shipped hardware-FMA path applies).
