@@ -809,3 +809,12 @@ Consequences, in order of importance:
 Only after that does it make sense to resume the two open engineering items
 (incremental region extension for compile; FOURIER's fmadd sites reaching
 superblock bodies where the shipped hardware-FMA path applies).
+
+
+**Automated verification pending:** `scratchpad/when-quiet-scorecard.sh` is
+armed — it polls until this shared host's load drops below 6, then runs
+`ARTIFACTS=<sc> NBENCH=1 SB=1 REPS=3 scorecard.mjs` and writes
+`scratchpad/quiet-scorecard.txt`. Because the scorecard now guards its own
+conditions (CPU probe, INVALID above 1.25x spread), that file is either a
+trustworthy 13-row result or states why it is not. Read it before doing
+anything else with the two open rows.
