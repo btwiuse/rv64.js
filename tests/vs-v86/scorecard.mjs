@@ -218,11 +218,34 @@ if (haveV86 && (await has(join(V86DIR, "src/main.js")))) {
 const R = {}; // name -> {rvj, rvi, v8j, v8i}
 const log = (m) => process.stderr.write(m);
 
+// HOST-DRIFT GUARD (this host is shared: a concurrent toolchain build took
+// the load average to 29 on 24 cores and made the SAME binary measure 3x
+// slower). Absolute numbers taken minutes apart are not comparable, and the
+// v86-then-rv64 ordering turns any drift into a systematic bias against
+// whichever side runs later. So: sample the host before and after every leg
+// with a fixed CPU probe, and mark the scorecard INVALID when the probe
+// moves more than DRIFT_TOL between the two sides of a row. A row measured
+// on a drifting host is not evidence, whichever way it points.
+const DRIFT_TOL = 1.25;
+const cpuProbe = () => {
+  const t0 = performance.now();
+  let x = 0;
+  for (let i = 0; i < 3_000_000; i++) x = (x * 1103515245 + 12345) & 0x7fffffff;
+  return { ms: performance.now() - t0, x };
+};
+const probes = [];
+const probeNow = (label) => {
+  const p = cpuProbe();
+  probes.push({ label, ms: p.ms });
+  return p.ms;
+};
+
 // v86 side runs FIRST: the rv64 rows compile thousands of wasm modules whose
 // background tier-up would otherwise pollute the v86 subprocesses (measured
 // 4x on the compile row). Order symmetric-quiet for both sides.
 // v86 side
 if (haveV86) {
+  probeNow("v86-start");
   for (const jit of FULL ? [false, true] : [true]) {
     log(`[v86 jit=${+jit}] alu`);
     { const r = await v86Compute("alu.i386", jit); const row = (R.ALU ??= {}); row[jit ? "v8j" : "v8i"] = r?.ms ?? null; row[jit ? "v8j_chk" : "v8i_chk"] = r?.chk ?? null; }
@@ -241,6 +264,7 @@ if (haveV86) {
   }
 }
 
+probeNow("rv64-start");
 // compute (alu, mixed): one boot per JIT setting, run both binaries
 for (const jit of FULL ? [false, true] : [true]) {
   log(`[rv64 compute jit=${+jit}] boot…`);
@@ -393,6 +417,21 @@ if (WANT_NBENCH) {
   }
   if (nb?.v8?.unstable) {
     problems.push(`nbench: v86 reported ${nb.v8.unstable} kernel(s) as statistically uncertain`);
+  }
+}
+probeNow("end");
+{
+  const v = probes.map((p) => p.ms);
+  const lo = Math.min(...v), hi = Math.max(...v);
+  const drift = hi / Math.max(lo, 1e-9);
+  md += `\n_Host CPU probe across the run: ${probes
+    .map((p) => `${p.label} ${p.ms.toFixed(0)}ms`)
+    .join(", ")} (spread ${drift.toFixed(2)}x)._\n`;
+  if (drift > DRIFT_TOL) {
+    problems.push(
+      `host drifted ${drift.toFixed(2)}x during the run (probe ${lo.toFixed(0)}-${hi.toFixed(0)}ms) — ` +
+        `rows are not comparable; rerun on a quiet host`,
+    );
   }
 }
 if (problems.length) {
