@@ -1294,17 +1294,15 @@ impl Ctx {
         m.local_get(VA).op(I32_WRAP_I64);
     }
 
-    /// ADD this block's retired count to the retirement cell. The cell is
-    /// CUMULATIVE across one host dispatch: the host zeroes it before the
-    /// first block of a chain, every block adds what it retired, and
-    /// tail-call transfers between blocks leave it accumulating — so the
-    /// host reads the whole chain's total no matter how many blocks ran.
+    /// Publish this block's retired count: a plain OVERWRITE of the cell.
+    /// The host reads it after every dispatch and no longer zeroes it
+    /// between calls (the old cumulative contract existed for tail-call
+    /// chaining, which measured 1.2us per cross-instance hop and is dead) —
+    /// dropping the zero-store plus the load+add here removes three memory
+    /// round-trips from every dispatch of every block.
     fn set_retired(&self, m: &mut WasmModule, n: u32) {
         m.i32_const(0);
-        m.i32_const(0).i64_load(self.lay.retired_addr as u64);
-        m.i64_const(n as i64)
-            .op(I64_ADD)
-            .i64_store(self.lay.retired_addr as u64);
+        m.i64_const(n as i64).i64_store(self.lay.retired_addr as u64);
     }
 
     /// Bail out of the block at instruction index `n` (retired so far),
@@ -1318,10 +1316,9 @@ impl Ctx {
             // segments/bodies flushed so far; `n` is the compile-time count of
             // instructions completed since that flush. Reporting ITER alone
             // undercounted, corrupting insn_count/minstret/clock/fuel.
-            // Cumulative-cell contract as in set_retired.
+            // Overwrite contract as in set_retired.
             m.i32_const(0);
-            m.i32_const(0).i64_load(self.lay.retired_addr as u64);
-            m.local_get(l).op(I64_ADD);
+            m.local_get(l);
             if n > 0 {
                 m.i64_const(n as i64).op(I64_ADD);
             }
@@ -2311,13 +2308,9 @@ fn emit_fuel_base(c: &Ctx, m: &mut WasmModule) {
         m.i64_const(LOOP_CAP as i64).local_set(BASE);
         return;
     }
-    m.i32_const(0).i64_load(c.lay.fuel_addr as u64);
-    m.i32_const(0).i64_load(c.lay.retired_addr as u64);
-    m.op(I64_SUB).local_set(BASE);
-    m.local_get(BASE).i64_const(0).op(I64_LT_S);
-    m.op(IF).op(VOID);
-    m.i64_const(0).local_set(BASE);
-    m.op(END);
+    // The retirement cell holds the PREVIOUS dispatch's count now (the
+    // host stopped zeroing it), so the grant is the fuel cell alone.
+    m.i32_const(0).i64_load(c.lay.fuel_addr as u64).local_set(BASE);
 }
 
 /// Chain exit: after a block has stored its successor pc and ADDED its
@@ -3383,8 +3376,7 @@ fn translate_copy_loop(
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, start_pc);
     m.i32_const(0);
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    m.local_get(ITER).i64_store(lay.retired_addr as u64);
     emit_chain_exit(&c, &mut m, true);
     m.op(RETURN);
     m.op(END);
@@ -3550,8 +3542,7 @@ fn translate_copy_loop(
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, cl.end_pc);
     m.i32_const(0);
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    m.local_get(ITER).i64_store(lay.retired_addr as u64);
     emit_chain_exit(&c, &mut m, true);
     m.op(RETURN);
     m.op(END); // loop
@@ -3703,7 +3694,13 @@ pub fn translate_block_hot(
     if scan_n > FUEL_GUARD_MIN && lay.fuel_addr != 0 {
         m.i32_const(0).i64_load(lay.fuel_addr as u64);
         m.i64_const(scan_n as i64).op(I64_LT_U);
-        m.op(IF).op(VOID).op(RETURN).op(END);
+        m.op(IF).op(VOID);
+        // Overwrite contract: every exit must publish its count — the host
+        // no longer zeroes the cell between dispatches.
+        m.i32_const(0);
+        m.i64_const(0).i64_store(lay.retired_addr as u64);
+        m.op(RETURN);
+        m.op(END);
     }
     // The FP gate is emitted AT the first FP instruction (see the loop),
     // not at entry: a long trace whose integer prefix always runs must make
@@ -4023,8 +4020,7 @@ fn translate_loop(
             c.flush_writes(&mut m);
             c.set_pc_const(&mut m, h);
             m.i32_const(0);
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    m.local_get(ITER).i64_store(lay.retired_addr as u64);
     emit_chain_exit(c, &mut m, true);
             m.op(RETURN);
             m.op(END);
@@ -4111,8 +4107,7 @@ fn translate_loop(
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, region.end_pc);
     m.i32_const(0);
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    m.local_get(ITER).i64_store(lay.retired_addr as u64);
     emit_chain_exit(c, &mut m, true);
     Some(Block {
         wasm: m.finish(),
@@ -4865,8 +4860,7 @@ pub fn translate_superblock_sparse(
     c.flush_writes(&mut m);
     m.i32_const(0).local_get(TPC).i64_store(lay.pc_addr as u64);
     m.i32_const(0);
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    m.local_get(ITER).i64_store(lay.retired_addr as u64);
     emit_chain_exit(&c, &mut m, true);
 
     Some(Block {

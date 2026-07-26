@@ -960,10 +960,9 @@ const MAX_LEADERS: usize = 512;
 #[inline]
 fn call_block(idx: i32, state_ptr: *mut u8) {
     unsafe {
-        // The retirement cell is CUMULATIVE across one host dispatch: blocks
-        // ADD what they retire (tail-call transfers keep accumulating without
-        // returning here), so it must start each chain at zero.
-        RETIRED_CELL = 0;
+        // The retirement cell is OVERWRITTEN by every block exit (the old
+        // cumulative-with-host-zeroing contract served tail-call chaining,
+        // which is dead) — no per-dispatch zero-store here.
         let f: extern "C" fn(i32) = core::mem::transmute(idx as usize);
         f(state_ptr as i32);
     }
