@@ -818,3 +818,88 @@ armed — it polls until this shared host's load drops below 6, then runs
 conditions (CPU probe, INVALID above 1.25x spread), that file is either a
 trustworthy 13-row result or states why it is not. Read it before doing
 anything else with the two open rows.
+
+
+# SESSION 2026-07-26: trace JIT, measured region lifecycle, quiet-host truth
+
+The armed quiet-scorecard and its artifacts did not survive /tmp cleanup;
+everything was rebuilt from setup.sh (plus a fresh copy/v86 build — nix
+GitHub tokens in ~/.config/nix/nix.conf were stale ghs_ tokens; overridden
+per-command with `NIX_CONFIG="access-tokens = github.com=$(gh auth token)"`).
+
+## Quiet-host verdicts on the open items
+
+- **The HUFFMAN "superblock miscompile" does not exist.** On a quiet host
+  (drift guard 1.17x) HUFFMAN WINS 1.22x with SB on. The collapse was host
+  load, as the invalidation notice suspected.
+- **FOURIER was never blocked on FMA.** It reached MATCH 0.99x on the
+  morning baseline and WINS 1.15-1.19x after this session's work.
+- **python fib is BIMODAL across boots** (3.3-6.7s on identical code, both
+  old and new trees). Single runs and even median-of-3 are soft; treat any
+  python row verdict within ~1.3x as a lottery until the coverage race is
+  fixed. A/B claims made from single python runs this session were
+  repeatedly wrong.
+- **ASSIGNMENT/HUFFMAN/NUMERIC/STRING regressed between 46736c3 and the
+  session start** (ASSIGNMENT 12.6 -> 9.5, HUFFMAN 1525 -> 959 measured
+  with 46736c3's wasm on today's artifacts/host). Root cause found in
+  build_superblock: a leftover bisect configuration ("SUB-BISECT(i):
+  per-page discovery") ran leader discovery per page from only that page's
+  own seeds, so pages without recorded hot pcs contributed no bodies and
+  functions covered fragments. Whole-run discovery is restored (1ebecdc).
+  ASSIGNMENT recovers only to ~8.4-8.9 — the rest of its gap is still open.
+
+## What landed (commits e950060, <overwrite-commit>, 1ebecdc)
+
+1. **Trace compilation**: individual blocks are extended basic blocks —
+   side-exited conditional branches with exact per-exit retired counts,
+   direct-call following both directions (link register is a compile-time
+   constant), leaf-return following, and guarded stack-restored-return
+   following (store-to-load forwarding of ra with a one-compare guard).
+   Multi-page trace windows (cached 64-page gathers), span-based dirty/map
+   verification through the regions table, entry fuel guards on long
+   traces. This alone: compile 3677 -> 2926ms at SB=0.
+2. **Measured region lifecycle**: per-landed-function exit sampling (stay
+   lengths, out-of-region targets) drives demotion (functions that provably
+   do not hold return their pcs to traces), extension along measured exit
+   traffic (memory-direct bodies for short-stay regions), and a rebuild-
+   pressure fix (only short uncovered blocks count as misses — traces mint
+   hot pcs continuously and every one counted as miss pressure, reviving
+   the rebuild-churn cliff).
+3. **Correctness**: the sparse-superblock rewrite had dropped the
+   emit_fp_flags call — hoisted FP-gate locals stayed zero and every
+   per-body gate silently passed (FP bodies unguarded under non-RNE
+   rounding / FS != Dirty). Restored. Trace FP gates emit AT the first FP
+   instruction as a mid-trace side exit (a kernel-page trace sweeping one
+   FP insn otherwise zero-retire-thrashed at 93M dispatches).
+4. **Dispatch cost**: overwrite retirement contract (no host zero-store, no
+   read-add-store per exit), fuel-cell store thinning in the sys chain loop.
+5. **Config**: TRACE_KEEP_MIN=0 (functions claim every entry — mixed
+   claiming fragmented execution), demotion stays as safety valve.
+
+## Row status after this session (fresh v86 legs, quiet host)
+
+WIN: ALU 1.37x, Mixed 1.44x, Boot 1.87x, STRING ~1.2x, BITFIELD 2.7x,
+FP EMULATION 2.2-2.3x, FOURIER 1.19x, IDEA 2.7-2.8x, HUFFMAN 1.2-1.3x.
+THIN: NUMERIC SORT ~1.04-1.13x (regressed from the trace work; wants
+trace-keeping that every other row wants gone — unresolved conflict).
+LOSS: ASSIGNMENT ~1.26x behind, python ~1.2-1.4x behind (lottery),
+compile ~2.2-2.4x behind (3282ms vs 1382ms).
+
+## Open engineering, in expected-value order
+
+1. **compile**: per-dispatch overhead is ~85ns x 23-27M dispatches. The
+   remaining structural ideas: full retired-in-return ABI (blocks return
+   the count), same-instance block batching so chain transfers avoid the
+   1.2us cross-instance tail-call tax, branch-direction profiles for
+   longer executed traces. Together they model out to ~1.5s — MATCH range.
+2. **ASSIGNMENT**: 46736c3 proves 12.6 exists. Its hot shape is rotated
+   bottom-tested scan nests the loop detector rejects (backward exit
+   branches); trace unrolling attempts measured net-negative because they
+   displace region coverage. Either teach loop_region rotated nests or
+   find what else the 46736c3 formation did differently (its rv64-wasm
+   policies, not the translator — contiguous emission is equivalent
+   post-gate-fix).
+3. **python**: fix the coverage race behind the 3.3-6.7s bimodality before
+   chasing the mean; suspects are dispatch-slot collisions under guest
+   ASLR (2-way dispatch associativity is untried) and function-landing
+   timing.
