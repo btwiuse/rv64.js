@@ -554,8 +554,12 @@ pub extern "C" fn jit_set_demote(on: u32) {
 /// Sampled exits before the demotion verdict is trusted. Zero-retire
 /// samples (entry bails: FP gate, first-instruction TLB miss) are excluded
 /// from the average — they are refusals, not stays, and a legitimate
-/// long-stay FP region bails exactly like that while FS is off.
-const DEMOTE_MIN_SAMPLES: u32 = 16;
+/// long-stay FP region bails exactly like that while FS is off. 64 (~2K
+/// real exits): the 16-sample verdict condemned regions on WARM-UP stays —
+/// NUMERIC SORT's straddling-loop region measured 320-467 iter/s across
+/// identical boots (a coin flip against v86's ~400) because whether it
+/// survived demotion depended on how cold its first sampled exits were.
+const DEMOTE_MIN_SAMPLES: u32 = 64;
 static mut SB_DEMOTED: u64 = 0;
 /// Trace-window: the 64-page (256KB) ALIGNED va region around a hot pc,
 /// gathered into one contiguous buffer so traces can follow calls across

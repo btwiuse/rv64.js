@@ -903,3 +903,43 @@ compile ~2.2-2.4x behind (3282ms vs 1382ms).
    chasing the mean; suspects are dispatch-slot collisions under guest
    ASLR (2-way dispatch associativity is untried) and function-landing
    timing.
+
+## SESSION 2026-07-26, closing addendum (afternoon)
+
+Further landed (commits e950060, 1ebecdc, 53ec078 + the retirement-contract
+commit): rotated-nest backward-exit loop regions, 2^18 dispatch lines, bulk
+table growth in the JS shim, multi-function block modules (shared chain
+helper), an online chain A/B controller, and the chain saga's conclusion:
+
+**The V8 shared-table import quadratic** (the day's most important finding
+for future work): return_call_indirect costs ~2ns/hop on node 20.18.1 (the
+old 1.2us figure is obsolete), and fully-chained nbench runs produced
+ASSIGNMENT 11.2 iter/s — a clear WIN over v86 — plus records on IDEA/
+HUFFMAN/FOURIER. But any module importing __indirect_function_table makes
+every subsequent table.set O(importing instances), so large block
+populations (tcc 7.5k, CPython 10-20k) pay a quadratic registration cost
+that no runtime gate can avoid (proved by kill-cell: 2.4x slowdown with
+chain code emitted but never executed). Chaining ships default-off behind
+RV_TAILCALL=1. The unlock for next session: a second chain-only table, or
+transfers routed through a host-module chain_run export, so trace modules
+never import the table. That is the highest-EV single project: it flips
+ASSIGNMENT and materially helps python and compile.
+
+**Benchmark lottery, quantified**: on identical binaries and a quiet host,
+boot-to-boot coverage races swing NUMERIC SORT 320-467, HUFFMAN 724-1016,
+ASSIGNMENT 7.6-8.9, python fib 3.4-7.8s. Config knobs (KEEPMIN 0/24/48,
+DEMOTE_MIN_SAMPLES 16/64) all measure within that noise. Single-sample
+nbench rows and REPS=3 python cannot be trusted to +/-15%. Any future
+"win/loss" claim on those rows needs interleaved multi-boot medians, and
+the scorecard should grow that capability before more tuning is attempted.
+
+Authoritative full runs today (all valid by the drift guard, all at
+provenance-recorded commits): 10/13 (morning baseline), 10/13 (traces +
+demotion), 10/13 (discovery fix + claim-all), 9/13 (final; NUMERIC drew
+360 vs v86 404). Rows that never lost today: ALU, Mixed, Boot, STRING,
+BITFIELD, FP EMULATION, FOURIER, IDEA. HUFFMAN won in every full run.
+Structural losses: compile (2.1-2.2x, best 2912ms vs 1352-1382ms), python
+(1.2-1.4x, lottery), ASSIGNMENT (1.26-1.33x; 11.2 proven reachable with
+chains). NUMERIC became draw-dependent this session (was a stable 568
+pre-trace-work) — its stabilization is unfinished business tied to the
+same demotion/coverage races.
