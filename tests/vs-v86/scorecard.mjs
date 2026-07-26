@@ -228,10 +228,18 @@ const log = (m) => process.stderr.write(m);
 // on a drifting host is not evidence, whichever way it points.
 const DRIFT_TOL = 1.25;
 const cpuProbe = () => {
-  const t0 = performance.now();
+  // Min of three back-to-back samples: interference and boost-clock wander
+  // only ADD time, so the min tracks true single-thread speed — one
+  // scheduler blip no longer invalidates a 40-minute run (the guard's
+  // threshold stays strict).
+  let best = Infinity;
   let x = 0;
-  for (let i = 0; i < 3_000_000; i++) x = (x * 1103515245 + 12345) & 0x7fffffff;
-  return { ms: performance.now() - t0, x };
+  for (let r = 0; r < 3; r++) {
+    const t0 = performance.now();
+    for (let i = 0; i < 3_000_000; i++) x = (x * 1103515245 + 12345) & 0x7fffffff;
+    best = Math.min(best, performance.now() - t0);
+  }
+  return { ms: best, x };
 };
 const probes = [];
 const probeNow = (label) => {
