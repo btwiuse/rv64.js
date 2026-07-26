@@ -2347,6 +2347,30 @@ fn emit_fuel_base(c: &Ctx, m: &mut WasmModule) {
 /// `iter_guard` additionally refuses to transfer when this call retired
 /// nothing (a fuel-exhausted or off-entry exit) — a zero-progress transfer
 /// to the same pc would tail-loop forever.
+/// Transfer to the next compiled block through the HOST module's
+/// chain_next export (imported as env.chain_next, exactly like tlb_fill):
+/// the dispatch-line fast path runs in one Rust function and the transfer
+/// is an indirect call through the table the host owns — generated modules
+/// never import the table, so registration stays O(1) per block (importing
+/// it made table.set O(importing instances): the V8 quadratic that killed
+/// emitted return_call_indirect chaining for large populations).
+/// `guard_progress`: refuse the transfer when ITER (the runtime retired
+/// accumulator) is zero — a zero-progress transfer to the same pc would
+/// recurse to the depth cap for nothing.
+fn emit_chain_next(c: &Ctx, m: &mut WasmModule, guard_progress: bool) {
+    let lay = &c.lay;
+    if !chain_enabled() || lay.sys.is_none() || lay.dispatch_base == 0 || lay.fuel_addr == 0 {
+        return;
+    }
+    if guard_progress {
+        m.local_get(ITER).op(I64_EQZ);
+        m.op(IF).op(VOID).op(RETURN).op(END);
+    }
+    m.use_chain_next();
+    m.local_get(0); // machine-state pointer parameter
+    m.call_chain_next();
+}
+
 /// Build the shared chain-check helper body for `lay` (WasmModule::set_helper):
 /// kill-cell, dispatch-line probe (pc match, blacklist, map generation),
 /// fuel — the host fast path's exact conditions — returning the verified,
@@ -3486,7 +3510,7 @@ fn translate_copy_loop(
     m.i32_const(0);
     m.i32_const(0).i64_load(lay.retired_addr as u64);
     m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
-    emit_chain_exit(&c, &mut m, true);
+    emit_chain_next(&c, &mut m, true);
     m.op(RETURN);
     m.op(END);
 
@@ -3653,7 +3677,7 @@ fn translate_copy_loop(
     m.i32_const(0);
     m.i32_const(0).i64_load(lay.retired_addr as u64);
     m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
-    emit_chain_exit(&c, &mut m, true);
+    emit_chain_next(&c, &mut m, true);
     m.op(RETURN);
     m.op(END); // loop
 
@@ -3891,6 +3915,7 @@ pub fn translate_block_hot(
                 c.flush_writes(&mut m);
                 c.set_pc_const(&mut m, target);
                 c.set_retired(&mut m, n + 1);
+                emit_chain_next(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
                     span: (lo, hi),
@@ -3938,6 +3963,7 @@ pub fn translate_block_hot(
                                     .i64_store(lay.pc_addr as u64);
                                 c.flush_writes(&mut m);
                                 c.set_retired(&mut m, n + 1);
+                emit_chain_next(&c, &mut m, false);
                                                 m.op(RETURN);
                                 m.op(END);
                             }
@@ -3961,6 +3987,7 @@ pub fn translate_block_hot(
                 m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
                 c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
+                emit_chain_next(&c, &mut m, false);
                 // Dynamic target (return/indirect): the chain call site
                 // would be megamorphic — dispatch through the host.
                 return Some(Block {
@@ -4008,6 +4035,7 @@ pub fn translate_block_hot(
                     c.set_pc_const(&mut m, exit_pc);
                     c.flush_writes(&mut m);
                     c.set_retired(&mut m, n + 1);
+                emit_chain_next(&c, &mut m, false);
                         m.op(RETURN);
                     m.op(END);
                     pc = follow_pc;
@@ -4022,6 +4050,7 @@ pub fn translate_block_hot(
                 m.op(END);
                 c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
+                emit_chain_next(&c, &mut m, false);
                 return Some(Block {
                     wasm: m.finish(),
                     span: (lo, hi),
@@ -4041,6 +4070,7 @@ pub fn translate_block_hot(
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, pc);
     c.set_retired(&mut m, n);
+    emit_chain_next(&c, &mut m, false);
     Some(Block {
         wasm: m.finish(),
         span: (lo, hi),
@@ -4122,7 +4152,7 @@ fn translate_loop(
             m.i32_const(0);
     m.i32_const(0).i64_load(lay.retired_addr as u64);
     m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
-    emit_chain_exit(c, &mut m, true);
+    emit_chain_next(c, &mut m, true);
             m.op(RETURN);
             m.op(END);
         }
@@ -4224,7 +4254,7 @@ fn translate_loop(
     m.i32_const(0);
     m.i32_const(0).i64_load(lay.retired_addr as u64);
     m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
-    emit_chain_exit(c, &mut m, true);
+    emit_chain_next(c, &mut m, true);
     Some(Block {
         wasm: m.finish(),
         span: (0, 0),
@@ -4978,7 +5008,7 @@ pub fn translate_superblock_sparse(
     m.i32_const(0);
     m.i32_const(0).i64_load(lay.retired_addr as u64);
     m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
-    emit_chain_exit(&c, &mut m, true);
+    emit_chain_next(&c, &mut m, true);
 
     Some(Block {
         wasm: m.finish(),

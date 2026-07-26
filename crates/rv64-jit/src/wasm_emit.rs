@@ -12,6 +12,11 @@ pub struct WasmModule {
     /// Import `env.__indirect_function_table` so the block can tail-call the
     /// next compiled block directly (see emit_chain_exit).
     wants_table: bool,
+    /// Import `env.chain_next: (i32 state) -> ()` — the host module's
+    /// dispatch-line transfer (see rv64-wasm chain_next). A FUNCTION import
+    /// like tlb_fill, deliberately NOT the table: table-importing modules
+    /// made every table.set O(importing instances) on V8.
+    wants_chain_next: bool,
     /// Optional SECOND function: the shared chain-check helper (() -> i32,
     /// returns the verified table index to tail-call or -1). Emitting the
     /// full chain machinery inline at every trace side exit bloated modules
@@ -160,6 +165,7 @@ impl WasmModule {
             n_locals_i32: 0,
             wants_tlb_fill: false,
             wants_table: false,
+            wants_chain_next: false,
             helper: None,
         }
     }
@@ -171,6 +177,7 @@ impl WasmModule {
             n_locals_i32,
             wants_tlb_fill: false,
             wants_table: false,
+            wants_chain_next: false,
             helper: None,
         }
     }
@@ -182,8 +189,8 @@ impl WasmModule {
         if self.helper.is_none() {
             self.helper = Some(body);
         }
-        // imported funcs (tlb_fill?) then the main body, then the helper.
-        u32::from(self.wants_tlb_fill) + 1
+        // imported funcs (tlb_fill? chain_next?) then the body, then helper.
+        u32::from(self.wants_tlb_fill) + u32::from(self.wants_chain_next) + 1
     }
 
     pub fn has_helper(&self) -> bool {
@@ -214,6 +221,21 @@ impl WasmModule {
 
     pub fn use_table(&mut self) -> &mut Self {
         self.wants_table = true;
+        self
+    }
+
+    /// Declare the chain_next import. Forces the tlb_fill import too so
+    /// call indices stay fixed: tlb_fill = 0, chain_next = 1, body = 2.
+    pub fn use_chain_next(&mut self) -> &mut Self {
+        self.wants_tlb_fill = true;
+        self.wants_chain_next = true;
+        self
+    }
+
+    /// call $chain_next (function import index 1; see use_chain_next).
+    pub fn call_chain_next(&mut self) -> &mut Self {
+        self.code.push(0x10);
+        uleb(&mut self.code, 1);
         self
     }
 
@@ -388,17 +410,26 @@ impl WasmModule {
 
         // import section: env.memory (+ env.tlb_fill and/or the function
         // table when the body uses them)
-        let n_imports =
-            1 + u8::from(self.wants_tlb_fill) + u8::from(self.wants_table);
+        let n_imports = 1
+            + u8::from(self.wants_tlb_fill)
+            + u8::from(self.wants_chain_next)
+            + u8::from(self.wants_table);
         let mut sec = vec![n_imports];
         if self.wants_tlb_fill {
             // imported functions come first in the index space, so declare
-            // tlb_fill (func 0) before memory; the body is then func 1.
+            // tlb_fill (func 0) before memory; the body follows the imports.
             sec.push(3);
             sec.extend_from_slice(b"env");
             sec.push(8);
             sec.extend_from_slice(b"tlb_fill");
             sec.extend_from_slice(&[0x00, 0x01]); // func, type 1
+        }
+        if self.wants_chain_next {
+            sec.push(3);
+            sec.extend_from_slice(b"env");
+            sec.push(10);
+            sec.extend_from_slice(b"chain_next");
+            sec.extend_from_slice(&[0x00, 0x00]); // func, type 0
         }
         sec.push(3);
         sec.extend_from_slice(b"env");
@@ -422,11 +453,13 @@ impl WasmModule {
             section(&mut m, 3, &[1, 0]);
         }
 
-        // export section: "run" -> the body function
+        // export section: "run" -> the body function (after func imports)
+        let n_func_imports =
+            u8::from(self.wants_tlb_fill) + u8::from(self.wants_chain_next);
         let mut sec = vec![1u8];
         sec.push(3);
         sec.extend_from_slice(b"run");
-        sec.extend_from_slice(&[0x00, if self.wants_tlb_fill { 1 } else { 0 }]);
+        sec.extend_from_slice(&[0x00, n_func_imports]);
         section(&mut m, 7, &sec);
 
         // code section (param is local 0; i64 locals then i32 locals — the

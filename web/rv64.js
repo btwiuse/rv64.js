@@ -88,6 +88,7 @@ export class RV64 {
               env: {
                 memory: vm.ex.memory,
                 tlb_fill: vm.ex.jit_tlb_fill,
+                chain_next: vm.ex.chain_next,
                 __indirect_function_table: vm.ex.__indirect_function_table,
               },
             });
@@ -127,6 +128,7 @@ export class RV64 {
                 env: {
                   memory: vm.ex.memory,
                   tlb_fill: vm.ex.jit_tlb_fill,
+                  chain_next: vm.ex.chain_next,
                   __indirect_function_table: vm.ex.__indirect_function_table,
                 },
               }),
@@ -188,20 +190,19 @@ export class RV64 {
         3, 2, 1, 0,
         10, 11, 1, 9, 0, 0x20, 0, 0x41, 0, 0x13, 0, 0, 0x0b,
       ]));
-      // DEFAULT OFF — but for a NEW reason (the old "~1.2us trampoline"
-      // figure is obsolete: a fresh probe on node 20.18.1 measured
-      // return_call_indirect at ~2ns/hop, same- or cross-instance). The
-      // real cost on this V8 is that any module IMPORTING the shared
-      // function table makes every later table.set O(importing instances)
-      // — per-instance call_indirect dispatch caches — so thousands of
-      // chain-bearing block modules turn registration quadratic (tcc:
-      // 2.4-3x slower with chain code merely emitted, never executed,
-      // in every gating variant tried: population caps, churn detection,
-      // an online A/B controller, and a shared per-module helper).
-      // Chained nbench kernels measured big wins (ASSIGNMENT 8.4 -> 11.2
-      // iter/s), so the machinery stays behind RV_TAILCALL=1 until blocks
-      // can chain without importing the table (second chain-only table, or
-      // transfers routed through a host-module chain_run export).
+      // Chaining is DEFAULT OFF after three measured architectures:
+      // (1) emitted return_call_indirect — ~2ns/hop on node 20.18.1, but
+      // any module importing the shared table makes table.set O(importing
+      // instances): quadratic registration for tcc/CPython populations;
+      // (2) per-module shared helper — same import, same quadratic;
+      // (3) env.chain_next, a host-module Rust dispatch reached as a
+      // function import (no table import, no quadratic) — measured SLOWER
+      // everywhere (nbench ASSIGNMENT 8.3 -> 6.2, python 4.6 -> 6.2s):
+      // the host dispatch loop is already wasm with no JS frame, so the
+      // sandwich (block -> host Rust -> block) re-does the loop's own
+      // bookkeeping plus two extra call frames per hop. The per-dispatch
+      // cost is the bookkeeping itself, not a boundary. RV_TAILCALL=1
+      // re-enables for experiments.
       if (process?.env?.RV_TAILCALL === "1") {
         vm.ex.jit_set_tailcall?.(1);
       }

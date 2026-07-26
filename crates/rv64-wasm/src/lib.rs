@@ -2788,6 +2788,50 @@ pub extern "C" fn sys_console_input() {
     }
 }
 
+/// Nested chain-transfer depth (see chain_next) and its bound: each hop
+/// holds two wasm frames (the calling block + chain_next) until the chain
+/// unwinds, so the cap bounds stack use; a chain that reaches it simply
+/// returns to the host loop, which re-dispatches seamlessly.
+static mut CHAIN_DEPTH: u32 = 0;
+const CHAIN_DEPTH_CAP: u32 = 64;
+static mut CHAIN_HOPS: u64 = 0;
+
+/// Block-to-block transfer WITHOUT the shared-table import: generated trace
+/// blocks call this main-module export as a FUNCTION import (env.chain_next
+/// — the same wasm-to-wasm shape as env.tlb_fill, which thousands of block
+/// modules already import with no penalty). Importing the function table
+/// instead made every table.set O(importing instances) on this V8 —
+/// quadratic registration across tcc's 7.5k blocks — which is why emitted
+/// return_call_indirect chaining is off. Here the dispatch-line fast path
+/// (pc match under the current map generation, blacklist, fuel) runs in
+/// ONE place in Rust and the transfer is a plain indirect call through the
+/// table the main module owns.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn chain_next(state: i32) {
+    unsafe {
+        if CHAIN_DEPTH >= CHAIN_DEPTH_CAP {
+            return;
+        }
+        let Some(jit) = SYS_JIT.as_mut() else { return };
+        let m = &mut *(state as *mut rv64_system::Machine);
+        // Fuel: the cumulative retired cell against this dispatch's grant.
+        if RETIRED_CELL >= FUEL_CELL {
+            return;
+        }
+        let pc = m.cpu.pc;
+        let line = jit.dispatch[JitState::dslot(pc)];
+        if line.pc != pc || line.gen != m.cpu.map_gen as u32 || line.idx < 0 {
+            return; // miss/blacklist/stale: the host loop owns the slow path
+        }
+        CHAIN_DEPTH += 1;
+        CHAIN_HOPS += 1;
+        let f: extern "C" fn(i32) = core::mem::transmute((line.idx & !SB_IDX_BIT) as usize);
+        f(state);
+        CHAIN_DEPTH -= 1;
+    }
+}
+
 /// Region-function modules issued but not yet landed. The host's run loop
 /// should yield to its event loop when this is nonzero: module compilation
 /// resolves on the microtask queue, and a loop that never yields leaves
