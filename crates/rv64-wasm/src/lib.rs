@@ -579,11 +579,13 @@ struct TraceWin {
 const TRACE_WIN_CACHE: usize = 8;
 static mut TRACE_WIN: Vec<TraceWin> = Vec::new();
 /// A landed region function does NOT claim a pc whose individual block is a
-/// trace at least this long: long traces beat br_table entries for call-
-/// shaped code (each function entry pays the register-union load), while
-/// short fragments are exactly what the page function is for.
-/// Runtime-settable for A/B (0 = functions claim everything, as before).
-static mut TRACE_KEEP_MIN: u32 = 24;
+/// trace at least this long. 0 = functions claim everything: with whole-
+/// region leader discovery restored, mixed claiming (some pcs on traces,
+/// some in the function) FRAGMENTED execution into function/trace ping-pong
+/// — claim-all measured best on every row (compile 3880 -> 3282ms, HUFFMAN
+/// 955 -> 1010, ASSIGNMENT 7.8 -> 8.4; the middle values 24/48 were worse
+/// on both compile and NUMERIC SORT). Runtime-settable for A/B.
+static mut TRACE_KEEP_MIN: u32 = 0;
 #[no_mangle]
 pub extern "C" fn jit_set_trace_keep_min(v: u32) {
     unsafe { TRACE_KEEP_MIN = v }
@@ -1693,34 +1695,47 @@ fn issue_region_inner(
         code.extend_from_slice(&m.bus.ram[o..o + 0x1000]);
     }
     let vas: Vec<u64> = pages.iter().map(|&(va, _)| va).collect();
-    // Per-page leader discovery from each page's own recorded hot pcs.
+    // Leader discovery per CONTIGUOUS RUN of pages, from the union of the
+    // run's recorded hot pcs: static reachability crosses page boundaries,
+    // so a seed on one page discovers the leaders of its neighbours. The
+    // per-page variant that briefly lived here (a bisect configuration from
+    // the invalidated 2026-07-25 session, labeled SUB-BISECT(i)) silently
+    // skipped every page with no seeds of its own — regions covered
+    // fragments, exits dominated, and the branchy-int kernels lost a third
+    // to half their throughput (ASSIGNMENT 12.6 -> 8.0, HUFFMAN 1525 -> 950
+    // against the 11/13-era JIT).
     let mut entries: Vec<u64> = Vec::new();
-    for (k, &(va, _)) in pages.iter().enumerate() {
-        if entries.len() >= MAX_LEADERS {
-            break;
+    let mut i = 0usize;
+    while i < pages.len() && entries.len() < MAX_LEADERS {
+        let mut j = i;
+        while j + 1 < pages.len() && pages[j + 1].0 == pages[j].0 + 0x1000 {
+            j += 1;
         }
-        let slice = &code[k * 0x1000..(k + 1) * 0x1000];
-        let pseeds: Vec<u64> = jit
-            .page_entries
-            .get(&(aspace, va))
-            .map(|v| v.clone())
-            .unwrap_or_default();
-        if pseeds.is_empty() {
-            continue;
+        let run_slice = &code[i * 0x1000..(j + 1) * 0x1000];
+        let run_va = pages[i].0;
+        let run_span = ((j - i + 1) * 0x1000) as u64;
+        let mut rseeds: Vec<u64> = Vec::new();
+        for &(va, _) in &pages[i..=j] {
+            if let Some(v) = jit.page_entries.get(&(aspace, va)) {
+                rseeds.extend_from_slice(v);
+            }
         }
-        let (mut l, back) = rv64_jit::discover_page_leaders_ext(
-            slice,
-            va,
-            va,
-            0x1000,
-            &pseeds,
-            MAX_LEADERS - entries.len(),
-        );
-        l.retain(|&e| {
-            rv64_jit::emittable_at(slice, va, e, lay)
-                && (!back.contains(&e) || !rv64_jit::is_loop_at(slice, va, e, lay))
-        });
-        entries.extend(l);
+        if !rseeds.is_empty() {
+            let (mut l, back) = rv64_jit::discover_page_leaders_ext(
+                run_slice,
+                run_va,
+                run_va,
+                run_span,
+                &rseeds,
+                MAX_LEADERS - entries.len(),
+            );
+            l.retain(|&e| {
+                rv64_jit::emittable_at(run_slice, run_va, e, lay)
+                    && (!back.contains(&e) || !rv64_jit::is_loop_at(run_slice, run_va, e, lay))
+            });
+            entries.extend(l);
+        }
+        i = j + 1;
     }
     let sb = rv64_jit::translate_superblock_sparse(&code, &vas, &entries, lay, regs_in_memory);
     if sb.is_none() {
