@@ -344,6 +344,12 @@ pub struct Block {
     /// as it does for multi-page regions. (0, 0) = the producer's code is
     /// wholly inside [start_pc, start_pc + len).
     pub span: (u64, u64),
+    /// The trace touches the FP register file (fp_read | fp_write): the
+    /// host's claim policy keeps long INTEGER traces out of page functions
+    /// but always lets functions claim FP traces — keeping FP traces made
+    /// libm pages ping-pong between trace and function ownership and
+    /// cratered FOURIER ~3x whenever integer keeping was enabled.
+    pub uses_fp: bool,
     /// Exit-target pcs of a trace (side-exited branch arms, unfollowed jump
     /// targets, the fall-out continuation): demonstrably-on-the-hot-path
     /// block leaders the host should seed superblock discovery with. Trace
@@ -3699,6 +3705,7 @@ fn translate_copy_loop(
         wasm: m.finish(),
         span: (0, 0),
         seeds: Vec::new(),
+        uses_fp: false,
         len: cl.end_pc - start_pc,
         n_insns: cl.body_n,
     })
@@ -3934,6 +3941,7 @@ pub fn translate_block_hot(
                     wasm: m.finish(),
                     span: (lo, hi),
                     seeds: core::mem::take(&mut seeds),
+                    uses_fp: (fp_read | fp_write) != 0,
                     len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
@@ -4008,6 +4016,7 @@ pub fn translate_block_hot(
                     wasm: m.finish(),
                     span: (lo, hi),
                     seeds: core::mem::take(&mut seeds),
+                    uses_fp: (fp_read | fp_write) != 0,
                     len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
@@ -4069,6 +4078,7 @@ pub fn translate_block_hot(
                     wasm: m.finish(),
                     span: (lo, hi),
                     seeds: core::mem::take(&mut seeds),
+                    uses_fp: (fp_read | fp_write) != 0,
                     len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
@@ -4089,6 +4099,7 @@ pub fn translate_block_hot(
         wasm: m.finish(),
         span: (lo, hi),
                     seeds: core::mem::take(&mut seeds),
+                    uses_fp: (fp_read | fp_write) != 0,
         len: pc.saturating_sub(start_pc),
         n_insns: n,
     })
@@ -4273,6 +4284,7 @@ fn translate_loop(
         wasm: m.finish(),
         span: (0, 0),
         seeds: Vec::new(),
+        uses_fp: false,
         len: region.end_pc - start_pc,
         n_insns: static_n.max(1),
     })
@@ -5028,6 +5040,7 @@ pub fn translate_superblock_sparse(
         wasm: m.finish(),
         span: (0, 0),
         seeds: Vec::new(),
+        uses_fp: false,
         len: (np * 0x1000) as u64,
         n_insns: 0,
     })

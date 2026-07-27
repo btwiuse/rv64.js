@@ -239,6 +239,8 @@ pub extern "C" fn user_load(mem_size: u32) -> i32 {
 
 #[derive(Clone, Copy)]
 struct JitBlock {
+    /// Trace touches the FP file (claim policy: see TRACE_KEEP_MIN).
+    fp: bool,
     /// Function-table index of the compiled block.
     idx: i32,
     /// Guest instructions it retires.
@@ -1104,6 +1106,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                         unsafe { JIT_OUT = blk.wasm };
                         let idx = unsafe { host_jit_register() };
                         (idx >= 0).then_some(JitBlock {
+                            fp: false,
                             idx,
                             n: blk.n_insns,
                             pa: pc,
@@ -2582,6 +2585,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             }
                             Some((
                                 JitBlock {
+                                    fp: blk.uses_fp,
                                     idx,
                                     n: blk.n_insns,
                                     pa,
@@ -2641,7 +2645,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             None => {
                                 m.bus.jit_mark_page(pa);
                                 m.cpu.clear_store_jtlb();
-                                let jb = JitBlock { idx: -1, n: 0, pa };
+                                let jb = JitBlock { fp: false, idx: -1, n: 0, pa };
                                 if jit.cache.insert(pc, Some(jb)).is_none() {
                                     jit.page_blocks
                                         .entry((pa - rv64_system::RAM_BASE) >> 12)
@@ -2918,11 +2922,13 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
             // A long trace block keeps its pc: it already amortizes its
             // dispatch, and the function entry would trade that for a
             // register-union load per visit (see TRACE_KEEP_MIN).
-            if matches!(jit.cache.get(&e), Some(Some(b)) if b.n != 0 && b.n >= unsafe { TRACE_KEEP_MIN }) {
+            if matches!(jit.cache.get(&e), Some(Some(b))
+                if b.n != 0 && !b.fp && b.n >= unsafe { TRACE_KEEP_MIN })
+            {
                 continue;
             }
             let epa = p.pages[pi].1 + (e & 0xfff);
-            let jb = JitBlock { idx, n: 0, pa: epa };
+            let jb = JitBlock { fp: false, idx, n: 0, pa: epa };
             let prev = jit.cache.insert(e, Some(jb));
             SB_ENTRIES_IN += 1;
             if e == TRACE_PC {
