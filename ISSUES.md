@@ -1031,3 +1031,53 @@ edges that currently end them, which is the only thing that moves the count.
 Everything else in this area is now measured and closed.
 
 Standing (authoritative, drift 1.00x, REPS=3 NBREPS=3): **10/13**.
+
+## SESSION 2026-07-27 (cont): inline caches land; 10/13 stands
+
+**Inline caches at indirect jumps** (commit c155cbd) are the session's real
+JIT win. Traces used to end at every jalr; now the dispatch loop records
+each block's observed successor with a stability count, and a stable edge
+triggers ONE recompile with a monomorphic IC — one compare against the
+cached target, hit continues the trace inline, miss exits as before.
+Measured: compile-row dispatches 25.5M -> 17.4M (-32%), insns/dispatch
+13.8 -> 20.1; FOURIER 6124 -> 7348 (WIN 1.15x -> 1.39x), STRING 1.18x ->
+1.26x, python 1.44x -> ~1.18x typical.
+
+**Batching cannot ship.** Batch modules compose with ICs and lift
+ASSIGNMENT +9..21% (best draw 0.944x — still a LOSS), but cost NUMERIC SORT
+~25% (358.5 -> 285.6 under identical contention), which flips that row from
+MATCH to LOSS. Four gating signals were measured before concluding this:
+cache population (python still stormed at 180s), build-time budget (saved
+python, erased ASSIGNMENT's gain), code footprint (page_entries accumulates
+boot/kernel pages, fires for everyone), and batch RATE (works for python,
+still costs NUMERIC). Default OFF behind jit_set_batch(1).
+
+**The two shipping configurations trade rows, both 10/13:**
+  batching ON : python MATCH 0.95x (a good draw), NUMERIC LOSS 1.26x
+  batching OFF: NUMERIC MATCH 0.98x (stable), python LOSS 1.18x
+Batching OFF is the better expected value — NUMERIC's MATCH is stable while
+python's was the top of a 3231-3759ms spread.
+
+**Final standing (scorecard-2026-07-27T07-01-59, drift 1.11x): 10/13.**
+WIN: ALU 1.43, Mixed 1.73, Boot 1.82, STRING 1.26, BITFIELD 2.72, FP
+EMULATION 2.17, FOURIER 1.39, IDEA 2.67, HUFFMAN 1.21. MATCH: NUMERIC 0.98.
+LOSS: python 1.18, ASSIGNMENT 1.32, compile 2.16.
+
+**What 11/13 and 12/13 need.** python needs a reliable ~15%; ASSIGNMENT
+~32%. Neither has a demonstrated path left in block/dispatch structure —
+that space is now exhausted by measurement (nine designs: three chaining
+architectures, batch modules, page co-location, build spacing, definedness
+tracking, next-executing-tail formation, inline caches). ICs proved dispatch
+COUNT was the binding constraint for indirect-heavy code and fixed it; the
+residue is per-instruction emitted-code quality (inline TLB probe on every
+memory op; no register allocation across block boundaries) against v86's
+register-allocating backend. That is the compile project, and it is the same
+project for ASSIGNMENT.
+
+**Tooling that makes that project tractable** (tests/vs-v86/flip.mjs):
+measure ONE row against the v86 number recorded in the newest scorecard
+JSON — v86 is the control, our JIT cannot change it. python screens in 11s,
+compile in 7s, ASSIGNMENT in 5min, against ~45min for the full scorecard.
+nbench single-kernel via CUSTOMRUN=T + DO<KERNEL>=T in a command file
+(nbench upper-cases the -c path, so it must be /C). Parallel config sweeps
+(64 threads) cut a 5-config comparison from 25min to 5min.
