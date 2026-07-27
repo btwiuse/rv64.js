@@ -930,7 +930,11 @@ const SB_BUILD_BUDGET: f64 = 0.08;
 /// (the measured FP EMULATION 3x cliff), so the wall-time budget alone is
 /// NOT a sufficient pacing signal. The budget still caps pathological
 /// translate storms below this floor's rate.
-const SB_MIN_SPACING: u64 = 16_000_000;
+static mut SB_MIN_SPACING: u64 = 16_000_000;
+#[no_mangle]
+pub extern "C" fn jit_set_sb_spacing(m_insns: u32) {
+    unsafe { SB_MIN_SPACING = m_insns as u64 * 1_000_000 }
+}
 static mut SB_BUILD_MS: f64 = 0.0;
 static mut SB_ANCHOR_MS: f64 = -1.0;
 
@@ -2590,12 +2594,22 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             // normally compiled before it. Loop headers are
                             // excluded — their tight wasm regions beat any
                             // trace — as are superblock entries (n == 0).
+                            // BATCH_PAGE: co-locate the hot pcs of the seed's
+                            // OWN page. Successor-seeded batches only reached
+                            // ~12% in-batch exits; if the per-dispatch cost is
+                            // dominated by V8 instance switches (each block
+                            // module is its own instance), packing a page's
+                            // blocks into one instance pays on EVERY dispatch
+                            // between them, links or not.
+                            let seedpage = pc & !0xfff;
+                            let page_mode = unsafe { BATCH_PAGE };
                             let want = |t: u64| {
                                 t >= wlo
                                     && t < whi
                                     && pages.iter().any(|&(va, _)| va == t & !0xfff)
                                     && hotmap.get(&t).is_some_and(|&c| c >= bar)
                                     && !matches!(cache.get(&t), Some(Some(b)) if b.n == 0)
+                                    && (!page_mode || t & !0xfff == seedpage)
                             };
                             rv64_jit::translate_batch(
                                 &w.buf,
@@ -3332,6 +3346,11 @@ static mut BATCH_CELL_NEXT: usize = 0;
 /// seeds. Machinery is fully tested and one flag away.
 static mut BATCH_ON: bool = false;
 static mut BATCH_CAP: usize = 12;
+static mut BATCH_PAGE: bool = false;
+#[no_mangle]
+pub extern "C" fn jit_set_batch_page(on: u32) {
+    unsafe { BATCH_PAGE = on != 0 }
+}
 static mut BATCH_BAR_SHIFT: u32 = 1;
 #[no_mangle]
 pub extern "C" fn jit_set_batch_cap(v: u32) {

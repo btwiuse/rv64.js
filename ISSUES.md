@@ -943,3 +943,54 @@ Structural losses: compile (2.1-2.2x, best 2912ms vs 1352-1382ms), python
 chains). NUMERIC became draw-dependent this session (was a stable 568
 pre-trace-work) — its stabilization is unfinished business tied to the
 same demotion/coverage races.
+
+## SESSION 2026-07-26/27, part 3: the dispatch-cost dead ends (all measured)
+
+Machine changed mid-session to a 64-core Threadripper; `tests/vs-v86/screen.mjs`
+(parallel K-boot medians, SCREENING-stamped) now gives ~8-minute A/B loops
+against the serial scorecard's ~40 minutes. Every verdict below is an
+INTERLEAVED multi-round A/B, the only method that survives the boot lottery.
+
+**The compile row's ~100ns/dispatch overhead resists every structural fix
+tried.** Six architectures, all rejected:
+
+1. *Emitted return_call_indirect chaining* — ~2ns/hop, but modules importing
+   the shared table make table.set O(importing instances): quadratic
+   registration (tcc 2.4-3x slower, even with the code never executed).
+2. *Shared per-module chain helper* (multi-function modules, ~15 bytes/site
+   instead of ~80) — same import, same quadratic.
+3. *env.chain_next host dispatch* (function import like tlb_fill; no table
+   import, no quadratic) — mechanically perfect (tcc dispatches 25M -> 3.7M
+   at 94 insns each) and SLOWER everywhere (ASSIGNMENT 8.3 -> 6.2, python
+   4.6 -> 6.2s): the host loop is already wasm with no JS frame, so a hop
+   that re-does its bookkeeping plus two call frames cannot win.
+4. *Batch modules with DIRECT tail calls* (translate_batch: N bodies in one
+   module, r0..rN-1, links guarded on dispatch-line pc + map generation +
+   fuel) — no table import, O(1) registration, ~2ns/hop, 766 batches /
+   2965 members on tcc, dispatches down 12%. Still loses 3 of 3 rounds
+   (4356/4075/4069 vs 4558/4169/4336ms): only ~12% of exits stay in-batch,
+   so ~88% pay the guard for nothing. Caps 32/64 are worse.
+5. *Page-co-located batches* (test of the "V8 instance switch dominates"
+   hypothesis: pack a page's hot pcs into one instance) — loses 2 of 2
+   rounds at both caps. Instance switching is NOT the dominant cost.
+6. *Superblock build spacing* — 16M insns is optimal; 4M and 1M lose
+   (4244/4308/5083 and 4345/4467/4888), i.e. rebuild churn still dominates
+   any coverage gain.
+
+Also rejected this session: rotated-nest loop regions (net-negative on every
+kernel), KEEPMIN 24/48 (0 is row-optimal; FP traces exempted either way).
+
+**What the evidence now says about 13/13.** The three open rows are all
+branchy, dispatch-bound code where the per-dispatch cost is the JIT's
+*bookkeeping*, not any boundary we can remove: compile 2.19x, python 1.43x,
+ASSIGNMENT 1.20x. Closing them needs a different class of change than
+anything tried here — cross-block register allocation so exits don't spill
+and reload the register union, i.e. a real trace-tree/region JIT with live
+ranges, which is a multi-session project rather than a knob. The measured
+upper bound for chaining-style fixes is ~12% of dispatches, worth a few
+percent; the gap needs 2x.
+
+Standing (authoritative, drift 1.01x, REPS=3 NBREPS=3, commit d7428f8):
+10/13 win-or-match. WIN: ALU 1.41, Mixed 1.82, Boot 1.82, STRING 1.22,
+BITFIELD 2.73, FP EMULATION 2.23, FOURIER 1.18, IDEA 2.78, HUFFMAN 1.28.
+MATCH: NUMERIC SORT 1.05. LOSS: ASSIGNMENT 1.20, python 1.43, compile 2.19.
