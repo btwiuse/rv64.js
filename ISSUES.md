@@ -994,3 +994,40 @@ Standing (authoritative, drift 1.01x, REPS=3 NBREPS=3, commit d7428f8):
 10/13 win-or-match. WIN: ALU 1.41, Mixed 1.82, Boot 1.82, STRING 1.22,
 BITFIELD 2.73, FP EMULATION 2.23, FOURIER 1.18, IDEA 2.78, HUFFMAN 1.28.
 MATCH: NUMERIC SORT 1.05. LOSS: ASSIGNMENT 1.20, python 1.43, compile 2.19.
+
+## SESSION 2026-07-27: validation restored, and the real diagnosis
+
+**Four correctness gates were silently not running.** Fixed (4464a6f,
+318b55d, 15be658): `rv64-isa-test` restored (deleted, unstaged, no
+replacement — one API fix, `BootImages.fs` is now `Vec<p9::Server>`), which
+un-skipped riscv-tests **134/134**, Spike lockstep **LOCKSTEP-OK**, and
+riscv-arch-test **193 match / 0 mismatch** (it read 0/193 while the binary
+was missing); `amo.rv64` given a producer AND `-mno-relax` (plain C `_start`
++ relaxation stored through an unset gp — instant fault, null checksums), so
+**AMO DIFFERENTIAL: PASS (interp == jit == superblock)** runs for the first
+time; `http-relay.mjs` no longer crashes the suite on Node 20's flagged
+WebSocket; and `run-all.sh` got `pipefail` — stages 5/6 pipe into `tail`, so
+a failing lockstep or signature comparison could print its failure and the
+suite would still report ALL STAGES PASSED. `rv64-boot.rs`/`rv64-vboot.rs`
+stay deleted: their HEAD versions predate the RTC/`--proxy` work.
+
+**The sharpened diagnosis for the three open rows.** tcc's traces average
+**15.5 instructions against a 256-instruction cap** — the cap is not
+binding. Traces end on INDIRECT control flow: function pointers, switch
+tables, and returns whose base register is not a traced constant. That is
+why seven successive dispatch-cost architectures all measured neutral
+(chaining x3, batch modules, page co-location, build spacing, definedness
+tracking): they attack the COST of a dispatch when the binding constraint is
+the COUNT, and the count is set by indirect branches. Batch formation was
+even rebuilt around the observed successor chain (next-executing-tail, one
+store per dispatch) — still neutral, because the successor of a
+15-instruction trace is usually reached through exactly the indirect edge
+the batch cannot span.
+
+**Next lever, concretely:** inline caches for indirect targets — emit
+`if (target == last_seen) <continue trace> else <exit>` at jalr sites, with
+the cached target refreshed by the host. That extends traces through the
+edges that currently end them, which is the only thing that moves the count.
+Everything else in this area is now measured and closed.
+
+Standing (authoritative, drift 1.00x, REPS=3 NBREPS=3): **10/13**.
