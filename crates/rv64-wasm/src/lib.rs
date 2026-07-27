@@ -32,6 +32,12 @@ extern "C" {
     /// jit_out_ptr/jit_out_len), append its `run` function to this module's
     /// exported function table, and return the table index (-1 on failure).
     fn host_jit_register() -> i32;
+    /// Instantiate the BATCH module in JIT_OUT and append its `r0`..`r{n-1}`
+    /// exports to the function table CONTIGUOUSLY; returns the base index
+    /// (-1 on failure). Members transfer to each other by direct tail call
+    /// inside the module, so nothing imports the table and registration
+    /// stays O(1) per batch.
+    fn host_jit_register_batch(n: u32) -> i32;
     /// One Ethernet frame the guest transmitted, for the page to forward over
     /// its WebSocket relay. Called at quantum granularity, like host_write.
     fn host_net_send(ptr: *const u8, len: usize);
@@ -824,6 +830,8 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             40 => SB_EXT_DRAIN_VISITS,
             41 => SB_EXT_DRAIN_NOMATCH,
             42 => SB_DEMOTED,
+            43 => BATCHES,
+            44 => BATCH_MEMBERS,
             _ => 0,
         }
     }
@@ -1009,6 +1017,7 @@ pub extern "C" fn sbtest() -> u64 {
             mstatus_addr: 0,
             copystat_addr: 0,
             chain_off_addr: 0,
+            batch_base_addr: 0,
             dispatch_base: 0,
             dispatch_mask: 0,
             map_gen_addr: 0,
@@ -1096,6 +1105,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     mstatus_addr: 0, // user mode: no privileged FP state
                     copystat_addr: 0,
             chain_off_addr: 0,
+            batch_base_addr: 0,
                     dispatch_base: 0,
                     dispatch_mask: 0,
                     map_gen_addr: 0,
@@ -1487,6 +1497,7 @@ fn jit_layout(m: &rv64_system::Machine) -> rv64_jit::JitLayout {
         mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
         copystat_addr: copystat_addr(),
         chain_off_addr: chain_off_addr(),
+        batch_base_addr: 0,
         dispatch_base: 0,
         dispatch_mask: 0,
         map_gen_addr: 0,
@@ -2355,6 +2366,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
                             copystat_addr: copystat_addr(),
                             chain_off_addr: chain_off_addr(),
+                            batch_base_addr: 0,
                             dispatch_base: jit.dispatch.as_ptr() as u32,
                             dispatch_mask: (DISPATCH_SIZE - 1) as u32,
                             map_gen_addr: m.cpu.jit_map_gen_ptr() as u32,
@@ -2543,6 +2555,138 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         let w = &wins[wi];
                         let winpages = &w.pages;
                         unsafe { COMPILES_TICK += 1 };
+                        // BATCH: compile this pc together with its fixed-
+                        // target successors as one module whose members
+                        // tail-call each other directly (~2ns/hop, no table
+                        // import, O(1) registration). Falls back to the
+                        // single-block path whenever a batch can't form.
+                        let cell = unsafe {
+                            let c = BATCH_CELL_NEXT;
+                            BATCH_CELL_NEXT = (c + 1) % BATCH_CELLS;
+                            c
+                        };
+                        let batch = if unsafe { BATCH_ON } && !w.pages.is_empty() {
+                            let mut blay = lay;
+                            blay.batch_base_addr = batch_cell_addr(cell);
+                            let cache = &jit.cache;
+                            let hotmap = &jit.hot;
+                            let hot =
+                                |t: u64| matches!(cache.get(&t), Some(Some(b)) if b.idx >= 0);
+                            let wlo = w.first_va;
+                            let whi = w.first_va + (TRACE_WIN_PAGES * 0x1000);
+                            let pages = &w.pages;
+                            // Members must be PROVEN hot: taking every exit
+                            // target compiled ~24 blocks per tier-up, most
+                            // never executed — a compile storm that ran
+                            // python fib 35x slower (173s). Warm pcs only
+                            // (half the tier-up threshold) keeps a batch to
+                            // the successor set actually being executed.
+                            let bar = unsafe { JIT_THRESHOLD >> BATCH_BAR_SHIFT };
+                            // Already-compiled successors DO join (the batch
+                            // supersedes them in the cache; the old block just
+                            // becomes unreachable): requiring uncompiled pcs
+                            // meant batches almost never formed with 2+
+                            // members, since a hot pc's successors are
+                            // normally compiled before it. Loop headers are
+                            // excluded — their tight wasm regions beat any
+                            // trace — as are superblock entries (n == 0).
+                            let want = |t: u64| {
+                                t >= wlo
+                                    && t < whi
+                                    && pages.iter().any(|&(va, _)| va == t & !0xfff)
+                                    && hotmap.get(&t).is_some_and(|&c| c >= bar)
+                                    && !matches!(cache.get(&t), Some(Some(b)) if b.n == 0)
+                            };
+                            rv64_jit::translate_batch(
+                                &w.buf,
+                                w.first_va,
+                                pc,
+                                blay,
+                                &hot,
+                                &want,
+                                unsafe { BATCH_CAP },
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some((wasm, members)) = batch {
+                            if members.len() >= 2 {
+                                let n = members.len() as u32;
+                                unsafe { JIT_OUT = wasm };
+                                let bbase = unsafe { host_jit_register_batch(n) };
+                                if bbase >= 0 {
+                                    unsafe {
+                                        BATCH_BASE_POOL[cell] = bbase as u32;
+                                        JIT_TABLE_ENTRIES += n as u64;
+                                        BATCHES += 1;
+                                        BATCH_MEMBERS += n as u64;
+                                    }
+                                    for (j, mb) in members.iter().enumerate() {
+                                        let (lo, hi) = if mb.span == (0, 0) {
+                                            (mb.pc, mb.pc + 2)
+                                        } else {
+                                            mb.span
+                                        };
+                                        let mut mpa = 0u64;
+                                        let mut spanned: Vec<(u64, u64)> = Vec::new();
+                                        let mut va = lo & !0xfff;
+                                        let mut okp = true;
+                                        while va <= (hi - 1) & !0xfff {
+                                            match w.pages.iter().find(|&&(v, _)| v == va) {
+                                                Some(&(_, pp)) => {
+                                                    if va == mb.pc & !0xfff {
+                                                        mpa = pp + (mb.pc & 0xfff);
+                                                    }
+                                                    spanned.push((va, pp));
+                                                }
+                                                None => {
+                                                    okp = false;
+                                                    break;
+                                                }
+                                            }
+                                            va += 0x1000;
+                                        }
+                                        if !okp || mpa == 0 {
+                                            continue;
+                                        }
+                                        for &(_, pp) in &spanned {
+                                            m.bus.jit_mark_page(pp);
+                                        }
+                                        let idx = bbase + j as i32;
+                                        if spanned.len() > 1 {
+                                            jit.regions.insert(idx, spanned.clone());
+                                        }
+                                        let b = JitBlock {
+                                            fp: mb.uses_fp,
+                                            idx,
+                                            n: mb.n_insns,
+                                            pa: mpa,
+                                        };
+                                        if jit.cache.insert(mb.pc, Some(b)).is_none() {
+                                            for &(_, pp) in &spanned {
+                                                jit.page_blocks
+                                                    .entry((pp - rv64_system::RAM_BASE) >> 12)
+                                                    .or_default()
+                                                    .push(mb.pc);
+                                            }
+                                        }
+                                        if unsafe { SYS_SUPERBLOCK } {
+                                            for &sd in &mb.seeds {
+                                                let e = jit
+                                                    .page_entries
+                                                    .entry((aspace, sd & !0xfff))
+                                                    .or_default();
+                                                if let Err(i) = e.binary_search(&sd) {
+                                                    e.insert(i, sd);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    m.cpu.clear_store_jtlb();
+                                    continue; // dispatch the seed member now
+                                }
+                            }
+                        }
                         let blk = {
                             // Hotness oracle for branch-direction bias: a
                             // compiled (non-blacklisted) target is proven-hot.
@@ -2997,6 +3141,7 @@ pub extern "C" fn sb_analyze(vpage: u64, which: u32) -> u64 {
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),
         chain_off_addr: chain_off_addr(),
+        batch_base_addr: 0,
             dispatch_base: 0,
             dispatch_mask: 0,
             map_gen_addr: 0,
@@ -3081,6 +3226,7 @@ pub extern "C" fn sb_analyze_pc(pc: u64, which: u32) -> u64 {
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),
         chain_off_addr: chain_off_addr(),
+        batch_base_addr: 0,
             dispatch_base: 0,
             dispatch_mask: 0,
             map_gen_addr: 0,
@@ -3155,6 +3301,57 @@ pub extern "C" fn jit_set_tailcall(on: u32) {
 pub extern "C" fn jit_set_rotated_nests(on: u32) {
     rv64_jit::set_rotated_nests(on != 0);
 }
+/// Base table index of the most recently REGISTERED batch (see
+/// JitLayout::batch_base_addr): the emitted intra-batch link checks
+/// `line.idx == base + j` against this cell, which the host writes right
+/// after the batch's functions land in the table.
+/// Per-batch base cells. A single global cell was wrong: every batch's
+/// emitted links read the same address, so as soon as a second batch
+/// registered, the first batch's freshness checks compared against the
+/// wrong base — silently defeating the check they exist to perform. Each
+/// batch gets its own slot (address baked into its emitted code), rotating
+/// through a fixed pool so addresses are stable for the module's lifetime.
+const BATCH_CELLS: usize = 4096;
+static mut BATCH_BASE_POOL: [u32; BATCH_CELLS] = [0; BATCH_CELLS];
+static mut BATCH_CELL_NEXT: usize = 0;
+/// Batch compilation (see rv64_jit::translate_batch). Members transfer by
+/// DIRECT tail call inside one module — the only chaining shape that avoids
+/// both historical blockers (no table import, so registration stays O(1);
+/// no host round-trip per hop). It WORKS: 766 batches / 2965 members on an
+/// in-guest `tcc -c`, host dispatches down 12%.
+///
+/// DEFAULT OFF anyway, on an interleaved 3-round A/B (the only method that
+/// survives this host's boot lottery): compile 4356/4075/4069 without vs
+/// 4558/4169/4336 with — batching loses every round. Reason, measured: only
+/// ~12% of exits stay inside a batch, so the other ~88% pay the link's
+/// guard (dispatch-line pc + map-generation + fuel) for nothing, and that
+/// costs slightly more than the saved host round-trips return. Raising the
+/// cap makes it worse (bigger modules, no better hit rate: 32 -> 4195,
+/// 64 -> 4546). What would flip it: hit rate, not hop cost — batches formed
+/// from OBSERVED dispatch sequences (trace trees) rather than static exit
+/// seeds. Machinery is fully tested and one flag away.
+static mut BATCH_ON: bool = false;
+static mut BATCH_CAP: usize = 12;
+static mut BATCH_BAR_SHIFT: u32 = 1;
+#[no_mangle]
+pub extern "C" fn jit_set_batch_cap(v: u32) {
+    unsafe { BATCH_CAP = v as usize }
+}
+#[no_mangle]
+pub extern "C" fn jit_set_batch_bar_shift(v: u32) {
+    unsafe { BATCH_BAR_SHIFT = v }
+}
+static mut BATCHES: u64 = 0;
+static mut BATCH_MEMBERS: u64 = 0;
+#[no_mangle]
+pub extern "C" fn jit_set_batch(on: u32) {
+    unsafe { BATCH_ON = on != 0 }
+}
+#[allow(static_mut_refs)]
+fn batch_cell_addr(i: usize) -> u32 {
+    unsafe { &BATCH_BASE_POOL[i % BATCH_CELLS] as *const u32 as u32 }
+}
+
 /// Live chain kill switch (see JitLayout::chain_off_addr): nonzero disables
 /// every emitted chain transfer. Driven by CODE-CHURN RATE at quantum
 /// boundaries: a workload still compiling new blocks (tcc churns ~7.5k

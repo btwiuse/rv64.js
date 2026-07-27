@@ -210,6 +210,24 @@ impl WasmModule {
         self
     }
 
+    /// return_call (DIRECT tail call, 0x12): replaces the current frame with
+    /// the named function — the intra-batch block-to-block transfer. Direct,
+    /// so no table, no import, no signature check at runtime.
+    pub fn return_call(&mut self, idx: u32) -> &mut Self {
+        self.code.push(0x12);
+        uleb(&mut self.code, idx as u64);
+        self
+    }
+
+    /// Locals counts declared for this module's body (for batch assembly).
+    pub fn locals(&self) -> (u32, u32) {
+        (self.n_locals_i64, self.n_locals_i32)
+    }
+
+    pub fn wants_tlb(&self) -> bool {
+        self.wants_tlb_fill
+    }
+
     // -- instruction stream helpers --
 
     /// Declare the tlb_fill import (function index 0; the block body becomes
@@ -505,4 +523,82 @@ fn section(m: &mut Vec<u8>, id: u8, payload: &[u8]) {
     m.push(id);
     uleb(m, payload.len() as u64);
     m.extend_from_slice(payload);
+}
+
+
+/// Assemble a BATCH module: N trace bodies (each with its own locals) in one
+/// module, exported "r0".."rN-1". Direct tail calls between bodies transfer
+/// in ~2ns with no table import — the design that finally reconciles cheap
+/// block chaining with O(1) registration (a shared-table import made every
+/// table.set O(importing instances); see the 2026-07-26 chain saga).
+/// Function index space: tlb_fill (import 0) then bodies 1..=N — emit links
+/// with `return_call(1 + target_member_index)`. The tlb import is always
+/// declared so indices are stable whether or not any body uses it.
+pub fn finish_batch(bodies: Vec<(Vec<u8>, u32, u32)>) -> Vec<u8> {
+    let n = bodies.len();
+    let mut m = vec![0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
+
+    // types: 0 = (i32) -> (), 1 = tlb (i64, i32) -> i64
+    let sec_types: Vec<u8> = vec![2, 0x60, 1, 0x7f, 0, 0x60, 2, 0x7e, 0x7f, 1, 0x7e];
+    section(&mut m, 1, &sec_types);
+
+    // imports: tlb_fill (func 0), memory
+    let mut sec = vec![2u8];
+    sec.push(3);
+    sec.extend_from_slice(b"env");
+    sec.push(8);
+    sec.extend_from_slice(b"tlb_fill");
+    sec.extend_from_slice(&[0x00, 0x01]);
+    sec.push(3);
+    sec.extend_from_slice(b"env");
+    sec.push(6);
+    sec.extend_from_slice(b"memory");
+    sec.extend_from_slice(&[0x02, 0x00, 0x01]);
+    section(&mut m, 2, &sec);
+
+    // functions: n bodies of type 0
+    let mut sec = Vec::new();
+    uleb(&mut sec, n as u64);
+    for _ in 0..n {
+        sec.push(0);
+    }
+    section(&mut m, 3, &sec);
+
+    // exports: "r<i>" -> func 1 + i
+    let mut sec = Vec::new();
+    uleb(&mut sec, n as u64);
+    for i in 0..n {
+        let name = format!("r{i}");
+        uleb(&mut sec, name.len() as u64);
+        sec.extend_from_slice(name.as_bytes());
+        sec.push(0x00);
+        uleb(&mut sec, (1 + i) as u64);
+    }
+    section(&mut m, 7, &sec);
+
+    // code: each body with its own locals (i64 group then i32 group)
+    let mut sec = Vec::new();
+    uleb(&mut sec, n as u64);
+    for (code, n64, n32) in &bodies {
+        let mut body = Vec::new();
+        let mut groups: Vec<(u32, u8)> = Vec::new();
+        if *n64 > 0 {
+            groups.push((*n64, 0x7e));
+        }
+        if *n32 > 0 {
+            groups.push((*n32, 0x7f));
+        }
+        uleb(&mut body, groups.len() as u64);
+        for (count, ty) in groups {
+            uleb(&mut body, count as u64);
+            body.push(ty);
+        }
+        body.extend_from_slice(code);
+        body.push(END);
+        uleb(&mut sec, body.len() as u64);
+        sec.extend_from_slice(&body);
+    }
+    section(&mut m, 10, &sec);
+
+    m
 }

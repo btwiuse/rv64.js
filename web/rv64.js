@@ -110,6 +110,33 @@ export class RV64 {
             return -1;
           }
         },
+        // Batch registration: one module carrying N trace bodies that
+        // tail-call each other directly. Its exports go into CONTIGUOUS
+        // table slots so emitted links can verify `line.idx == base + j`.
+        host_jit_register_batch: (n) => {
+          try {
+            const bytes = new Uint8Array(
+              vm.ex.memory.buffer,
+              vm.ex.jit_out_ptr(),
+              vm.ex.jit_out_len(),
+            ).slice();
+            const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+              env: { memory: vm.ex.memory, tlb_fill: vm.ex.jit_tlb_fill },
+            });
+            const table = vm.ex.__indirect_function_table;
+            vm.tableNext ??= table.length;
+            if (vm.tableNext + n > table.length) table.grow(Math.max(4096, n));
+            const base = vm.tableNext;
+            for (let j = 0; j < n; j++) table.set(base + j, inst.exports["r" + j]);
+            vm.tableNext += n;
+            vm.jitBlocks = (vm.jitBlocks ?? 0) + n;
+            vm.jitBatches = (vm.jitBatches ?? 0) + 1;
+            return base;
+          } catch (e) {
+            console.warn("batch jit register failed:", e);
+            return -1;
+          }
+        },
         // Async variant for LARGE modules (page superblocks): compiles on
         // V8's background threads via WebAssembly.compile so guest execution
         // never stalls on a big synchronous Module build. When ready, the

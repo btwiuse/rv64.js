@@ -20,6 +20,41 @@ function check(name, ok, detail = "") {
   if (!ok) failures++;
 }
 
+// This project instantiates plain wasm32-unknown-unknown with a deliberately
+// small raw ABI. In particular, TLS dependencies must not smuggle in
+// wasm-bindgen/externref support that web/rv64.js does not provide.
+{
+  const expected = [
+    "host_http_request",
+    "host_jit_register",
+    "host_jit_register_async",
+    "host_jit_register_batch",
+    "host_net_send",
+    "host_now_ms",
+    "host_random",
+    "host_unix_ms",
+    "host_write",
+  ];
+  const imports = WebAssembly.Module.imports(new WebAssembly.Module(wasmBytes));
+  const actual = imports
+    .filter((item) => item.module === "env" && item.kind === "function")
+    .map((item) => item.name)
+    .sort();
+  const unexpected = imports.filter(
+    (item) =>
+      item.module !== "env" ||
+      item.kind !== "function" ||
+      !expected.includes(item.name),
+  );
+  check(
+    "raw wasm import ABI",
+    unexpected.length === 0 &&
+      actual.length === expected.length &&
+      actual.every((name, index) => name === expected[index]),
+    actual.join(", "),
+  );
+}
+
 // ---- user-mode guests under JIT ----
 const guests = [
   ["hello-std", ["h", "x"], 0, "sum of squares 1..10 = 385"],
@@ -318,11 +353,66 @@ for (const [name, argv, wantExit, wantOut] of guests) {
     await new Promise((r) => origin.listen(0, "127.0.0.1", r));
     const port = origin.address().port;
 
+    // A deterministic request-level relay. fetch() below is made to fail for
+    // one synthetic origin, exactly as a browser does when CORS hides the
+    // response; the relay then streams a response through the same wasm ABI.
+    let relayRequests = 0;
+    class FakeHttpRelay {
+      constructor() {
+        this.readyState = 0;
+        queueMicrotask(() => {
+          this.readyState = 1;
+          this.onopen?.();
+        });
+      }
+      send(data) {
+        const request = new Uint8Array(data);
+        if (
+          request[0] !== 0x52 ||
+          request[1] !== 0x48 ||
+          request[2] !== 0x52 ||
+          request[3] !== 0x31 ||
+          request[4] !== 1
+        ) {
+          throw new Error("bad request relay frame");
+        }
+        const id = new DataView(
+          request.buffer,
+          request.byteOffset,
+        ).getBigUint64(8, true);
+        relayRequests++;
+        const frame = (type, payload = new Uint8Array()) => {
+          const out = new Uint8Array(16 + payload.length);
+          out.set([0x52, 0x48, 0x52, 0x31]);
+          out[4] = type;
+          new DataView(out.buffer).setBigUint64(8, id, true);
+          out.set(payload, 16);
+          return out.buffer;
+        };
+        const head = new Uint8Array(8);
+        new DataView(head.buffer).setUint32(0, 200, true);
+        const body = new TextEncoder().encode(`RELAY-FALLBACK-${relayRequests}\n`);
+        queueMicrotask(() => {
+          this.onmessage?.({ data: frame(2, head) });
+          this.onmessage?.({ data: frame(3, body) });
+          this.onmessage?.({ data: frame(4) });
+        });
+      }
+      close() {
+        this.readyState = 3;
+        queueMicrotask(() => this.onclose?.());
+      }
+    }
+
     const vm = await RV64.create(wasmBytes);
     let out = "";
     vm.onWrite = (fd, b) => {
       out += new TextDecoder().decode(b);
     };
+    vm.connectHttpRelay("ws://test.invalid", {
+      WebSocket: FakeHttpRelay,
+      timeoutMs: 1000,
+    });
     vm.bootLinux({
       bios: new Uint8Array(await readFile(img("bbl64.bin"))),
       kernel: new Uint8Array(await readFile(img("kernel-riscv64.bin"))),
@@ -353,15 +443,47 @@ for (const [name, argv, wantExit, wantOut] of guests) {
     check("proxy URL is reported", url.startsWith("http://10.0.2.2:"), url);
     let ok = false;
     let big = false;
+    let fallback = false;
+    let cached = false;
+    let blockedFetches = 0;
     if (gotShell) {
       await run("ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up && echo NET_'O'K", "NET_OK");
       await run(`export http_proxy=${url}; echo ENV_'O'K`, "ENV_OK");
       ok = await run(`wget -q -O- http://127.0.0.1:${port}/hello`, "FETCH-EGRESS-OK");
       // Proves the streamed body reassembles: the origin writes 20 chunks.
       big = await run(`wget -q -O- http://127.0.0.1:${port}/big | wc -c`, "20000");
+
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (resource, init) => {
+        if (String(resource).startsWith("http://cors-blocked.invalid")) {
+          blockedFetches++;
+          return Promise.reject(new TypeError("Failed to fetch"));
+        }
+        return realFetch(resource, init);
+      };
+      try {
+        fallback = await run(
+          "wget -q -O- http://cors-blocked.invalid/first",
+          "RELAY-FALLBACK-1",
+        );
+        // The first safe failure caches this origin, so no second failed fetch
+        // is paid and later methods can be routed without duplicate delivery.
+        cached = await run(
+          "wget -q -O- http://cors-blocked.invalid/second",
+          "RELAY-FALLBACK-2",
+        );
+      } finally {
+        globalThis.fetch = realFetch;
+      }
     }
     check("http proxy over fetch egress (wasm)", ok, `shell=${gotShell}`);
     check("streamed response through the proxy (wasm)", big);
+    check(
+      "per-origin fetch-to-relay fallback (wasm)",
+      fallback && cached && blockedFetches === 1 && relayRequests === 2,
+      `fetch-failures=${blockedFetches} relay-requests=${relayRequests}`,
+    );
+    vm.disconnectHttpRelay();
     origin.close();
   }
 }

@@ -122,6 +122,16 @@ pub fn trace_level() -> u32 {
 /// masks it before its own table call.
 pub const SB_IDX_BIT: i32 = 1 << 30;
 
+/// When set, translate_block_link skips the copy/loop detectors and returns
+/// Block.wasm as the RAW body stream (no module wrapper, no trailing END)
+/// with Block.locals filled — the shape translate_batch assembles into one
+/// multi-function module. Single-threaded wasm host; contained to
+/// translate_batch's scope.
+static RAW_BODY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn raw_body() -> bool {
+    RAW_BODY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Linear-trace register value facts (see translate_block). `Proven` values
 /// are set by the trace's own emitted code (jal link, lui, auipc) with no
 /// later write — following them needs no runtime check. `Predicted` values
@@ -307,6 +317,12 @@ pub struct JitLayout {
     /// 2-2.9x slower with chains than without; nbench's small kernels win
     /// up to +23% chained). 0 = no cell, chains ungated.
     pub chain_off_addr: u32,
+    /// i32 cell holding the global-table BASE index of the batch this body
+    /// belongs to (host writes it at registration). Intra-batch links
+    /// verify `line.idx == base + j` before a direct tail call, so a link
+    /// never runs a member the dispatch cache has since replaced. 0 = not
+    /// in a batch.
+    pub batch_base_addr: u32,
 }
 
 impl JitLayout {
@@ -327,6 +343,7 @@ impl JitLayout {
             mstatus_addr: 0,
             copystat_addr: 0,
             chain_off_addr: 0,
+            batch_base_addr: 0,
         }
     }
 }
@@ -344,6 +361,9 @@ pub struct Block {
     /// as it does for multi-page regions. (0, 0) = the producer's code is
     /// wholly inside [start_pc, start_pc + len).
     pub span: (u64, u64),
+    /// Locals declared by this block's body (i64, i32) — batch assembly
+    /// re-declares them per body (see wasm_emit::finish_batch).
+    pub locals: (u32, u32),
     /// The trace touches the FP register file (fp_read | fp_write): the
     /// host's claim policy keeps long INTEGER traces out of page functions
     /// but always lets functions claim FP traces — keeping FP traces made
@@ -3706,6 +3726,7 @@ fn translate_copy_loop(
         span: (0, 0),
         seeds: Vec::new(),
         uses_fp: false,
+        locals: (0, 0),
         len: cl.end_pc - start_pc,
         n_insns: cl.body_n,
     })
@@ -3797,6 +3818,64 @@ pub fn translate_block_hot(
     lay: JitLayout,
     hot: &dyn Fn(u64) -> bool,
 ) -> Option<Block> {
+    translate_block_link(code, base, start_pc, lay, hot, &|_| None)
+}
+
+/// Emit the intra-batch link at a fixed-target exit: verify the dispatch
+/// line still names OUR co-member (pc, generation, and idx == base + j),
+/// verify fuel, then DIRECT tail call. The target pc is a compile-time
+/// constant, so its dispatch slot is too — every load here is at a constant
+/// address and the whole sequence needs no scratch locals. Falls through to
+/// the ordinary host return when any check fails.
+/// Finish a trace body: full module normally, raw stream in batch mode.
+fn seal(m: WasmModule) -> (Vec<u8>, (u32, u32)) {
+    let locals = m.locals();
+    if raw_body() {
+        (m.into_code(), locals)
+    } else {
+        (m.finish(), locals)
+    }
+}
+
+fn emit_batch_link(m: &mut WasmModule, lay: &JitLayout, target: u64, j: u32) {
+    let off = ((target >> 1) as u64 & lay.dispatch_mask as u64) << 4;
+    let line = lay.dispatch_base as u64 + off;
+    // line.pc == target?
+    m.i32_const(0).i64_load(line);
+    m.i64_const(target as i64).op(I64_NE);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+    // verified under the current address-space generation?
+    m.i32_const(0).i32_load(line + 12);
+    m.i32_const(0).i32_load(lay.map_gen_addr as u64);
+    m.op(I32_NE);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+    // NO base/idx check: `line.pc == target` already proves the dispatch
+    // cache holds THIS pc, and the map-generation check proves the mapping
+    // is current; the dirty-page tracker clears the line whenever the code
+    // bytes change. Our direct callee is by construction the body compiled
+    // for exactly `target`, so it is architecturally correct even if the
+    // cache has since pointed that pc at a newer block or page function.
+    // fuel left in this grant?
+    m.i32_const(0).i64_load(lay.retired_addr as u64);
+    m.i32_const(0).i64_load(lay.fuel_addr as u64);
+    m.op(I64_GE_U);
+    m.op(IF).op(VOID).op(RETURN).op(END);
+    m.local_get(0);
+    m.return_call(1 + j); // func index space: tlb_fill(0), bodies 1..=N
+}
+
+/// translate_block_hot plus an intra-batch LINK oracle: link(target_pc) =
+/// Some(member_index) when the fixed-target exit can transfer to a
+/// co-member of the same batch module by direct tail call.
+pub fn translate_block_link(
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+    link: &dyn Fn(u64) -> Option<u32>,
+) -> Option<Block> {
+    let skip_detectors = raw_body();
     // The loop/copy detectors see the FULL trace window: a loop that
     // straddles a page boundary can now close into a loop region (span
     // registration handles the multi-page dirty/map bookkeeping) — with
@@ -3804,7 +3883,7 @@ pub fn translate_block_hot(
     // back to per-iteration trace dispatches (568 -> 448 iter/s).
     // Bulk-copyable self-loop (memcpy/memmove word loops): one wasm
     // memory.copy per page-bounded chunk — see translate_copy_loop.
-    if lay.sys.is_some() {
+    if lay.sys.is_some() && !skip_detectors {
         if let Some(cl) = detect_copy_loop(code, base, start_pc) {
             if let Some(b) = translate_copy_loop(&cl, code, base, start_pc, lay) {
                 return Some(b);
@@ -3814,7 +3893,7 @@ pub fn translate_block_hot(
     // Structured loop region (nested loops + forward if-then/break) → compile
     // the whole thing as one wasm function so register locals persist across
     // every iteration of every level (3e-2 / v86 control-flow structuring).
-    if lay.mem.is_some() || lay.sys.is_some() {
+    if (lay.mem.is_some() || lay.sys.is_some()) && !skip_detectors {
         if let Some(region) = loop_region(code, base, start_pc, &lay) {
             let (rm, wm, fr, fw) = scan_regs_region(code, base, start_pc, region.end_pc, &lay);
             let (mut c, mut m) = build_ctx(lay, rm, wm, fr, fw);
@@ -3936,9 +4015,15 @@ pub fn translate_block_hot(
                 c.flush_writes(&mut m);
                 c.set_pc_const(&mut m, target);
                 c.set_retired(&mut m, n + 1);
-                emit_chain_next(&c, &mut m, false);
+                if let Some(lj) = link(target) {
+                    emit_batch_link(&mut m, &lay, target, lj);
+                } else {
+                    emit_chain_next(&c, &mut m, false);
+                }
+                let (wasm, locals) = seal(m);
                 return Some(Block {
-                    wasm: m.finish(),
+                    wasm,
+                    locals,
                     span: (lo, hi),
                     seeds: core::mem::take(&mut seeds),
                     uses_fp: (fp_read | fp_write) != 0,
@@ -4012,8 +4097,10 @@ pub fn translate_block_hot(
                 emit_chain_next(&c, &mut m, false);
                 // Dynamic target (return/indirect): the chain call site
                 // would be megamorphic — dispatch through the host.
+                let (wasm, locals) = seal(m);
                 return Some(Block {
-                    wasm: m.finish(),
+                    wasm,
+                    locals,
                     span: (lo, hi),
                     seeds: core::mem::take(&mut seeds),
                     uses_fp: (fp_read | fp_write) != 0,
@@ -4058,8 +4145,12 @@ pub fn translate_block_hot(
                     c.set_pc_const(&mut m, exit_pc);
                     c.flush_writes(&mut m);
                     c.set_retired(&mut m, n + 1);
-                emit_chain_next(&c, &mut m, false);
-                        m.op(RETURN);
+                    if let Some(lj) = link(exit_pc) {
+                        emit_batch_link(&mut m, &lay, exit_pc, lj);
+                    } else {
+                        emit_chain_next(&c, &mut m, false);
+                    }
+                    m.op(RETURN);
                     m.op(END);
                     pc = follow_pc;
                     n += 1;
@@ -4074,8 +4165,10 @@ pub fn translate_block_hot(
                 c.flush_writes(&mut m);
                 c.set_retired(&mut m, n + 1);
                 emit_chain_next(&c, &mut m, false);
+                let (wasm, locals) = seal(m);
                 return Some(Block {
-                    wasm: m.finish(),
+                    wasm,
+                    locals,
                     span: (lo, hi),
                     seeds: core::mem::take(&mut seeds),
                     uses_fp: (fp_read | fp_write) != 0,
@@ -4094,12 +4187,18 @@ pub fn translate_block_hot(
     c.flush_writes(&mut m);
     c.set_pc_const(&mut m, pc);
     c.set_retired(&mut m, n);
-    emit_chain_next(&c, &mut m, false);
+    if let Some(lj) = link(pc) {
+        emit_batch_link(&mut m, &lay, pc, lj);
+    } else {
+        emit_chain_next(&c, &mut m, false);
+    }
+    let (wasm, locals) = seal(m);
     Some(Block {
-        wasm: m.finish(),
+        wasm,
+        locals,
         span: (lo, hi),
-                    seeds: core::mem::take(&mut seeds),
-                    uses_fp: (fp_read | fp_write) != 0,
+        seeds: core::mem::take(&mut seeds),
+        uses_fp: (fp_read | fp_write) != 0,
         len: pc.saturating_sub(start_pc),
         n_insns: n,
     })
@@ -4285,6 +4384,7 @@ fn translate_loop(
         span: (0, 0),
         seeds: Vec::new(),
         uses_fp: false,
+        locals: (0, 0),
         len: region.end_pc - start_pc,
         n_insns: static_n.max(1),
     })
@@ -5041,6 +5141,7 @@ pub fn translate_superblock_sparse(
         span: (0, 0),
         seeds: Vec::new(),
         uses_fp: false,
+        locals: (0, 0),
         len: (np * 0x1000) as u64,
         n_insns: 0,
     })
@@ -5310,4 +5411,88 @@ mod tests {
         assert_eq!(b.n_insns, 3);
         assert_eq!(b.len, 6);
     }
+}
+
+
+/// One member of a compiled batch: its entry pc and how many instructions
+/// its body retires (the host caches these like ordinary blocks).
+pub struct BatchMember {
+    pub pc: u64,
+    pub n_insns: u32,
+    pub span: (u64, u64),
+    pub uses_fp: bool,
+    pub seeds: Vec<u64>,
+}
+
+/// Compile a hot pc AND its fixed-target successors as ONE module whose
+/// members transfer by direct tail call (~2ns), with no table import and
+/// therefore none of the O(importing instances) table.set cost that killed
+/// every earlier chaining design. Discovery is breadth-first over each
+/// trace's own exit seeds, bounded by `cap`; only pcs the caller's `want`
+/// predicate accepts (in-window, not already compiled, ...) join.
+///
+/// Returns the module bytes plus one BatchMember per exported body, in
+/// export order — member j is export "r{j}" and table index base + j.
+pub fn translate_batch(
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+    want: &dyn Fn(u64) -> bool,
+    cap: usize,
+) -> Option<(Vec<u8>, Vec<BatchMember>)> {
+    // Pass 1 (no links): discover the member set breadth-first from the
+    // seed pc's exits. Bodies are re-emitted in pass 2 once every member's
+    // index is known, so a link can name a member discovered after it.
+    RAW_BODY.store(true, std::sync::atomic::Ordering::Relaxed);
+    let no_link = |_: u64| None;
+    let mut pcs: Vec<u64> = vec![start_pc];
+    let mut probed = 0usize;
+    // A loop header keeps its structured region: never pull one into a
+    // batch as a plain trace.
+    let is_loop_hdr = |t: u64| is_loop_at(code, base, t, lay);
+    while probed < pcs.len() && pcs.len() < cap {
+        let p = pcs[probed];
+        probed += 1;
+        let Some(b) = translate_block_link(code, base, p, lay, hot, &no_link) else {
+            continue;
+        };
+        for sd in b.seeds {
+            if pcs.len() >= cap {
+                break;
+            }
+            if !pcs.contains(&sd) && want(sd) && !is_loop_hdr(sd) {
+                pcs.push(sd);
+            }
+        }
+    }
+    // Pass 2: emit every member with links resolved against the final set.
+    let index_of = |t: u64| pcs.iter().position(|&q| q == t).map(|k| k as u32);
+    let mut bodies: Vec<(Vec<u8>, u32, u32)> = Vec::new();
+    let mut members: Vec<BatchMember> = Vec::new();
+    let mut ok = true;
+    for &p in &pcs {
+        match translate_block_link(code, base, p, lay, hot, &index_of) {
+            Some(b) => {
+                bodies.push((b.wasm, b.locals.0, b.locals.1));
+                members.push(BatchMember {
+                    pc: p,
+                    n_insns: b.n_insns,
+                    span: b.span,
+                    uses_fp: b.uses_fp,
+                    seeds: b.seeds,
+                });
+            }
+            None => {
+                ok = false;
+                break;
+            }
+        }
+    }
+    RAW_BODY.store(false, std::sync::atomic::Ordering::Relaxed);
+    if !ok || bodies.is_empty() {
+        return None;
+    }
+    Some((wasm_emit::finish_batch(bodies), members))
 }
