@@ -1558,6 +1558,7 @@ fn scan_regs(
     start_pc: u64,
     lay: &JitLayout,
     hot: &dyn Fn(u64) -> bool,
+    next: &dyn Fn(u64) -> Option<u64>,
 ) -> (u32, u32, u32, u32, u32) {
     let (mut read, mut write) = (0u32, 0u32);
     // Uses per register: hoisting one into a wasm local costs a load in the
@@ -1583,6 +1584,7 @@ fn scan_regs(
     // will take.
     let mut tf = TraceFacts::new();
     let tl = trace_level();
+    let mut seg_entry = start_pc;
     while n < MAX_TRACE as u32 {
         let Some((insn, ilen)) = fetch(code, base, pc) else {
             break;
@@ -1711,6 +1713,25 @@ fn scan_regs(
                 }
                 mark(&mut read, s1);
                 mark(&mut write, d);
+                // Inline cache (mirror translate_block exactly): an indirect
+                // jump whose observed target is in-window keeps the trace
+                // going under a one-compare guard.
+                if tl >= 3 {
+                    if let Some(t) = next(seg_entry) {
+                        if t != pc && t >= base && t < base + code.len() as u64 {
+                            seg_entry = t;
+                            if d != 0 {
+                                tf.step(insn, pc);
+                                tf.known[d] = Known::Proven(next_pc);
+                            } else {
+                                tf.step(insn, pc);
+                            }
+                            pc = t;
+                            n += 1;
+                            continue;
+                        }
+                    }
+                }
                 break;
             }
             0x63 => {
@@ -3926,6 +3947,28 @@ pub fn translate_block_link(
     hot: &dyn Fn(u64) -> bool,
     link: &dyn Fn(u64) -> Option<u32>,
 ) -> Option<Block> {
+    translate_block_ic(code, base, start_pc, lay, hot, link, &|_| None)
+}
+
+/// translate_block_link with an INLINE CACHE oracle: `next(pc)` is the
+/// target an indirect jump at `pc` was last observed to take. Indirect
+/// control flow — function pointers, switch tables, returns whose base is
+/// not a traced constant — is what ends tcc-shaped traces at ~15
+/// instructions against a 256-instruction cap, so extending traces THROUGH
+/// those edges is the only thing that reduces the dispatch COUNT (the
+/// binding constraint; seven dispatch-COST designs measured neutral).
+/// The guard is one compare against the cached target: hit continues the
+/// trace inline, miss publishes the real target and exits to the host.
+#[allow(clippy::too_many_arguments)]
+pub fn translate_block_ic(
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+    link: &dyn Fn(u64) -> Option<u32>,
+    next: &dyn Fn(u64) -> Option<u64>,
+) -> Option<Block> {
     let skip_detectors = raw_body();
     // The loop/copy detectors see the FULL trace window: a loop that
     // straddles a page boundary can now close into a loop region (span
@@ -3970,7 +4013,7 @@ pub fn translate_block_link(
     // indirect transfer or unhandled op. Registers the trace touches live in
     // wasm locals for its lifetime.
     let (read_mask, write_mask, fp_read, fp_write, scan_n) =
-        scan_regs(code, base, start_pc, &lay, hot);
+        scan_regs(code, base, start_pc, &lay, hot, next);
     // Trace prologue loads only what the trace READS; write-only registers
     // start undefined and each exit flushes only what has been written by
     // that point (Ctx::defined). A linear trace makes this exact — unlike a
@@ -4009,6 +4052,8 @@ pub fn translate_block_link(
     // jump — which is how a leaf callee's `ret` continues the caller's trace.
     let mut tf = TraceFacts::new();
     let tl = trace_level();
+    // Entry pc of the current observation segment (see the inline cache).
+    let mut seg_entry = start_pc;
     // Actual va range consumed (a trace can run backward through a followed
     // call) — the host dirty-tracks and map-verifies every page in it.
     let (mut lo, mut hi) = (start_pc, start_pc);
@@ -4145,6 +4190,8 @@ pub fn translate_block_link(
                         }
                     }
                 }
+                // Target into SCR FIRST (rd may alias rs1), then the
+                // architectural link write, then the inline-cache guard.
                 c.push_reg(&mut m, s1);
                 m.i64_const(imm_i(insn))
                     .op(I64_ADD)
@@ -4154,6 +4201,47 @@ pub fn translate_block_link(
                 if c.store_pre(&mut m, d) {
                     m.i64_const(next_pc as i64);
                     c.store_post(&mut m, d);
+                }
+                // INLINE CACHE: continue the trace at the OBSERVED target
+                // under one compare. A miss publishes the real target (SCR)
+                // and exits exactly as an uncached jalr would. This is the
+                // only construct that reduces the dispatch COUNT for
+                // indirect-heavy code — traces otherwise end here at ~15
+                // instructions against a 256-instruction cap.
+                // Observations are keyed by the entry pc of a dispatched
+                // block: "the block entered at E exited to T" describes E's
+                // FIRST indirect site. After an inline cache continues the
+                // trace at T, T was itself a dispatched block entry, so
+                // next(T) describes the NEXT indirect site. Walking that
+                // chain lets one compile thread several indirect edges
+                // instead of needing a recompile per edge.
+                let ic = if tl >= 3 {
+                    next(seg_entry).filter(|&t| {
+                        t != pc && t >= base && t < base + code.len() as u64
+                    })
+                } else {
+                    None
+                };
+                if let Some(t) = ic {
+                    seg_entry = t;
+                    m.local_get(SCR).i64_const(t as i64).op(I64_NE);
+                    m.op(IF).op(VOID);
+                    m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
+                    c.flush_writes(&mut m);
+                    c.set_retired(&mut m, n + 1);
+                    emit_chain_next(&c, &mut m, false);
+                    m.op(RETURN);
+                    m.op(END);
+                    seed(&mut seeds, t);
+                    tf.step(insn, pc);
+                    if d != 0 {
+                        // The link is the constant next_pc, so a later
+                        // `ret` through it can itself be followed.
+                        tf.known[d] = Known::Proven(next_pc);
+                    }
+                    pc = t;
+                    n += 1;
+                    continue;
                 }
                 m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
                 c.flush_writes(&mut m);

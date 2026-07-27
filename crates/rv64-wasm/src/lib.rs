@@ -340,7 +340,11 @@ struct JitState {
     /// trace-tree JITs form regions from: batches built from STATIC exit
     /// seeds only kept ~12% of exits in-batch, because a trace's textual
     /// successors are not the ones execution actually takes.
-    succ: Vec<(u64, u64)>,
+    succ: Vec<(u64, u64, u32)>,
+    /// Entry pcs already recompiled once with an inline cache — trace
+    /// EXTENSION happens at most once per pc, so a flapping successor
+    /// cannot loop the compiler.
+    ic_done: std::collections::HashSet<u64>,
     /// Table index -> the (virtual page, physical page) list a MULTI-page
     /// superblock was compiled over. Entries carry their own page's pa (probed
     /// like any block at dispatch); this is the rest of the region, verified on
@@ -403,7 +407,8 @@ impl JitState {
             ],
             flush_gen: 0,
             page_entries: Default::default(),
-            succ: vec![(NO_PC, 0); DISPATCH_SIZE],
+            succ: vec![(NO_PC, 0, 0); DISPATCH_SIZE],
+            ic_done: Default::default(),
             interp_hot: vec![0; DISPATCH_SIZE],
             interp_hot_tag: vec![0; DISPATCH_SIZE],
             page_blocks: Default::default(),
@@ -434,8 +439,9 @@ impl JitState {
             *t = 0;
         }
         for e in self.succ.iter_mut() {
-            *e = (NO_PC, 0);
+            *e = (NO_PC, 0, 0);
         }
+        self.ic_done.clear();
         self.page_blocks.clear();
         self.clear_dispatch();
     }
@@ -842,6 +848,7 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             42 => SB_DEMOTED,
             43 => BATCHES,
             44 => BATCH_MEMBERS,
+            45 => IC_EXTENDS,
             _ => 0,
         }
     }
@@ -2224,11 +2231,29 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 break; // blacklisted (pa-verified for the current mapping)
             }
             call_block(idx & !SB_IDX_BIT, mptr);
-            // Observed successor (JitState::succ): one store per dispatch,
-            // the raw material for execution-driven batch formation.
+            // Observed successor + stability count (JitState::succ). A
+            // trace ends at its first indirect jump, so this records where
+            // that jump actually goes. Once the target is proven stable,
+            // drop the block ONCE so it recompiles with an inline cache
+            // that continues through the edge — trace EXTENSION at a hot
+            // side exit, the mechanism that reduces dispatch COUNT for
+            // indirect-heavy code. (The oracle is empty at first compile
+            // by construction: the pc has never dispatched yet.)
             {
                 let sl = JitState::dslot(pc);
-                jit.succ[sl] = (pc, m.cpu.pc);
+                let e = &mut jit.succ[sl];
+                if e.0 == pc && e.1 == m.cpu.pc {
+                    e.2 = e.2.saturating_add(1);
+                } else {
+                    *e = (pc, m.cpu.pc, 1);
+                }
+                if e.2 == unsafe { IC_EXTEND_TRIGGER } && !jit.ic_done.contains(&pc) {
+                    jit.ic_done.insert(pc);
+                    jit.cache.remove(&pc);
+                    jit.dispatch[sl].pc = NO_PC;
+                    unsafe { IC_EXTENDS += 1 };
+                    break; // recompile on the next pass through tier-up
+                }
             }
             // Sampled exit attribution: after a region function returns,
             // cpu.pc holds the pc it exited TO. Out-of-region targets are
@@ -2730,7 +2755,22 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             let cache = &jit.cache;
                             let hot =
                                 |t: u64| matches!(cache.get(&t), Some(Some(b)) if b.idx >= 0);
-                            rv64_jit::translate_block_hot(&w.buf, w.first_va, pc, lay, &hot)
+                            // Inline-cache oracle: the target this pc's
+                            // indirect jump was last observed to take.
+                            let succ = &jit.succ;
+                            let next = |t: u64| {
+                                let e = succ[JitState::dslot(t)];
+                                (e.0 == t && e.2 >= unsafe { IC_EXTEND_TRIGGER }).then_some(e.1)
+                            };
+                            rv64_jit::translate_block_ic(
+                                &w.buf,
+                                w.first_va,
+                                pc,
+                                lay,
+                                &hot,
+                                &|_| None,
+                                &next,
+                            )
                         };
                         let entry = blk.and_then(|blk| {
                             // Pages the emitted code actually came from
@@ -3373,6 +3413,17 @@ static mut BATCH_CELL_NEXT: usize = 0;
 /// from OBSERVED dispatch sequences (trace trees) rather than static exit
 /// seeds. Machinery is fully tested and one flag away.
 static mut BATCH_ON: bool = false;
+/// Consecutive identical successors before a trace is recompiled with an
+/// inline cache through its terminating indirect jump. 256 measured best:
+/// the extension costs one recompile per pc, so a higher bar spends that
+/// only on genuinely stable edges (python fib 3520 -> 3356ms, compile
+/// 4505 -> 4468ms against trigger 64).
+static mut IC_EXTEND_TRIGGER: u32 = 256;
+static mut IC_EXTENDS: u64 = 0;
+#[no_mangle]
+pub extern "C" fn jit_set_ic_trigger(v: u32) {
+    unsafe { IC_EXTEND_TRIGGER = if v == 0 { u32::MAX } else { v } }
+}
 static mut BATCH_CAP: usize = 12;
 static mut BATCH_PAGE: bool = false;
 #[no_mangle]
