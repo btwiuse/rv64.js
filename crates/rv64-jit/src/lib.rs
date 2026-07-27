@@ -5506,6 +5506,26 @@ pub fn translate_batch(
     want: &dyn Fn(u64) -> bool,
     cap: usize,
 ) -> Option<(Vec<u8>, Vec<BatchMember>)> {
+    translate_batch_obs(code, base, start_pc, lay, hot, want, &|_| None, cap)
+}
+
+/// translate_batch with an OBSERVED-SUCCESSOR oracle: `next(pc)` is the pc
+/// execution was last seen to take after `pc`. Members are discovered along
+/// that chain FIRST (the next-executing-tail of trace-tree JITs) and only
+/// then from static exit seeds — a batch built from where control actually
+/// goes keeps far more exits inside the module than one built from where
+/// the instruction stream textually leads.
+#[allow(clippy::too_many_arguments)]
+pub fn translate_batch_obs(
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+    want: &dyn Fn(u64) -> bool,
+    next: &dyn Fn(u64) -> Option<u64>,
+    cap: usize,
+) -> Option<(Vec<u8>, Vec<BatchMember>)> {
     // Pass 1 (no links): discover the member set breadth-first from the
     // seed pc's exits. Bodies are re-emitted in pass 2 once every member's
     // index is known, so a link can name a member discovered after it.
@@ -5522,6 +5542,13 @@ pub fn translate_batch(
         let Some(b) = translate_block_link(code, base, p, lay, hot, &no_link) else {
             continue;
         };
+        // Observed successor first: it is where execution goes, so the link
+        // that matters most is the one that reaches it.
+        if let Some(nx) = next(p) {
+            if pcs.len() < cap && !pcs.contains(&nx) && want(nx) && !is_loop_hdr(nx) {
+                pcs.push(nx);
+            }
+        }
         for sd in b.seeds {
             if pcs.len() >= cap {
                 break;

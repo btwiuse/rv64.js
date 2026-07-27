@@ -335,6 +335,12 @@ struct JitState {
     /// the page function does not cover them — the direct measure of a page
     /// function that has fallen behind the code actually running.
     sb_missed: std::collections::HashMap<(u64, u64), u32>,
+    /// Observed successor of each dispatched pc, direct-mapped by dispatch
+    /// slot (pc, next_pc). This is the NEXT-EXECUTING-TAIL signal that
+    /// trace-tree JITs form regions from: batches built from STATIC exit
+    /// seeds only kept ~12% of exits in-batch, because a trace's textual
+    /// successors are not the ones execution actually takes.
+    succ: Vec<(u64, u64)>,
     /// Table index -> the (virtual page, physical page) list a MULTI-page
     /// superblock was compiled over. Entries carry their own page's pa (probed
     /// like any block at dispatch); this is the rest of the region, verified on
@@ -397,6 +403,7 @@ impl JitState {
             ],
             flush_gen: 0,
             page_entries: Default::default(),
+            succ: vec![(NO_PC, 0); DISPATCH_SIZE],
             interp_hot: vec![0; DISPATCH_SIZE],
             interp_hot_tag: vec![0; DISPATCH_SIZE],
             page_blocks: Default::default(),
@@ -425,6 +432,9 @@ impl JitState {
         }
         for t in self.interp_hot_tag.iter_mut() {
             *t = 0;
+        }
+        for e in self.succ.iter_mut() {
+            *e = (NO_PC, 0);
         }
         self.page_blocks.clear();
         self.clear_dispatch();
@@ -2214,6 +2224,12 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                 break; // blacklisted (pa-verified for the current mapping)
             }
             call_block(idx & !SB_IDX_BIT, mptr);
+            // Observed successor (JitState::succ): one store per dispatch,
+            // the raw material for execution-driven batch formation.
+            {
+                let sl = JitState::dslot(pc);
+                jit.succ[sl] = (pc, m.cpu.pc);
+            }
             // Sampled exit attribution: after a region function returns,
             // cpu.pc holds the pc it exited TO. Out-of-region targets are
             // the measured signal for incremental extension.
@@ -2611,13 +2627,20 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                     && !matches!(cache.get(&t), Some(Some(b)) if b.n == 0)
                                     && (!page_mode || t & !0xfff == seedpage)
                             };
-                            rv64_jit::translate_batch(
+                            let succ = &jit.succ;
+                            // Observed successor of a pc, when we have one.
+                            let next = |t: u64| {
+                                let e = succ[JitState::dslot(t)];
+                                (e.0 == t).then_some(e.1)
+                            };
+                            rv64_jit::translate_batch_obs(
                                 &w.buf,
                                 w.first_va,
                                 pc,
                                 blay,
                                 &hot,
                                 &want,
+                                &next,
                                 unsafe { BATCH_CAP },
                             )
                         } else {
