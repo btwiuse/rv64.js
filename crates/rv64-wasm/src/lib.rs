@@ -2605,12 +2605,16 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         // tail-call each other directly (~2ns/hop, no table
                         // import, O(1) registration). Falls back to the
                         // single-block path whenever a batch can't form.
+                        let batch_t0 = unsafe { host_now_ms() };
                         let cell = unsafe {
                             let c = BATCH_CELL_NEXT;
                             BATCH_CELL_NEXT = (c + 1) % BATCH_CELLS;
                             c
                         };
-                        let batch = if unsafe { BATCH_ON } && !w.pages.is_empty() {
+                        let batch = if unsafe { BATCH_ON }
+                            && jit.cache.len() < unsafe { BATCH_POP_CAP }
+                            && !w.pages.is_empty()
+                        {
                             let mut blay = lay;
                             blay.batch_base_addr = batch_cell_addr(cell);
                             let cache = &jit.cache;
@@ -2672,6 +2676,34 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             None
                         };
                         if let Some((wasm, members)) = batch {
+                            unsafe {
+                                SB_BUILD_MS += host_now_ms() - batch_t0;
+                                SB_LAST_ICOUNT = m.cpu.insn_count;
+                            }
+                            // RATE GOVERNOR. The gates that separate a
+                            // workload batching PAYS for from one it does
+                            // not are neither population nor footprint
+                            // (both accumulate kernel/boot code and fire
+                            // for everyone) — it is how FAST batches are
+                            // demanded. nbench ASSIGNMENT wants a few dozen
+                            // over tens of billions of instructions; CPython
+                            // wants thousands inside its first second, and
+                            // pays a batch compile per tier-up for code it
+                            // never re-enters (python fib 3.7s -> 180s).
+                            // Once the observed rate proves that shape,
+                            // batching switches off for the rest of the run.
+                            unsafe {
+                                // Deferring this verdict until the guest is
+                                // warm was tried and is WORSE: python's
+                                // storm resumes unchecked (all runs time
+                                // out) while ASSIGNMENT still gains nothing.
+                                // Judging from the first batch on is what
+                                // produced python's MATCH.
+                                let gi = (m.cpu.insn_count / 1_000_000_000).max(1);
+                                if BATCHES > 64 && BATCHES / gi > BATCH_RATE_CAP {
+                                    BATCH_ON = false;
+                                }
+                            }
                             if members.len() >= 2 {
                                 let n = members.len() as u32;
                                 unsafe { JIT_OUT = wasm };
@@ -3412,7 +3444,44 @@ static mut BATCH_CELL_NEXT: usize = 0;
 /// 64 -> 4546). What would flip it: hit rate, not hop cost — batches formed
 /// from OBSERVED dispatch sequences (trace trees) rather than static exit
 /// seeds. Machinery is fully tested and one flag away.
-static mut BATCH_ON: bool = false;
+/// Batching is ON, but only while the code cache is SMALL. Measured:
+/// batching lifts nbench ASSIGNMENT from 8.37 to 9.14-10.13 iter/s
+/// (uncontended), and destroys CPython — python fib went from 3.7s to 180s,
+/// because a workload with a five-figure block population pays a batch
+/// compile per tier-up for code it never re-enters. The separating property
+/// is the population itself, not the workload: below the cap a batch's
+/// members are a large fraction of all hot code, above it they are noise.
+static mut BATCH_ON: bool = true;
+/// Blocks in the cache beyond which batching stops (see BATCH_ON).
+/// NOTE: population alone is NOT a sufficient gate — python fib still ran
+/// 180s with a 4096-block cap, because the storm happens during warm-up
+/// while the cache is still small. Batch builds are therefore ALSO charged
+/// to the measured build-time budget (SB_BUILD_MS), which is what actually
+/// bounds a workload that wants a batch per tier-up.
+static mut BATCH_POP_CAP: usize = 4096;
+/// Distinct hot code PAGES beyond which batching stops. This is the
+/// footprint signal that actually separates the two behaviours: nbench
+/// ASSIGNMENT's hot code is a handful of pages and its batches cover most
+/// of what runs, while CPython spreads over dozens and its batches are
+/// noise it pays for per tier-up. A build-time budget was tried and is too
+/// blunt — tight enough to save python (180s -> 3.7s) also erased
+/// ASSIGNMENT's gain (10.1 -> 8.3).
+static mut BATCH_PAGE_CAP: usize = 64;
+/// Batches per billion retired instructions above which batching is judged
+/// unprofitable and switched off for the run (see the rate governor).
+static mut BATCH_RATE_CAP: u64 = 200;
+#[no_mangle]
+pub extern "C" fn jit_set_batch_rate_cap(v: u32) {
+    unsafe { BATCH_RATE_CAP = v as u64 }
+}
+#[no_mangle]
+pub extern "C" fn jit_set_batch_page_cap(v: u32) {
+    unsafe { BATCH_PAGE_CAP = v as usize }
+}
+#[no_mangle]
+pub extern "C" fn jit_set_batch_pop_cap(v: u32) {
+    unsafe { BATCH_POP_CAP = v as usize }
+}
 /// Consecutive identical successors before a trace is recompiled with an
 /// inline cache through its terminating indirect jump. 256 measured best:
 /// the extension costs one recompile per pc, so a higher bar spends that
@@ -3424,7 +3493,7 @@ static mut IC_EXTENDS: u64 = 0;
 pub extern "C" fn jit_set_ic_trigger(v: u32) {
     unsafe { IC_EXTEND_TRIGGER = if v == 0 { u32::MAX } else { v } }
 }
-static mut BATCH_CAP: usize = 12;
+static mut BATCH_CAP: usize = 32;
 static mut BATCH_PAGE: bool = false;
 #[no_mangle]
 pub extern "C" fn jit_set_batch_page(on: u32) {

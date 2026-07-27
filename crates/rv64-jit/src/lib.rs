@@ -5627,7 +5627,11 @@ pub fn translate_batch_obs(
     while probed < pcs.len() && pcs.len() < cap {
         let p = pcs[probed];
         probed += 1;
-        let Some(b) = translate_block_link(code, base, p, lay, hot, &no_link) else {
+        // Members are compiled WITH the inline cache oracle: a batch member
+        // that still ended at every indirect jump would defeat the point —
+        // the two mechanisms compose (IC extends a member through an edge,
+        // links carry the exits that remain to co-members).
+        let Some(b) = translate_block_ic(code, base, p, lay, hot, &no_link, next) else {
             continue;
         };
         // Observed successor first: it is where execution goes, so the link
@@ -5652,7 +5656,7 @@ pub fn translate_batch_obs(
     let mut members: Vec<BatchMember> = Vec::new();
     let mut ok = true;
     for &p in &pcs {
-        match translate_block_link(code, base, p, lay, hot, &index_of) {
+        match translate_block_ic(code, base, p, lay, hot, &index_of, next) {
             Some(b) => {
                 bodies.push((b.wasm, b.locals.0, b.locals.1));
                 members.push(BatchMember {
