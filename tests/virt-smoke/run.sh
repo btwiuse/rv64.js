@@ -9,7 +9,7 @@
 # etc.) makes this script time out and FAIL.
 #
 # All inputs come from the flake so the test is reproducible:
-#   .#virt-kernel   stock riscv64 kernel Image (virtio/serial/initramfs)
+#   .#virt-kernel   riscv64 kernel Image (boot-critical virtio paths built in)
 #   .#virt-opensbi  OpenSBI fw_dynamic firmware
 #   .#virt-cc       riscv64 Linux C cross-compiler (builds init.c)
 # The first run builds the kernel + toolchain (cached thereafter).
@@ -58,9 +58,9 @@ VBOOT_MAX_INSNS=9000000000000000 timeout 120 \
   < /dev/null > "$out" 2>&1 || true
 
 echo "[virt-smoke] guest markers:"
-grep -aE 'SMOKE_START|RDTIME_OK|TTY_DRAIN_OK|FORKS_OK|SMOKE_OK|FAIL_' "$out" | sed 's/^/    /' || true
+grep -aE 'SMOKE_START|RDTIME_OK|RTC_OK|TTY_DRAIN_OK|FORKS_OK|SMOKE_OK|FAIL_' "$out" | sed 's/^/    /' || true
 
-if grep -qa 'SMOKE_OK' "$out"; then
+if grep -qa 'SMOKE_OK' "$out" && grep -qa 'RTC_OK' "$out" && ! grep -qa 'FAIL_' "$out"; then
   echo "[virt-smoke] PASS"
   exit 0
 else

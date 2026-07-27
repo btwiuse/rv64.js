@@ -130,6 +130,11 @@ impl VirtioDev {
             // descriptors — so the ring needs MAX_MSIZE/4096 entries plus
             // headroom. 128 is also the driver's own VIRTQUEUE_NUM.
             Backend::Fs { .. } => 128,
+            // Modern virtio_net stops a TX queue unless it has enough free
+            // descriptors for a maximally fragmented skb plus its header.
+            // A 16-entry ring can transmit once and then remain stopped even
+            // after we publish the used entry; 256 is the conventional size.
+            Backend::Net { .. } => 256,
             _ => 16,
         }
     }
@@ -258,7 +263,11 @@ impl VirtioDev {
             Backend::Block { disk } => {
                 // struct virtio_blk_config { le64 capacity; ... } in sectors.
                 let sectors = (disk.len() / SECTOR) as u64;
-                sectors.to_le_bytes().get(off as usize).copied().unwrap_or(0)
+                sectors
+                    .to_le_bytes()
+                    .get(off as usize)
+                    .copied()
+                    .unwrap_or(0)
             }
             Backend::Fs { srv } => {
                 // struct virtio_9p_config { le16 tag_len; u8 tag[tag_len]; }
@@ -310,8 +319,10 @@ impl VirtioDev {
     pub fn process(&mut self, qi: usize, ram: &mut [u8], ram_base: u64) {
         if qi >= MAX_QUEUES || self.queues[qi].ready == 0 {
             if vio_dbg() {
-                eprintln!("[vio] notify q{qi} BAILED ready={}",
-                    self.queues.get(qi).map_or(0, |q| q.ready));
+                eprintln!(
+                    "[vio] notify q{qi} BAILED ready={}",
+                    self.queues.get(qi).map_or(0, |q| q.ready)
+                );
             }
             return;
         }
@@ -726,9 +737,7 @@ mod tests {
         // Read the tag exactly as Linux does: a 16-bit length, then one byte at
         // a time. This is what a 32-bit-only config space would break.
         assert_eq!(dev.read_sized(0x100, 2), 9);
-        let tag: Vec<u8> = (0..9)
-            .map(|i| dev.read_sized(0x102 + i, 1) as u8)
-            .collect();
+        let tag: Vec<u8> = (0..9).map(|i| dev.read_sized(0x102 + i, 1) as u8).collect();
         assert_eq!(&tag, b"hostshare");
     }
 
@@ -757,7 +766,13 @@ mod tests {
         setup_queue(&mut dev);
 
         // Tversion — negotiate msize.
-        let r = round_trip(&mut dev, &mut ram, 100, &B::default().u32(8192).str("9P2000.L"), 1);
+        let r = round_trip(
+            &mut dev,
+            &mut ram,
+            100,
+            &B::default().u32(8192).str("9P2000.L"),
+            1,
+        );
         assert_eq!(u32_at(&r, 7), 8192);
         assert!(dev.irq_pending(), "used-ring update must raise the irq");
 
@@ -837,6 +852,7 @@ mod tests {
         // status is only meaningful with VIRTIO_NET_F_STATUS, which we do not
         // offer — the guest treats the link as up unconditionally.
         assert_eq!(dev.read_sized(0x106, 2), 0);
+        assert_eq!(dev.read(0x034), 256, "modern TX needs a non-tiny ring");
     }
 
     #[test]
@@ -904,7 +920,10 @@ mod tests {
         // a 10-byte header here would shift every frame by two bytes.
         assert_eq!(&ram[RXBUF..RXBUF + 10], &[0u8; 10]);
         assert_eq!(u16_at(&ram, RXBUF + 10), 1, "num_buffers");
-        assert_eq!(&ram[RXBUF + NET_HDR_LEN..RXBUF + NET_HDR_LEN + frame.len()], &frame[..]);
+        assert_eq!(
+            &ram[RXBUF + NET_HDR_LEN..RXBUF + NET_HDR_LEN + frame.len()],
+            &frame[..]
+        );
         assert!(!dev.net_rx_pending(), "frame consumed");
         assert!(dev.irq_pending(), "RX must raise the interrupt");
     }

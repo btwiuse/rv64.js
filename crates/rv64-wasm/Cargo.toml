@@ -9,6 +9,7 @@ description = "wasm32 export surface for rv64.js — plain extern \"C\" ABI, v86
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+getrandom = { version = "=0.2.17", features = ["custom"] }
 rv64-core = { path = "../rv64-core" }
 rv64-linux = { path = "../rv64-linux" }
 rv64-system = { path = "../rv64-system" }

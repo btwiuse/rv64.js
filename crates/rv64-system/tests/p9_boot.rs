@@ -88,10 +88,10 @@ fn guest_mounts_and_uses_a_host_directory() {
             kernel: Some(&kernel),
             cmdline: "console=hvc0 root=/dev/vda rw",
             disk: Some(disk),
-            fs: Some(p9::Server::new(
+            fs: vec![p9::Server::new(
                 "hostshare",
                 Box::new(p9fs::HostFs::new(&share)),
-            )),
+            )],
             net: None,
         },
     );

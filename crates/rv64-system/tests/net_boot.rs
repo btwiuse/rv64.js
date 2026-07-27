@@ -192,7 +192,7 @@ fn guest_pings_a_host_over_virtio_net() {
             kernel: Some(&kernel),
             cmdline: "console=hvc0 root=/dev/vda rw",
             disk: Some(disk),
-            fs: None,
+            fs: vec![],
             net: Some(virtio::DEFAULT_MAC),
         },
     );

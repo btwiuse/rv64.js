@@ -17,6 +17,7 @@
 //! a0=hartid, a1=dtb; OpenSBI sets up the SBI and drops to the S-mode kernel.
 
 use crate::dtb::Fdt;
+use crate::rtc::GoldfishRtc;
 use crate::virtio::{Backend, VirtioDev};
 use rv64_core::csr::{IRQ_MEIP, IRQ_MSIP, IRQ_MTIP, IRQ_SEIP};
 use rv64_core::{Bus, Cpu, Exception, StopReason};
@@ -35,6 +36,8 @@ pub const PLIC_BASE: u64 = 0x0c00_0000;
 pub const PLIC_SIZE: u64 = 0x0400_0000;
 pub const UART_BASE: u64 = 0x1000_0000;
 pub const UART_SIZE: u64 = 0x100;
+pub const GOLDFISH_RTC_BASE: u64 = 0x0010_1000;
+pub const GOLDFISH_RTC_SIZE: u64 = 0x1000;
 pub const VIRTIO_BASE: u64 = 0x1000_1000;
 pub const VIRTIO_SIZE: u64 = 0x1000;
 pub const VIRTIO_COUNT: u64 = 8;
@@ -45,6 +48,7 @@ const KERNEL_OFFSET: u64 = 0x20_0000; // kernel Image at RAM_BASE + 2 MiB
 
 // Interrupt source numbers (PLIC). Source 0 = "no interrupt".
 const UART_IRQ: u32 = 10;
+const GOLDFISH_RTC_IRQ: u32 = 11;
 const VIRTIO_IRQ_BASE: u32 = 1; // virtio dev i -> source (1 + i)
 
 const PLIC_SOURCES: usize = 32; // one u32 bitmask is enough
@@ -53,15 +57,21 @@ const PLIC_CONTEXTS: usize = 2; // ctx0 = hart0 M-ext, ctx1 = hart0 S-ext
 /// Full SiFive/QEMU-style PLIC.
 struct Plic {
     priority: [u32; PLIC_SOURCES],
-    pending: u32,               // level-driven by device lines (recomputed)
+    pending: u32, // level-driven by device lines (recomputed)
     enable: [u32; PLIC_CONTEXTS],
     threshold: [u32; PLIC_CONTEXTS],
-    claimed: u32,               // in-service (claimed, awaiting complete)
+    claimed: u32, // in-service (claimed, awaiting complete)
 }
 
 impl Plic {
     fn new() -> Plic {
-        Plic { priority: [0; PLIC_SOURCES], pending: 0, enable: [0; PLIC_CONTEXTS], threshold: [0; PLIC_CONTEXTS], claimed: 0 }
+        Plic {
+            priority: [0; PLIC_SOURCES],
+            pending: 0,
+            enable: [0; PLIC_CONTEXTS],
+            threshold: [0; PLIC_CONTEXTS],
+            claimed: 0,
+        }
     }
 
     /// Best claimable source for a context (highest priority > threshold,
@@ -101,20 +111,28 @@ impl Plic {
             // enables: 0x2000 + ctx*0x80
             _ if (0x2000..0x2000 + (PLIC_CONTEXTS as u64) * 0x80).contains(&off) => {
                 let ctx = ((off - 0x2000) / 0x80) as usize;
-                if (off - 0x2000) % 0x80 == 0 { self.enable[ctx] } else { 0 }
+                if (off - 0x2000) % 0x80 == 0 {
+                    self.enable[ctx]
+                } else {
+                    0
+                }
             }
             // per-context: threshold at 0x200000 + ctx*0x1000, claim at +4
             _ if off >= 0x20_0000 => {
                 let ctx = ((off - 0x20_0000) / 0x1000) as usize;
                 let reg = (off - 0x20_0000) % 0x1000;
-                if ctx >= PLIC_CONTEXTS { return 0; }
+                if ctx >= PLIC_CONTEXTS {
+                    return 0;
+                }
                 match reg {
                     0x0 => self.threshold[ctx],
                     0x4 => {
                         // claim: return best, mark in-service, clear pending
                         let id = self.best(ctx);
                         if id != 0 {
-                            if plic_dbg() { eprintln!("[plic] claim[ctx{ctx}] -> src={id}"); }
+                            if plic_dbg() {
+                                eprintln!("[plic] claim[ctx{ctx}] -> src={id}");
+                            }
                             self.claimed |= 1 << id;
                         }
                         id
@@ -131,7 +149,9 @@ impl Plic {
             0x0000..=0x0fff => {
                 let id = (off / 4) as usize;
                 if id != 0 {
-                    if plic_dbg() { eprintln!("[plic] priority[{id}]={val}"); }
+                    if plic_dbg() {
+                        eprintln!("[plic] priority[{id}]={val}");
+                    }
                     if let Some(p) = self.priority.get_mut(id) {
                         *p = val;
                     }
@@ -140,22 +160,30 @@ impl Plic {
             _ if (0x2000..0x2000 + (PLIC_CONTEXTS as u64) * 0x80).contains(&off) => {
                 let ctx = ((off - 0x2000) / 0x80) as usize;
                 if (off - 0x2000) % 0x80 == 0 {
-                    if plic_dbg() { eprintln!("[plic] enable[ctx{ctx}]={val:#x}"); }
+                    if plic_dbg() {
+                        eprintln!("[plic] enable[ctx{ctx}]={val:#x}");
+                    }
                     self.enable[ctx] = val & !1; // source 0 never enabled
                 }
             }
             _ if off >= 0x20_0000 => {
                 let ctx = ((off - 0x20_0000) / 0x1000) as usize;
                 let reg = (off - 0x20_0000) % 0x1000;
-                if ctx >= PLIC_CONTEXTS { return; }
+                if ctx >= PLIC_CONTEXTS {
+                    return;
+                }
                 match reg {
                     0x0 => {
-                        if plic_dbg() { eprintln!("[plic] threshold[ctx{ctx}]={val}"); }
+                        if plic_dbg() {
+                            eprintln!("[plic] threshold[ctx{ctx}]={val}");
+                        }
                         self.threshold[ctx] = val;
                     }
                     0x4 => {
                         // complete: clear in-service for this source
-                        if plic_dbg() { eprintln!("[plic] complete[ctx{ctx}] src={val}"); }
+                        if plic_dbg() {
+                            eprintln!("[plic] complete[ctx{ctx}] src={val}");
+                        }
                         if (val as usize) < PLIC_SOURCES {
                             self.claimed &= !(1 << val);
                         }
@@ -170,7 +198,7 @@ impl Plic {
 
 /// Minimal ns16550 (8250) UART: enough for OpenSBI + kernel console.
 struct Uart {
-    ier: u8,   // interrupt enable
+    ier: u8, // interrupt enable
     lcr: u8,
     mcr: u8,
     scr: u8,
@@ -184,7 +212,15 @@ struct Uart {
 
 impl Uart {
     fn new() -> Uart {
-        Uart { ier: 0, lcr: 0, mcr: 0, scr: 0, rx: Default::default(), tx_out: Vec::new(), thre_ip: false }
+        Uart {
+            ier: 0,
+            lcr: 0,
+            mcr: 0,
+            scr: 0,
+            rx: Default::default(),
+            tx_out: Vec::new(),
+            thre_ip: false,
+        }
     }
     // Register offsets (byte): 0 RBR/THR/DLL, 1 IER/DLM, 2 IIR/FCR, 3 LCR,
     // 4 MCR, 5 LSR, 6 MSR, 7 SCR. DLAB (LCR bit7) selects divisor latches.
@@ -192,7 +228,7 @@ impl Uart {
         let dlab = self.lcr & 0x80 != 0;
         match off {
             0 if !dlab => self.rx.pop_front().unwrap_or(0), // RBR
-            0 => 0,                                          // DLL
+            0 => 0,                                         // DLL
             1 if !dlab => self.ier,
             1 => 0, // DLM
             2 => {
@@ -228,8 +264,8 @@ impl Uart {
         match off {
             0 if !dlab => {
                 self.tx_out.push(val); // THR — transmitted instantly
-                // THR is now empty again: re-arm the THR-empty interrupt so
-                // interrupt-driven TX keeps flowing.
+                                       // THR is now empty again: re-arm the THR-empty interrupt so
+                                       // interrupt-driven TX keeps flowing.
                 if self.ier & 2 != 0 {
                     self.thre_ip = true;
                 }
@@ -263,6 +299,7 @@ pub struct VirtBus {
     pub mtime: u64,
     pub mtimecmp: u64,
     pub msip: bool,
+    pub rtc: GoldfishRtc,
     plic: Plic,
     uart: Uart,
     pub virtio: Vec<VirtioDev>,
@@ -278,6 +315,9 @@ impl VirtBus {
         let mut p = 0u32;
         if self.uart.irq() {
             p |= 1 << UART_IRQ;
+        }
+        if self.rtc.irq() {
+            p |= 1 << GOLDFISH_RTC_IRQ;
         }
         for (i, d) in self.virtio.iter().enumerate() {
             if d.irq_pending() {
@@ -340,17 +380,22 @@ impl VirtBus {
     fn mmio_read(&mut self, addr: u64, size: u32) -> Option<u64> {
         match addr {
             _ if (TEST_BASE..TEST_BASE + 0x1000).contains(&addr) => Some(0),
-            _ if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) => Some(match addr - CLINT_BASE {
-                0x0 => self.msip as u64,
-                0x4000 => self.mtimecmp,
-                0xbff8 => self.mtime,
-                _ => 0,
-            }),
+            _ if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr) => {
+                Some(match addr - CLINT_BASE {
+                    0x0 => self.msip as u64,
+                    0x4000 => self.mtimecmp,
+                    0xbff8 => self.mtime,
+                    _ => 0,
+                })
+            }
             _ if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&addr) => {
                 Some(self.plic.read(addr - PLIC_BASE) as u64)
             }
             _ if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) => {
                 Some(self.uart.read(addr - UART_BASE) as u64)
+            }
+            _ if (GOLDFISH_RTC_BASE..GOLDFISH_RTC_BASE + GOLDFISH_RTC_SIZE).contains(&addr) => {
+                Some(self.rtc.read(addr - GOLDFISH_RTC_BASE) as u64)
             }
             _ if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_COUNT * VIRTIO_SIZE).contains(&addr) => {
                 let i = ((addr - VIRTIO_BASE) / VIRTIO_SIZE) as usize;
@@ -389,6 +434,10 @@ impl VirtBus {
             }
             _ if (UART_BASE..UART_BASE + UART_SIZE).contains(&addr) => {
                 self.uart.write(addr - UART_BASE, val as u8);
+                true
+            }
+            _ if (GOLDFISH_RTC_BASE..GOLDFISH_RTC_BASE + GOLDFISH_RTC_SIZE).contains(&addr) => {
+                self.rtc.write(addr - GOLDFISH_RTC_BASE, val as u32);
                 true
             }
             _ if (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_COUNT * VIRTIO_SIZE).contains(&addr) => {
@@ -479,8 +528,8 @@ pub struct VirtImages<'a> {
     pub cmdline: &'a str,
     pub initrd: Option<&'a [u8]>,
     pub disk: Option<Vec<u8>>,
-    /// Host filesystem exported over virtio-9p; see [`crate::BootImages::fs`].
-    pub fs: Option<crate::p9::Server>,
+    /// Host filesystems exported over virtio-9p; see [`crate::BootImages::fs`].
+    pub fs: Vec<crate::p9::Server>,
     /// MAC for a virtio-net device; see [`crate::BootImages::net`].
     pub net: Option<[u8; 6]>,
 }
@@ -511,9 +560,8 @@ impl VirtMachine {
 
         let _ = kend;
         // One mmio slot per device we will instantiate below, in the same order.
-        let n_virtio = images.disk.is_some() as usize
-            + images.fs.is_some() as usize
-            + images.net.is_some() as usize;
+        let n_virtio =
+            images.disk.is_some() as usize + images.fs.len() + images.net.is_some() as usize;
         // Place initrd + DTB near the TOP of RAM (as QEMU/U-Boot do) so the
         // kernel's early allocations near the Image don't clobber them.
         // Layout from the top down: [DTB][initrd][fw_dynamic_info], each
@@ -549,7 +597,7 @@ impl VirtMachine {
         if let Some(disk) = images.disk {
             virtio.push(VirtioDev::new(Backend::Block { disk }));
         }
-        if let Some(srv) = images.fs {
+        for srv in images.fs {
             virtio.push(VirtioDev::new(Backend::Fs { srv }));
         }
         if let Some(mac) = images.net {
@@ -566,12 +614,12 @@ impl VirtMachine {
         // real DTB in a1 and jumps to the address we specify here.
         {
             let info: [u64; 6] = [
-                0x4942_534f,                 // magic "OSBI"
-                2,                           // version
-                RAM_BASE + KERNEL_OFFSET,    // next_addr = kernel Image
-                1,                           // next_mode = PRV_S
-                0,                           // options
-                0,                           // boot_hart = 0
+                0x4942_534f,              // magic "OSBI"
+                2,                        // version
+                RAM_BASE + KERNEL_OFFSET, // next_addr = kernel Image
+                1,                        // next_mode = PRV_S
+                0,                        // options
+                0,                        // boot_hart = 0
             ];
             for (i, v) in info.iter().enumerate() {
                 ram[dyn_off + i * 8..dyn_off + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
@@ -595,6 +643,7 @@ impl VirtMachine {
                 mtime: 0,
                 mtimecmp: u64::MAX,
                 msip: false,
+                rtc: GoldfishRtc::new(),
                 plic: Plic::new(),
                 uart: Uart::new(),
                 virtio,
@@ -633,6 +682,11 @@ impl VirtMachine {
             .find(|d| d.device_id() == 1)
             .map(|d| d.net_take_output())
             .unwrap_or_default()
+    }
+
+    /// Supply the RTC's Unix-epoch time from the embedding host.
+    pub fn set_rtc_unix_ns(&mut self, ns: u64) {
+        self.bus.rtc.set_host_time_ns(ns);
     }
 
     pub fn sync_devices(&mut self) {
@@ -816,6 +870,12 @@ fn build_virt_fdt(
     f.prop_u32s("interrupts-extended", &[plic_phandle, UART_IRQ]);
     f.end_node();
 
+    f.begin_node(&format!("rtc@{GOLDFISH_RTC_BASE:x}"));
+    f.prop_str("compatible", "google,goldfish-rtc");
+    f.prop_u64_pair("reg", GOLDFISH_RTC_BASE, GOLDFISH_RTC_SIZE);
+    f.prop_u32s("interrupts-extended", &[plic_phandle, GOLDFISH_RTC_IRQ]);
+    f.end_node();
+
     // CLINT
     f.begin_node(&format!("clint@{CLINT_BASE:x}"));
     f.prop_strs("compatible", &["sifive,clint0", "riscv,clint0"]);
@@ -841,7 +901,10 @@ fn build_virt_fdt(
         f.begin_node(&format!("virtio_mmio@{base:x}"));
         f.prop_str("compatible", "virtio,mmio");
         f.prop_u64_pair("reg", base, VIRTIO_SIZE);
-        f.prop_u32s("interrupts-extended", &[plic_phandle, VIRTIO_IRQ_BASE + i as u32]);
+        f.prop_u32s(
+            "interrupts-extended",
+            &[plic_phandle, VIRTIO_IRQ_BASE + i as u32],
+        );
         f.end_node();
     }
 

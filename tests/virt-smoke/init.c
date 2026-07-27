@@ -12,6 +12,7 @@
  *      probe; the deterministic guard is
  *      cpu::tests::trap_invalidates_lr_reservation.
  *   3. rdtime advancing           -> a delta across nanosleep.
+ *   4. goldfish RTC / wall clock  -> CLOCK_REALTIME must be a modern epoch.
  *
  * On success it prints SMOKE_OK and powers off. If any path is broken the
  * guest wedges and the harness times out -> test failure.
@@ -34,6 +35,7 @@ static inline long sys(long n, long a0, long a1, long a2, long a3) {
 #define SYS_write     64
 #define SYS_exit      93
 #define SYS_nanosleep 101
+#define SYS_clock_gettime 113
 #define SYS_reboot    142
 #define SYS_clone     220
 #define SYS_wait4     260
@@ -60,6 +62,14 @@ void _start(void) {
     sys(SYS_nanosleep, (long)&ts, 0, 0, 0);
     if (rdtime() == t0) emit("FAIL_RDTIME_STUCK\n");
     else emit("RDTIME_OK\n");
+
+    /* (4) Linux must seed CLOCK_REALTIME from the emulated goldfish RTC. */
+    struct timespec real;
+    if (sys(SYS_clock_gettime, 0, (long)&real, 0, 0) != 0 ||
+        real.tv_sec < 1700000000L)
+        emit("FAIL_RTC_EPOCH\n");
+    else
+        emit("RTC_OK\n");
 
     /* (1) flood the console then drain -> forces interrupt-driven TX / THRE */
     for (int i = 0; i < 400; i++)

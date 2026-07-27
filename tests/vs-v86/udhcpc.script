@@ -1,0 +1,22 @@
+#!/bin/sh
+# Minimal lease hook for the benchmark/proxy guest. The image is assembled by
+# debootstrap's foreign stage, so no distribution networking service or DHCP
+# hook is configured for us.
+set -eu
+
+case "${1:-}" in
+    deconfig)
+        ip addr flush dev "$interface"
+        ip link set "$interface" up
+        ;;
+    bound|renew)
+        ip link set "$interface" up
+        ip addr flush dev "$interface"
+        # The in-browser proxy stack deliberately serves one fixed /24.
+        ip addr add "$ip/24" dev "$interface"
+        if [ -n "${router:-}" ]; then
+            set -- $router
+            ip route replace default via "$1" dev "$interface"
+        fi
+        ;;
+esac

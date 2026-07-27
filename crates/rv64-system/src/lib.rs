@@ -19,6 +19,8 @@ pub mod httpproxy;
 pub mod netstack;
 pub mod p9;
 pub mod p9fs;
+pub mod rtc;
+pub mod tlsproxy;
 pub mod virt;
 pub mod virtio;
 /// WebSocket relay transport for virtio-net. Host-side networking, so absent on
@@ -39,8 +41,22 @@ pub const VIRTIO_SIZE: u64 = 0x1000;
 pub const PLIC_BASE: u64 = 0x4010_0000;
 pub const PLIC_SIZE: u64 = 0x40_0000;
 pub const HTIF_BASE: u64 = 0x4000_8000;
+pub const GOLDFISH_RTC_BASE: u64 = 0x0010_1000;
+pub const GOLDFISH_RTC_SIZE: u64 = 0x1000;
+pub const GOLDFISH_RTC_IRQ: u32 = 11;
 /// 10 MHz timebase, like TinyEMU's RTC_FREQ.
 pub const RTC_FREQ: u64 = 10_000_000;
+
+/// Current Unix-epoch time for native machine embeddings. Browser embeddings
+/// provide the equivalent value through their host ABI.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn host_unix_time_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
 
 /// Guest-physical bus: RAM + devices. The CPU hands us *physical*
 /// addresses (its MMU translated already).
@@ -51,6 +67,7 @@ pub struct SystemBus {
     pub mtime: u64,
     pub mtimecmp: u64,
     pub msip: bool,
+    pub rtc: rtc::GoldfishRtc,
     // PLIC (TinyEMU-style: pending & served masks, claim/complete only)
     pub plic_pending: u32,
     pub plic_served: u32,
@@ -103,6 +120,9 @@ impl SystemBus {
                     }
                     _ => 0,
                 })
+            }
+            _ if (GOLDFISH_RTC_BASE..GOLDFISH_RTC_BASE + GOLDFISH_RTC_SIZE).contains(&addr) => {
+                Some(self.rtc.read(addr - GOLDFISH_RTC_BASE))
             }
             _ if (self.htif_base..self.htif_base + 16).contains(&addr) => {
                 Some(match addr - self.htif_base {
@@ -177,6 +197,11 @@ impl SystemBus {
                 }
                 true
             }
+            _ if (GOLDFISH_RTC_BASE..GOLDFISH_RTC_BASE + GOLDFISH_RTC_SIZE).contains(&addr) => {
+                self.rtc.write(addr - GOLDFISH_RTC_BASE, val);
+                self.refresh_plic();
+                true
+            }
             _ if (self.htif_base..self.htif_base + 16).contains(&addr) => {
                 match addr - self.htif_base {
                     0 => {
@@ -240,13 +265,16 @@ impl SystemBus {
         }
     }
 
-    /// Recompute PLIC pending bits from virtio interrupt lines.
+    /// Recompute PLIC pending bits from device interrupt lines.
     pub fn refresh_plic(&mut self) {
         let mut pending = 0u32;
         for (i, d) in self.virtio.iter().enumerate() {
             if d.irq_pending() {
                 pending |= 1 << i; // irq number = i+1 -> bit i
             }
+        }
+        if self.rtc.irq() {
+            pending |= 1 << (GOLDFISH_RTC_IRQ - 1);
         }
         self.plic_pending = pending;
     }
@@ -443,10 +471,10 @@ pub struct BootImages<'a> {
     pub kernel: Option<&'a [u8]>,
     pub cmdline: &'a str,
     pub disk: Option<Vec<u8>>,
-    /// Host filesystem to export over virtio-9p. The guest mounts it by the
-    /// server's tag (`mount -t 9p -o trans=virtio <tag> /mnt`), or boots from
-    /// it directly with `rootfstype=9p` when the tag is `/dev/root`.
-    pub fs: Option<p9::Server>,
+    /// Host filesystems to export over virtio-9p. The guest mounts each by its
+    /// server tag (`mount -t 9p -o trans=virtio <tag> /mnt`), or can boot from
+    /// one directly with `rootfstype=9p` when its tag is `/dev/root`.
+    pub fs: Vec<p9::Server>,
     /// MAC address for a virtio-net device, or `None` for no networking. The
     /// device only moves Ethernet frames; the host layer decides where they go
     /// (see [`ws`] for the WebSocket relay).
@@ -479,7 +507,7 @@ impl Machine {
         if let Some(disk) = images.disk {
             virtio.push(VirtioDev::new(Backend::Block { disk }));
         }
-        if let Some(srv) = images.fs {
+        for srv in images.fs {
             virtio.push(VirtioDev::new(Backend::Fs { srv }));
         }
         if let Some(mac) = images.net {
@@ -527,6 +555,7 @@ impl Machine {
                 mtime: 0,
                 mtimecmp: u64::MAX,
                 msip: false,
+                rtc: rtc::GoldfishRtc::new(),
                 plic_pending: 0,
                 plic_served: 0,
                 virtio,
@@ -586,6 +615,12 @@ impl Machine {
             .unwrap_or_default()
     }
 
+    /// Supply the RTC's Unix-epoch time from the embedding host.
+    pub fn set_rtc_unix_ns(&mut self, ns: u64) {
+        self.bus.rtc.set_host_time_ns(ns);
+        self.bus.refresh_plic();
+    }
+
     /// Run one slice; returns instructions retired.
     pub fn run_slice(&mut self, max_insns: u64) -> u64 {
         let start = self.cpu.insn_count;
@@ -618,7 +653,11 @@ impl Machine {
     /// the system JIT dispatcher's warm-interp fallback. Runs one instruction at
     /// a time (interrupts/exceptions handled by `cpu.run`), refreshing the clock
     /// only periodically so the per-instruction cost stays near the interpreter's.
-    pub fn run_slice_until(&mut self, max_insns: u64, mut compiled: impl FnMut(u64) -> bool) -> u64 {
+    pub fn run_slice_until(
+        &mut self,
+        max_insns: u64,
+        mut compiled: impl FnMut(u64) -> bool,
+    ) -> u64 {
         let start = self.cpu.insn_count;
         self.sync_devices();
         self.bus.poll_net_rx();
@@ -748,6 +787,12 @@ fn build_fdt(
     f.prop_u64_pair("reg", PLIC_BASE, PLIC_SIZE);
     f.prop_u32s("interrupts-extended", &[intc_phandle, 9, intc_phandle, 11]);
     f.prop_u32("phandle", plic_phandle);
+    f.end_node();
+
+    f.begin_node(&format!("rtc@{GOLDFISH_RTC_BASE:x}"));
+    f.prop_str("compatible", "google,goldfish-rtc");
+    f.prop_u64_pair("reg", GOLDFISH_RTC_BASE, GOLDFISH_RTC_SIZE);
+    f.prop_u32s("interrupts-extended", &[plic_phandle, GOLDFISH_RTC_IRQ]);
     f.end_node();
 
     for i in 0..ndevs {

@@ -12,6 +12,9 @@
 //! so the guest must load them (or use a kernel with them built in) before:
 //!   mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
 
+use rv64_system::egress::NativeEgress;
+use rv64_system::httpproxy::Proxy;
+use rv64_system::netstack::{NetConfig, NetStack};
 use rv64_system::virt::{VirtImages, VirtMachine};
 use rv64_system::{p9, p9fs, ws};
 use std::io::{Read, Write};
@@ -28,6 +31,7 @@ fn main() {
     let mut share = None;
     let mut tag = "host".to_string();
     let mut relay_url = None;
+    let mut proxy_mode = false;
     let mut mac = rv64_system::virtio::DEFAULT_MAC;
     let mut ram_gb = 2.0f64;
     let mut positional = Vec::new();
@@ -39,29 +43,41 @@ fn main() {
             "--9p" => share = it.next(),
             "--9p-tag" => tag = it.next().unwrap_or(tag),
             "--net" => relay_url = it.next(),
+            "--proxy" => proxy_mode = true,
             "--net-mac" => {
-                mac = it
-                    .next()
-                    .as_deref()
-                    .and_then(parse_mac)
-                    .unwrap_or_else(|| { eprintln!("bad --net-mac"); std::process::exit(2) })
+                mac = it.next().as_deref().and_then(parse_mac).unwrap_or_else(|| {
+                    eprintln!("bad --net-mac");
+                    std::process::exit(2)
+                })
             }
             "--ram" => ram_gb = it.next().and_then(|v| v.parse().ok()).unwrap_or(2.0),
             _ => positional.push(a),
         }
     }
     if positional.len() < 2 {
-        eprintln!("usage: rv64-vboot <opensbi.bin> <kernel> [--initrd F] [--disk F] [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT] [--net-mac MAC] [--ram GB] [-- cmdline]");
+        eprintln!("usage: rv64-vboot <opensbi.bin> <kernel> [--initrd F] [--disk F] [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT | --proxy] [--net-mac MAC] [--ram GB] [-- cmdline]");
+        std::process::exit(2);
+    }
+    if relay_url.is_some() && proxy_mode {
+        eprintln!("--net and --proxy are mutually exclusive");
+        std::process::exit(2);
+    }
+    if proxy_mode && share.is_some() && tag == rv64_system::httpproxy::CA_9P_TAG {
+        eprintln!(
+            "--9p-tag '{}' is reserved for the proxy CA",
+            rv64_system::httpproxy::CA_9P_TAG
+        );
         std::process::exit(2);
     }
     let opensbi = std::fs::read(&positional[0]).expect("read opensbi");
     let kernel = std::fs::read(&positional[1]).expect("read kernel");
     let initrd = initrd_path.map(|p| std::fs::read(p).expect("read initrd"));
     let disk = disk_path.map(|p| std::fs::read(p).expect("read disk"));
-    let fs = share.map(|dir| {
+    let mut fs = Vec::new();
+    if let Some(dir) = share {
         eprintln!("[vboot] 9p: exporting {dir} as tag '{tag}'");
-        p9::Server::new(tag, Box::new(p9fs::HostFs::new(dir)))
-    });
+        fs.push(p9::Server::new(tag, Box::new(p9fs::HostFs::new(dir))));
+    }
 
     // Connect the relay before booting: a NIC the guest can see but that has
     // nowhere to send is worse than no NIC at all.
@@ -78,12 +94,35 @@ fn main() {
         },
         None => None,
     };
-    let net = relay.is_some().then_some(mac);
+    let mut proxy_stack = if proxy_mode {
+        let stack = NetStack::new(NetConfig::default());
+        // Preserve ordinary http:// requests. Requests decrypted from CONNECT
+        // are independently marked https:// by the proxy.
+        let mut proxy = Proxy::new().keep_scheme();
+        let ca_fs = proxy.ca_9p_server().unwrap_or_else(|error| {
+            eprintln!("[vboot] proxy CA: {error}");
+            std::process::exit(1);
+        });
+        fs.push(ca_fs);
+        eprintln!(
+            "[vboot] proxy: {} — guest address {} netmask {}; CA on 9p tag '{}'",
+            stack.proxy_url(),
+            fmt_ip(&stack.config().guest_ip),
+            fmt_ip(&stack.config().netmask),
+            rv64_system::httpproxy::CA_9P_TAG,
+        );
+        Some((stack, proxy, NativeEgress::new()))
+    } else {
+        None
+    };
+    let net = (relay.is_some() || proxy_mode).then_some(mac);
 
     let ram_bytes = (ram_gb * (1u64 << 30) as f64) as u64;
     eprintln!(
         "[vboot] opensbi={}B kernel={}B ram={:.1}GB initrd={} disk={} cmdline='{}'",
-        opensbi.len(), kernel.len(), ram_gb,
+        opensbi.len(),
+        kernel.len(),
+        ram_gb,
         initrd.as_ref().map_or(0, |v| v.len()),
         disk.as_ref().map_or(0, |v| v.len()),
         cmdline,
@@ -91,31 +130,59 @@ fn main() {
 
     let mut m = VirtMachine::new(
         ram_bytes,
-        VirtImages { opensbi: &opensbi, kernel: &kernel, cmdline: &cmdline, initrd: initrd.as_deref(), disk, fs, net },
+        VirtImages {
+            opensbi: &opensbi,
+            kernel: &kernel,
+            cmdline: &cmdline,
+            initrd: initrd.as_deref(),
+            disk,
+            fs,
+            net,
+        },
     );
 
     let _raw = RawTerm::enable();
-    let mut stdin = { libcish::set_nonblocking(0); std::io::stdin() };
+    let mut stdin = {
+        libcish::set_nonblocking(0);
+        std::io::stdin()
+    };
     let mut ctrl_a = false;
     let t0 = std::time::Instant::now();
-    let max_insns: Option<u64> = std::env::var("VBOOT_MAX_INSNS").ok().and_then(|v| v.parse().ok());
+    let max_insns: Option<u64> = std::env::var("VBOOT_MAX_INSNS")
+        .ok()
+        .and_then(|v| v.parse().ok());
     // Optional heartbeat: every N wall-seconds print retired-insn count,
     // throughput, and current guest PC (privilege) — for diagnosing hangs.
-    let hb_secs: Option<u64> = std::env::var("VBOOT_HEARTBEAT").ok().and_then(|v| v.parse().ok());
+    let hb_secs: Option<u64> = std::env::var("VBOOT_HEARTBEAT")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let net_trace = std::env::var_os("RV64_NET_TRACE").is_some();
     let mut hb_last = std::time::Instant::now();
     let mut hb_insns = 0u64;
 
     loop {
+        m.set_rtc_unix_ns(rv64_system::host_unix_time_ns());
         m.run_slice(2_000_000);
         if let Some(hb) = hb_secs {
             if hb_last.elapsed().as_secs() >= hb {
                 let now_insns = m.cpu.insn_count;
                 let dt = hb_last.elapsed().as_secs_f64();
                 let mips = (now_insns - hb_insns) as f64 / dt / 1e6;
-                let mode = m.cpu.sys.as_ref().map(|s| format!("{:?}", s.mode)).unwrap_or_default();
-                eprintln!("\r[hb] t={:.0}s insns={} {:.0} MIPS pc={:#x} mode={} {}",
-                    t0.elapsed().as_secs_f64(), now_insns, mips, m.cpu.pc, mode,
-                    m.debug_irq_state());
+                let mode = m
+                    .cpu
+                    .sys
+                    .as_ref()
+                    .map(|s| format!("{:?}", s.mode))
+                    .unwrap_or_default();
+                eprintln!(
+                    "\r[hb] t={:.0}s insns={} {:.0} MIPS pc={:#x} mode={} {}",
+                    t0.elapsed().as_secs_f64(),
+                    now_insns,
+                    mips,
+                    m.cpu.pc,
+                    mode,
+                    m.debug_irq_state()
+                );
                 eprintln!("[hb] last syscalls (a7@satp): {}", fmt_syscalls(&m.cpu));
                 hb_last = std::time::Instant::now();
                 hb_insns = now_insns;
@@ -129,6 +196,22 @@ fn main() {
         if m.power_off {
             eprintln!("\r\n[vboot] powered off");
             break;
+        }
+        // Pump the in-process proxy both ways once per slice.
+        if let Some((stack, proxy, egress)) = proxy_stack.as_mut() {
+            for frame in m.net_take_output() {
+                if net_trace {
+                    eprintln!("[vboot] net guest->proxy {}", describe_frame(&frame));
+                }
+                stack.input(&frame);
+            }
+            proxy.pump(stack, egress);
+            for frame in stack.take_output() {
+                if net_trace {
+                    eprintln!("[vboot] net proxy->guest {}", describe_frame(&frame));
+                }
+                m.net_input(&frame);
+            }
         }
         // Pump the relay both ways once per slice.
         if let Some(r) = relay.as_mut() {
@@ -169,8 +252,12 @@ fn main() {
         }
         if let Some(mx) = max_insns {
             if m.cpu.insn_count > mx {
-                eprintln!("\r\n[vboot] insn budget reached: {} insns in {:.1}s, pc={:#x}",
-                    m.cpu.insn_count, t0.elapsed().as_secs_f64(), m.cpu.pc);
+                eprintln!(
+                    "\r\n[vboot] insn budget reached: {} insns in {:.1}s, pc={:#x}",
+                    m.cpu.insn_count,
+                    t0.elapsed().as_secs_f64(),
+                    m.cpu.pc
+                );
                 break;
             }
         }
@@ -188,7 +275,22 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 }
 
 fn fmt_mac(mac: &[u8; 6]) -> String {
-    mac.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    mac.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn fmt_ip(o: &[u8; 4]) -> String {
+    format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
+}
+
+fn describe_frame(frame: &[u8]) -> String {
+    let ethertype = frame
+        .get(12..14)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+        .unwrap_or(0);
+    format!("{} bytes ethertype=0x{ethertype:04x}", frame.len())
 }
 
 /// Format the last ~20 user syscalls from the CPU ring buffer, decoding
@@ -196,21 +298,48 @@ fn fmt_mac(mac: &[u8; 6]) -> String {
 fn fmt_syscalls(cpu: &rv64_core::Cpu) -> String {
     fn name(n: u64) -> String {
         match n {
-            17 => "getcwd".into(), 23 => "dup".into(), 25 => "fcntl".into(),
-            29 => "ioctl".into(), 48 => "faccessat".into(), 56 => "openat".into(),
-            57 => "close".into(), 61 => "getdents".into(), 62 => "lseek".into(),
-            63 => "read".into(), 64 => "write".into(), 66 => "writev".into(),
-            72 => "pselect6".into(), 73 => "ppoll".into(), 78 => "readlinkat".into(),
-            79 => "newfstatat".into(), 80 => "fstat".into(), 93 => "exit".into(),
-            94 => "exit_group".into(), 96 => "set_tid_address".into(),
-            98 => "futex".into(), 99 => "set_robust_list".into(),
-            101 => "nanosleep".into(), 113 => "clock_gettime".into(),
-            124 => "sched_yield".into(), 129 => "kill".into(), 134 => "sigaction".into(),
-            135 => "sigprocmask".into(), 172 => "getpid".into(), 173 => "getppid".into(),
-            174 => "getuid".into(), 178 => "gettid".into(), 214 => "brk".into(),
-            215 => "munmap".into(), 220 => "clone".into(), 221 => "execve".into(),
-            222 => "mmap".into(), 226 => "mprotect".into(), 233 => "madvise".into(),
-            260 => "wait4".into(), 261 => "prlimit64".into(), 278 => "getrandom".into(),
+            17 => "getcwd".into(),
+            23 => "dup".into(),
+            25 => "fcntl".into(),
+            29 => "ioctl".into(),
+            48 => "faccessat".into(),
+            56 => "openat".into(),
+            57 => "close".into(),
+            61 => "getdents".into(),
+            62 => "lseek".into(),
+            63 => "read".into(),
+            64 => "write".into(),
+            66 => "writev".into(),
+            72 => "pselect6".into(),
+            73 => "ppoll".into(),
+            78 => "readlinkat".into(),
+            79 => "newfstatat".into(),
+            80 => "fstat".into(),
+            93 => "exit".into(),
+            94 => "exit_group".into(),
+            96 => "set_tid_address".into(),
+            98 => "futex".into(),
+            99 => "set_robust_list".into(),
+            101 => "nanosleep".into(),
+            113 => "clock_gettime".into(),
+            124 => "sched_yield".into(),
+            129 => "kill".into(),
+            134 => "sigaction".into(),
+            135 => "sigprocmask".into(),
+            172 => "getpid".into(),
+            173 => "getppid".into(),
+            174 => "getuid".into(),
+            178 => "gettid".into(),
+            214 => "brk".into(),
+            215 => "munmap".into(),
+            220 => "clone".into(),
+            221 => "execve".into(),
+            222 => "mmap".into(),
+            226 => "mprotect".into(),
+            233 => "madvise".into(),
+            260 => "wait4".into(),
+            261 => "prlimit64".into(),
+            278 => "getrandom".into(),
             435 => "clone3".into(),
             u64::MAX => "-".into(),
             other => format!("sys{other}"),

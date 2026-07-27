@@ -170,7 +170,7 @@ fn guest_fetches_through_the_in_process_proxy() {
             kernel: Some(&kernel),
             cmdline: "console=hvc0 root=/dev/vda rw",
             disk: Some(disk),
-            fs: None,
+            fs: vec![],
             net: Some(virtio::DEFAULT_MAC),
         },
     );

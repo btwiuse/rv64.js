@@ -15,8 +15,8 @@
 //!
 //! `--proxy` instead runs an in-process HTTP proxy behind the NIC: no relay, no
 //! external anything. The guest configures the NIC (DHCP or static) and points
-//! http_proxy at the printed URL. Natively the proxy speaks plaintext http only
-//! (see egress.rs); the browser build gets https because fetch does the TLS.
+//! http_proxy at the printed URL. Native egress supports both HTTP and HTTPS;
+//! the browser build performs the equivalent request through fetch().
 
 use rv64_system::egress::NativeEgress;
 use rv64_system::httpproxy::Proxy;
@@ -45,17 +45,23 @@ fn main() {
             "--net" => relay_url = it.next(),
             "--proxy" => proxy_mode = true,
             "--net-mac" => {
-                mac = it
-                    .next()
-                    .as_deref()
-                    .and_then(parse_mac)
-                    .unwrap_or_else(|| { eprintln!("bad --net-mac"); std::process::exit(2) })
+                mac = it.next().as_deref().and_then(parse_mac).unwrap_or_else(|| {
+                    eprintln!("bad --net-mac");
+                    std::process::exit(2)
+                })
             }
             _ => positional.push(a),
         }
     }
     if positional.is_empty() {
         eprintln!("usage: rv64-boot <bios> [kernel] [disk] [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT | --proxy] [--net-mac MAC] [-- cmdline]");
+        std::process::exit(2);
+    }
+    if proxy_mode && share.is_some() && tag == rv64_system::httpproxy::CA_9P_TAG {
+        eprintln!(
+            "--9p-tag '{}' is reserved for the proxy CA",
+            rv64_system::httpproxy::CA_9P_TAG
+        );
         std::process::exit(2);
     }
     let bios = std::fs::read(&positional[0]).expect("read bios");
@@ -65,10 +71,11 @@ fn main() {
     let disk = positional
         .get(2)
         .map(|p| std::fs::read(p).expect("read disk"));
-    let fs = share.map(|dir| {
+    let mut fs = Vec::new();
+    if let Some(dir) = share {
         eprintln!("[rv64-boot] 9p: exporting {dir} as tag '{tag}'");
-        p9::Server::new(tag, Box::new(p9fs::HostFs::new(dir)))
-    });
+        fs.push(p9::Server::new(tag, Box::new(p9fs::HostFs::new(dir))));
+    }
     // Connect the relay before booting: a NIC the guest can see but that has
     // nowhere to send is worse than no NIC at all.
     let mut relay = match &relay_url {
@@ -85,20 +92,29 @@ fn main() {
         None => None,
     };
     // Either transport needs the NIC; the proxy needs the host-side stack too.
-    let mut proxy_stack = proxy_mode.then(|| {
+    let mut proxy_stack = if proxy_mode {
         let stack = NetStack::new(NetConfig::default());
+        let mut proxy = Proxy::new().keep_scheme();
+        let ca_fs = proxy.ca_9p_server().unwrap_or_else(|error| {
+            eprintln!("[rv64-boot] proxy CA: {error}");
+            std::process::exit(1);
+        });
+        fs.push(ca_fs);
         eprintln!(
             "[rv64-boot] proxy: {} — in the guest:\n\
              [rv64-boot]   ifconfig eth0 {} netmask {} up\n\
-             [rv64-boot]   export http_proxy={}",
+             [rv64-boot]   export http_proxy={}\n\
+             [rv64-boot]   proxy CA: mount 9p tag '{}'",
             stack.proxy_url(),
             fmt_ip(&stack.config().guest_ip),
             fmt_ip(&stack.config().netmask),
             stack.proxy_url(),
+            rv64_system::httpproxy::CA_9P_TAG,
         );
-        // Native egress is plaintext-only, so leave the guest's scheme alone.
-        (stack, Proxy::new().keep_scheme(), NativeEgress::new())
-    });
+        Some((stack, proxy, NativeEgress::new()))
+    } else {
+        None
+    };
     let net = (relay.is_some() || proxy_mode).then_some(mac);
 
     let mut m = Machine::new(
@@ -120,6 +136,7 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     loop {
+        m.set_rtc_unix_ns(rv64_system::host_unix_time_ns());
         m.run_slice(200_000);
         if m.power_off {
             let out = m.console_output();

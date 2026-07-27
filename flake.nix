@@ -42,7 +42,28 @@
         # with virtio-blk/ext4 built in, and OpenSBI fw_dynamic, both booted by
         # the virt machine. Exposed as packages so the harness resolves them
         # reproducibly without hard-coded store paths.
-        virtKernel = pkgs.pkgsCross.riscv64.linux_latest;
+        # The distro kernel ships these as modules, which is too late when the
+        # root filesystem itself is an ext4 virtio-blk disk. Keep the kernel
+        # otherwise stock, but make the boot-critical disk/NIC path built-in.
+        # This image does not ship the kernel's module tree into the guest, so
+        # packet sockets (used by DHCP clients) must be built in as well.
+        virtKernel = pkgs.pkgsCross.riscv64.linux_latest.override {
+          structuredExtraConfig = with pkgs.lib.kernel; {
+            VIRTIO = yes;
+            VIRTIO_MMIO = yes;
+            VIRTIO_BLK = yes;
+            VIRTIO_NET = yes;
+            EXT4_FS = yes;
+            PACKET = yes;
+            # The proxy exposes its ephemeral public CA before networking via
+            # a fixed virtio-9p mount tag. This guest has no module tree, so the
+            # complete mount path must be available in the kernel itself.
+            NET_9P = yes;
+            NET_9P_VIRTIO = yes;
+            "9P_FS" = yes;
+          };
+          ignoreConfigErrors = true;
+        };
         virtOpensbi = pkgs.pkgsCross.riscv64.opensbi;
       in
       {

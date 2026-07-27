@@ -2,6 +2,12 @@
 resolver = "2"
 members = ["crates/rv64-core", "crates/rv64-jit", "crates/rv64-linux", "crates/rv64-run", "crates/rv64-system", "crates/rv64-wasm"]
 
+[patch.crates-io]
+# Upstream's `web` clock uses wasm-bindgen. rv64.js intentionally exposes a
+# raw WebAssembly host ABI, so the vendored patch obtains Unix time through
+# the same `host_unix_ms` import as rv64-wasm instead.
+rustls-pki-types = { path = "vendor/rustls-pki-types-1.15.1" }
+
 [profile.release]
 lto = true
 opt-level = 3
