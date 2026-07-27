@@ -3310,6 +3310,11 @@ pub extern "C" fn jit_set_hw_fma(on: u32) {
 pub extern "C" fn jit_set_tailcall(on: u32) {
     rv64_jit::set_chain(on != 0);
 }
+/// A/B: trace definedness tracking (rv64_jit::set_defined_track).
+#[no_mangle]
+pub extern "C" fn jit_set_defined(on: u32) {
+    rv64_jit::set_defined_track(on != 0);
+}
 /// A/B: rotated-nest loop regions (see rv64_jit::set_rotated_nests).
 #[no_mangle]
 pub extern "C" fn jit_set_rotated_nests(on: u32) {

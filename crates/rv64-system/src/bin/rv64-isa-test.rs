@@ -165,7 +165,7 @@ fn main() {
                 kernel: None,
                 cmdline: "",
                 disk: None,
-                fs: None,
+                fs: vec![],
                 net: None,
             },
         );

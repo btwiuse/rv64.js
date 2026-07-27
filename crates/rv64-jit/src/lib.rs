@@ -91,6 +91,17 @@ pub fn set_chain(on: bool) {
 fn chain_enabled() -> bool {
     CHAIN.load(std::sync::atomic::Ordering::Relaxed)
 }
+/// Trace prologue/epilogue register-traffic reduction (Ctx::defined): load
+/// only what a trace reads, flush only what it has written by each exit.
+/// A/B flag.
+static DEFINED_TRACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub fn set_defined_track(on: bool) {
+    DEFINED_TRACK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+fn defined_track() -> bool {
+    DEFINED_TRACK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Rotated-nest acceptance in loop_region (backward exit branches).
 /// DEFAULT OFF: a 6-boot parallel screen showed it net-negative on every
 /// nbench kernel (NUMERIC SORT 392 -> 343, HUFFMAN 989 -> 904, ASSIGNMENT
@@ -430,6 +441,18 @@ struct Ctx {
     /// be reported accurately or the system-mode kernel clock (derived from
     /// insn_count) stalls. `None` for basic blocks (retired == static index).
     retired_local: Option<u32>,
+    /// Registers whose local currently holds a DEFINED value at the point
+    /// being emitted: either loaded by the prologue or written since. A
+    /// linear trace only needs to flush what it has actually written by
+    /// each exit, and only needs to LOAD what it reads — a short trace
+    /// otherwise pays a prologue load and an epilogue store for every
+    /// register it merely writes (tcc's 8-19-instruction traces spend a
+    /// large fraction of their work on that traffic). Loops and superblocks
+    /// keep the conservative all-ones mask: an exit can be reached on a
+    /// later iteration than the write that defined a register, so the
+    /// statically-tracked set is not sound there.
+    defined: std::cell::Cell<u32>,
+    fp_defined: std::cell::Cell<u32>,
     /// (fs_bad, round_bad) i64 locals holding the FP gate's two conditions,
     /// evaluated ONCE at function entry. Nothing a compiled block executes can
     /// change mstatus.FS, frm or the sticky NX flag, so each FP body only has
@@ -463,6 +486,7 @@ impl Ctx {
     }
 
     fn store_post(&self, m: &mut WasmModule, rd: usize) {
+        self.defined.set(self.defined.get() | (1 << rd));
         if self.reg_local[rd] != 0 {
             m.local_set(self.reg_local[rd]);
         } else {
@@ -764,7 +788,7 @@ impl Ctx {
     /// state struct. Precedes every block exit and mid-block bail so the
     /// interpreter (which reads registers from state) sees current values.
     fn flush_writes(&self, m: &mut WasmModule) {
-        let mut w = self.write_mask;
+        let mut w = self.write_mask & self.defined.get();
         while w != 0 {
             let r = w.trailing_zeros() as usize;
             w &= w - 1;
@@ -774,7 +798,7 @@ impl Ctx {
                     .i64_store(self.lay.x_base as u64 + r as u64 * 8);
             }
         }
-        let mut w = self.fp_write_mask;
+        let mut w = self.fp_write_mask & self.fp_defined.get();
         while w != 0 {
             let r = w.trailing_zeros() as usize;
             w &= w - 1;
@@ -2254,6 +2278,21 @@ fn build_ctx(
     fp_read: u32,
     fp_write: u32,
 ) -> (Ctx, WasmModule) {
+    build_ctx_load(lay, read_mask, write_mask, fp_read, fp_write, None)
+}
+
+/// build_ctx with an explicit PROLOGUE LOAD set: `Some((gpr, fp))` loads
+/// only those registers (the rest start undefined and are tracked by
+/// Ctx::defined), `None` loads everything touched (the conservative form
+/// loops and superblocks require).
+fn build_ctx_load(
+    lay: JitLayout,
+    read_mask: u32,
+    write_mask: u32,
+    fp_read: u32,
+    fp_write: u32,
+    load: Option<(u32, u32)>,
+) -> (Ctx, WasmModule) {
     // read_mask bit 0 (x0 — never a real register) smuggles the "block
     // contains FMADD-family" flag from the scanners; strip it BEFORE any mask
     // use (a set bit 0 would make the prologue clobber local 0, the machine
@@ -2293,6 +2332,14 @@ fn build_ctx(
         fp_write_mask: fp_write,
         fma_scratch: if want_fma { N_I64_LOCALS + 1 + n_reg + n_fp } else { 0 },
         retired_local: None,
+        defined: std::cell::Cell::new(match load {
+            Some((g, _)) => g & !1,
+            None => u32::MAX,
+        }),
+        fp_defined: std::cell::Cell::new(match load {
+            Some((_, f)) => f,
+            None => u32::MAX,
+        }),
         fp_flags: if want_flags {
             let b = N_I64_LOCALS + 1 + n_reg + n_fp + n_fma;
             Some((b, b + 1))
@@ -2303,7 +2350,11 @@ fn build_ctx(
     // Two i32 locals: IDXB (TLB/dispatch index math) and IDXB+1 (the chain
     // stub's function-table index).
     let mut m = WasmModule::with_locals(N_I64_LOCALS + n_reg + n_fp + n_fma + n_flags, 2);
-    let mut t = touched;
+    let (load_g, load_f) = match load {
+        Some((g, f)) => (g & touched & !1, f & fp_touched),
+        None => (touched, fp_touched),
+    };
+    let mut t = load_g;
     while t != 0 {
         let r = t.trailing_zeros() as usize;
         t &= t - 1;
@@ -2311,7 +2362,7 @@ fn build_ctx(
             .i64_load(lay.x_base as u64 + r as u64 * 8)
             .local_set(reg_local[r]);
     }
-    let mut t = fp_touched;
+    let mut t = load_f;
     while t != 0 {
         let r = t.trailing_zeros() as usize;
         t &= t - 1;
@@ -3920,7 +3971,20 @@ pub fn translate_block_link(
     // wasm locals for its lifetime.
     let (read_mask, write_mask, fp_read, fp_write, scan_n) =
         scan_regs(code, base, start_pc, &lay, hot);
-    let (c, mut m) = build_ctx(lay, read_mask, write_mask, fp_read, fp_write);
+    // Trace prologue loads only what the trace READS; write-only registers
+    // start undefined and each exit flushes only what has been written by
+    // that point (Ctx::defined). A linear trace makes this exact — unlike a
+    // loop, no exit can be reached before a write that a later iteration
+    // performed. FP keeps the conservative set (its emitters write locals
+    // outside store_post).
+    let (c, mut m) = build_ctx_load(
+        lay,
+        read_mask,
+        write_mask,
+        fp_read,
+        fp_write,
+        defined_track().then_some((read_mask, fp_read | fp_write)),
+    );
     // Budget guard: a long trace retires its whole length once dispatched,
     // which would overshoot small fuel grants (the user_run(1) contract).
     // Bail with zero retired when the grant can't cover the trace — the
