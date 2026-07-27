@@ -3451,7 +3451,14 @@ static mut BATCH_CELL_NEXT: usize = 0;
 /// compile per tier-up for code it never re-enters. The separating property
 /// is the population itself, not the workload: below the cap a batch's
 /// members are a large fraction of all hot code, above it they are noise.
-static mut BATCH_ON: bool = true;
+/// DEFAULT OFF on the evidence: batching's only beneficiary is nbench
+/// ASSIGNMENT (+9..21%), which remains a LOSS either way (best draw 0.944x),
+/// while it costs NUMERIC SORT ~25% (285.6 vs 358.5 iter/s under identical
+/// contention) — enough to drop that row from MATCH to LOSS on the
+/// authoritative scorecard. A mechanism that cannot flip the row it helps
+/// and does flip a row it hurts is not worth shipping on. The machinery,
+/// the IC composition and the rate governor stay behind jit_set_batch(1).
+static mut BATCH_ON: bool = false;
 /// Blocks in the cache beyond which batching stops (see BATCH_ON).
 /// NOTE: population alone is NOT a sufficient gate — python fib still ran
 /// 180s with a 4096-block cap, because the storm happens during warm-up
