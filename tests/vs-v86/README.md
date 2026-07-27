@@ -94,8 +94,9 @@ ARTIFACTS=target/bench nix develop -c node tests/vs-v86/compare-sys.mjs
 
 Pieces (each runnable alone): `build-kernels.sh` (the fixed-work C kernels for
 both ISAs), `mk-nbench-rootfs.sh` (fetch + build nbench, bake into the buildroot
-rootfs), `mk-debian-rootfs.sh` (Debian riscv64 rootfs with python for
-arch-python). The v86 side still needs a built `copy/v86` checkout at
+rootfs), `mk-debian-rootfs.sh` (Debian riscv64 rootfs with Python plus the
+curl/OpenSSL/networking tools used by `tests/virt-proxy`). The v86 side still
+needs a built `copy/v86` checkout at
 `<outdir>/v86` (see "Reproducing").
 
 ## Running it — one command
@@ -231,14 +232,18 @@ real userland, we assemble a minimal **Debian riscv64** rootfs — no building
 from scratch, just prebuilt `.debs` — that boots under our JIT-capable machine
 (bbl64 + kernel-riscv64). `mk-debian-rootfs.sh` does it with no root and no
 binfmt: `fakeroot debootstrap --foreign` (host-side download + first-stage
-unpack), then `dpkg-deb -x` the `--include=python3` packages (a bare interpreter
-needs no maintainer-script configuration), then `mke2fs -d` into a ~300 MB ext4
-image. The virtio-blk disk is read on demand, so it fits under wasm's 4 GB
+unpack), then `dpkg-deb -x` the requested packages. The default includes
+Python, curl, OpenSSL, CA roots, iproute2, and a static busybox `udhcpc`; the
+builder supplies the CA bundle and DHCP lease script that the foreign
+debootstrap stage cannot generate. It then uses `mke2fs -d` to produce the
+ext4 image. The virtio-blk disk is read on demand, so it fits under wasm's 4 GB
 (image + 512 MB RAM). Boot with `init=/binit.sh` (mounts proc/dev/sys → shell).
 
 ```sh
-nix develop -c tests/vs-v86/mk-debian-rootfs.sh <outdir>   # -> deb-rootfs.ext4
+nix develop -c tests/vs-v86/mk-debian-rootfs.sh target/bench
+# -> target/bench/deb-riscv64.ext4
 ARTIFACTS=<outdir> nix develop -c node tests/vs-v86/deb-python.mjs
+nix develop -c tests/virt-proxy/run.sh
 ```
 
 **arch-python — fib(30), APPLES-TO-APPLES** (same Debian trixie python 3.13 on

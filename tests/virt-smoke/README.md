@@ -1,7 +1,8 @@
 # virt-smoke — modern-system (Debian-class) boot harness
 
 Boots the **virt** machine (`crates/rv64-system/src/virt.rs`, runner
-`bin/rv64-vboot`) — OpenSBI `fw_dynamic` + a stock riscv64 Linux kernel — and
+`bin/rv64-vboot`) — OpenSBI `fw_dynamic` + a riscv64 Linux kernel whose
+boot-critical virtio paths are built in — and
 runs a tiny initramfs whose `init` (`init.c`) drives the full-system paths that
 were once broken. On success it prints `SMOKE_OK` and powers off; a hang makes
 the harness time out and fail.
@@ -44,12 +45,13 @@ invariants; this smoke test pins the emergent full-system behavior.
 
 Runs as PID 1 in the initramfs and, in order:
 
-1. `rdtime` delta across a `nanosleep` (sanity that the clock moves).
-2. A large console-output burst + `tcsetattr(TCSADRAIN)` — forces the 8250
+1. `rdtime` delta across a `nanosleep` (sanity that the monotonic clock moves).
+2. `CLOCK_REALTIME` is a modern Unix epoch, seeded from the goldfish RTC.
+3. A large console-output burst + `tcsetattr(TCSADRAIN)` — forces the 8250
    driver into interrupt-driven TX and blocks on the drain if THRE is missing.
-3. A `fork`+`exec` loop with the timer ticking underneath (multi-process /
+4. A `fork`+`exec` loop with the timer ticking underneath (multi-process /
    atomic churn).
-4. `SMOKE_OK`, then `reboot(RB_POWER_OFF)`.
+5. `SMOKE_OK`, then `reboot(RB_POWER_OFF)`.
 
 ## Heavier tier — full Debian + kernel compile (manual)
 

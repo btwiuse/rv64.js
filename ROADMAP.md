@@ -201,6 +201,11 @@ lever now. Its two reverted attempts are documented in git history.
   guest gets an **HTTP proxy** instead of a route: it sets `http_proxy`, hands us
   a hostname and a complete request, and we perform it.
 
+  **See [HANDOFF.md](HANDOFF.md) for a condensed status snapshot.** The RTC,
+  TLS-capable Debian guest, `rv64-vboot --proxy`, HTTP/HTTPS integration test,
+  and raw-Wasm-compatible TLS termination are complete. This item's full
+  narrative continues below.
+
   Moving up a layer deletes most of a slirp: no DNS (the guest never resolves
   anything — it passes the name to us), no NAT, no per-destination tracking, no
   UDP beyond DHCP. What remains is `netstack.rs` — ARP, DHCP, ICMP echo, and TCP
@@ -209,8 +214,9 @@ lever now. Its two reverted attempts are documented in git history.
   `slirp/` at ~8.5k lines.
 
   Both are pure logic driven by the host loop, so the same code serves native
-  (`egress.rs`, real sockets, plaintext only) and browser (`fetch`, which brings
-  HTTPS for free). `--proxy` on `rv64-boot`; `proxy: true` in `bootLinux`.
+  (`egress.rs`, raw TCP for HTTP and validating rustls for HTTPS) and browser
+  (`fetch`, which brings HTTPS for free). `--proxy` is on both native runners;
+  `proxy: true` is in `bootLinux`.
 
   **Reach is bounded by CORS, and the boundary is better than it sounds.** Only
   hosts sending `Access-Control-Allow-Origin` can be read — but measured, that
@@ -238,20 +244,50 @@ lever now. Its two reverted attempts are documented in git history.
   the response or make the guest gunzip plaintext; `Connection: close` delimits
   it instead, which is also what lets it stream without chunked encoding.
 
-  **`CONNECT` + TLS MITM is deferred, on two independent findings** (measured
-  2026-07-25, so nobody re-derives them):
-  1. The TinyEMU guest has **no TLS client at all** — no `ssl_client`,
-     `openssl`, `wolfssl`, `mbedtls` or `curl`; busybox `wget` has no TLS
-     backend. MITM could not be tested end to end against a real client with
-     this image, whatever we built.
-  2. `rustls` does not build for `wasm32-unknown-unknown` as-is (`UnixTime::now`
-     needs `SystemTime`). It would need a custom time provider plus a
-     wasm-capable crypto provider, and would be the first external dependencies
-     in a zero-dependency repo.
+  **`CONNECT` + TLS termination is complete (2026-07-26).** `tlsproxy.rs`
+  combines rustls with the pure-Rust `oxitls-rustcrypto-provider`, an ephemeral
+  Ed25519 CA, and cached per-host certificates. Its public certificate is
+  available from `http://rv64-proxy.invalid/ca.der` and, before networking, as
+  `/ca.der` on the fixed `rv64-proxy` 9p tag; only guest boot policy decides
+  whether to install it. The small vendored `rustls-pki-types` patch changes
+  only its wasm clock boundary from wasm-bindgen/web-time to the project's
+  existing raw `host_unix_ms` import, while a custom getrandom backend uses
+  `host_random`. Release-Wasm inspection shows only the expected raw `env`
+  imports and no wasm-bindgen/externref imports.
+  `tests/virt-proxy/run.sh` proves the entire RTC + boot-time CA mount/install
+  + DHCP + OpenSSL validation + HTTPS curl CONNECT path through the real Debian
+  guest.
 
-  So the honest order now: a guest that can speak TLS (the virt machine's Debian
-  userland has curl+openssl) before MITM; then chunked request bodies; then
-  per-request routing between `fetch` and the relay.
+  **Chunked request bodies are complete (2026-07-26).** The parser waits for
+  and decodes the complete chunk stream within the existing body bound before
+  crossing the request-shaped `Egress` boundary. It rejects conflicting
+  `Content-Length`, stacked transfer codings, malformed chunks, oversized
+  decoded bodies, and trailers that `Egress` cannot represent.
+  `tests/virt-proxy/run.sh` includes a real chunked curl POST whose decoded body
+  is checked by the loopback origin.
+
+  **Per-request relay fallback is complete (2026-07-26).** The raw Ethernet
+  websockproxy transport cannot consume a request after the in-process proxy
+  has terminated it, so `connectHttpRelay()` uses a separate, request-level
+  WebSocket protocol. Browser fetch remains first and infrastructure-free.
+  GET/HEAD failures before a response head retry through the relay and cache
+  that origin for direct routing; non-idempotent methods require explicit
+  `routeHttpViaRelay()` selection, preventing duplicate delivery after an
+  ambiguous CORS failure. `web/http-relay.mjs` supplies the loopback-default
+  Node relay and restricts browser Origins by default. Tests cover the real
+  WebSocket server plus fallback and origin caching through the booted Wasm
+  guest.
+
+  **Native HTTPS + boot-time CA delivery are complete (2026-07-26).**
+  `NativeEgress` now uses rustls with the host trust bundle for independently
+  verified upstream HTTPS, while ordinary native HTTP remains plaintext.
+  CONNECT traffic is always reconstructed as HTTPS after decryption instead of
+  sharing the browser-only mixed-content upgrade decision. Proxy-enabled
+  machines eagerly expose only their ephemeral public CA certificate at
+  `/ca.der` on the fixed virtio-9p tag `rv64-proxy`; the signing key remains in
+  the proxy. The Debian guest mounts and installs that CA before becoming ready.
+  Its E2E reaches real example.com over both schemes and verifies that the HTTPS
+  peer presented `CN=example.com`, issued by `rv64.js ephemeral proxy CA`.
 
 - [x] **9. Modern guest images** *(done 2026-07-23)* — a new **virt**-class
   machine (`crates/rv64-system/src/virt.rs`, runner `bin/rv64-vboot`) boots a

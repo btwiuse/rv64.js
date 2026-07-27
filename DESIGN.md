@@ -120,7 +120,16 @@ browser" requires. Both landed later: **virtio-9p** (`p9.rs`/`p9fs.rs`) exports 
 host directory or an in-memory tree, and **virtio-net** (`virtio.rs`) carries
 frames either to a WebSocket relay (`ws.rs`) or to an **in-browser HTTP proxy**
 (`netstack.rs` + `httpproxy.rs`) whose egress is `fetch()` — the only design that
-reaches the network from a page with no external infrastructure.
+reaches the network from a page with no external infrastructure. An optional,
+separate request-level WebSocket relay (`web/http-relay.mjs`) handles
+CORS-blocked origins without changing the guest-facing proxy: fetch is tried
+first, safe failures fall back, and that origin is then routed directly.
+CONNECT is terminated with a per-host certificate signed by an ephemeral
+in-process CA. Proxy-enabled machines expose only that CA's public DER file on
+the fixed virtio-9p tag `rv64-proxy`, allowing a guest boot policy to install
+the exact authority for that run without putting signing keys in guest memory.
+Native egress uses rustls and the host trust store for its separate upstream
+HTTPS connection; browser egress gets the equivalent behavior from `fetch()`.
 
 ## Testing strategy
 

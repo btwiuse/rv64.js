@@ -32,11 +32,36 @@ target/release/rv64-boot web/images/*.bin --9p ~/src
 # ...with networking through the in-process HTTP proxy; in the guest:
 #   ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
 #   export http_proxy=http://10.0.2.2:8080 && wget -O- http://example.com/
+# HTTPS uses CONNECT through an ephemeral local CA. `--proxy` exposes its public
+# certificate as /ca.der on the fixed 9p tag `rv64-proxy`; mount it read-only:
+#   mount -t 9p -o trans=virtio,version=9p2000.L,ro rv64-proxy /run/rv64-proxy
+# The Debian test image installs it into the system trust bundle during boot;
+# other guests can convert/install it according to their own trust policy.
+#   curl -x "$http_proxy" https://example.com/
 target/release/rv64-boot web/images/*.bin --proxy
+
+# optional browser CORS fallback (loopback-only by default)
+node web/http-relay.mjs --port 8090
+# In the page, before or after bootLinux({ proxy: true }):
+#   vm.connectHttpRelay("ws://127.0.0.1:8090")
+
+# boot the modern OpenSBI/Linux machine with the reusable Debian test disk
+nix develop -c tests/vs-v86/mk-debian-rootfs.sh target/bench
+nix develop -c tests/virt-proxy/run.sh
 
 # run a static riscv64 Linux binary (qemu-user style)
 cargo run --release -p rv64-run -- <static-elf> [args...]
 ```
+
+The browser proxy tries `fetch()` first, retaining its zero-infrastructure
+path. If a GET or HEAD fails before a response is exposed, an attached HTTP
+relay retries it and remembers that origin for later requests. Non-idempotent
+requests are never retried automatically; opt an origin in beforehand with
+`vm.routeHttpViaRelay("https://example.com")`. The relay accepts only local
+page origins by default; use `--allow-origin` explicitly for a remotely served
+page, and put it behind a `wss://` reverse proxy when the page itself uses
+HTTPS. See [web/HTTP_RELAY.md](web/HTTP_RELAY.md) for the wire protocol and
+deployment details.
 
 ## Build & test
 
