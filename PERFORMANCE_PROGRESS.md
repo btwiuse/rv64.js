@@ -40,6 +40,10 @@ retains the decisions that should guide future work.
 - **Current likely losses:** Compile and Assignment. Python has
   historically been bimodal and must be classified only by a replicated
   candidate-relative run.
+- **Extended E004–E008 outcome:** no runtime change was promoted. Page-cache
+  and tier-threshold sweeps were neutral or negative; multi-latch loop
+  compilation produced a large but invalid Assignment result that remains
+  quarantined pending a deterministic explanation of its internal variance.
 
 An exploratory scorecard is a plumbing check, not status evidence. Only a
 valid `AUTHORITATIVE=1`, `REPS>=3`, `NBREPS>=3` scorecard may change the
@@ -126,6 +130,10 @@ needed to justify reopening the design.
 | Relaxed SIMD experimental mode | Enabling the flag taxed total execution more than it helped | Relaxed SIMD becomes stable/default or is isolated to generated code |
 | Removing TLB-miss bailouts alone | Eliminating the observed misses did not move Compile wall time | New counters show TLB handling has become a dominant fraction |
 | Global batch/IC composition | Assignment gained 9–21%, but Numeric lost about 25%; best Assignment draw still missed the old pass bar | A general, workload-independent gate predicts benefit without row-specific tuning |
+| Per-trace page-cache threshold sweep | Threshold 2 regressed Compile 6.6%; disabling the cache improved it only 4.5%, below the fixed gate | A changed memory-access shape or new counters show the cache is materially dominant |
+| Ordinary JIT tier threshold sweep | Thresholds 128, 32, and 16 changed Compile by −2.3%, +2.6%, and −5.5% respectively | Module generation or interpreter/JIT crossover costs change materially |
+| Individually selected multi-latch scan loops | Large-stride-only was an invalid +4.1%; small-stride-only was a valid −3.0% | A new structural selector identifies a different independently beneficial loop |
+| Broad multi-latch scan-loop compilation | Apparent Assignment gain was 69.7%, but all three candidate trials failed nbench's internal confidence test | The variance is explained and the unchanged canonical benchmark produces a valid result; never relax the confidence rule |
 
 ## Invalidated and superseded conclusions
 
@@ -273,36 +281,69 @@ were again the only losses. One of three rv64 nbench repetitions reported
 internal instability, below the authoritative invalidation threshold. This is
 the promotion report.
 
-### P2 — Next: prototype cross-block guest-state caching
+### P2 — Next session: make the Assignment opportunity testable
 
-If configuration cannot recover the open rows, the next distinct mechanism is
-emitted-code quality:
+The proposed cross-block GPR-cache prototype was based on an incomplete audit:
+ordinary traces already allocate locals for every touched GPR/FP register,
+keep them live across conditional, direct-call/return, and inline-cache-followed
+edges, load only read registers, and spill only writes visible at each exit.
+Sparse superblocks likewise retain selected locals across their internal
+control-flow graph. Reimplementing that mechanism would not be an experiment.
 
-1. Select a small set of hot guest GPRs from a Compile profile.
-2. Keep them in Wasm locals across direct and inline-cache-followed trace
-   edges inside one generated function.
-3. Spill at side exits, calls that require architectural memory state, traps,
-   invalidation guards, and externally observable boundaries.
-4. Pin aliasing, x0, fault, retirement, and interrupt behavior with
-   differential tests.
-5. Gate first on Compile plus `python,numeric,assignment`; generalize only
-   after a valid improvement of at least 10%.
-
-This is deliberately narrower than implementing a complete allocator. It
-tests whether cross-block spills are actually causal before committing to a
-multi-session backend rewrite.
+A frozen-control Compile profile
+(`ab-2026-07-28T14-28-24.json`) retired 322.7M JIT instructions across 16.6M
+dispatches (19.42 instructions/dispatch), while only 3,109 entries used
+superblocks. Historical `c155cbd` evidence is more decisive: inline caches
+cut Compile dispatches by roughly one third without improving its wall time.
+Compile is therefore an emitted-code-quality problem, not currently a
+dispatcher or superblock-entry problem.
 
 E003 is committed at `314e441`; its clean Nix build is frozen as
-`e003-control-b5a857b087bd.wasm`. The first E004 gate is a focused serial A/B
-on `compile,python,numeric,assignment,fourier`; Compile must improve by at
-least 10% with no selected-row regression. Only then run another authoritative
-scorecard.
+`e003-control-b5a857b087bd.wasm`. E008 found a concrete Assignment mechanism,
+but the broad form is not a candidate: its +69.7% median failed nbench's
+internal confidence check in every candidate trial, while neither structural
+half helped alone.
 
-### P3 — Region live ranges/register allocation
+Use this sequence for the next session:
 
-Proceed only if P2 demonstrates material benefit. Add live-in/live-out
-analysis, local allocation, and precise side-exit reconstruction across a
-whole trace/region. Compile and Assignment are the motivating rows.
+1. Add a diagnostic-only fixed-work, checksum-bearing reproducer for the two
+   `DoAssignIteration` scan-loop shapes. It may validate semantics and expose
+   phase changes, but it cannot promote a candidate or replace nbench.
+2. Capture nbench's internal sample count, mean, standard deviation, and
+   confidence decision, plus multi-latch compile/entry counts. Keep the
+   canonical workload, Node flags, timing boundaries, and invalidation rules
+   unchanged.
+3. Diagnose whether the variance follows Wasm tiering with separate
+   non-canonical engine-flag runs. Such runs explain behavior only; they are
+   never score evidence.
+4. Recreate the exact broad E008 mechanism only after the variance has a
+   measured cause. Screen one serial fresh-process pair. Continue to three
+   alternating pairs only if the report is valid and the effect is at least
+   10%.
+5. If that gate passes, run guard rows
+   `compile,python,numeric,fourier`, then the authoritative 13-row scorecard
+   and all eight correctness stages. Any internal-instability majority,
+   checksum mismatch, host spread over 1.25×, or selected-row regression of
+   at least 10% rejects the candidate.
+
+This keeps the quick cycle at one focused pair until evidence justifies the
+more expensive stages and prevents a diagnostic benchmark from becoming a
+new scoring methodology.
+
+### P3 — Compile emitted-code investigation
+
+The page-cache and tier-threshold axes are closed. Before another Compile
+implementation, add immutable-control counters that divide generated memory
+operations among page-local cache hits, full TLB hits/fills, crossings, and
+bailouts, and record generated function/instruction size. Select one bounded
+lowering only if a measured category is dominant. A focused serial Compile
+pair remains the first gate; `python,numeric,assignment,fourier` are guards
+only after a valid improvement of at least 10%.
+
+True region live ranges/register allocation remains a possible larger backend
+project, but it is not the same as adding a hot-register local cache. Start it
+only if those counters show that region entry/exit register traffic is
+material; current evidence does not.
 
 ### P4 — Python coverage stability
 
@@ -338,7 +379,16 @@ must add one row immediately after its decision.
 | E001c | 2026-07-28 | TIE | `TRACELVL=2` versus `3` | Three-pair `numeric,fourier,assignment`; report `ab-2026-07-28T04-43-26.json`; host spread 1.22× | Numeric −1.3%, Fourier −8.6%, Assignment −1.8%; no global improvement, and the trace-level sweep is closed |
 | E002 | 2026-07-28 | REJECTED | Independent conditional-branch trace gate (`TRACELVL=3,BRTRACE=0`) | One-pair `numeric,fourier,assignment`; report `ab-2026-07-28T04-54-44.json`; candidate Wasm `553a820b…`; host spread 1.21× | Numeric −42.1%, Fourier −28.5%, Assignment −9.7%; fewer dispatches but much less work per dispatch, so the temporary gate was removed |
 | E003 | 2026-07-28 | LANDED | Narrow translation window with full traces (`TRACEWIN=1`, now default) | Factorial screens `ab-2026-07-28T04-58-37.json`/`ab-2026-07-28T05-01-52.json`; focused `ab-2026-07-28T05-20-58.json`; guard `ab-2026-07-28T05-22-07.json`; valid host-toolchain scorecards `scorecard-2026-07-28T05-38-26.json`/`06-29-49`; two intervening 1.26×-drift reports invalid; valid canonical Nix scorecard `scorecard-2026-07-28T07-03-26.json`; all eight correctness stages passed on final `b5a857b0…` build | Numeric +60.1% against frozen control and a reproducible 11/13 scorecard across host and pinned toolchains; Compile/Assignment remain the only losses |
-| E004 | — | OPEN | Cross-block guest-state caching prototype | Immutable control `e003-control-b5a857b087bd.wasm` from clean `314e441`; next profile Compile, then focused three-pair `compile,python,numeric,assignment,fourier` gate | Test a small hot-GPR local cache before considering whole-region register allocation |
+| E004 | 2026-07-28 | DIAGNOSTIC | Audit proposed cross-block guest-state caching; profile immutable E003 control against itself | Source audit plus deterministic Compile profiles in `ab-2026-07-28T14-28-24.json`; 322.7M JIT instructions, 16.6M dispatches, 3,109 superblock entries | Superseded before implementation: trace and sparse-region GPR/FP local caching already implement the proposed mechanism; historical `c155cbd` also proved Compile wall time insensitive to a one-third dispatch reduction |
+| E005a | 2026-07-28 | REJECTED | Lower the per-trace TLB page-cache activation threshold from 3 memory operations to 2 behind a diagnostic knob | One serial profiled Compile pair, report `ab-2026-07-28T14-31-45.json`; affinity `0,2,4,6`, host spread 1.02×, identical 16.62M dispatches and 19.42 instructions/dispatch | Compile regressed 6.6% (`2414.15`→`2584.19` ms); the extra cache guards/locals cost more than the avoided probes, so do not replicate or retain threshold 2 |
+| E005b | 2026-07-28 | TIE | Disable the per-trace TLB page cache (`MEMCACHEMIN=0`) | One serial profiled Compile pair, report `ab-2026-07-28T14-32-25.json`; affinity `0,2,4,6`, host spread 1.05×, identical aggregate execution counters | Compile improved only 4.5% (`2444.81`→`2339.52` ms), below the fixed 10% threshold; close the page-cache sweep and remove the diagnostic knob |
+| E006a | 2026-07-28 | TIE | Raise the ordinary JIT tier-up threshold from 64 to 128 behind a diagnostic knob | One serial profiled Compile pair, report `ab-2026-07-28T14-34-24.json`; affinity `0,2,4,6`, host spread 1.01× | Compile regressed 2.3%; 828 fewer modules did not pay for moving 4.5M instructions from JIT to interpreter |
+| E006b | 2026-07-28 | TIE | Lower the ordinary JIT tier-up threshold from 64 to 32 | One serial profiled Compile pair, report `ab-2026-07-28T14-35-02.json`; affinity `0,2,4,6`, host spread 1.02× | Compile improved 2.6%; 321 extra modules recovered 3.6M interpreted instructions but remained well below the 10% bar |
+| E006c | 2026-07-28 | REJECTED | Lower the ordinary JIT tier-up threshold from 64 to the historical value 16 | One serial profiled Compile pair, report `ab-2026-07-28T14-35-38.json`; affinity `0,2,4,6`, host spread 1.02× | Compile regressed 5.5%; threshold 32 was the best non-default sample at only +2.6%, so close the tier axis and remove the diagnostic knob |
+| E007 | 2026-07-28 | DIAGNOSTIC | Profile immutable-control Assignment and select a structural candidate from its measured execution shape | The first integration report `ab-2026-07-28T14-36-23.json` is invalid and excluded because slow profiling was not explicitly enabled; slow identical-artifact diagnostic report `ab-2026-07-28T14-40-57.json` used the required opt-in, affinity `0,2,4,6`, and host spread 1.02×; timing/counter differences are not a performance claim because nbench is self-timed | The stable top sites are `0x100934e` and `0x10092c6` in `DoAssignIteration`, both about 7 instructions/dispatch and together dominant; disassembly shows multi-latch scan loops with multiple conditional continues plus a final unconditional backedge |
+| E008a | 2026-07-28 | INVALID | Compile all precise multi-latch scan loops as structured Wasm loops | Exact-shape unit and feature-enabled full-state/retirement differential pass; invalid one-pair reports `ab-2026-07-28T14-51-45.json` and `ab-2026-07-28T14-56-31.json`; alternating three-pair report `ab-2026-07-28T15-09-00.json` | Three-pair medians showed +69.7% (`14.60`→`24.77`), external MAD 0.1%/1.0%, host spread 1.03×, but candidate nbench confidence failed in 3/3 trials; no code or diagnostic knob was retained, and this form cannot be reconsidered until the internal variance is explained |
+| E008b | 2026-07-28 | REJECTED | Restrict multi-latch compilation to large-stride scans | One-pair report `ab-2026-07-28T15-16-28.json`; numerically +4.1%, and invalid because both sides reported nbench instability | The large-stride `0x100934e` loop does not explain E008a's gain; do not replicate |
+| E008c | 2026-07-28 | TIE | Restrict multi-latch compilation to small-stride scans | Valid one-pair Assignment report `ab-2026-07-28T15-20-54.json`; affinity `0,2,4,6`, host spread 1.01×, no internal nbench warning | Assignment regressed 3.0% (`14.48`→`14.05`), below the 10% threshold; together E008b/E008c show that neither loop shape independently explains E008a, so close the factorial and retain no code |
 
 ### Required record for new experiments
 
