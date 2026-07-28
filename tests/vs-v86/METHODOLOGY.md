@@ -51,6 +51,15 @@ detection are about 33 seconds for Numeric, 87 seconds for Assignment, and
 The orchestrators take an exclusive lock in `ARTIFACTS`, so two local benchmark
 runs cannot silently contend with each other.
 
+On heterogeneous-core hosts, scheduler migration can invalidate an otherwise
+idle run. If repeated runs exceed the fixed 1.25× probe-spread limit, measure
+the existing `cpuProbe()` both unrestricted and on a proposed homogeneous CPU
+set before retrying. Apply a chosen `taskset` to the entire orchestrator so
+both emulators and every child inherit it; never pin only one side. The
+scorecard records the actual Linux `Cpus_allowed_list` in provenance. CPU
+affinity controls host variance—it does not justify relaxing the validity
+limit or accepting an earlier invalid report.
+
 ## 0. Establish the session control
 
 Build HEAD and save the exact Wasm before editing JIT code:

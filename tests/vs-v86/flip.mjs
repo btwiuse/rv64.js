@@ -87,7 +87,8 @@ if (process.env.FLIP_CHILD) {
     vm.ex.jit_set_enabled(1);
     vm.ex.jit_set_tlb_fill(+(process.env.TLBFILL ?? 0));
     for (const [env, fn] of [
-      ["TRACELVL", "jit_set_trace_level"], ["KEEPMIN", "jit_set_trace_keep_min"],
+      ["TRACELVL", "jit_set_trace_level"], ["TRACEWIN", "jit_set_trace_window"],
+      ["KEEPMIN", "jit_set_trace_keep_min"],
       ["DEMOTE", "jit_set_demote"], ["BATCH", "jit_set_batch"],
       ["ICTRIG", "jit_set_ic_trigger"], ["DEFTRACK", "jit_set_defined"],
       ["BCAP", "jit_set_batch_cap"], ["BPAGE", "jit_set_batch_page"],

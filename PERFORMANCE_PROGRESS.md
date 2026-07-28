@@ -17,19 +17,25 @@ retains the decisions that should guide future work.
 
 ## Current status
 
-- **Best known engineering baseline:** repository HEAD `1ec9130`.
+- **Best known engineering baseline:** the E003 narrow-window default in the
+  current repository state (checkpoint parent `a161200`).
 - **Frozen performance control:** Wasm SHA-256
   `21b638123cee4072cb84397c98f9cf340dad6e05e3907845bff4dc66642f50a1`.
 - **Control artifact:** `target/bench/wasm-candidates/`
   `head-control-21b638123cee.wasm`.
-- **Current instrumented build:** Wasm SHA-256
-  `0ec8d4f0c1a199a87882463be51d4f69c859e13a5c980d9b42ad14a5c7d28f25`.
-  A three-pair Compile A/B and a one-pair Numeric integration check detected
-  no effect at the 10% decision threshold.
+- **Promoted default build:** Wasm SHA-256
+  `b5a857b087bd49631866c9bcd77e3d9d98df1dfb93eedf3ce16782c3e02d4433`.
+  It differs from the scored `c8a196b5…` artifact only by making the tested
+  `TRACEWIN=1` runtime state the default, comment/source-location metadata,
+  and use of the project-pinned Rust 1.97.1 toolchain; the final build passed
+  all eight correctness stages.
 - **Comparison v86 revision:** `2f1346b0e7d88d4cbbbcc05fe15b4e369c3de23f`.
-- **Reproducible scorecard ceiling:** 10/13. Isolated 11/13 observations have
-  not repeated on the same Wasm and must not update the baseline.
-- **Current likely losses:** Compile, Numeric Sort, and Assignment. Python has
+- **Reproducible scorecard ceiling:** 11/13 with the narrow-window candidate.
+  Reports `scorecard-2026-07-28T05-38-26.json` and
+  `scorecard-2026-07-28T06-29-49.json` are valid authoritative host-toolchain
+  results; `scorecard-2026-07-28T07-03-26.json` is the valid canonical
+  Nix-toolchain result on the final artifact.
+- **Current likely losses:** Compile and Assignment. Python has
   historically been bimodal and must be classified only by a replicated
   candidate-relative run.
 
@@ -140,7 +146,7 @@ needed to justify reopening the design.
 
 ## Plan of attack
 
-### P0 — Complete the untried trace-level configuration experiment
+### P0 — Completed: trace-level configuration experiment
 
 **Hypothesis:** trace compilation caused the persistent Numeric regression;
 `TRACELVL=0`, `1`, or `2` may recover Numeric without surrendering Fourier or
@@ -154,7 +160,25 @@ the frozen control Wasm.
 10% and no selected-row regression of at least 10%. Configuration results do
 not justify workload-specific heuristics.
 
-### P1 — Explain Numeric before changing code
+**Level 0 result:** rejected. Against level 3, Numeric improved 31.2%
+(`518.26`→`679.77`) while Fourier regressed 35.0%
+(`24867`→`16175`); Assignment changed −5.2%, a tie. MAD was at most 1.4% and
+host-probe spread was 1.22×, so the row trade is real rather than measurement
+noise. Continue with levels 1 and 2 to locate which trace capability creates
+the conflict.
+
+**Level 1 result:** rejected. Numeric (−2.5%) and Assignment (−0.4%) tied,
+while Fourier regressed 10.9%. MAD was at most 1.7% and host spread was 1.23×.
+Branch traces lose Numeric's level-0 benefit but do not provide all of level
+3's Fourier benefit.
+
+**Level 2 result:** tie. Numeric changed −1.3%, Fourier −8.6%, and Assignment
+−1.8%. MAD was at most 3.4% and host spread was 1.22×. No lower global trace
+level beats level 3. Numeric's gain exists only when branch traces are disabled
+entirely; level 3's return/inline-cache following recovers Fourier relative to
+levels 0–2.
+
+### P1 — Completed: explain and recover Numeric
 
 Current aggregate evidence shows roughly 1.7B dispatches at only about 18.7
 retired instructions/dispatch. Compare trace levels using exact aggregate
@@ -165,7 +189,89 @@ instruction-family fallback.
 The output of this step must be a falsifiable code-change hypothesis, not
 “dispatch count is high.”
 
-### P2 — Prototype cross-block guest-state caching
+**E002 hypothesis recorded before editing:** level 1 is sufficient to lose the
+level-0 Numeric improvement, but the cumulative `TRACELVL` knob also changes
+the translation window and disables the higher-level call/return/inline-cache
+features. Add an independent conditional-branch continuation gate and compare
+`TRACELVL=3,BRTRACE=0` with normal level 3. This keeps the wide loop-detector
+window and all indirect-edge machinery. The candidate advances only if
+Numeric improves by at least 10% without a 10% Fourier or Assignment
+regression; otherwise it is a diagnostic result that narrows the next change.
+
+**E002 result:** rejected after one complete serial pair. Numeric regressed
+42.1% (`501.99`→`290.81`), Fourier regressed 28.5%
+(`25180`→`18015`), and Assignment regressed 9.7%
+(`20.15`→`18.19`). Host-probe spread was 1.21× and all integrity checks
+passed. Dispatches fell on every row, but instructions per dispatch also fell
+sharply on Numeric (`18.68`→`8.21`). Higher-level call/return/IC following
+without conditional-branch continuation produces less useful traces, so the
+temporary branch gate was removed rather than replicated.
+
+**E003 hypothesis recorded before editing:** the level-0 comparison also
+switches from the 64-page translation window to one page. Add a diagnostic
+window override and complete the two missing factorial comparisons:
+level-0 narrow versus level-0 wide, then level-3 wide versus level-3 narrow.
+Use one serial pair of Numeric and Fourier for localization; only a
+configuration that improves a row by at least 10% without regressing the other
+earns three-pair replication.
+
+**E003 screen result:** the translation window is causal. At level 0, forcing
+the wide window regressed Numeric 57.1% (`678.67`→`290.94`) while Fourier tied
+at +1.3%. At level 3, forcing the narrow window improved Numeric 62.6%
+(`502.42`→`816.70`) while Fourier slowed from `24515` to `22124` (0.902×,
+just across the harness's regression boundary). Both reports were valid with
+host spread at most 1.23×. Because the Numeric effect is large and Fourier is
+close to the decision boundary, replicate the narrow level-3 candidate for
+three pairs and add Assignment before accepting or rejecting it.
+
+**E003 focused result:** the frozen-control three-pair replication passed.
+Numeric improved 60.1% (`504.67`→`807.93`); Fourier changed −7.3% and
+Assignment −3.4%, both ties. MAD was at most 3.0%, host spread was 1.21×, and
+all integrity checks passed. Before the full scorecard, run a one-pair
+Compile/Python guard because cross-page compiler call graphs were the original
+reason for widening the window. A regression of at least 10% still rejects
+the candidate.
+
+**E003 promotion status:** the Compile/Python guard passed (Compile +13.7%,
+Python −7.6% tie). The first authoritative 3×/3× scorecard was valid at 11/13:
+Numeric became a win at `800.93` versus v86 `738.79`; Compile and Assignment
+were the only losses. Report `scorecard-2026-07-28T05-38-26.json`, candidate
+Wasm `c8a196b5…`, no nbench instability, host spread 1.23×. Repeat the exact
+authoritative scorecard before promotion because HUFFMAN was a borderline
+match and historical isolated 11/13 runs did not reproduce.
+
+The first repeat produced the same 11/13 shape (Numeric `807.73`, HUFFMAN
+match), but report `scorecard-2026-07-28T05-55-29.json` is **invalid**:
+host-probe spread was 1.26× against the fixed 1.25× limit. Its apparent
+reproduction does not count. Do not loosen or round the limit; rerun the exact
+candidate on a quiet host.
+
+The next unrestricted attempt, `scorecard-2026-07-28T06-11-53.json`, again
+produced 11/13 but was also invalid at 1.26× host spread. Probe outliers
+clustered around Compile despite an otherwise idle 24-thread heterogeneous
+host. A 100-probe preflight measured 1.233× unrestricted spread versus 1.015×
+when pinned to physical-core threads `0,2,4,6`. Record actual Linux CPU
+affinity in scorecard provenance and repeat under that affinity; this controls
+scheduler migration without changing the 1.25× validity threshold.
+
+The affinity-controlled repeat, `scorecard-2026-07-28T06-29-49.json`, is
+valid at 1.24× host spread and records CPU affinity `0,2,4,6`. It reproduced
+11/13: Numeric `818.32` versus v86 `747.05`, HUFFMAN match, with Compile and
+Assignment the only losses. The tested narrow window is now the default. The
+final `b5a857b0…` build passed all eight `tests/run-all.sh` stages inside the
+Nix environment: Cargo, guest builds, three QEMU differentials, 134 ISA tests,
+109 lockstep tests, 193 architecture signatures, Wasm/differential checks,
+and modern virt boot.
+
+The final canonical run used the project-pinned Rust 1.97.1/Node 20
+environment, exact Wasm `b5a857b0…`, and recorded affinity `0,2,4,6`.
+`scorecard-2026-07-28T07-03-26.json` is valid at 1.24× host spread and
+reproduced 11/13: Numeric `844.96` versus v86 `730.07`; Compile and Assignment
+were again the only losses. One of three rv64 nbench repetitions reported
+internal instability, below the authoritative invalidation threshold. This is
+the promotion report.
+
+### P2 — Next: prototype cross-block guest-state caching
 
 If configuration cannot recover the open rows, the next distinct mechanism is
 emitted-code quality:
@@ -183,6 +289,12 @@ emitted-code quality:
 This is deliberately narrower than implementing a complete allocator. It
 tests whether cross-block spills are actually causal before committing to a
 multi-session backend rewrite.
+
+Start a fresh experiment series before editing: commit E003, build its default
+Wasm, and snapshot it as the immutable E004 control. The first E004 gate is a
+focused serial A/B on `compile,python,numeric,assignment,fourier`; Compile must
+improve by at least 10% with no selected-row regression. Only then run another
+authoritative scorecard.
 
 ### P3 — Region live ranges/register allocation
 
@@ -219,7 +331,12 @@ must add one row immediately after its decision.
 | N001 | 2026-07-27/28 | IMPLEMENTED | Isolated benchmark methodology and profiler instrumentation | Complete 13-row plumbing runs, harness self-test, all eight correctness stages | Present in the working tree; instrumentation is not a performance candidate |
 | N002 | 2026-07-27 | TIE | Frozen HEAD vs instrumented build on Compile | Three-pair serial fresh-process A/B, report `ab-2026-07-27T23-00-09.json` | 0.999×; profiler’s disabled path is timing-neutral |
 | N003 | 2026-07-28 | DIAGNOSTIC | Frozen HEAD vs instrumented build on Numeric | One-pair integration A/B, report `ab-2026-07-28T00-12-48.json` | 0.999× with matching inputs and no nbench instability; integration proof, not promotion evidence |
-| E001 | — | OPEN | `TRACELVL=0/1/2` versus `3` | Required: three-pair `numeric,fourier,assignment` A/B per level | First enhancement experiment |
+| E001a | 2026-07-28 | REJECTED | `TRACELVL=0` versus `3` | Three-pair `numeric,fourier,assignment`; report `ab-2026-07-28T04-02-37.json`; host spread 1.22× | Numeric +31.2%, Fourier −35.0%, Assignment −5.2% tie; global level 0 is a row trade, not an enhancement |
+| E001b | 2026-07-28 | REJECTED | `TRACELVL=1` versus `3` | Three-pair `numeric,fourier,assignment`; report `ab-2026-07-28T04-23-01.json`; host spread 1.23× | Numeric −2.5% tie, Assignment −0.4% tie, Fourier −10.9% regression; branch traces do not improve the trade |
+| E001c | 2026-07-28 | TIE | `TRACELVL=2` versus `3` | Three-pair `numeric,fourier,assignment`; report `ab-2026-07-28T04-43-26.json`; host spread 1.22× | Numeric −1.3%, Fourier −8.6%, Assignment −1.8%; no global improvement, and the trace-level sweep is closed |
+| E002 | 2026-07-28 | REJECTED | Independent conditional-branch trace gate (`TRACELVL=3,BRTRACE=0`) | One-pair `numeric,fourier,assignment`; report `ab-2026-07-28T04-54-44.json`; candidate Wasm `553a820b…`; host spread 1.21× | Numeric −42.1%, Fourier −28.5%, Assignment −9.7%; fewer dispatches but much less work per dispatch, so the temporary gate was removed |
+| E003 | 2026-07-28 | LANDED | Narrow translation window with full traces (`TRACEWIN=1`, now default) | Factorial screens `ab-2026-07-28T04-58-37.json`/`ab-2026-07-28T05-01-52.json`; focused `ab-2026-07-28T05-20-58.json`; guard `ab-2026-07-28T05-22-07.json`; valid host-toolchain scorecards `scorecard-2026-07-28T05-38-26.json`/`06-29-49`; two intervening 1.26×-drift reports invalid; valid canonical Nix scorecard `scorecard-2026-07-28T07-03-26.json`; all eight correctness stages passed on final `b5a857b0…` build | Numeric +60.1% against frozen control and a reproducible 11/13 scorecard across host and pinned toolchains; Compile/Assignment remain the only losses |
+| E004 | — | OPEN | Cross-block guest-state caching prototype | First snapshot E003 as the immutable control; profile Compile; focused three-pair `compile,python,numeric,assignment,fourier` gate | Test a small hot-GPR local cache before considering whole-region register allocation |
 
 ### Required record for new experiments
 

@@ -585,12 +585,10 @@ pub extern "C" fn jit_set_demote(on: u32) {
 /// survived demotion depended on how cold its first sampled exits were.
 const DEMOTE_MIN_SAMPLES: u32 = 64;
 static mut SB_DEMOTED: u64 = 0;
-/// Trace-window: the 64-page (256KB) ALIGNED va region around a hot pc,
-/// gathered into one contiguous buffer so traces can follow calls across
-/// page boundaries — tcc's cross-page calls were the compile row's 9-insn
-/// dispatches, and its hot call graph spans ~50 pages. Aligned windows make
-/// every compile in the region share one gather, cached below and
-/// invalidated on address-space changes, dirty code pages, and reboot.
+/// Legacy wide trace-window support: a 64-page (256KB) aligned VA region
+/// around a hot pc, gathered into one contiguous buffer so traces can follow
+/// calls across page boundaries. The measured default is now one page, but
+/// the wide mode remains available for diagnostics and uses this cache.
 const TRACE_WIN_PAGES: u64 = 64;
 const TRACE_WIN_MASK: u64 = TRACE_WIN_PAGES * 0x1000 - 1;
 struct TraceWin {
@@ -609,6 +607,18 @@ struct TraceWin {
 /// miss re-copies 256KB, which dwarfed the compile itself).
 const TRACE_WIN_CACHE: usize = 8;
 static mut TRACE_WIN: Vec<TraceWin> = Vec::new();
+/// Translation-window control: 1 (the measured default) uses one page, 2
+/// forces the legacy 64-page window, and 0 follows TRACE_LEVEL (level 0 is one
+/// page, higher levels are wide). This keeps the old combinations available
+/// for diagnostics while making the reproducibly faster narrow window the
+/// normal policy.
+static mut TRACE_WINDOW_MODE: u32 = 1;
+#[no_mangle]
+pub extern "C" fn jit_set_trace_window(mode: u32) {
+    // Benchmark/runtime knobs are configured before boot, while TRACE_WIN is
+    // still empty (the same pre-boot contract as the other JIT setters).
+    unsafe { TRACE_WINDOW_MODE = mode.min(2) }
+}
 /// A landed region function does NOT claim a pc whose individual block is a
 /// trace at least this long. 0 = functions claim everything: mixed claiming
 /// fragments execution into function/trace ping-pong. Measured medians favor
@@ -2550,17 +2560,17 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         // behind an async compile that may never land — that
                         // was measured as 138M retries and a 10x slowdown once
                         // pending builds backed up.
-                        // The trace window is the ALIGNED 64-page gather of
-                        // the pc's region (see TraceWin): every compile in
-                        // the region shares one cached copy, so the extended-
-                        // basic-block path can follow calls anywhere within
-                        // 256KB. The block registers against every page its
-                        // final span covers, and a multi-page span rides the
-                        // regions pa-verify.
-                        // Trace level 0 (A/B diagnostics) restores the old
-                        // single-page window with no gather and no span
-                        // registration.
-                        let single_page = rv64_jit::trace_level() == 0;
+                        // The measured default supplies the current 4KB page.
+                        // TRACE_WINDOW_MODE can instead select the legacy
+                        // aligned 64-page gather (see TraceWin), in which case
+                        // a trace may follow calls within 256KB and registers
+                        // every page its final span covers. Multi-page spans
+                        // ride the regions pa-verify.
+                        let single_page = match unsafe { TRACE_WINDOW_MODE } {
+                            1 => true,
+                            2 => false,
+                            _ => rv64_jit::trace_level() == 0,
+                        };
                         let first_va = if single_page {
                             vpage
                         } else {

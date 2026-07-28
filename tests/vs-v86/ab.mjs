@@ -77,6 +77,7 @@ const KNOBS = new Set([
   "SB",
   "TLBFILL",
   "TRACELVL",
+  "TRACEWIN",
   "KEEPMIN",
   "DEMOTE",
   "BATCH",

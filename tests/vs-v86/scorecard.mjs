@@ -707,6 +707,9 @@ const git = (...args) => {
   }
 };
 const cpuInfo = cpus();
+const procStatus = await readFile("/proc/self/status", "utf8").catch(() => "");
+const cpuAffinity =
+  procStatus.match(/^Cpus_allowed_list:\s*(.+)$/m)?.[1]?.trim() ?? null;
 const provenance = {
   schema: 2,
   git: git("-C", root, "rev-parse", "HEAD"),
@@ -721,6 +724,7 @@ const provenance = {
     arch: process.arch,
     cpu: cpuInfo[0]?.model ?? "unknown",
     logical_cpus: cpuInfo.length,
+    cpu_affinity: cpuAffinity,
   },
   protocol: {
     authoritative: AUTHORITATIVE,
@@ -736,6 +740,7 @@ const provenance = {
     sb: SB,
     tlbfill: TLBFILL,
     tracelvl: process.env.TRACELVL ?? null,
+    tracewin: process.env.TRACEWIN ?? null,
     ictrig: process.env.ICTRIG ?? null,
     batch: process.env.BATCH ?? null,
     keepmin: process.env.KEEPMIN ?? null,

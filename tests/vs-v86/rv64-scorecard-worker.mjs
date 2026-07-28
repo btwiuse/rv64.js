@@ -113,6 +113,7 @@ function configure(vm) {
   const knobs = [
     ["TLBFILL", "jit_set_tlb_fill"],
     ["TRACELVL", "jit_set_trace_level"],
+    ["TRACEWIN", "jit_set_trace_window"],
     ["KEEPMIN", "jit_set_trace_keep_min"],
     ["DEMOTE", "jit_set_demote"],
     ["BATCH", "jit_set_batch"],
@@ -630,6 +631,7 @@ console.log(
       sb: superblocks,
       tlbfill: +(process.env.TLBFILL ?? 0),
       tracelvl: process.env.TRACELVL ?? null,
+      tracewin: process.env.TRACEWIN ?? null,
       keepmin: process.env.KEEPMIN ?? null,
       demote: process.env.DEMOTE ?? null,
       ictrig: process.env.ICTRIG ?? null,

@@ -3970,11 +3970,11 @@ pub fn translate_block_ic(
     next: &dyn Fn(u64) -> Option<u64>,
 ) -> Option<Block> {
     let skip_detectors = raw_body();
-    // The loop/copy detectors see the FULL trace window: a loop that
-    // straddles a page boundary can now close into a loop region (span
-    // registration handles the multi-page dirty/map bookkeeping) — with
-    // page-clamped windows, nbench NUMERIC SORT's straddling sift loop fell
-    // back to per-iteration trace dispatches (568 -> 448 iter/s).
+    // The loop/copy detectors see the complete translation window supplied by
+    // the host. In diagnostic wide-window mode, a loop that straddles a page
+    // boundary can close into a loop region and span registration handles the
+    // multi-page dirty/map bookkeeping. The measured host default deliberately
+    // supplies one page; region/superblock discovery still spans pages later.
     // Bulk-copyable self-loop (memcpy/memmove word loops): one wasm
     // memory.copy per page-bounded chunk — see translate_copy_loop.
     if lay.sys.is_some() && !skip_detectors {
