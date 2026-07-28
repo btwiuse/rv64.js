@@ -17,11 +17,13 @@ retains the decisions that should guide future work.
 
 ## Current status
 
-- **Best known engineering baseline:** the E003 narrow-window default in the
-  current repository state (checkpoint parent `a161200`).
+- **Best known engineering baseline:** `314e441` (E003 narrow-window default).
 - **Frozen performance control:** Wasm SHA-256
-  `21b638123cee4072cb84397c98f9cf340dad6e05e3907845bff4dc66642f50a1`.
+  `b5a857b087bd49631866c9bcd77e3d9d98df1dfb93eedf3ce16782c3e02d4433`.
 - **Control artifact:** `target/bench/wasm-candidates/`
+  `e003-control-b5a857b087bd.wasm`, snapshotted from clean commit `314e441`
+  with Nix Node 20.
+- **Prior E003-series control:** Wasm `21b638123cee…`, artifact
   `head-control-21b638123cee.wasm`.
 - **Promoted default build:** Wasm SHA-256
   `b5a857b087bd49631866c9bcd77e3d9d98df1dfb93eedf3ce16782c3e02d4433`.
@@ -290,11 +292,11 @@ This is deliberately narrower than implementing a complete allocator. It
 tests whether cross-block spills are actually causal before committing to a
 multi-session backend rewrite.
 
-Start a fresh experiment series before editing: commit E003, build its default
-Wasm, and snapshot it as the immutable E004 control. The first E004 gate is a
-focused serial A/B on `compile,python,numeric,assignment,fourier`; Compile must
-improve by at least 10% with no selected-row regression. Only then run another
-authoritative scorecard.
+E003 is committed at `314e441`; its clean Nix build is frozen as
+`e003-control-b5a857b087bd.wasm`. The first E004 gate is a focused serial A/B
+on `compile,python,numeric,assignment,fourier`; Compile must improve by at
+least 10% with no selected-row regression. Only then run another authoritative
+scorecard.
 
 ### P3 — Region live ranges/register allocation
 
@@ -336,7 +338,7 @@ must add one row immediately after its decision.
 | E001c | 2026-07-28 | TIE | `TRACELVL=2` versus `3` | Three-pair `numeric,fourier,assignment`; report `ab-2026-07-28T04-43-26.json`; host spread 1.22× | Numeric −1.3%, Fourier −8.6%, Assignment −1.8%; no global improvement, and the trace-level sweep is closed |
 | E002 | 2026-07-28 | REJECTED | Independent conditional-branch trace gate (`TRACELVL=3,BRTRACE=0`) | One-pair `numeric,fourier,assignment`; report `ab-2026-07-28T04-54-44.json`; candidate Wasm `553a820b…`; host spread 1.21× | Numeric −42.1%, Fourier −28.5%, Assignment −9.7%; fewer dispatches but much less work per dispatch, so the temporary gate was removed |
 | E003 | 2026-07-28 | LANDED | Narrow translation window with full traces (`TRACEWIN=1`, now default) | Factorial screens `ab-2026-07-28T04-58-37.json`/`ab-2026-07-28T05-01-52.json`; focused `ab-2026-07-28T05-20-58.json`; guard `ab-2026-07-28T05-22-07.json`; valid host-toolchain scorecards `scorecard-2026-07-28T05-38-26.json`/`06-29-49`; two intervening 1.26×-drift reports invalid; valid canonical Nix scorecard `scorecard-2026-07-28T07-03-26.json`; all eight correctness stages passed on final `b5a857b0…` build | Numeric +60.1% against frozen control and a reproducible 11/13 scorecard across host and pinned toolchains; Compile/Assignment remain the only losses |
-| E004 | — | OPEN | Cross-block guest-state caching prototype | First snapshot E003 as the immutable control; profile Compile; focused three-pair `compile,python,numeric,assignment,fourier` gate | Test a small hot-GPR local cache before considering whole-region register allocation |
+| E004 | — | OPEN | Cross-block guest-state caching prototype | Immutable control `e003-control-b5a857b087bd.wasm` from clean `314e441`; next profile Compile, then focused three-pair `compile,python,numeric,assignment,fourier` gate | Test a small hot-GPR local cache before considering whole-region register allocation |
 
 ### Required record for new experiments
 
