@@ -8,7 +8,10 @@
 #   alu.i386 / rvbench_fs.i386 freestanding i386 for v86 (-m32 -nostdlib)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="${1:-$PWD}"; XB="$OUT/xbench"; mkdir -p "$XB"
+OUT="${1:-$PWD}"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
+XB="$OUT/xbench"; mkdir -p "$XB"
 command -v riscv64-none-elf-gcc >/dev/null || { echo "run inside: nix develop -c $0"; exit 1; }
 
 RVCC=riscv64-none-elf-gcc

@@ -306,7 +306,7 @@ struct JitState {
     /// Full-pc tag for each interp_hot slot (low 32 bits of pc>>1). Untagged
     /// direct-mapped counters let unrelated pcs (or another address space)
     /// inherit a slot's heat and get compiled on their first execution —
-    /// compile storms that depend on address layout (ISSUES.md P2).
+    /// compile storms that depend on address layout (PERFORMANCE_PROGRESS.md).
     interp_hot_tag: Vec<u32>,
     /// Physical page -> pcs of cache entries whose code lives there (blocks
     /// AND pa-stamped blacklist sentinels). Lets dirty-page invalidation drop
@@ -489,7 +489,7 @@ fn copystat_addr() -> u32 {
 /// Wasm function-table entries are unreclaimable (invalidated blocks become
 /// unreachable but their slots persist), so unbounded compilation — reboots,
 /// address-space churn, self-modifying code — would grow the table forever
-/// (ISSUES.md P2). Above this bound the JIT stops COMPILING new blocks
+/// (PERFORMANCE_PROGRESS.md). Above this bound the JIT stops COMPILING new blocks
 /// (existing blocks keep running; the interpreter covers the rest). 1M
 /// entries ~= a few hundred MB of compiled code, far beyond any observed
 /// workload (fib ~20k, boot ~2k, tcc ~15k) but a hard stop for runaways.
@@ -694,17 +694,28 @@ static mut DPROF_PC: [u64; DPROF_N] = [0; DPROF_N];
 static mut DPROF_CNT: [u64; DPROF_N] = [0; DPROF_N];
 static mut DPROF_RET: [u64; DPROF_N] = [0; DPROF_N];
 static mut DPROF_ON: bool = false;
+/// Profile one of every 2^N dispatches. Full attribution materially perturbs
+/// dispatch-heavy nbench kernels, so diagnostics default to sampling in the
+/// JS worker while shift=0 preserves the original exact profiler.
+static mut DPROF_SAMPLE_SHIFT: u32 = 0;
+static mut DPROF_TICK: u64 = 0;
 
 #[no_mangle]
 pub extern "C" fn dprof_set(on: u32) {
     unsafe {
         DPROF_ON = on != 0;
         if on != 0 {
+            DPROF_TICK = 0;
             DPROF_PC = [0; DPROF_N];
             DPROF_CNT = [0; DPROF_N];
             DPROF_RET = [0; DPROF_N];
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn dprof_set_sample_shift(shift: u32) {
+    unsafe { DPROF_SAMPLE_SHIFT = shift.min(20) }
 }
 
 /// which: 0 = pc, 1 = dispatches, 2 = retired insns.
@@ -879,7 +890,7 @@ pub extern "C" fn jit_set_enabled(on: u32) {
         JIT_THRESHOLD = if on == 0 { u32::MAX } else { JIT_ON_THRESHOLD };
         // "Disabled" means EXECUTE NO JIT CODE, not just "stop compiling":
         // drop already-compiled blocks so A/B comparisons and the API name
-        // stay honest (ISSUES.md P2). (Wasm function-table entries are not
+        // stay honest (PERFORMANCE_PROGRESS.md). (Wasm function-table entries are not
         // reclaimable, but they become unreachable.)
         if on == 0 {
             if let Some(j) = SYS_JIT.as_mut() {
@@ -1472,7 +1483,7 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
         SYS = Some(m);
         // A new machine means every compiled block and stat is stale — a
         // second boot in the same wasm instance must never execute code
-        // generated from the previous guest (ISSUES.md P2 cache lifecycle).
+        // generated from the previous guest (PERFORMANCE_PROGRESS.md cache lifecycle).
         BOOT_GEN += 1;
         PENDING_SB.clear();
         if let Some(j) = SYS_JIT.as_mut() {
@@ -1638,7 +1649,7 @@ fn build_superblock(
     // entry a bigger register union and V8 a bigger
     // function; the compile row's cross-page calls need
     // regions that EXTEND on measured misses (see the
-    // incremental-extension design in ISSUES.md), not
+    // historical incremental-extension design (see PERFORMANCE_PROGRESS.md), not
     // regions that guess from reachability. The selection
     // code stays — it is one predicate away from being
     // re-enabled behind that signal.
@@ -2271,7 +2282,15 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             // Sys blocks with inline memory ops may bail mid-block; read the
             // count they actually retired (pc is set by the block either way).
             let retired = unsafe { RETIRED_CELL };
-            if unsafe { DPROF_ON } {
+            let dprof_sample = unsafe {
+                if DPROF_ON {
+                    DPROF_TICK = DPROF_TICK.wrapping_add(1);
+                    DPROF_TICK & ((1u64 << DPROF_SAMPLE_SHIFT) - 1) == 0
+                } else {
+                    false
+                }
+            };
+            if dprof_sample {
                 dprof_hit(pc, retired);
             }
             retired_sum += retired;
@@ -2282,7 +2301,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             // spin re-calling it.
             if retired == 0 {
                 unsafe { ZERO_RETIRE += 1 };
-                if unsafe { DPROF_ON } {
+                if dprof_sample {
                     let fcsr = m.cpu.fcsr;
                     let fs = m.cpu.sys.as_ref().map_or(3, |c| (c.mstatus >> 13) & 3);
                     unsafe {
@@ -2981,7 +3000,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
         // buffering until sys_run returns skews benchmark timing: a marker
         // printed early in a slice would be timestamped after the whole slice
         // (v86 timestamps serial bytes as they arrive; symmetry demands we
-        // surface output comparably; see ISSUES.md P0).
+        // surface output comparably; see PERFORMANCE_PROGRESS.md).
         let out = m.console_output();
         if !out.is_empty() {
             unsafe { host_write(1, out.as_ptr(), out.len()) }

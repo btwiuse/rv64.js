@@ -1,4 +1,4 @@
-// JIT differential fuzzer (ISSUES.md P1): random instruction programs run
+// JIT differential fuzzer (PERFORMANCE_PROGRESS.md): random instruction programs run
 // twice in the user-mode machine — JIT enabled and disabled — and the FULL
 // architectural state must be bit-identical: pc, exit code, insn_count,
 // x1..x31, f0..f31, fcsr.

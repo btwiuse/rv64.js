@@ -1,68 +1,92 @@
-// SCREENING harness — fast parallel first-pass, NOT for scored claims.
+// Very fast parallel smoke screen for the current rv64 wasm/config.
 //
-// Runs K parallel fresh-boot samples of a row (or the whole nbench table)
-// and prints per-metric median + spread. Parallel boots share the machine,
-// so absolute numbers skew a few percent and V8 background tier-up gets
-// less headroom than a lone run — fine for "did my change help?", useless
-// for win/loss verdicts. Confirm anything interesting with the serial,
-// drift-guarded scorecard (REPS/NBREPS medians).
+// Parallel contention makes absolute timings unsuitable for claims. Use this
+// only to reject broken or dramatically bad ideas, then use ab.mjs for serial
+// paired evidence.
 //
-//   node tests/vs-v86/screen.mjs nb  [K]     # all nbench kernels, K boots
-//   node tests/vs-v86/screen.mjs cc  [K]     # compile row
-//   node tests/vs-v86/screen.mjs py  [K]     # python fib row
-// Env passed through to the children: SB, DEMOTE, KEEPMIN, ROTNEST, WASM,
-// TRACELVL, ARTIFACTS.
+//   ARTIFACTS=target/bench node tests/vs-v86/screen.mjs compile 4
+//   ARTIFACTS=target/bench TRACELVL=0 node tests/vs-v86/screen.mjs numeric 3
 import { spawn } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { acquireBenchmarkLock } from "./bench-lock.mjs";
+import { median } from "./bench-math.mjs";
 
-const row = process.argv[2] || "nb";
-const K = Math.max(1, +(process.argv[3] || 6));
-const SP = process.env.SCREEN_DIR || "/tmp/claude-1000/-home-darren-src-arm64-js/1cdc4884-3763-44a5-97f3-a9990c34339a/scratchpad";
-const script = { nb: `${SP}/nb-focus.mjs`, cc: `${SP}/cc-focus.mjs`, py: `${SP}/py-focus.mjs` }[row];
-if (!script) {
-  console.error("row must be nb|cc|py");
+const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
+const artifactsArg = process.env.ARTIFACTS || process.env.SC;
+if (!artifactsArg) {
+  console.error("set ARTIFACTS=<artifacts dir>");
   process.exit(2);
 }
-
-const runOne = () =>
-  new Promise((resolve) => {
-    const p = spawn(process.execPath, [script], { env: process.env });
-    let buf = "";
-    p.stdout.on("data", (d) => (buf += d));
-    p.stderr.on("data", () => {});
-    p.on("close", () => resolve(buf));
-  });
-
-const t0 = performance.now();
-const outs = await Promise.all(Array.from({ length: K }, runOne));
-const dt = ((performance.now() - t0) / 1000).toFixed(0);
-
-const median = (a) => {
-  const v = [...a].sort((x, y) => x - y);
-  return v.length ? v[(v.length / 2) | 0] : null;
-};
-const fmt = (name, vals) => {
-  const v = vals.filter((x) => x != null && Number.isFinite(x));
-  if (!v.length) return `${name}: no samples`;
-  return `${name}: median=${median(v)} min=${Math.min(...v)} max=${Math.max(...v)} n=${v.length}`;
-};
-
-console.log(`SCREENING (${K} parallel boots, ${dt}s wall) — not for scored claims`);
-if (row === "nb") {
-  const tables = outs.map((o) => {
-    try {
-      const m = o.match(/\{[\s\S]*?\}/);
-      return m ? JSON.parse(m[0]) : null;
-    } catch {
-      return null;
-    }
-  }).filter(Boolean);
-  const kernels = new Set(tables.flatMap((t) => Object.keys(t)));
-  for (const k of kernels) console.log(" " + fmt(k, tables.map((t) => t[k])));
-  console.log(` (${tables.length}/${K} runs parsed)`);
-} else if (row === "cc") {
-  const vals = outs.map((o) => +(o.match(/^ms=(\d+)/m)?.[1] ?? NaN));
-  console.log(" " + fmt("compile ms", vals));
-} else {
-  const vals = outs.map((o) => +(o.match(/fib_ms=(\d+)/)?.[1] ?? NaN));
-  console.log(" " + fmt("python fib ms", vals));
+const ARTIFACTS = resolve(artifactsArg);
+const aliases = { cc: "compile", py: "python", nb: "nbench" };
+const requestedRow = (process.argv[2] || "compile").toLowerCase();
+const row = aliases[requestedRow] || requestedRow;
+const validRows = new Set([
+  "alu", "mixed", "boot", "python", "compile", "nbench", "numeric", "string",
+  "bitfield", "fpemul", "fourier", "assignment", "idea", "huffman",
+]);
+if (!validRows.has(row)) {
+  console.error(`unknown row "${row}"`);
+  process.exit(2);
 }
+const K = Number(process.argv[3] ?? 4);
+if (!Number.isSafeInteger(K) || K < 1) {
+  console.error("worker count must be a positive integer");
+  process.exit(2);
+}
+const releaseBenchmarkLock = await acquireBenchmarkLock(ARTIFACTS);
+
+function runOne() {
+  return new Promise((resolveRun) => {
+    const child = spawn(
+      process.execPath,
+      [join(root, "tests/vs-v86/rv64-scorecard-worker.mjs"), row],
+      { cwd: root, env: { ...process.env, ARTIFACTS, DISABLE_JIT: "0" } },
+    );
+    let stdout = "";
+    child.stdout.on("data", (data) => (stdout += data));
+    child.on("close", (code) => {
+      const match = stdout.match(/^RESULT_JSON (.+)$/m);
+      if (code !== 0 || !match) return resolveRun(null);
+      try {
+        resolveRun(JSON.parse(match[1]));
+      } catch {
+        resolveRun(null);
+      }
+    });
+  });
+}
+
+const started = performance.now();
+const results = (await Promise.all(Array.from({ length: K }, runOne))).filter(Boolean);
+const elapsed = (performance.now() - started) / 1000;
+if (results.length !== K) {
+  console.error(`only ${results.length}/${K} workers completed`);
+  process.exitCode = 1;
+}
+const printValues = (name, values) => {
+  const clean = values.filter(Number.isFinite);
+  if (!clean.length) return;
+  console.log(
+    `${name}: median=${median(clean)} min=${Math.min(...clean)} max=${Math.max(...clean)} n=${clean.length}`,
+  );
+};
+
+console.log(
+  `PARALLEL SMOKE SCREEN (${results.length}/${K} boots, ${elapsed.toFixed(1)}s wall)`,
+);
+if (row === "nbench") {
+  const kernels = new Set(results.flatMap((result) => Object.keys(result.value)));
+  for (const kernel of kernels) {
+    printValues(kernel, results.map((result) => result.value[kernel]));
+  }
+} else {
+  printValues(row, results.map((result) => result.value));
+}
+const fingerprints = [
+  ...new Set(results.map((result) => result.md5 ?? result.checksum).filter(Boolean)),
+];
+if (fingerprints.length) console.log(`correctness=${fingerprints.join(",")}`);
+console.log("REJECTION SCREEN ONLY — use serial ab.mjs before making a claim.");
+await releaseBenchmarkLock();

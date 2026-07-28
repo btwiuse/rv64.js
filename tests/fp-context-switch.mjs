@@ -1,4 +1,4 @@
-// FP context-switch test (ISSUES.md P1): two CONCURRENT processes running
+// FP context-switch test (PERFORMANCE_PROGRESS.md): two CONCURRENT processes running
 // the same FP-checksummed binary — same physical FP code pages, compiled
 // blocks shared across both address spaces — must each produce the correct
 // checksum while the kernel context-switches them (mstatus.FS transitions

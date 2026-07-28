@@ -81,6 +81,7 @@ fi
 
 note "7/8 wasm build + smoke"
 if command -v node >/dev/null 2>&1; then
+    node tests/vs-v86/harness-selftest.mjs || FAILED=1
     cargo build --release -q -p rv64-wasm --target wasm32-unknown-unknown || FAILED=1
     node tests/http-relay.mjs || FAILED=1
     node tests/wasm-smoke.mjs || FAILED=1

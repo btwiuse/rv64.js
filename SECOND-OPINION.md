@@ -1,5 +1,15 @@
 # Second opinion requested: which rv64.js JIT commit is actually the best?
 
+> **Status:** this is the historical evaluation brief. The benchmark harness
+> was repaired after the review; use
+> [`tests/vs-v86/METHODOLOGY.md`](tests/vs-v86/METHODOLOGY.md) for current
+> testing and promotion rules. In particular, wall rows now run in isolated
+> fresh processes, repeat symmetrically on both emulators, alternate paired
+> order, and retain raw trials.
+> Consolidated outcomes, rejected designs, current priorities, and the
+> append-only experiment ledger now live in
+> [`PERFORMANCE_PROGRESS.md`](PERFORMANCE_PROGRESS.md).
+
 You are being asked for an INDEPENDENT evaluation. A long session (2026-07-26/27,
 ~14 hours, 23 commits) tried to win a 13-row benchmark against copy/v86 and
 plateaued at 10/13. The author of that session (an AI agent) suspects some of its
@@ -53,7 +63,7 @@ Proof, from two runs of the **same commit `6ccf10a`**, same machine:
 The session author compared later work against **run 1** and reported "IDEA more
 than doubled" and "FP EMULATION 1.86 → 2.23" as wins. **Both were false** — the
 baseline already measured 2.72 and 2.24 in run 2. Treat every single-sample
-claim in `ISSUES.md` with suspicion for these rows: NUMERIC SORT, ASSIGNMENT,
+claim in the historical narrative with suspicion for these rows: NUMERIC SORT, ASSIGNMENT,
 HUFFMAN, IDEA, FP EMULATION, and `python fib(30)` (observed 3231/3279/3486/
 3644/3701/3759 ms on effectively the same build).
 
@@ -86,7 +96,7 @@ timestamp            commit  pass  nbreps  NUM  STR  BITF  FP   FOUR ASGN IDEA H
 ALU/Mixed/Boot are omitted: they won comfortably (1.37-1.44 / 1.44-1.89 /
 1.62-1.91) in every run and are not in contention.
 
-**No run ever exceeded 10/13.** (An "11/13" appears in `ISSUES.md` from the
+**No run ever exceeded 10/13.** (An "11/13" appeared in the old narrative from the
 PREVIOUS session, 2026-07-25 — measured single-sample on a different, noisier
 machine, before the drift guard and interleaved medians existed. It has never
 been reproduced under the current methodology and should be treated as
@@ -255,7 +265,7 @@ Both are fixed, but a SKIP there means you are not actually testing conformance.
    costly because RISC-V has 31 GPRs to spill/reload at each edge vs x86's 8).
    **Worth independently verifying — it drives all future direction.**
 3. **Nine structural designs measured neutral or negative** and are documented
-   in `ISSUES.md`: three chaining architectures (the V8 shared-table import
+   in `PERFORMANCE_PROGRESS.md`: three chaining architectures (the V8 shared-table import
    makes `table.set` O(importing instances) — quadratic registration), batch
    modules, page co-location, superblock spacing, definedness tracking,
    next-executing-tail formation. Re-deriving any of these is likely wasted
@@ -275,8 +285,9 @@ Both are fixed, but a SKIP there means you are not actually testing conformance.
 5. Independent read on claim §7.2 — is `compile` really not dispatch-bound?
 
 ## 9. Ground truth files
-- `ISSUES.md` — full session narrative, all measured dead ends, dates, numbers.
-  Long, and written by the agent whose conclusions you are checking.
+- `PERFORMANCE_PROGRESS.md` — consolidated outcomes, measured dead ends,
+  current plan, and append-only experiment ledger. The removed narrative
+  remains available in Git history at `1ec9130`.
 - `target/bench/scorecard-*.json` — every run, with provenance.
 - `tests/vs-v86/README.md` — benchmark policy, anti-overfitting rules,
   reproduction instructions.

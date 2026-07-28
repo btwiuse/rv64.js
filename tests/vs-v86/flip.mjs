@@ -1,6 +1,8 @@
-// FLIP CHECK — measure ONE row on the rv64 side only, against the v86
-// number recorded by the last full scorecard, and say whether it clears the
-// bar. The full scorecard is ~45 min; this is ~1-3 min, because:
+// LEGACY FLIP CHECK — prefer screen.mjs for rejection and ab.mjs for serial
+// candidate-vs-control evidence. This measures ONE row on rv64 against a saved
+// v86 number, so it accepts only a valid AUTHORITATIVE scorecard.
+//
+// The full scorecard is slow; this is quicker because:
 //
 //   * v86 is the CONTROL. Changing our JIT cannot change v86's number, so
 //     re-measuring it every iteration buys nothing. Its spread across every
@@ -62,6 +64,7 @@ async function baseline() {
     .sort();
   for (const f of files.reverse()) {
     const j = JSON.parse(await readFile(join(ARTIFACTS, f), "utf8"));
+    if (j.valid !== true || j.authoritative !== true) continue;
     const v = kernelFlag ? j.nbench?.v8?.[rowName] : j.results?.[rowName]?.v8j;
     if (v != null) return { v, from: f };
   }

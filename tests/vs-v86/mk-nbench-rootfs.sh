@@ -12,7 +12,9 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-OUT="${1:-$PWD}"; mkdir -p "$OUT"
+OUT="${1:-$PWD}"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
 MINSECONDS="${MINSECONDS:-2}"
 URL="${NBENCH_URL:-https://www.math.utah.edu/~mayer/linux/nbench-byte-2.2.3.tar.gz}"
 SRC="$OUT/nbench-byte-2.2.3"

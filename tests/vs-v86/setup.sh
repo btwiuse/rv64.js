@@ -12,7 +12,9 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-OUT="${1:-$REPO/target/bench}"; mkdir -p "$OUT"
+OUT="${1:-$REPO/target/bench}"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
 
 echo "== 1/3 building rv64-wasm =="
 ( cd "$REPO" && cargo build --release -p rv64-wasm --target wasm32-unknown-unknown )

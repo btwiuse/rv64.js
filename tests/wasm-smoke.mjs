@@ -115,8 +115,8 @@ for (const [name, argv, wantExit, wantOut] of guests) {
 // ---- retirement accounting: JIT and interpreter must agree EXACTLY ----
 // User mode is deterministic (no interrupts), so insn_count at exit must be
 // bit-identical with the JIT on and off. Mid-block bails (FP eligibility,
-// budget yields) that under- or over-report retirement break this (ISSUES.md
-// P1 — exact bailout retirement).
+// budget yields) that under- or over-report retirement break this (see
+// PERFORMANCE_PROGRESS.md, "Exact bailout retirement").
 {
   const path = join(
     root,

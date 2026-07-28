@@ -8,7 +8,10 @@
 # Produces $OUT/deb-i386-bench.cpio.gz (boot with vmlinuz-i386 from mk-v86-debian.sh).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="${1:-$PWD}"; ROOT="$OUT/deb-i386"
+OUT="${1:-$PWD}"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
+ROOT="$OUT/deb-i386"
 [ -d "$ROOT" ] || { echo "need $ROOT — run: ARCH=i386 mk-debian-rootfs.sh $OUT"; exit 1; }
 for b in tcc.i386 nbench.i386; do [ -f "$OUT/$b" ] || { echo "need $OUT/$b — run mk-bench-bins.sh $OUT"; exit 1; }; done
 [ -f "$OUT/w.c" ] || python3 "$HERE/../compile-bench/gen_c.py" "${NFUNCS:-2000}" > "$OUT/w.c"

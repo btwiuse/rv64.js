@@ -11,7 +11,9 @@
 #   ARCH=i386    nix develop -c tests/vs-v86/mk-debian-rootfs.sh <outdir>
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="${1:-$PWD}"; mkdir -p "$OUT"
+OUT="${1:-$PWD}"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
 ARCH="${ARCH:-riscv64}"
 ROOT="$OUT/deb-$ARCH"
 IMG="$OUT/deb-$ARCH.ext4"

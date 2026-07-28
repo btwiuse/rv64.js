@@ -1388,7 +1388,7 @@ impl Ctx {
         self.flush_writes(m);
         self.set_pc_const(m, pc);
         if let Some(l) = self.retired_local {
-            // Exact mid-segment retirement (ISSUES.md P1): ITER holds only the
+            // Exact mid-segment retirement (PERFORMANCE_PROGRESS.md): ITER holds only the
             // segments/bodies flushed so far; `n` is the compile-time count of
             // instructions completed since that flush. Reporting ITER alone
             // undercounted, corrupting insn_count/minstret/clock/fuel.
@@ -1937,7 +1937,7 @@ fn alu_handled(op: u32, f7: u32, f3: u32) -> bool {
         // OP-IMM: shift encodings have RESERVED upper immediate bits — SLLI
         // funct6 must be 000000 (f7 in {0,1}: bit 0 is shamt[5]), SRLI/SRAI
         // 000000/010000. Reserved patterns must NOT compile (the interpreter
-        // owns the illegal-instruction trap; ISSUES.md P3 hardening).
+        // owns the illegal-instruction trap; see PERFORMANCE_PROGRESS.md).
         0x13 => match f3 {
             1 => matches!(f7, 0x00 | 0x01),
             5 => matches!(f7, 0x00 | 0x01 | 0x20 | 0x21),
@@ -5304,7 +5304,7 @@ pub fn translate_superblock_sparse(
 mod tests {
     use super::*;
 
-    /// Reserved encodings must not compile (ISSUES.md P3): shift immediates
+    /// Reserved encodings must not compile (PERFORMANCE_PROGRESS.md): shift immediates
     /// with reserved upper bits, OP-IMM-32 shamt[5], FMV/FSQRT fixed rs2.
     #[test]
     fn reserved_encodings_rejected() {

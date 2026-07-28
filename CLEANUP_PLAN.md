@@ -76,7 +76,7 @@ history management.
 
 ### Documentation problems
 
-- `ROADMAP.md`, `ISSUES.md`, `tests/BASELINE.md`, `tests/VALIDATION.md`, and
+- `ROADMAP.md`, `PERFORMANCE_PROGRESS.md`, `tests/BASELINE.md`, `tests/VALIDATION.md`, and
   `HANDOFF.md` overlap as plans, status reports, investigation logs, and
   historical records.
 - The current README points at the main test runner but does not explain its
@@ -346,7 +346,8 @@ Assign one purpose to each document:
   scorecard usage.
 - `DESIGN.md` or `docs/architecture.md`: current technical architecture.
 - `ROADMAP.md`: future work only.
-- `ISSUES.md`: unresolved technical issues only.
+- `PERFORMANCE_PROGRESS.md`: current performance status, decisions, and
+  append-only experiment ledger.
 - `docs/history/`: completed investigations, old baselines, performance
   narratives, and superseded decisions.
 

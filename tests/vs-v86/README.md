@@ -32,6 +32,13 @@ differs only by 32-bit-vs-64-bit rounding, with identical operation counts).
 
 ## Benchmark policy (anti-overfitting)
 
+The operational procedure is [METHODOLOGY.md](METHODOLOGY.md). It is mandatory
+for performance claims: immutable Wasm control, parallel rejection screen,
+serial fresh-process A/B, authoritative 13-row promotion, then full
+correctness. Effects below 10% are ties.
+Current priorities, rejected approaches, and the append-only result ledger are
+in [PERFORMANCE_PROGRESS.md](../../PERFORMANCE_PROGRESS.md).
+
 The bar is WIN or MATCH on **every** row, which removes the temptation to
 optimize a favorite subset — but benchmark-driven tuning can still overfit.
 Rules, per the 2026-07-24 review:
@@ -66,8 +73,15 @@ directly comparable. This is the entry point — use the individual harnesses
 below only for focused runs.
 
 ```sh
-nix develop -c tests/vs-v86/setup.sh target/bench           # build artifacts (DEBIAN=1 for python + v86 compile/nbench)
-ARTIFACTS=target/bench nix develop -c node tests/vs-v86/scorecard.mjs   # + FULL=1 (interp), NBENCH=1 (BYTEmark)
+nix develop -c tests/vs-v86/setup.sh target/bench  # DEBIAN=1 for python + v86 compile/nbench
+
+# Exploratory, not a promotion result:
+ARTIFACTS=target/bench SB=1 REPS=1 \
+  nix develop -c node tests/vs-v86/scorecard.mjs
+
+# Authoritative promotion result:
+AUTHORITATIVE=1 ARTIFACTS=target/bench NBENCH=1 SB=1 \
+  REPS=3 NBREPS=3 nix develop -c node tests/vs-v86/scorecard.mjs
 ```
 
 It covers ALU, Mixed, Boot, python fib(30), and **compile (tcc -c)** — all as
@@ -81,6 +95,13 @@ The cross-ISA binaries come from `mk-bench-bins.sh`, which builds static musl
 toolchain needed (the old blocker; see below). `mk-v86-bench.sh` bakes tcc +
 nbench + `w.c` into one Debian-i386 v86 initramfs that dispatches on a `bench=`
 cmdline token (python | tcc | nbench); the rv64 compile side boots `cc-bench.img`.
+
+Every authoritative wall row runs in a fresh child process on both emulators,
+with paired side order alternating each repetition. The whole nbench table uses
+the same protocol. The JSON retains raw trials, host probes, JIT counters,
+runtime configuration, v86 revision, and hashes for Wasm and guest artifacts.
+An exclusive artifact-directory lock prevents concurrent benchmark
+orchestrators.
 
 ## Automated setup (build everything once)
 

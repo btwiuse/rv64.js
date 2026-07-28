@@ -2,7 +2,7 @@
  * initramfs on both x86-64 (v86) and riscv64 (rv64.js). Identical work; the
  * host harness times wall-clock from boot to the BENCH_DONE line. Folds all
  * kernel results into one hex checksum printed for cross-build verification. */
-typedef unsigned long long u64; typedef unsigned int u32; /* u64 is 64-bit on BOTH ISAs (i386 unsigned long is 32-bit) — ISSUES.md P2 cross-ISA equivalence */
+typedef unsigned long long u64; typedef unsigned int u32; /* u64 is 64-bit on BOTH ISAs (i386 unsigned long is 32-bit) — PERFORMANCE_PROGRESS.md cross-ISA equivalence */
 
 #if defined(__x86_64__)
 #define SYS_write 1

@@ -13,7 +13,10 @@ Devices are virtio-mmio: console, block, **9p** for sharing a host directory (or
 an in-memory tree, in the browser) into the guest, and **net** — either over a
 WebSocket relay, or through an in-browser HTTP proxy that needs no external
 infrastructure at all (egress is the page's own `fetch`).
-See [DESIGN.md](DESIGN.md) for architecture and [ROADMAP.md](ROADMAP.md) for what comes next.
+See [DESIGN.md](DESIGN.md) for architecture,
+[ROADMAP.md](ROADMAP.md) for project-wide future work, and
+[PERFORMANCE_PROGRESS.md](PERFORMANCE_PROGRESS.md) for current JIT performance
+status, decisions, and experiments.
 
 ```sh
 # boot Linux in the browser

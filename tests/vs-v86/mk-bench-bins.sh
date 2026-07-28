@@ -13,7 +13,9 @@
 #   nix develop -c tests/vs-v86/mk-bench-bins.sh <artifacts-dir>
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="${1:-$PWD}"; mkdir -p "$OUT"
+OUT="${1:-$PWD}"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
 TCC_URL="${TCC_URL:-https://repo.or.cz/tinycc.git}"
 TCC_COMMIT="${TCC_COMMIT:-d9d02c5}"                 # 0.9.28rc mob@d9d02c5
 NBENCH_URL="${NBENCH_URL:-https://www.math.utah.edu/~mayer/linux/nbench-byte-2.2.3.tar.gz}"

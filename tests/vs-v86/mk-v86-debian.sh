@@ -14,6 +14,8 @@
 #   BENCH='/usr/bin/python3 /fib.py' nix develop -c tests/vs-v86/mk-v86-debian.sh <out>
 set -euo pipefail
 OUT="${1:-$PWD}"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
 ROOT="$OUT/deb-i386"
 KURL="${KURL:-http://deb.debian.org/debian/pool/main/l/linux-signed-i386/linux-image-6.1.0-47-686-pae_6.1.170-3_i386.deb}"
 BENCH="${BENCH:-/usr/bin/python3 /fib.py}"
