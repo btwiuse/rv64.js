@@ -1,20 +1,32 @@
 # rv64.js
 
-A RISC-V RV64 emulator for the browser: the scope of
-[TinyEMU](https://bellard.org/tinyemu/) with an architecture inspired by
-[copy/v86](https://github.com/copy/v86). The CPU core is Rust compiled to
-WebAssembly; devices and browser integration are plain JavaScript.
+> [!NOTE]
+> This codebase was written 100% with AI using Claude Code and Codex, directed
+> by [@ibuildthecloud](https://github.com/ibuildthecloud), who is not a
+> virtualization or JIT expert.
 
-**Status: boots Linux.** The RV64GC interpreter and WebAssembly JIT boot
-TinyEMU's Linux 4.15/buildroot image to an interactive BusyBox shell, both
-natively and in the browser. User-mode emulation also runs static riscv64 musl
-binaries.
+A RISC-V RV64 full-system emulator written in Rust, with a WebAssembly target
+and a JavaScript browser frontend. Its machine model is based on
+[TinyEMU](https://bellard.org/tinyemu/), and its browser architecture is
+inspired by [copy/v86](https://github.com/copy/v86).
 
-Features include:
+**Project status: pre-release, with working Linux boots.** The native Rust
+interpreter and the browser's WebAssembly interpreter/JIT boot Linux to an
+interactive shell. The browser demo offers a small Linux 4.15/BusyBox system
+and a larger OpenSBI/Linux 6.12/Debian system.
+
+The separate Linux user-mode runner is **experimental**. It can load static
+riscv64 ELF executables and supports enough of the Linux syscall ABI for the
+repository's small, static musl test programs. It is not a general-purpose
+`qemu-riscv64` replacement: there is currently no guest filesystem, process
+creation, networking, threading, or complete signal handling, and several
+implemented syscalls are compatibility stubs.
+
+Implemented and tested paths include:
 
 - RV64 I/M/A/F/D/C, Zicsr, and the privileged architecture
 - Sv39 and Sv48 virtual memory
-- WebAssembly JIT in both user-mode and full-system run loops
+- WebAssembly JIT in both user-mode and full-system browser run loops
 - virtio console and block devices
 - virtio-9p host-directory and in-memory file sharing
 - virtio networking through WebSocket or an in-browser HTTP proxy
@@ -22,10 +34,15 @@ Features include:
 Architecture details live in [DESIGN.md](DESIGN.md). See
 [ROADMAP.md](ROADMAP.md) for future work and
 [PERFORMANCE_PROGRESS.md](PERFORMANCE_PROGRESS.md) for measured JIT results.
+Claims here describe the current test coverage, not complete RISC-V or Linux
+compatibility.
 
 ## Quick start
 
 ### Browser
+
+The hosted demo is available at
+<https://ibuildthecloud.github.io/rv64.js/>. To run it locally:
 
 ```sh
 web/get-images.sh
@@ -35,9 +52,8 @@ python3 -m http.server -d . 8000
 
 Open <http://localhost:8000/web/>.
 
-The two-machine demo is at <http://localhost:8000/web/>. It offers the fast
-BusyBox machine above and a modern OpenSBI/Linux 6.12 Debian machine. Prepare
-the modern images once with:
+The page offers a fast BusyBox machine and a modern OpenSBI/Linux 6.12 Debian
+machine. Prepare the modern images once with:
 
 ```sh
 nix develop -c web/prepare-modern-images.sh
@@ -106,19 +122,6 @@ Connect it before or after `bootLinux({ proxy: true })`:
 vm.connectHttpRelay("ws://127.0.0.1:8090");
 ```
 
-### Modern OpenSBI/Linux machine
-
-```sh
-nix develop -c tests/vs-v86/mk-debian-rootfs.sh target/bench
-nix develop -c tests/virt-proxy/run.sh
-```
-
-### User-mode emulator
-
-```sh
-cargo run --release -p rv64-run -- <static-elf> [args...]
-```
-
 The browser proxy tries `fetch()` first, retaining its zero-infrastructure
 path. If a GET or HEAD fails before a response is exposed, an attached HTTP
 relay retries it and remembers that origin for later requests. Non-idempotent
@@ -129,6 +132,23 @@ page, and put it behind a `wss://` reverse proxy when the page itself uses
 HTTPS. See [web/HTTP_RELAY.md](web/HTTP_RELAY.md) for the wire protocol and
 deployment details.
 
+### Modern OpenSBI/Linux machine
+
+```sh
+nix develop -c tests/vs-v86/mk-debian-rootfs.sh target/bench
+nix develop -c tests/virt-proxy/run.sh
+```
+
+### User-mode emulator
+
+This runner is experimental and intended for the included static test guests,
+instruction testing, and JIT development. It does not currently provide a
+general Linux userspace environment.
+
+```sh
+cargo run --release -p rv64-run -- <static-elf> [args...]
+```
+
 ## Build & test
 
 ```sh
@@ -137,8 +157,9 @@ deployment details.
 nix develop
 
 # the full automated suite: cargo tests, guest builds, qemu differential,
-# official riscv-tests (134/134), wasm build + Node smoke (user-mode, JIT,
-# Linux boot). Unavailable external stages are reported as skips.
+# official riscv-tests, architecture-signature comparison against Spike,
+# wasm build + Node smoke (limited user mode, JIT, Linux boot). Unavailable
+# external stages are reported as skips.
 tests/run-all.sh
 
 # release gate: treat any unavailable tool-dependent stage as a failure
@@ -148,7 +169,7 @@ REQUIRE_ALL=1 tests/run-all.sh
 cargo test --workspace                  # unit + integration tests
 tests/run-isa-tests.sh                  # official ISA suite only
 cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
-python3 -m http.server -d . 8000        # then open /web/system.html
+python3 -m http.server -d . 8000        # then open /web/
 
 # native TinyEMU oracle (differential testing)
 make -C reference/tinyemu CONFIG_FS_NET= CONFIG_SDL= CONFIG_X86EMU= CONFIG_SLIRP=

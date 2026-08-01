@@ -1,7 +1,7 @@
 import { RV64 } from "./rv64.js";
 
-export const RELEASE_ASSETS =
-  "https://github.com/ibuildthecloud/rv64.js/releases/download/demo-images-v1";
+export const RELEASE_API =
+  "https://api.github.com/repos/ibuildthecloud/rv64.js/releases/tags/demo-images-v1";
 
 export const PRESETS = Object.freeze({
   fast: {
@@ -27,6 +27,7 @@ const encoder = new TextEncoder();
 let selected = "fast";
 let active = null;
 let generation = 0;
+let releaseAssetsPromise;
 
 function write(data) {
   let text = typeof data === "string" ? data : decoder.decode(data, { stream: true });
@@ -35,36 +36,67 @@ function write(data) {
   term.scrollTop = term.scrollHeight;
 }
 
-function assetCandidates(local, release) {
+async function releaseAssets() {
+  if (!releaseAssetsPromise) {
+    releaseAssetsPromise = fetch(RELEASE_API, {
+      headers: { Accept: "application/vnd.github+json" },
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(`release metadata: ${response.status} ${response.statusText}`);
+      const release = await response.json();
+      return new Map(release.assets.map((asset) => [asset.name, asset.url]));
+    });
+  }
+  return releaseAssetsPromise;
+}
+
+function localAssetCandidates(local, release) {
   const override = new URLSearchParams(location.search).get("assets");
-  if (override) return [`${override.replace(/\/$/, "")}/${release}`];
-  return [local, `${RELEASE_ASSETS}/${release}`];
+  if (override) return [{ url: `${override.replace(/\/$/, "")}/${release}` }];
+  return (Array.isArray(local) ? local : [local]).map((url) => ({ url }));
+}
+
+async function downloadAsset(candidate, progress) {
+  const response = await fetch(candidate.url, { headers: candidate.headers });
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  const total = Number(response.headers.get("content-length")) || 0;
+  if (!response.body) return new Uint8Array(await response.arrayBuffer());
+  const reader = response.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.length;
+    progress(loaded, total);
+  }
+  const result = new Uint8Array(loaded);
+  let offset = 0;
+  for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; }
+  return result;
 }
 
 async function fetchAsset(local, release, progress) {
   let last;
-  for (const url of assetCandidates(local, release)) {
+  const override = new URLSearchParams(location.search).has("assets");
+  const candidates = localAssetCandidates(local, release);
+  for (const candidate of candidates) {
     try {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-      const total = Number(response.headers.get("content-length")) || 0;
-      if (!response.body) return new Uint8Array(await response.arrayBuffer());
-      const reader = response.body.getReader();
-      const chunks = [];
-      let loaded = 0;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        loaded += value.length;
-        progress(loaded, total);
-      }
-      const result = new Uint8Array(loaded);
-      let offset = 0;
-      for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; }
-      return result;
+      return await downloadAsset(candidate, progress);
     } catch (error) {
-      last = new Error(`${url}: ${error.message}`);
+      last = new Error(`${candidate.url}: ${error.message}`);
+    }
+  }
+
+  if (!override) {
+    const assets = await releaseAssets();
+    const url = assets.get(release);
+    if (!url) throw new Error(`${release} is missing from release demo-images-v1`);
+    const candidate = { url, headers: { Accept: "application/octet-stream" } };
+    try {
+      return await downloadAsset(candidate, progress);
+    } catch (error) {
+      last = new Error(`${candidate.url}: ${error.message}`);
     }
   }
   throw last;
@@ -72,7 +104,7 @@ async function fetchAsset(local, release, progress) {
 
 async function loadWasm() {
   return fetchAsset(
-    "../target/wasm32-unknown-unknown/release/rv64_wasm.wasm",
+    ["./rv64_wasm.wasm", "../target/wasm32-unknown-unknown/release/rv64_wasm.wasm"],
     "rv64_wasm.wasm",
     () => {},
   );
