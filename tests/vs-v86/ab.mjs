@@ -87,6 +87,8 @@ const KNOBS = new Set([
   "BCAP",
   "BPAGE",
   "SBSPACE",
+  "REGSTRESS",
+  "MULTILATCH",
 ]);
 
 function parseConfig(name) {

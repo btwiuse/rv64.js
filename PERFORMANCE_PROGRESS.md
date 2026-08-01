@@ -17,7 +17,8 @@ retains the decisions that should guide future work.
 
 ## Current status
 
-- **Best known engineering baseline:** `314e441` (E003 narrow-window default).
+- **Best known engineering baseline:** the current E018 working tree, built on
+  `314e441` (E003 narrow-window default plus the promoted Assignment selector).
 - **Frozen performance control:** Wasm SHA-256
   `b5a857b087bd49631866c9bcd77e3d9d98df1dfb93eedf3ce16782c3e02d4433`.
 - **Control artifact:** `target/bench/wasm-candidates/`
@@ -26,24 +27,26 @@ retains the decisions that should guide future work.
 - **Prior E003-series control:** Wasm `21b638123cee…`, artifact
   `head-control-21b638123cee.wasm`.
 - **Promoted default build:** Wasm SHA-256
-  `b5a857b087bd49631866c9bcd77e3d9d98df1dfb93eedf3ce16782c3e02d4433`.
-  It differs from the scored `c8a196b5…` artifact only by making the tested
-  `TRACEWIN=1` runtime state the default, comment/source-location metadata,
-  and use of the project-pinned Rust 1.97.1 toolchain; the final build passed
-  all eight correctness stages.
+  `91ab401df4b6530a07f0697c658ffe25d170a6c28aa529440c2edaf445546737`,
+  artifact `e018-multi-latch-promoted-91ab401df4b6.wasm`. It makes the tested
+  E018 multi-latch state the default; the runtime setter remains only for
+  same-Wasm control comparisons. The promoted build passed all eight
+  `tests/run-all.sh` stages.
 - **Comparison v86 revision:** `2f1346b0e7d88d4cbbbcc05fe15b4e369c3de23f`.
-- **Reproducible scorecard ceiling:** 11/13 with the narrow-window candidate.
-  Reports `scorecard-2026-07-28T05-38-26.json` and
-  `scorecard-2026-07-28T06-29-49.json` are valid authoritative host-toolchain
-  results; `scorecard-2026-07-28T07-03-26.json` is the valid canonical
-  Nix-toolchain result on the final artifact.
-- **Current likely losses:** Compile and Assignment. Python has
-  historically been bimodal and must be classified only by a replicated
-  candidate-relative run.
-- **Extended E004–E008 outcome:** no runtime change was promoted. Page-cache
-  and tier-threshold sweeps were neutral or negative; multi-latch loop
-  compilation produced a large but invalid Assignment result that remains
-  quarantined pending a deterministic explanation of its internal variance.
+- **Reproducible scorecard ceiling/current score:** 11/13. E018 reproduced it
+  in two valid authoritative reports,
+  `scorecard-2026-08-01T00-57-47.json` and
+  `scorecard-2026-08-01T01-18-18.json`, with Assignment now a 1.29× win.
+- **Current likely losses:** Compile and Python, not Assignment. Python is
+  historically bimodal; a direct three-pair E018 comparison was a tie with
+  the candidate 7.7% faster (`ab-2026-08-01T00-59-00.json`), so its scorecard
+  loss is not an E018 regression.
+- **Extended E004–E018 outcome:** page-cache and tier-threshold sweeps were
+  neutral or negative. The destructive E017 implementation caused broad
+  regressions because failure of its extended scan suppressed the ordinary
+  detector. E018 preserves the ordinary fallback and safely promotes the
+  narrow LD+LHU selector, fixing Assignment without candidate-relative guard
+  regressions.
 
 An exploratory scorecard is a plumbing check, not status evidence. Only a
 valid `AUTHORITATIVE=1`, `REPS>=3`, `NBREPS>=3` scorecard may change the
@@ -133,7 +136,7 @@ needed to justify reopening the design.
 | Per-trace page-cache threshold sweep | Threshold 2 regressed Compile 6.6%; disabling the cache improved it only 4.5%, below the fixed gate | A changed memory-access shape or new counters show the cache is materially dominant |
 | Ordinary JIT tier threshold sweep | Thresholds 128, 32, and 16 changed Compile by −2.3%, +2.6%, and −5.5% respectively | Module generation or interpreter/JIT crossover costs change materially |
 | Individually selected multi-latch scan loops | Large-stride-only was an invalid +4.1%; small-stride-only was a valid −3.0% | A new structural selector identifies a different independently beneficial loop |
-| Broad multi-latch scan-loop compilation | Apparent Assignment gain was 69.7%, but all three candidate trials failed nbench's internal confidence test | The variance is explained and the unchanged canonical benchmark produces a valid result; never relax the confidence rule |
+| Broad multi-latch scan-loop compilation | Reconstructed form improved Assignment 31.8% validly but regressed Python 18.4% | A workload-independent structural selector excludes the Python shapes while retaining a separately measured ≥10% Assignment gain |
 
 ## Invalidated and superseded conclusions
 
@@ -281,7 +284,7 @@ were again the only losses. One of three rv64 nbench repetitions reported
 internal instability, below the authoritative invalidation threshold. This is
 the promotion report.
 
-### P2 — Next session: make the Assignment opportunity testable
+### P2 — Completed: make the Assignment opportunity testable
 
 The proposed cross-block GPR-cache prototype was based on an incomplete audit:
 ordinary traces already allocate locals for every touched GPR/FP register,
@@ -330,6 +333,55 @@ This keeps the quick cycle at one focused pair until evidence justifies the
 more expensive stages and prevents a diagnostic benchmark from becoming a
 new scoring methodology.
 
+**Outcome (E009–E010):** the fixed-work reproducer and canonical internal-stat
+capture are implemented. The baseline was stable, and the reconstructed
+multi-latch candidate passed a valid three-pair Assignment gate (+31.8%) but
+failed its first guard on Python (−18.4%); Fourier was also internally
+unstable. The broad detector is closed and no candidate code remains. A future
+Assignment attempt needs a structural selector demonstrated to exclude the
+Python shapes before emission; absent that mechanism, proceed to P3.
+
+**E016 selector attempt:** requiring exactly one LD and one LHU plus two
+conditional continues and a final unconditional backedge targets the canonical
+Assignment occupancy scans while excluding pointer-only shapes. The fixed-work
+checksum remained `f168198e29a44860`, but its compiler emits a rotated secondary
+latch and therefore did not match this exact selector. The valid canonical
+one-pair gate (`ab-2026-07-31T23-48-51.json`) improved only 2.0% (9.86→10.06)
+despite reducing dispatches 252.9M→247.8M; host spread was 1.03×. This is below
+the 10% replication gate and agrees with E008b/E008c that the obvious scan
+loops alone do not explain the broad candidate's gain. Candidate code was
+removed. Any next Assignment selector must first attribute the broad E010 gain
+to additional loop shapes; do not further specialize the two known scans.
+
+**E017 corrected reconstruction:** E016 still stopped at the first conditional
+backedge, so it never exercised the intended final unconditional latch. After
+correcting that behavior, broad mode improved a valid one-pair Assignment gate
+74.5%. A factorial split showed LD+LHU scans alone improved 69.5%, while all
+other shapes regressed Assignment 27.1%. Scan-only replicated at +60.7% over
+three pairs (`ab-2026-07-31T23-58-08.json`), passed the focused guards, and
+tied on a valid Fourier retry (`ab-2026-08-01T00-02-32.json`). Nevertheless,
+the valid authoritative 3×/3× scorecard
+(`scorecard-2026-08-01T00-23-49.json`) fell to 7/13: Assignment became a
+1.33× win, but ALU, Python, String Sort, Bitfield, and Fourier were losses;
+Compile remained a loss. The selector is a severe cross-workload trade. All
+multi-latch candidate code and runtime modes were removed, and the
+authoritative baseline remains 11/13. E018 subsequently proved that these
+regressions came from E017's destructive fallback: when the extended detector
+rejected a shape, E017 failed to retry the ordinary loop detector. They were
+not intrinsic collisions of the LD+LHU selector.
+
+**E018 non-destructive promotion:** the extended LD+LHU scan now runs as a
+lookahead and falls back unchanged to ordinary loop detection on any mismatch.
+Assignment improved 59.4% over three pairs and the focused guard rows tied;
+the first combined guard was invalid only because its Fourier control was
+unstable, while a valid Fourier retry tied. Two authoritative scorecards both
+returned 11/13 and made Assignment a 1.29× win, with none of E017's ALU,
+String, Bitfield, or Fourier regressions. A direct three-pair Python comparison
+was also a tie (candidate 7.7% faster), attributing the scorecard's Python loss
+to its known bimodality rather than the selector. Exact extended-detection and
+ordinary-fallback unit tests pass, and the promoted default Wasm passed all
+eight correctness stages.
+
 ### P3 — Compile emitted-code investigation
 
 The page-cache and tier-threshold axes are closed. Before another Compile
@@ -343,7 +395,69 @@ only after a valid improvement of at least 10%.
 True region live ranges/register allocation remains a possible larger backend
 project, but it is not the same as adding a hot-register local cache. Start it
 only if those counters show that region entry/exit register traffic is
-material; current evidence does not.
+material; E011 now establishes that it is material by count.
+
+**E011 first profile:** diagnostic-only `MEMPROFILE=1` is implemented with no
+generated counter code when disabled. A valid three-pair frozen-control
+Compile comparison (`ab-2026-07-31T23-13-15.json`) established the disabled
+path as a tie: 2873.08 ms versus 2862.80 ms (1.004×), identical dispatch and
+retirement counters, host spread 1.06×. The pinned Compile diagnostic counted
+107.22M page-cache hits (68.5% of classified accesses), 46.97M full fused-TLB
+hits (30.0%), 2.25M memory bailouts (1.4%), and zero crossings/fills. It emitted
+38.29 MB across 6,570 registered modules, averaging 5.83 KB; 404 modules over
+16 KB account for 22.64 MB (59.1%) of all generated bytes. A separate register
+profile counted 154.28M GPR prologue loads and 139.50M exit stores—293.78M
+boundary operations against 322.70M JIT-retired guest instructions (0.91 per
+instruction); FP traffic was only 569 loads/stores. The distribution
+does not reopen the closed page-cache or TLB-miss experiments: cache removal
+was only +4.5%, threshold 2 regressed 6.6%, and eliminating TLB misses alone
+was neutral. No bounded memory lowering is justified yet. Register boundary
+traffic is now proven material by count, but the next step must
+attribute it by module kind/hot entry before changing allocation: historical
+inline-cache evidence shows that reducing a structural count does not
+guarantee a wall-time improvement.
+
+**E012 width attribution:** the register profiler now also counts executed
+entry and exit events by their GPR width (≤4, ≤8, ≤16, >16). On pinned Compile,
+19.77M entries split 28.4% / 37.1% / 26.2% / 8.3%, while 19.38M exits split
+39.7% / 27.2% / 29.3% / 3.9%.
+Thus ≤8-register boundaries account for 65.5% of entry events and 66.9% of
+exit events; the traffic is broad and frequent rather than concentrated in
+the >16-register module population. Do not pursue a large-union-only lowering.
+The next implementation candidate must reduce boundary frequency or safely
+carry a small common register set across calls, and must first identify a
+specific hot transition population where that state can remain live.
+
+**E013 transition attribution:** the sampled dispatch profiler now records
+source→target edges independently of source-PC totals. Its disabled path is a
+valid frozen-control Compile tie (`ab-2026-07-31T23-32-35.json`): 2896.47 ms
+versus 2881.59 ms (1.005×), 0.1% MAD on both sides, identical execution
+counters, and 1.03× host spread. In the pinned diagnostic the hottest edge was
+only 1.6% of sampled dispatches and the top 20 edges together were 17.4%; the
+two hottest host-dispatched self-edges together were about 1.4%. Boundary
+traffic is therefore fragmented across many transitions. A per-edge or
+self-loop-only carry prototype cannot meet the 10% row gate even under an
+unrealistic zero-cost assumption. Compile now lacks a bounded evidence-backed
+lowering; a future attempt requires a general cross-module calling convention
+or a new dominant category, not another isolated edge special case.
+
+**E014–E015 ABI leverage bound:** a semantics-preserving `REGSTRESS=1` mode
+duplicates every GPR prologue load and exit spill. Its valid three-pair Compile
+comparison (`ab-2026-07-31T23-40-28.json`) slowed 2872.30→3206.32 ms (10.4%),
+with 0.2%/1.5% MAD, identical execution counters, and 1.02× host spread. This
+shows the whole boundary axis is material, but leaves little implementation
+margin. Per-GPR attribution then found the top four identities (`x10`, `x1`,
+`x11`, `x2`) cover 32.9% of all boundary operations and the top eight (adding
+`x8`, `x12`, `x9`, `x18`) cover 55.5%. Even scaling the stress result as an
+optimistic zero-overhead bound puts an eight-register convention near 5.8%,
+below the promotion threshold. A 31-register multi-value ABI would be the only
+form broad enough, requiring every generated signature, indirect-table type,
+dispatcher, bailout, interrupt, and interpreter boundary to change. Do not
+start that project without a new measurement showing substantially more than
+the present 10.4% whole-axis ceiling. The complete diagnostic build remains
+timing-neutral when disabled: frozen-control report
+`ab-2026-07-31T23-43-25.json` is a 1.003× tie with identical counters,
+0.3%/0.0% MAD, and 1.02× host spread.
 
 ### P4 — Python coverage stability
 
@@ -389,6 +503,16 @@ must add one row immediately after its decision.
 | E008a | 2026-07-28 | INVALID | Compile all precise multi-latch scan loops as structured Wasm loops | Exact-shape unit and feature-enabled full-state/retirement differential pass; invalid one-pair reports `ab-2026-07-28T14-51-45.json` and `ab-2026-07-28T14-56-31.json`; alternating three-pair report `ab-2026-07-28T15-09-00.json` | Three-pair medians showed +69.7% (`14.60`→`24.77`), external MAD 0.1%/1.0%, host spread 1.03×, but candidate nbench confidence failed in 3/3 trials; no code or diagnostic knob was retained, and this form cannot be reconsidered until the internal variance is explained |
 | E008b | 2026-07-28 | REJECTED | Restrict multi-latch compilation to large-stride scans | One-pair report `ab-2026-07-28T15-16-28.json`; numerically +4.1%, and invalid because both sides reported nbench instability | The large-stride `0x100934e` loop does not explain E008a's gain; do not replicate |
 | E008c | 2026-07-28 | TIE | Restrict multi-latch compilation to small-stride scans | Valid one-pair Assignment report `ab-2026-07-28T15-20-54.json`; affinity `0,2,4,6`, host spread 1.01×, no internal nbench warning | Assignment regressed 3.0% (`14.48`→`14.05`), below the 10% threshold; together E008b/E008c show that neither loop shape independently explains E008a, so close the factorial and retain no code |
+| E009 | 2026-07-31 | IMPLEMENTED | Fixed-work checksum reproducer for Assignment's row/column multi-latch scans plus opt-in nbench internal-stat capture | `assignment-repro` executes 20,000 calls of each scan with checksum `f168198e29a44860`; exact dispatch profiles identify the fixed-work latches at `0x1002568`/`0x10025d0` and canonical nbench latches at `0x100934e`/`0x10092c6`. The command-file harness now mounts tmpfs for the full rootfs's `/C -> /tmp/C` link and emits short console-safe commands; before this fix selected-row runs silently fell back to the whole table. | Default and synchronous tier-up measured ~95–96 ms versus ~222 ms Liftoff-only, proving tier choice is material but not yet explaining E008 variance. Pinned Node 20, affinity `0,2,4,6`, canonical Wasm `b5a857b0…`: unshortened baseline Assignment passed confidence in 5 samples, mean `10.569`, stdev `0.164322` (1.55%). Baseline variance is therefore low; recreate broad E008 next and capture the same fields. Diagnostics remain non-score evidence. |
+| E010 | 2026-07-31 | REJECTED | Reconstructed broad multi-latch scan-loop compiler, accepting multiple conditional continues plus a final unconditional backedge | Exact-shape translation test and fixed-work checksum passed. Valid three-pair Assignment report `ab-2026-07-31T23-03-42.json`: `10.75`→`14.17` (+31.8%), candidate MAD 2.1%, host spread 1.05×, no internal instability. One-pair guards in `ab-2026-07-31T23-06-48.json`: Compile −0.4% tie, Numeric −1.5% tie, Python −18.4% regression, Fourier apparent +57.6% but internally unstable; host spread 1.01×. | Reject under the selected-row 10% regression rule. The narrower reconstruction explains the old Assignment opportunity without reproducing its variance, but its broad structural detector changes unrelated workloads and materially harms Python. No candidate code retained; reconsider only with a structural selector that excludes the Python shapes before code generation. |
+| E011 | 2026-07-31 | IMPLEMENTED | Independently selectable generated-memory, register-boundary, and uninstrumented-size profilers | Disabled-path three-pair Compile tie in `ab-2026-07-31T23-13-15.json`; pinned diagnostics preserve checksum and aggregate execution counters | Memory: 68.5% cache hits, 30.0% TLB hits, 1.4% bailouts. Registers: 154.28M GPR entry loads + 139.50M exit stores (0.91 boundary ops/JIT instruction), negligible FP. Size: 38.29 MB/6,570 modules; >16K modules are 6.1% by count but 59.1% of bytes. Retain diagnostics; attribute register traffic by module kind/hot entry before a backend change. |
+| E012 | 2026-07-31 | DIAGNOSTIC | Execution-weighted GPR entry/exit width buckets | Pinned Compile, `REGPROFILE=1`, checksum and aggregate execution counters match E011; Wasm `157e1e20…` | 19.77M entry events: 28.4% ≤4, 37.1% ≤8, 26.2% ≤16, 8.3% >16. 19.38M exit events: 39.7% ≤4, 27.2% ≤8, 29.3% ≤16, 3.9% >16. Close a large-register-union-only optimization; find hot cross-module transitions that can preserve a small common set before implementing. |
+| E013 | 2026-07-31 | DIAGNOSTIC | Sampled source→target JIT transition profiler | Disabled-path Compile report `ab-2026-07-31T23-32-35.json`: 1.005× tie, 0.1%/0.1% MAD, identical counters, host spread 1.03×. Pinned profile checksum/counters match E011/E012; Wasm `7a791770…`. | Hottest edge is 1.6% of sampled dispatches; top 20 total 17.4%; two hottest self-edges total about 1.4%. Boundary traffic is fragmented. Reject a bounded per-edge/self-loop carry prototype; only a general calling-convention project could address this axis broadly. |
+| E014 | 2026-07-31 | DIAGNOSTIC | Duplicate every GPR entry load and exit spill (`REGSTRESS=1`) to bound boundary-traffic leverage | Valid three-pair same-Wasm/config A/B `ab-2026-07-31T23-40-28.json`: 2872.30→3206.32 ms, 0.2%/1.5% MAD, identical counters, host spread 1.02× | Doubling all 293.78M GPR boundary operations costs 10.4%. The axis matters, but complete elimination has only a narrow theoretical margin over the 10% gate. Retain the diagnostic; require identity concentration before an ABI prototype. |
+| E015 | 2026-07-31 | DIAGNOSTIC | Per-GPR executed entry-load and exit-spill attribution | Pinned Compile `REGPROFILE=1`, checksum and aggregate execution counters match E011–E014; Wasm `17c8043e…`. Complete disabled-path report `ab-2026-07-31T23-43-25.json`: 1.003× tie, identical counters, 0.3%/0.0% MAD, host spread 1.02×. | Top four identities (`x10,x1,x11,x2`) cover 32.9% of boundary ops; top eight (plus `x8,x12,x9,x18`) cover 55.5%. An ideal zero-overhead eight-register convention scales to only ~5.8% from E014, below the gate. Reject fixed-small-set and full-ABI prototypes on current evidence; retain timing-neutral diagnostics. |
+| E016 | 2026-07-31 | TIE | Multi-latch selector requiring an LD+LHU occupancy scan, two conditional continues, and a final unconditional backedge | Fixed-work checksum passed but its rotated secondary latch did not match. Valid canonical one-pair Assignment report `ab-2026-07-31T23-48-51.json`: 9.86→10.06, dispatches 252.9M→247.8M, host spread 1.03×. | +2.0% is below the replication gate. The two obvious occupancy scans are not the source of E010's broad gain; candidate removed. Attribute additional profitable shapes before another selector. |
+| E017 | 2026-08-01 | REJECTED | Corrected multi-latch reconstruction plus LD+LHU scan-only selector | Broad `ab-2026-07-31T23-55-10.json`: Assignment +74.5%. Scan-only `23-55-49`: +69.5%; other-only `23-56-13`: −27.1%. Scan-only three-pair `23-58-08`: +60.7%. Focused guard `00-01-14` was invalid only for unstable Fourier control; valid Fourier retry `00-02-32` tied. Valid authoritative 3×/3× `scorecard-2026-08-01T00-23-49.json`, host spread 1.05×. | Score fell to 7/13. Assignment flipped to a 1.33× win, but ALU, Python, String Sort, Bitfield, and Fourier were losses; Compile remained a loss. Reject and remove all candidate/runtime-mode code. Baseline stays 11/13. |
+| E018 | 2026-08-01 | LANDED | Non-destructive LD+LHU multi-latch lookahead with unchanged ordinary-loop fallback | Assignment one-pair `ab-2026-08-01T00-31-22.json` (+64.8%); valid three-pair `00-32-46` (+59.4%, 0.4%/0.4% MAD); guards `00-36-58` plus valid Fourier retry `00-38-04`; valid authoritative reports `scorecard-2026-08-01T00-57-47.json` and `01-18-18`, both 11/13; direct Python `ab-2026-08-01T00-59-00.json` tied with candidate 7.7% faster; exact detector/fallback unit tests and all eight correctness stages passed; promoted Wasm `91ab401df4b6…`. | Assignment flips from loss to 1.29× win without reproducing E017's regressions. Score remains 11/13 because bimodal Python was independently slow in both scorecards; current losses are Python and Compile. Default enabled; retain the setter for controlled diagnostics. |
 
 ### Required record for new experiments
 

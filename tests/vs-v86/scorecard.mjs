@@ -750,6 +750,7 @@ const provenance = {
     bcap: process.env.BCAP ?? null,
     bpage: process.env.BPAGE ?? null,
     sbspace: process.env.SBSPACE ?? null,
+    multilatch: process.env.MULTILATCH ?? null,
     nbench_timeout_ms: NBENCH_TIMEOUT_MS,
   },
   nbench: WANT_NBENCH,

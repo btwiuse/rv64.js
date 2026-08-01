@@ -694,6 +694,65 @@ static mut JIT_RETIRED: u64 = 0;
 static mut SLICE_CALLS: u64 = 0;
 static mut SLICE_INSNS: u64 = 0;
 static mut JIT_DISPATCHES: u64 = 0;
+/// Diagnostic mode bits: 1=memory paths, 2=register boundaries, 4=size only.
+static mut MEMPROF_MODE: u32 = 0;
+static mut MULTI_LATCH: bool = true;
+static mut MEMPROF: [u64; 89] = [0; 89];
+
+#[no_mangle]
+pub extern "C" fn memprof_set(on: u32) {
+    unsafe {
+        MEMPROF_MODE = on;
+        MEMPROF = [0; 89];
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn memprof_get(index: u32) -> u64 {
+    unsafe { MEMPROF[index as usize % 89] }
+}
+
+#[no_mangle]
+pub extern "C" fn jit_set_multi_latch(on: u32) {
+    unsafe { MULTI_LATCH = on != 0 }
+}
+
+
+#[allow(static_mut_refs)]
+fn mem_profile_layout() -> Option<[u32; 17]> {
+    unsafe {
+        if MEMPROF_MODE & 3 == 0 { return None; }
+        let base = MEMPROF.as_ptr() as u32;
+        let mem = MEMPROF_MODE & 1 != 0;
+        let regs = MEMPROF_MODE & 2 != 0;
+        Some([
+            if mem { base } else { 0 }, if mem { base + 8 } else { 0 },
+            if mem { base + 16 } else { 0 }, if mem { base + 24 } else { 0 },
+            if mem { base + 32 } else { 0 }, if regs { base + 40 } else { 0 },
+            if regs { base + 48 } else { 0 }, if regs { base + 56 } else { 0 },
+            if regs { base + 64 } else { 0 },
+            if regs { base + 152 } else { 0 }, if regs { base + 160 } else { 0 },
+            if regs { base + 168 } else { 0 }, if regs { base + 176 } else { 0 },
+            if regs { base + 184 } else { 0 }, if regs { base + 192 } else { 0 },
+            if regs { base + 200 } else { 0 }, if regs { base + 208 } else { 0 },
+        ])
+    }
+}
+
+fn reg_stress() -> bool {
+    unsafe { MEMPROF_MODE & 8 != 0 }
+}
+
+#[allow(static_mut_refs)]
+fn reg_profile_base() -> u32 {
+    unsafe {
+        if MEMPROF_MODE & 2 != 0 {
+            MEMPROF.as_ptr().add(27) as u32
+        } else {
+            0
+        }
+    }
+}
 
 // Dispatch-site profiler (diagnostic, off by default): direct-mapped
 // (pc -> dispatches, retired) so a run can be attributed per guest pc —
@@ -703,6 +762,10 @@ const DPROF_N: usize = 8192;
 static mut DPROF_PC: [u64; DPROF_N] = [0; DPROF_N];
 static mut DPROF_CNT: [u64; DPROF_N] = [0; DPROF_N];
 static mut DPROF_RET: [u64; DPROF_N] = [0; DPROF_N];
+static mut EPROF_SRC: [u64; DPROF_N] = [0; DPROF_N];
+static mut EPROF_DST: [u64; DPROF_N] = [0; DPROF_N];
+static mut EPROF_CNT: [u64; DPROF_N] = [0; DPROF_N];
+static mut EPROF_RET: [u64; DPROF_N] = [0; DPROF_N];
 static mut DPROF_ON: bool = false;
 /// Profile one of every 2^N dispatches. Full attribution materially perturbs
 /// dispatch-heavy nbench kernels, so diagnostics default to sampling in the
@@ -719,6 +782,25 @@ pub extern "C" fn dprof_set(on: u32) {
             DPROF_PC = [0; DPROF_N];
             DPROF_CNT = [0; DPROF_N];
             DPROF_RET = [0; DPROF_N];
+            EPROF_SRC = [0; DPROF_N];
+            EPROF_DST = [0; DPROF_N];
+            EPROF_CNT = [0; DPROF_N];
+            EPROF_RET = [0; DPROF_N];
+        }
+    }
+}
+
+/// which: 0 = source pc, 1 = target pc, 2 = transitions, 3 = retired insns.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn eprof_get(which: u32, i: u32) -> u64 {
+    let i = i as usize % DPROF_N;
+    unsafe {
+        match which {
+            0 => EPROF_SRC[i],
+            1 => EPROF_DST[i],
+            2 => EPROF_CNT[i],
+            _ => EPROF_RET[i],
         }
     }
 }
@@ -817,6 +899,24 @@ fn dprof_hit(pc: u64, retired: u64) {
         }
         DPROF_CNT[h] += 1;
         DPROF_RET[h] += retired;
+    }
+}
+
+#[inline(always)]
+#[allow(static_mut_refs)]
+fn eprof_hit(src: u64, dst: u64, retired: u64) {
+    unsafe {
+        let h = ((src >> 1) ^ (src >> 13) ^ (dst >> 3) ^ (dst >> 17)) as usize
+            & (DPROF_N - 1);
+        if EPROF_SRC[h] != src || EPROF_DST[h] != dst {
+            if EPROF_CNT[h] != 0 {
+                return; // collision: first hot edge keeps the slot
+            }
+            EPROF_SRC[h] = src;
+            EPROF_DST[h] = dst;
+        }
+        EPROF_CNT[h] += 1;
+        EPROF_RET[h] += retired;
     }
 }
 
@@ -1052,6 +1152,10 @@ pub extern "C" fn sbtest() -> u64 {
             pc_addr: sp + 256,
             mem: None,
             sys: None,
+            mem_profile: None,
+            reg_stress: false,
+            reg_profile_base: 0,
+            multi_latch: false,
             retired_addr: sp + 264,
             f_base: 0,
             fcsr_addr: 0,
@@ -1140,6 +1244,10 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     pc_addr: &m.cpu.pc as *const u64 as u32,
                     mem: Some((m.mem.as_ptr() as u32, m.mem.len() as u64)),
                     sys: None,
+                    mem_profile: None,
+                    reg_stress: false,
+                    reg_profile_base: 0,
+                    multi_latch: false,
                     retired_addr: retired_addr(),
                     f_base: m.cpu.f.as_ptr() as u32,
                     fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
@@ -1532,6 +1640,10 @@ fn jit_layout(m: &rv64_system::Machine) -> rv64_jit::JitLayout {
             ftlb_store_off: so as u32,
             tlb_mask: (rv64_core::Cpu::jit_tlb_size() - 1) as u32,
         }),
+        mem_profile: mem_profile_layout(),
+        reg_stress: reg_stress(),
+        reg_profile_base: reg_profile_base(),
+        multi_latch: unsafe { MULTI_LATCH },
         retired_addr: retired_addr(),
         f_base: m.cpu.f.as_ptr() as u32,
         fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
@@ -2302,6 +2414,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             };
             if dprof_sample {
                 dprof_hit(pc, retired);
+                eprof_hit(pc, m.cpu.pc, retired);
             }
             retired_sum += retired;
             chained += 1;
@@ -2433,6 +2546,10 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             pc_addr: &m.cpu.pc as *const u64 as u32,
                             mem: None,
                             sys: Some(sysmem),
+                            mem_profile: mem_profile_layout(),
+                            reg_stress: reg_stress(),
+                            reg_profile_base: reg_profile_base(),
+                            multi_latch: unsafe { MULTI_LATCH },
                             retired_addr: retired_addr(),
                             f_base: m.cpu.f.as_ptr() as u32,
                             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
@@ -3272,6 +3389,10 @@ pub extern "C" fn sb_analyze(vpage: u64, which: u32) -> u64 {
                 ftlb_store_off: so as u32,
                 tlb_mask: (rv64_core::Cpu::jit_tlb_size() - 1) as u32,
             }),
+            mem_profile: mem_profile_layout(),
+            reg_stress: reg_stress(),
+            reg_profile_base: reg_profile_base(),
+            multi_latch: unsafe { MULTI_LATCH },
             retired_addr: retired_addr(),
             f_base: m.cpu.f.as_ptr() as u32,
             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
@@ -3357,6 +3478,10 @@ pub extern "C" fn sb_analyze_pc(pc: u64, which: u32) -> u64 {
                 ftlb_store_off: so as u32,
                 tlb_mask: (rv64_core::Cpu::jit_tlb_size() - 1) as u32,
             }),
+            mem_profile: mem_profile_layout(),
+            reg_stress: reg_stress(),
+            reg_profile_base: reg_profile_base(),
+            multi_latch: unsafe { MULTI_LATCH },
             retired_addr: retired_addr(),
             f_base: m.cpu.f.as_ptr() as u32,
             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
@@ -3720,5 +3845,15 @@ pub extern "C" fn jit_out_ptr() -> *const u8 {
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn jit_out_len() -> u32 {
-    unsafe { JIT_OUT.len() as u32 }
+    unsafe {
+        if MEMPROF_MODE & 4 != 0 {
+            let len = JIT_OUT.len() as u64;
+            MEMPROF[9] += len;
+            MEMPROF[10] += 1;
+            let bucket = if len <= 1024 { 0 } else if len <= 4096 { 1 } else if len <= 16384 { 2 } else { 3 };
+            MEMPROF[11 + bucket] += 1;
+            MEMPROF[15 + bucket] += len;
+        }
+        JIT_OUT.len() as u32
+    }
 }

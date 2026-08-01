@@ -36,6 +36,7 @@ const ROWS = {
   fpemul: { kind: "nbench", name: "FP EMULATION", flag: "DOEMFLOAT" },
   fourier: { kind: "nbench", name: "FOURIER", flag: "DOFOUR" },
   assignment: { kind: "nbench", name: "ASSIGNMENT", flag: "DOASSIGN" },
+  "assignment-repro": { kind: "assignment-repro" },
   idea: { kind: "nbench", name: "IDEA", flag: "DOIDEA" },
   huffman: { kind: "nbench", name: "HUFFMAN", flag: "DOHUFF" },
 };
@@ -66,6 +67,11 @@ function envFlag(name, fallback = false) {
 }
 const jit = !envFlag("DISABLE_JIT");
 const profile = envFlag("PROFILE");
+const nbenchInternalStats = envFlag("NBENCH_INTERNAL_STATS");
+const memProfile = envFlag("MEMPROFILE");
+const regProfile = envFlag("REGPROFILE");
+const sizeProfile = envFlag("SIZEPROFILE");
+const regStress = envFlag("REGSTRESS");
 const superblocks = envFlag("SB", true);
 function envInteger(name, fallback, minimum, maximum) {
   const value =
@@ -110,10 +116,17 @@ const step = (vm, n) => {
 
 function configure(vm) {
   vm.ex.jit_set_enabled(jit ? 1 : 0);
+  vm.ex.memprof_set?.(
+    (memProfile ? 1 : 0) |
+    (regProfile ? 2 : 0) |
+    (sizeProfile ? 4 : 0) |
+    (regStress ? 8 : 0),
+  );
   const knobs = [
     ["TLBFILL", "jit_set_tlb_fill"],
     ["TRACELVL", "jit_set_trace_level"],
     ["TRACEWIN", "jit_set_trace_window"],
+    ["MULTILATCH", "jit_set_multi_latch"],
     ["KEEPMIN", "jit_set_trace_keep_min"],
     ["DEMOTE", "jit_set_demote"],
     ["BATCH", "jit_set_batch"],
@@ -203,6 +216,7 @@ const statDelta = (before, after) => {
 function readProfile(vm, sampleShift) {
   if (!profile) return null;
   const dispatch = [];
+  const transitions = [];
   for (let i = 0; i < 8192; i++) {
     const count = Number(vm.ex.dprof_get(1, i));
     if (!count) continue;
@@ -215,7 +229,23 @@ function readProfile(vm, sampleShift) {
       insns_per_dispatch: retired / count,
     });
   }
+  for (let i = 0; i < 8192; i++) {
+    const edgeCount = Number(vm.ex.eprof_get?.(2, i) ?? 0n);
+    if (edgeCount > 0) {
+      const src = vm.ex.eprof_get(0, i);
+      const dst = vm.ex.eprof_get(1, i);
+      const edgeRetired = Number(vm.ex.eprof_get(3, i));
+      transitions.push({
+        source_pc: `0x${src.toString(16)}`,
+        target_pc: `0x${dst.toString(16)}`,
+        transitions: edgeCount,
+        retired: edgeRetired,
+        insns_per_transition: edgeRetired / edgeCount,
+      });
+    }
+  }
   dispatch.sort((a, b) => b.dispatches - a.dispatches);
+  transitions.sort((a, b) => b.transitions - a.transitions);
 
   const fallback = [];
   for (let i = 0; i < 1024; i++) {
@@ -248,6 +278,7 @@ function readProfile(vm, sampleShift) {
     dispatch_coverage_sha256: coverageFingerprint,
     dispatch_sites: dispatch.length,
     top_dispatch: dispatch.slice(0, 20),
+    top_transitions: transitions.slice(0, 20),
     top_fallback: fallback.slice(0, 20),
   };
 }
@@ -268,6 +299,47 @@ function finishMeasurement(vm, before) {
   return {
     jit: statDelta(before.stats, readStats(vm)),
     profile: readProfile(vm, before.sampleShift),
+    memory_profile: (memProfile || regProfile || sizeProfile) ? (() => {
+      const emittedWasmBytes = Number(vm.ex.memprof_get(9));
+      const emittedModules = Number(vm.ex.memprof_get(10));
+      return {
+        page_cache_hits: Number(vm.ex.memprof_get(0)),
+        tlb_hits: Number(vm.ex.memprof_get(1)),
+        tlb_fills: Number(vm.ex.memprof_get(2)),
+        page_crossings: Number(vm.ex.memprof_get(3)),
+        memory_bailouts: Number(vm.ex.memprof_get(4)),
+        gpr_entry_loads: Number(vm.ex.memprof_get(5)),
+        fp_entry_loads: Number(vm.ex.memprof_get(6)),
+        gpr_exit_stores: Number(vm.ex.memprof_get(7)),
+        fp_exit_stores: Number(vm.ex.memprof_get(8)),
+        gpr_entry_width_events: {
+          le_4: Number(vm.ex.memprof_get(19)),
+          le_8: Number(vm.ex.memprof_get(20)),
+          le_16: Number(vm.ex.memprof_get(21)),
+          gt_16: Number(vm.ex.memprof_get(22)),
+        },
+        gpr_exit_width_events: {
+          le_4: Number(vm.ex.memprof_get(23)),
+          le_8: Number(vm.ex.memprof_get(24)),
+          le_16: Number(vm.ex.memprof_get(25)),
+          gt_16: Number(vm.ex.memprof_get(26)),
+        },
+        gpr_identity: Array.from({ length: 31 }, (_, i) => ({
+          register: `x${i + 1}`,
+          entry_loads: Number(vm.ex.memprof_get(27 + i)),
+          exit_stores: Number(vm.ex.memprof_get(58 + i)),
+        })),
+        emitted_wasm_bytes: emittedWasmBytes,
+        emitted_modules: emittedModules,
+        average_module_bytes: emittedModules ? emittedWasmBytes / emittedModules : null,
+        module_size_buckets: {
+          le_1k: { modules: Number(vm.ex.memprof_get(11)), bytes: Number(vm.ex.memprof_get(15)) },
+          le_4k: { modules: Number(vm.ex.memprof_get(12)), bytes: Number(vm.ex.memprof_get(16)) },
+          le_16k: { modules: Number(vm.ex.memprof_get(13)), bytes: Number(vm.ex.memprof_get(17)) },
+          gt_16k: { modules: Number(vm.ex.memprof_get(14)), bytes: Number(vm.ex.memprof_get(18)) },
+        },
+      };
+    })() : null,
   };
 }
 
@@ -533,10 +605,26 @@ function parseNbench(out) {
       unstable++;
     }
   }
-  return { values, unstable };
+  const attempts = out.match(/Number of runs:\s*(\d+)/);
+  const stdev = out.match(/Absolute standard deviation:\s*([\d.e+-]+)/i);
+  return {
+    values,
+    unstable,
+    internal_stats: attempts || stdev ? {
+      sample_count: attempts ? +attempts[1] : null,
+      mean: null,
+      standard_deviation: stdev ? +stdev[1] : null,
+      confidence_passed: unstable === 0,
+    } : null,
+  };
 }
 
 async function runNbench() {
+  if (nbenchInternalStats && !row.flag) {
+    throw new Error(
+      "NBENCH_INTERNAL_STATS=1 requires a single nbench kernel",
+    );
+  }
   if (profile && !row.flag) {
     throw new Error("PROFILE=1 requires a single nbench kernel, not row=nbench");
   }
@@ -552,21 +640,23 @@ async function runNbench() {
     await readFile(join(ARTIFACTS, "root-nbench.bin")),
   );
   await bootBuildroot(vm, disk);
+  let commandPrefix = "";
   if (row.flag) {
-    vm.consoleInput(enc.encode("echo CUSTOMRUN=T > /C\n"));
-    step(vm, 400);
+    const commandFile = ["CUSTOMRUN=T"];
     if (profile) {
       // Profiling adds a branch to every dispatch and can turn calibration
       // into a multi-minute feedback loop. These command-file settings make
       // an explicitly diagnostic, non-publishable run; timing from PROFILE=1
       // is never accepted by scorecard.mjs or ab.mjs.
-      vm.consoleInput(enc.encode("echo GLOBALMINTICKS=1 >> /C\n"));
-      step(vm, 400);
-      vm.consoleInput(enc.encode("echo MINSECONDS=1 >> /C\n"));
-      step(vm, 400);
+      commandFile.push("GLOBALMINTICKS=1", "MINSECONDS=1");
     }
-    vm.consoleInput(enc.encode(`echo ${row.flag}=T >> /C\n`));
-    step(vm, 400);
+    if (nbenchInternalStats) {
+      commandFile.push("ALLSTATS=T");
+    }
+    commandFile.push(`${row.flag}=T`);
+    commandPrefix = "mount -t tmpfs tmpfs /tmp\n" + commandFile
+      .map((line, index) => `echo ${line} ${index === 0 ? ">" : ">>"} /C\n`)
+      .join("");
   }
 
   let out = "";
@@ -575,7 +665,11 @@ async function runNbench() {
   };
   const before = beginMeasurement(vm);
   vm.consoleInput(
-    enc.encode(row.flag ? "cd / && ./nbench -c/C\n" : "cd / && ./nbench\n"),
+    enc.encode(
+      row.flag
+        ? `${commandPrefix}cd / && ./nbench -c/C\n`
+        : "cd / && ./nbench\n",
+    ),
   );
   const guardStart = performance.now();
   let complete = false;
@@ -585,7 +679,11 @@ async function runNbench() {
     if ((i & 15) === 0) {
       const values = parseNbench(out).values;
       const required = row.name ? [row.name] : NBENCH_KERNELS;
-      if (required.every((name) => values[name] != null)) {
+      const statsComplete =
+        !nbenchInternalStats ||
+        !row.name ||
+        out.includes(`Done with ${row.name}`);
+      if (required.every((name) => values[name] != null) && statsComplete) {
         complete = true;
         break;
       }
@@ -598,6 +696,9 @@ async function runNbench() {
     );
   }
   const parsed = parseNbench(out);
+  if (parsed.internal_stats && row.name) {
+    parsed.internal_stats.mean = parsed.values[row.name] ?? null;
+  }
   if (row.name && parsed.values[row.name] == null) {
     throw new Error(`${row.name} missing from nbench output`);
   }
@@ -606,6 +707,7 @@ async function runNbench() {
     metric: "iterations_per_second",
     value: row.name ? parsed.values[row.name] : parsed.values,
     unstable: parsed.unstable,
+    internal_stats: parsed.internal_stats,
     diagnostic_shortened: profile && !!row.flag,
     timeout_ms: nbenchTimeoutMs,
     input_sha256: {
@@ -616,11 +718,55 @@ async function runNbench() {
   };
 }
 
+async function runAssignmentRepro() {
+  const vm = await RV64.create(wasm);
+  configure(vm);
+  const disk = new Uint8Array(
+    await readFile(join(ARTIFACTS, "root-assignment-repro.bin")),
+  );
+  await bootBuildroot(vm, disk);
+  const binary = await readFile(join(ARTIFACTS, "assignment-repro.rv64"));
+  let out = "";
+  vm.onWrite = (_fd, bytes) => { out += new TextDecoder().decode(bytes); };
+  const before = beginMeasurement(vm);
+  const hostStart = performance.now();
+  vm.consoleInput(enc.encode("/assignment-repro\n"));
+  const guardStart = performance.now();
+  while (!out.includes("ASSIGN_REPRO_DONE")) {
+    vm.runSystem(4_000_000n);
+    await tick();
+    if (performance.now() - guardStart > 120_000) {
+      throw new Error(`assignment reproducer timed out; output tail:\n${out.slice(-2000)}`);
+    }
+  }
+  const match = out.match(/ASSIGN_REPRO checksum=([0-9a-f]{16}) reps=(\d+)/);
+  if (!match) throw new Error(`assignment reproducer result missing; output:\n${out}`);
+  if (match[1] !== "f168198e29a44860") {
+    throw new Error(`assignment reproducer checksum mismatch: ${match[1]}`);
+  }
+  const hostElapsedMs = performance.now() - hostStart;
+  return {
+    row: rowKey,
+    metric: "fixed_work",
+    value: +match[2],
+    checksum: match[1],
+    diagnostic_only: true,
+    host_elapsed_ms: hostElapsedMs,
+    input_sha256: {
+      ...commonInputSha256,
+      disk: sha256(disk),
+      binary: sha256(binary),
+    },
+    ...finishMeasurement(vm, before),
+  };
+}
+
 let result;
 if (row.kind === "compute") result = await runCompute();
 else if (row.kind === "boot") result = await runBoot();
 else if (row.kind === "python") result = await runPython();
 else if (row.kind === "compile") result = await runCompile();
+else if (row.kind === "assignment-repro") result = await runAssignmentRepro();
 else result = await runNbench();
 
 console.log(
@@ -642,6 +788,12 @@ console.log(
       bpage: process.env.BPAGE ?? null,
       sbspace: process.env.SBSPACE ?? null,
       nbench_timeout_ms: nbenchTimeoutMs,
+      nbench_internal_stats: nbenchInternalStats,
+      memory_profile: memProfile,
+      register_profile: regProfile,
+      size_profile: sizeProfile,
+      register_stress: regStress,
+      multi_latch: process.env.MULTILATCH ?? null,
     },
     wasm_sha256: sha256(wasm),
   })}`,

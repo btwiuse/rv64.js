@@ -292,6 +292,18 @@ pub struct JitLayout {
     /// Full-system memory layout (mutually exclusive with `mem`). When
     /// both are None, loads/stores end the block.
     pub sys: Option<SysMem>,
+    /// Optional diagnostic counters: memory paths, register-boundary totals,
+    /// and execution-weighted GPR entry/exit width buckets. None emits no code.
+    pub mem_profile: Option<[u32; 17]>,
+    /// Diagnostic-only: emit a second, semantics-preserving copy of every
+    /// GPR prologue load and exit store to measure boundary-traffic leverage.
+    pub reg_stress: bool,
+    /// Base of 31 entry-load followed by 31 exit-store per-GPR counters.
+    /// Zero disables identity profiling without emitting any counter code.
+    pub reg_profile_base: u32,
+    /// Diagnostic/promotion candidate: try the non-destructive LD+LHU
+    /// multi-latch loop detector before the ordinary loop detector.
+    pub multi_latch: bool,
     /// Cell that every block writes with the number of guest instructions
     /// it actually retired before returning. Sys blocks with inline memory
     /// ops can bail mid-block (TLB miss / MMIO), so the dispatcher must read
@@ -344,6 +356,10 @@ impl JitLayout {
             pc_addr: 256,
             mem: None,
             sys: None,
+            mem_profile: None,
+            reg_stress: false,
+            reg_profile_base: 0,
+            multi_latch: false,
             retired_addr: 264,
             f_base: 0,
             fcsr_addr: 0,
@@ -461,6 +477,30 @@ struct Ctx {
 }
 
 impl Ctx {
+    fn memprof_addr_inc(m: &mut WasmModule, addr: u32) {
+        if addr == 0 {
+            return;
+        }
+        let addr = addr as u64;
+        m.i32_const(0);
+        m.i32_const(0).i64_load(addr).i64_const(1).op(I64_ADD);
+        m.i64_store(addr);
+    }
+
+    fn memprof_inc(&self, m: &mut WasmModule, index: usize) {
+        let Some(addrs) = self.lay.mem_profile else { return };
+        Self::memprof_addr_inc(m, addrs[index]);
+    }
+
+    fn regprof_inc(m: &mut WasmModule, base: u32, index: usize) {
+        if base != 0 {
+            Self::memprof_addr_inc(m, base + index as u32 * 8);
+        }
+    }
+
+    fn reg_width_bucket(n: u32) -> usize {
+        if n <= 4 { 0 } else if n <= 8 { 1 } else if n <= 16 { 2 } else { 3 }
+    }
     /// Emit `push x[r]` (reads the register; x0 is constant 0). Reads the
     /// cached local if the register has one, else falls back to memory.
     fn push_reg(&self, m: &mut WasmModule, r: usize) {
@@ -594,6 +634,8 @@ impl Ctx {
             self.push_freg(m, s2);
             m.i64_const(0x7fff_ffff).op(I64_AND).op(I64_EQZ);
             m.op(IF).op(VOID);
+            self.memprof_inc(m, 3);
+            self.memprof_inc(m, 4);
             self.bail(m, pc, n);
             m.op(END);
         }
@@ -789,6 +831,10 @@ impl Ctx {
     /// interpreter (which reads registers from state) sees current values.
     fn flush_writes(&self, m: &mut WasmModule) {
         let mut w = self.write_mask & self.defined.get();
+        let gpr_stores = w.count_ones();
+        if gpr_stores != 0 {
+            self.memprof_inc(m, 13 + Self::reg_width_bucket(gpr_stores));
+        }
         while w != 0 {
             let r = w.trailing_zeros() as usize;
             w &= w - 1;
@@ -796,6 +842,13 @@ impl Ctx {
                 m.i32_const(0)
                     .local_get(self.reg_local[r])
                     .i64_store(self.lay.x_base as u64 + r as u64 * 8);
+                if self.lay.reg_stress {
+                    m.i32_const(0)
+                        .local_get(self.reg_local[r])
+                        .i64_store(self.lay.x_base as u64 + r as u64 * 8);
+                }
+                self.memprof_inc(m, 7);
+                Self::regprof_inc(m, self.lay.reg_profile_base, 31 + r - 1);
             }
         }
         let mut w = self.fp_write_mask & self.fp_defined.get();
@@ -806,6 +859,7 @@ impl Ctx {
                 m.i32_const(0)
                     .local_get(self.fp_local[r])
                     .i64_store(self.lay.f_base as u64 + r as u64 * 8);
+                self.memprof_inc(m, 8);
             }
         }
     }
@@ -1450,6 +1504,7 @@ impl Ctx {
         if let Some((cpg, coff)) = cache {
             m.local_get(PAGE).local_get(cpg).op(I64_EQ);
             m.op(IF).op(0x7f); // i32 result: the linear index
+            self.memprof_inc(m, 0);
             m.local_get(VA).local_get(coff).op(I64_ADD).op(I32_WRAP_I64);
             m.op(ELSE);
             // slow probe (host-filled on miss); cache (page, off) for later
@@ -1507,15 +1562,18 @@ impl Ctx {
         m.local_get_i32(self.idxb).i64_load_at(tag_base as u64);
         m.local_get(PAGE).op(I64_NE);
         m.op(IF).op(VOID);
+        self.memprof_inc(m, 2);
         // miss: off = tlb_fill(va, store)
         m.local_get(VA).i32_const(store as i32);
         m.call_tlb_fill();
         m.local_set(SCR2);
         m.local_get(SCR2).i64_const(-1).op(I64_EQ);
         m.op(IF).op(VOID);
+        self.memprof_inc(m, 4);
         self.bail(m, pc, n);
         m.op(END);
         m.op(ELSE);
+        self.memprof_inc(m, 1);
         m.local_get_i32(self.idxb).i64_load_at(off_base as u64);
         m.local_set(SCR2);
         m.op(END);
@@ -1543,8 +1601,10 @@ impl Ctx {
         m.local_get_i32(self.idxb).i64_load_at(tag_base as u64);
         m.local_get(PAGE).op(I64_NE);
         m.op(IF).op(VOID);
+        self.memprof_inc(m, 4);
         self.bail(m, pc, n);
         m.op(END);
+        self.memprof_inc(m, 1);
     }
 }
 
@@ -1977,6 +2037,7 @@ fn alu_handled(op: u32, f7: u32, f3: u32) -> bool {
 struct LoopRegion {
     end_pc: u64,
     loops: Vec<(u64, u64)>,
+    unconditional_latch: bool,
 }
 
 /// Detect and fully validate a structured loop region at `start_pc` (which must
@@ -1985,6 +2046,21 @@ struct LoopRegion {
 /// register file is present. Returns None for anything not provably structured
 /// (the caller then compiles a plain basic block).
 fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option<LoopRegion> {
+    if lay.multi_latch {
+        if let Some(region) = loop_region_mode(code, base, start_pc, lay, true) {
+            return Some(region);
+        }
+    }
+    loop_region_mode(code, base, start_pc, lay, false)
+}
+
+fn loop_region_mode(
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    lay: &JitLayout,
+    extend: bool,
+) -> Option<LoopRegion> {
     // Compile loops for user-mode (flat memory) or system-mode (inline TLB).
     // System memory ops can bail mid-iteration; the compiled loop handles that
     // (flush locals, set pc, report ITER-retired, return) — see translate_loop.
@@ -1995,6 +2071,10 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
     // collecting every conditional branch. Every instruction must be handled.
     let mut branches: Vec<(u64, u64, u64)> = Vec::new(); // (pc, target, next)
     let mut end_pc = None;
+    let mut ld_count = 0u32;
+    let mut lhu_count = 0u32;
+    let mut other_mem = 0u32;
+    let mut unconditional_latch = false;
     let mut pc = start_pc;
     let mut n = 0u32;
     while n < MAX_BLOCK as u32 {
@@ -2021,10 +2101,20 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
                 if funct3(insn) == 7 {
                     return None;
                 }
+                if extend {
+                    match funct3(insn) {
+                        3 => ld_count += 1,
+                        5 => lhu_count += 1,
+                        _ => other_mem += 1,
+                    }
+                }
             }
             0x23 => {
                 if funct3(insn) > 3 {
                     return None;
+                }
+                if extend {
+                    other_mem += 1;
                 }
             }
             0x2f if lay.sys.is_some() => {
@@ -2036,6 +2126,9 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
                 if !matches!(funct3(insn), 2 | 3) {
                     return None;
                 }
+                if extend {
+                    other_mem += 1;
+                }
             }
             0x63 => {
                 if !matches!(funct3(insn), 0 | 1 | 4 | 5 | 6 | 7) {
@@ -2044,9 +2137,27 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
                 let t = pc.wrapping_add(imm_b(insn) as u64);
                 branches.push((pc, t, next));
                 if t == start_pc {
-                    end_pc = Some(next);
-                    break;
+                    if !extend {
+                        end_pc = Some(next);
+                        break;
+                    }
                 }
+            }
+            0x6f if extend => {
+                let t = pc.wrapping_add(imm_j(insn) as u64);
+                let continues = branches.iter().filter(|&&(_, bt, _)| bt == start_pc).count();
+                if rd(insn) != 0
+                    || t != start_pc
+                    || continues < 2
+                    || ld_count != 1
+                    || lhu_count != 1
+                    || other_mem != 0
+                {
+                    return None;
+                }
+                end_pc = Some(next);
+                unconditional_latch = true;
+                break;
             }
             _ => return None, // calls / jumps / system / AMO / single-FP end it
         }
@@ -2075,6 +2186,11 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
         }
     }
     loops.sort_by_key(|&(h, _)| h);
+    if unconditional_latch {
+        if let Some(e) = loops.iter_mut().find(|(h, _)| *h == start_pc) {
+            e.1 = end_pc;
+        }
+    }
     // Reject duplicate headers and improperly-overlapping loop ranges.
     for i in 0..loops.len() {
         let (hi, ei) = loops[i];
@@ -2122,7 +2238,7 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
     if loops.is_empty() {
         return None;
     }
-    Some(LoopRegion { end_pc, loops })
+    Some(LoopRegion { end_pc, loops, unconditional_latch })
 }
 
 /// Register scan over a whole loop region `[start_pc, end_pc)` (linear; every
@@ -2376,20 +2492,45 @@ fn build_ctx_load(
         None => (touched, fp_touched),
     };
     let mut t = load_g;
+    if t != 0 {
+        c.memprof_inc(&mut m, 9 + Ctx::reg_width_bucket(t.count_ones()));
+    }
     while t != 0 {
         let r = t.trailing_zeros() as usize;
         t &= t - 1;
-        m.i32_const(0)
-            .i64_load(lay.x_base as u64 + r as u64 * 8)
-            .local_set(reg_local[r]);
+            m.i32_const(0)
+                .i64_load(lay.x_base as u64 + r as u64 * 8)
+                .local_set(reg_local[r]);
+            if lay.reg_stress {
+                m.i32_const(0)
+                    .i64_load(lay.x_base as u64 + r as u64 * 8)
+                    .local_set(reg_local[r]);
+            }
+            Ctx::regprof_inc(&mut m, lay.reg_profile_base, r - 1);
+            if let Some(addrs) = lay.mem_profile {
+                let addr = addrs[5] as u64;
+                if addr != 0 {
+                m.i32_const(0);
+                m.i32_const(0).i64_load(addr).i64_const(1).op(I64_ADD);
+                m.i64_store(addr);
+                }
+            }
     }
     let mut t = load_f;
     while t != 0 {
         let r = t.trailing_zeros() as usize;
         t &= t - 1;
-        m.i32_const(0)
-            .i64_load(lay.f_base as u64 + r as u64 * 8)
-            .local_set(fp_local[r]);
+            m.i32_const(0)
+                .i64_load(lay.f_base as u64 + r as u64 * 8)
+                .local_set(fp_local[r]);
+            if let Some(addrs) = lay.mem_profile {
+                let addr = addrs[6] as u64;
+                if addr != 0 {
+                m.i32_const(0);
+                m.i32_const(0).i64_load(addr).i64_const(1).op(I64_ADD);
+                m.i64_store(addr);
+                }
+            }
     }
     if want_fma {
         // memory page-cache locals ([8]=load pg, [10]=store pg) must start
@@ -4437,6 +4578,23 @@ fn translate_loop(
         }
         let (insn, ilen) = fetch(code, base, pc)?;
         let next = pc.wrapping_add(ilen);
+        if region.unconditional_latch && opcode(insn) == 0x6f {
+            let target = pc.wrapping_add(imm_j(insn) as u64);
+            if rd(insn) != 0 || target >= pc {
+                return None;
+            }
+            m.local_get(ITER)
+                .i64_const((seg + 1) as i64)
+                .op(I64_ADD)
+                .local_set(ITER);
+            seg = 0;
+            let li = scopes.iter().rposition(|&(k, _, h)| k == 1 && h == target)?;
+            let depth = (scopes.len() - 1 - li) as u32;
+            m.br(depth);
+            pc = next;
+            static_n += 1;
+            continue;
+        }
         if opcode(insn) != 0x63 {
             // Pass the SEGMENT-relative completed count: a mid-block bail
             // reports ITER (flushed segments) + this (see Ctx::bail).
@@ -5519,9 +5677,6 @@ mod tests {
         assert!(libm_rate >= 90, "libm-like hit rate too low: {libm_rate}%");
     }
 
-
-    use super::*;
-
     // sum 1..10 program from the core tests
     const PROG: [u32; 7] = [
         0x00000093, 0x00100113, 0x00b00193, 0x002080b3, 0x00110113, 0xfe311ce3, 0x00000073,
@@ -5529,6 +5684,71 @@ mod tests {
 
     fn code_bytes() -> Vec<u8> {
         PROG.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    fn branch(f3: u32, rs1: u32, rs2: u32, off: i32) -> u32 {
+        let imm = off as u32;
+        0x63
+            | (f3 << 12)
+            | (rs1 << 15)
+            | (rs2 << 20)
+            | (((imm >> 11) & 1) << 7)
+            | (((imm >> 1) & 0xf) << 8)
+            | (((imm >> 5) & 0x3f) << 25)
+            | (((imm >> 12) & 1) << 31)
+    }
+
+    fn jal(rd: u32, off: i32) -> u32 {
+        let imm = off as u32;
+        0x6f
+            | (rd << 7)
+            | (((imm >> 12) & 0xff) << 12)
+            | (((imm >> 11) & 1) << 20)
+            | (((imm >> 1) & 0x3ff) << 21)
+            | (((imm >> 20) & 1) << 31)
+    }
+
+    #[test]
+    fn multi_latch_falls_back_to_ordinary_loop() {
+        let code = code_bytes();
+        let mut ordinary = JitLayout::bare();
+        ordinary.mem = Some((0, 0x2000));
+        let expected = loop_region(&code, 0x1000, 0x100c, &ordinary).unwrap();
+
+        let mut enabled = ordinary;
+        enabled.multi_latch = true;
+        let actual = loop_region(&code, 0x1000, 0x100c, &enabled).unwrap();
+        assert_eq!(actual.end_pc, expected.end_pc);
+        assert_eq!(actual.loops, expected.loops);
+        assert!(!actual.unconditional_latch);
+        assert_eq!(translate_block(&code, 0x1000, 0x100c, enabled).unwrap().n_insns, 3);
+    }
+
+    #[test]
+    fn detects_ld_lhu_multi_latch_loop() {
+        // ld t0,0(a0); bnez t0,start; lhu t1,0(a1);
+        // bnez t1,start; j start
+        let words = [
+            0x03 | (5 << 7) | (3 << 12) | (10 << 15),
+            branch(1, 5, 0, -4),
+            0x03 | (6 << 7) | (5 << 12) | (11 << 15),
+            branch(1, 6, 0, -12),
+            jal(0, -16),
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut lay = JitLayout::bare();
+        lay.mem = Some((0, 0x2000));
+
+        let ordinary = loop_region(&code, 0, 0, &lay).unwrap();
+        assert_eq!(ordinary.end_pc, 8);
+        assert!(!ordinary.unconditional_latch);
+
+        lay.multi_latch = true;
+        let extended = loop_region(&code, 0, 0, &lay).unwrap();
+        assert_eq!(extended.end_pc, 20);
+        assert!(extended.unconditional_latch);
+        assert_eq!(extended.loops, vec![(0, 20)]);
+        assert_eq!(translate_block(&code, 0, 0, lay).unwrap().n_insns, 5);
     }
 
     #[test]

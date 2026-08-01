@@ -96,11 +96,20 @@ cp "$HERE/nbench-extras/fastmem.c" fastmem.c
 rv64cc -DLINUX -O2 -static -fno-builtin-memmove -fno-builtin-memcpy -o "$OUT/nbench.rv64" \
    nbench0.c nbench1.c sysspec.c misc.c emfloat.c hwstub.c fastmem.c
 echo "  $OUT/nbench.rv64: $(file -b "$OUT/nbench.rv64" | cut -d, -f1-2)"
+rv64cc -O2 -static -s -o "$OUT/assignment-repro.rv64" \
+   "$HERE/nbench-extras/assignment-repro.c"
+echo "  $OUT/assignment-repro.rv64: $(file -b "$OUT/assignment-repro.rv64" | cut -d, -f1-2)"
 # bake into the buildroot rootfs image the nbench harness boots
 cp "$HERE/../../web/images/root-riscv64.bin" "$OUT/root-nbench.bin"
+debugfs -w -R "rm /C" "$OUT/root-nbench.bin" >/dev/null 2>&1 || true
+debugfs -w -R "symlink C /tmp/C" "$OUT/root-nbench.bin" >/dev/null
 debugfs -w -R "rm /nbench" "$OUT/root-nbench.bin" >/dev/null 2>&1 || true
 debugfs -w -R "write $OUT/nbench.rv64 nbench" "$OUT/root-nbench.bin" >/dev/null 2>&1
 debugfs -w -R "sif /nbench mode 0100755" "$OUT/root-nbench.bin" >/dev/null 2>&1
+cp "$OUT/root-nbench.bin" "$OUT/root-assignment-repro.bin"
+debugfs -w -R "rm /nbench" "$OUT/root-assignment-repro.bin" >/dev/null
+debugfs -w -R "write $OUT/assignment-repro.rv64 assignment-repro" "$OUT/root-assignment-repro.bin" >/dev/null
+debugfs -w -R "sif /assignment-repro mode 0100755" "$OUT/root-assignment-repro.bin" >/dev/null
 echo "  baked $OUT/root-nbench.bin"
 
-echo "done: tcc.i386 tcc.rv64 nbench.i386 nbench.rv64 root-nbench.bin in $OUT"
+echo "done: tcc.i386 tcc.rv64 nbench.i386 nbench.rv64 assignment-repro.rv64 root-nbench.bin root-assignment-repro.bin in $OUT"

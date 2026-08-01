@@ -145,6 +145,7 @@ ARTIFACTS=$ARTIFACTS WASM=$CANDIDATE_WASM PROFILE=1 \
 The result includes:
 
 - JIT-retired instructions and dispatch count;
+- sampled source→target transition counts and instructions per transition;
 - instructions per dispatch;
 - compiled block and superblock lifecycle counters;
 - inline-cache extensions and TLB fills;
@@ -162,6 +163,33 @@ Per-PC profiling is intended for short rows such as Compile and Python.
 Dispatch-heavy nbench kernels remain multi-minute runs even with sampling; use
 their always-on aggregate JIT counters for normal A/B. A deliberately slow
 nbench profile requires `ALLOW_SLOW_PROFILE=1` and is diagnostic only.
+
+For Assignment variance work, `NBENCH_INTERNAL_STATS=1` preserves the
+canonical workload and includes nbench's sample count, mean, standard
+deviation, and confidence decision in the worker JSON.  The separate
+`assignment-repro` worker row is fixed-work and checksum-bearing; it is for
+semantic, counter, and engine-tier diagnostics only and can never count as a
+scorecard row:
+
+```sh
+ARTIFACTS=target/bench NBENCH_INTERNAL_STATS=1 node rv64-scorecard-worker.mjs assignment
+ARTIFACTS=target/bench PROFILE=1 node rv64-scorecard-worker.mjs assignment-repro
+node --liftoff-only rv64-scorecard-worker.mjs assignment-repro # explanatory only
+```
+
+The generated-code profilers are diagnostic-only and separated so their own
+instrumentation does not contaminate unrelated measurements:
+
+- `MEMPROFILE=1`: page-cache/TLB hits, fills, crossings, and memory bailouts.
+- `REGPROFILE=1`: executed GPR/FP prologue loads and exit spills, plus
+  execution-weighted GPR entry/exit width buckets (≤4, ≤8, ≤16, >16) and
+  per-GPR load/spill counts.
+- `SIZEPROFILE=1`: module counts and bytes in ≤1K, ≤4K, ≤16K, and >16K buckets;
+  this mode emits no guest-path counter code.
+- `REGSTRESS=1`: duplicate every GPR prologue load and exit spill without
+  changing semantics, to bound the wall-time leverage of boundary traffic.
+
+Never use wall time from the first two modes as score evidence.
 
 ## 4. Authoritative cross-emulator promotion
 
