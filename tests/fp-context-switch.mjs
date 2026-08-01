@@ -22,7 +22,7 @@ const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
 const binPath = ARTIFACTS && join(ARTIFACTS, "xbench", "rvbench_fs.rv64");
 if (!ARTIFACTS || !existsSync(binPath)) {
   console.log("SKIP fp-context-switch (need ARTIFACTS with xbench/rvbench_fs.rv64)");
-  process.exit(0);
+  process.exit(process.env.REQUIRE_ALL === "1" ? 2 : 0);
 }
 const { RV64 } = await import(join(root, "web/rv64.js"));
 const wasm = await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"));

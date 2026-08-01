@@ -1,8 +1,12 @@
 # Validation status
 
-Last full run: 2026-07-22. Reproduce everything with `tests/run-all.sh`
-(all tools provided by `nix develop`; stages skip gracefully if a tool is
-missing).
+Last strict full run: 2026-07-31. Reproduce it with
+`REQUIRE_ALL=1 tests/run-all.sh` inside `nix develop`; strict mode fails if a
+required tool, benchmark artifact, or modern-system kernel is unavailable.
+The run passed all eight stages with no skips: release workspace tests, guest
+builds, three QEMU differentials, 134 ISA tests, 109 Spike lockstep tests, 193
+architecture signatures, Wasm smoke/JIT/FP/AMO differentials, and the modern
+OpenSBI/Linux boot smoke test.
 
 ## Official riscv-tests (ISA suites, p-variants, 134 tests)
 
@@ -35,7 +39,7 @@ Runner: `tests/run-isa-tests.sh` (needs gcc-riscv64-unknown-elf).
 
 ## JIT
 
-- `wasm-validate` (wabt): 231/231 modules emitted by `translate_block`
+- Wasm emitter validation: 338/338 modules emitted by `translate_block`
   from every halfword offset of a real guest binary (i.e. mostly garbage
   input) are structurally valid wasm.
 - Interpreter-vs-JIT: guests produce bit-identical results with the JIT

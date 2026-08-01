@@ -91,8 +91,8 @@ if command -v node >/dev/null 2>&1; then
     node tests/http-relay.mjs || FAILED=1
     node tests/wasm-smoke.mjs || FAILED=1
     node tests/jit-differential.mjs || FAILED=1
-    node tests/fp-context-switch.mjs || FAILED=1  # SKIPs without ARTIFACTS
-    node tests/amo-diff.mjs || FAILED=1  # SKIPs without ARTIFACTS
+    ARTIFACTS="${ARTIFACTS:-target/bench}" node tests/fp-context-switch.mjs || FAILED=1
+    ARTIFACTS="${ARTIFACTS:-target/bench}" node tests/amo-diff.mjs || FAILED=1
 else
     skip "node not found"
 fi
