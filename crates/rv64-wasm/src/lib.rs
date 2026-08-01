@@ -772,6 +772,10 @@ static mut DPROF_ON: bool = false;
 /// JS worker while shift=0 preserves the original exact profiler.
 static mut DPROF_SAMPLE_SHIFT: u32 = 0;
 static mut DPROF_TICK: u64 = 0;
+static mut DPROF_BLOCK_CALLS: u64 = 0;
+static mut DPROF_BLOCK_INSNS: u64 = 0;
+static mut DPROF_REGION_CALLS: u64 = 0;
+static mut DPROF_REGION_INSNS: u64 = 0;
 
 #[no_mangle]
 pub extern "C" fn dprof_set(on: u32) {
@@ -786,6 +790,10 @@ pub extern "C" fn dprof_set(on: u32) {
             EPROF_DST = [0; DPROF_N];
             EPROF_CNT = [0; DPROF_N];
             EPROF_RET = [0; DPROF_N];
+            DPROF_BLOCK_CALLS = 0;
+            DPROF_BLOCK_INSNS = 0;
+            DPROF_REGION_CALLS = 0;
+            DPROF_REGION_INSNS = 0;
         }
     }
 }
@@ -970,6 +978,10 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             43 => BATCHES,
             44 => BATCH_MEMBERS,
             45 => IC_EXTENDS,
+            46 => DPROF_BLOCK_CALLS,
+            47 => DPROF_BLOCK_INSNS,
+            48 => DPROF_REGION_CALLS,
+            49 => DPROF_REGION_INSNS,
             _ => 0,
         }
     }
@@ -2415,6 +2427,17 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
             if dprof_sample {
                 dprof_hit(pc, retired);
                 eprof_hit(pc, m.cpu.pc, retired);
+            }
+            if unsafe { DPROF_ON } {
+                unsafe {
+                    if idx & SB_IDX_BIT != 0 {
+                        DPROF_REGION_CALLS += 1;
+                        DPROF_REGION_INSNS += retired;
+                    } else {
+                        DPROF_BLOCK_CALLS += 1;
+                        DPROF_BLOCK_INSNS += retired;
+                    }
+                }
             }
             retired_sum += retired;
             chained += 1;

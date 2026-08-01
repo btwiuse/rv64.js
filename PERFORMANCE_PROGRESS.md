@@ -474,6 +474,17 @@ synchronous registration and single-fallback-opcode work. The next Compile
 diagnostic must attribute execution cost inside generated code by lowering
 category; do not infer it from static module bytes alone.
 
+**E020 module-kind execution attribution:** the opt-in dispatch profiler now
+counts exact calls and retired instructions separately for ordinary trace
+blocks and region/superblock functions. Pinned Compile retired 322,691,608 of
+322,695,164 JIT instructions (99.9989%) in ordinary traces across 16,615,572
+calls. Region functions retired only 3,556 instructions in 632 calls despite
+3,109 installed region entries. Compile's generated execution is therefore
+not a superblock problem: landing, extension, region register unions, and
+asynchronous large-module tuning cannot materially change the row. The next
+diagnostic is trace-only and must attribute execution-weighted instruction
+categories within ordinary traces.
+
 ### P4 — Python coverage stability
 
 Work on Python only if replicated candidate-relative trials still show a loss.
@@ -529,6 +540,7 @@ must add one row immediately after its decision.
 | E017 | 2026-08-01 | REJECTED | Corrected multi-latch reconstruction plus LD+LHU scan-only selector | Broad `ab-2026-07-31T23-55-10.json`: Assignment +74.5%. Scan-only `23-55-49`: +69.5%; other-only `23-56-13`: −27.1%. Scan-only three-pair `23-58-08`: +60.7%. Focused guard `00-01-14` was invalid only for unstable Fourier control; valid Fourier retry `00-02-32` tied. Valid authoritative 3×/3× `scorecard-2026-08-01T00-23-49.json`, host spread 1.05×. | Score fell to 7/13. Assignment flipped to a 1.33× win, but ALU, Python, String Sort, Bitfield, and Fourier were losses; Compile remained a loss. Reject and remove all candidate/runtime-mode code. Baseline stays 11/13. |
 | E018 | 2026-08-01 | LANDED | Non-destructive LD+LHU multi-latch lookahead with unchanged ordinary-loop fallback | Assignment one-pair `ab-2026-08-01T00-31-22.json` (+64.8%); valid three-pair `00-32-46` (+59.4%, 0.4%/0.4% MAD); guards `00-36-58` plus valid Fourier retry `00-38-04`; valid authoritative reports `scorecard-2026-08-01T00-57-47.json` and `01-18-18`, both 11/13; direct Python `ab-2026-08-01T00-59-00.json` tied with candidate 7.7% faster; exact detector/fallback unit tests and all eight correctness stages passed; promoted Wasm `91ab401df4b6…`. | Assignment flips from loss to 1.29× win without reproducing E017's regressions. Score remains 11/13 because bimodal Python was independently slow in both scorecards; current losses are Python and Compile. Default enabled; retain the setter for controlled diagnostics. |
 | E019 | 2026-08-01 | DIAGNOSTIC | Expose existing host JIT registration timings and inspect Compile fallback concentration | Pinned Compile: 2,898.4 ms total; 3,764 synchronous modules / 17.07 MB; 188.9 ms module compilation; 234.3 ms complete registration. `PROFILE=1` reproduced aggregate counters and attributed 17.31M interpreted instructions; largest starting-instruction bucket was 313k (1.8%). | Synchronous registration has an impossible-elimination ceiling of 8.1%, below the gate, and fallback work is fragmented. Close both bounded axes. Next measure execution-weighted generated lowering categories. |
+| E020 | 2026-08-01 | DIAGNOSTIC | Exact ordinary-trace versus region-function execution split under `PROFILE=1` | Pinned Compile: ordinary traces 16,615,572 calls / 322,691,608 retired instructions; regions 632 / 3,556; total JIT retired 322,695,164; aggregate counters reproduce E019. | Ordinary traces execute 99.9989% of JIT instructions. Close all Compile superblock/region tuning; perform the next lowering-category attribution only in the trace backend. |
 
 ### Required record for new experiments
 

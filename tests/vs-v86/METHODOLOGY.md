@@ -194,6 +194,10 @@ Every worker result also reports `host_jit.sync_modules`, `emitted_bytes`,
 counters that are already maintained in normal runs, so they add no
 generated-code instrumentation and bound both synchronous V8 compilation and
 complete compile/instantiate/table-install shares of a row's wall time.
+With `PROFILE=1`, the JIT stats additionally split calls and retired guest
+instructions between ordinary trace blocks and region/superblock functions.
+Those four counters are exact (not sampled); the detailed per-PC and edge
+tables remain sampled according to `PROFILE_SHIFT`.
 
 Never use wall time from the first two modes as score evidence.
 
