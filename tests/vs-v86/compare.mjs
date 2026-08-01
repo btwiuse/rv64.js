@@ -18,9 +18,10 @@
 
 import { readFile, copyFile, access } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
-const ROOT = "/home/darren/src/arm64.js";
+const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
 if (!ARTIFACTS) {
   console.error("set ARTIFACTS=<dir containing xbench/ benchmark binaries>");

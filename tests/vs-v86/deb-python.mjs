@@ -3,7 +3,8 @@
 // time `python3 /fib.py`, JIT vs interpreter, with the wall-clock time source.
 //   ARTIFACTS=<dir-with-deb-rootfs.ext4> node tests/vs-v86/deb-python.mjs
 import { readFile } from "node:fs/promises";
-const root = "/home/darren/src/arm64.js";
+import { fileURLToPath } from "node:url";
+const root = fileURLToPath(new URL("../..", import.meta.url));
 const { RV64 } = await import(root + "/web/rv64.js");
 const wasm = await readFile(root + "/target/wasm32-unknown-unknown/release/rv64_wasm.wasm");
 const img = f => readFile(f).then(b => new Uint8Array(b));

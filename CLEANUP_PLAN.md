@@ -69,8 +69,9 @@ history management.
   - `tests/vs-v86/xbench-user.mjs`
   - `tests/vs-v86/v86-boot.mjs`
   - `tests/vs-v86/tstamp.py`
-- Some scripts hard-code `/home/darren/src/arm64.js` instead of deriving the
-  repository root.
+- The machine-specific repository paths in active comparison scripts were
+  removed during the release-readiness pass; historical command examples may
+  still show the original checkout path.
 - Correctness validation and performance measurement do not have clearly
   separated canonical entry points.
 

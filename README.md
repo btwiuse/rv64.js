@@ -75,8 +75,11 @@ nix develop
 
 # the full automated suite: cargo tests, guest builds, qemu differential,
 # official riscv-tests (134/134), wasm build + Node smoke (user-mode, JIT,
-# Linux boot). Stages skip gracefully when a tool is missing.
+# Linux boot). Unavailable external stages are reported as skips.
 tests/run-all.sh
+
+# release gate: treat any unavailable tool-dependent stage as a failure
+REQUIRE_ALL=1 tests/run-all.sh
 
 # individual pieces
 cargo test --workspace                  # unit + integration tests
@@ -89,6 +92,8 @@ make -C reference/tinyemu CONFIG_FS_NET= CONFIG_SDL= CONFIG_X86EMU= CONFIG_SLIRP
 ```
 
 Validation status lives in [tests/VALIDATION.md](tests/VALIDATION.md).
+The source-release checklist and known gate limitations live in
+[RELEASING.md](RELEASING.md).
 
 ## Layout
 
@@ -99,5 +104,5 @@ Validation status lives in [tests/VALIDATION.md](tests/VALIDATION.md).
 
 ## License
 
-MIT. `reference/tinyemu/` retains its own MIT license and copyright
+MIT; see [LICENSE](LICENSE). `reference/tinyemu/` retains its own MIT license and copyright
 (Fabrice Bellard); see `reference/README.md`.

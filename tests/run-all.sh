@@ -1,10 +1,11 @@
 #!/bin/sh
 # rv64.js full test suite. Run from anywhere; skips stages whose external
-# tools are missing (each skip is reported). Exit 0 = everything that could
-# run passed.
+# tools are missing (each skip is reported). Set REQUIRE_ALL=1 for a release
+# gate where a skipped tool-dependent stage is a failure. Exit 0 means every
+# stage that ran passed, and in strict mode that every stage was available.
 #
 # Stages:
-#   1. cargo tests        unit + guest-integration tests (23)
+#   1. cargo tests        unit + guest-integration tests
 #   2. guest builds       Rust->riscv64gc-musl test binaries
 #   3. qemu differential  guests bit-identical on qemu-riscv64
 #   4. riscv-tests        official ISA suite, 134 tests (cross-gcc needed)
@@ -24,9 +25,13 @@ if [ -z "${RUNALL_PIPEFAIL:-}" ] && command -v bash >/dev/null 2>&1; then
     RUNALL_PIPEFAIL=1 exec bash "$0" "$@"
 fi
 (set -o pipefail) 2>/dev/null && set -o pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 FAILED=0
 note() { printf '\n=== %s\n' "$*"; }
+skip() {
+    echo "SKIP ($*)"
+    if [ "${REQUIRE_ALL:-0}" = 1 ]; then FAILED=1; fi
+}
 
 note "1/8 cargo tests"
 cargo test --workspace --release -q || FAILED=1
@@ -52,7 +57,7 @@ if command -v qemu-riscv64 >/dev/null 2>&1; then
         fi
     done
 else
-    echo "SKIP (qemu-riscv64 not found)"
+    skip "qemu-riscv64 not found"
 fi
 
 note "4/8 riscv-tests ISA suite"
@@ -60,7 +65,7 @@ PREFIX="${RISCV_PREFIX:-riscv64-unknown-elf-}"
 if command -v "${PREFIX}gcc" >/dev/null 2>&1; then
     RISCV_PREFIX="$PREFIX" tests/run-isa-tests.sh || FAILED=1
 else
-    echo "SKIP (${PREFIX}gcc not found; set RISCV_PREFIX or enter nix develop)"
+    skip "${PREFIX}gcc not found; set RISCV_PREFIX or enter nix develop"
 fi
 
 note "5/8 spike lockstep differential"
@@ -69,14 +74,14 @@ if command -v spike >/dev/null 2>&1 && [ -d tests/riscv-tests/isa ]; then
         tests/riscv-tests/isa/rv64ud-p-* tests/riscv-tests/isa/rv64uf-p-* \
         2>/dev/null | grep -v dump) | tail -3 || FAILED=1
 else
-    echo "SKIP (spike or built riscv-tests missing; run stage 4 first)"
+    skip "spike or built riscv-tests missing; run stage 4 first"
 fi
 
 note "6/8 riscv-arch-test signatures vs Spike"
 if command -v spike >/dev/null 2>&1 && command -v "${PREFIX}gcc" >/dev/null 2>&1; then
     tests/run-arch-tests.sh | tail -1 || FAILED=1
 else
-    echo "SKIP (spike or ${PREFIX}gcc not found)"
+    skip "spike or ${PREFIX}gcc not found"
 fi
 
 note "7/8 wasm build + smoke"
@@ -89,7 +94,7 @@ if command -v node >/dev/null 2>&1; then
     node tests/fp-context-switch.mjs || FAILED=1  # SKIPs without ARTIFACTS
     node tests/amo-diff.mjs || FAILED=1  # SKIPs without ARTIFACTS
 else
-    echo "SKIP (node not found)"
+    skip "node not found"
 fi
 
 note "8/8 virt-smoke (modern-system boot)"
@@ -98,7 +103,7 @@ note "8/8 virt-smoke (modern-system boot)"
 if command -v nix >/dev/null 2>&1 && nix path-info .#virt-kernel >/dev/null 2>&1; then
     tests/virt-smoke/run.sh || FAILED=1
 else
-    echo "SKIP (virt-kernel not built; run tests/virt-smoke/run.sh once to build+cache it)"
+    skip "virt-kernel not built; run tests/virt-smoke/run.sh once to build+cache it"
 fi
 
 printf '\n'

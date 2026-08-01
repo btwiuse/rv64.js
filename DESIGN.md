@@ -112,7 +112,7 @@ fflags.NX is already sticky-set — conditions under which no new flag
 information is possible — falling back to softfp otherwise. ~2x on
 FP-heavy code in wasm, verified by 600k-iteration differential fuzz.
 
-The post-1.0 roadmap lives in [ROADMAP.md](../ROADMAP.md) (perf: inline-TLB
+The post-1.0 roadmap lives in [ROADMAP.md](ROADMAP.md) (perf: inline-TLB
 JIT memory ops, block chaining, FP-in-blocks; validation: RISCOF, Spike
 lockstep; features: snapshots). virtio-net/9p were intentionally descoped from
 phase 5 — the boot target was console + blk, which is what "Linux shell in the

@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-const root = "/home/darren/src/arm64.js";
+import { join } from "node:path";
+const root = fileURLToPath(new URL("../..", import.meta.url));
 const { RV64, Stop } = await import(join(root, "web/rv64.js"));
 const wasm = new Uint8Array(await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm")));
 const elf = new Uint8Array(await readFile(process.argv[2]));

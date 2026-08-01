@@ -1,5 +1,10 @@
 # Networking and proxy handoff (updated 2026-07-27)
 
+> **Historical:** the work described here is complete. Current project status
+> and future work live in [`ROADMAP.md`](ROADMAP.md); validation status lives
+> in [`tests/VALIDATION.md`](tests/VALIDATION.md). This file is retained as an
+> implementation record and should not be used as a release checklist.
+
 Status snapshot for whoever picks up the networking/proxy work next. Read this
 before ROADMAP.md items 7/8/8b (which have the full narrative) — this is the
 condensed "what's true right now" version.

@@ -27,9 +27,10 @@
 //         fourier assignment idea huffman
 import { readFile, readdir } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
-const root = process.env.ROOT || "/home/darren/src/arm64.js";
+const root = process.env.ROOT || fileURLToPath(new URL("../..", import.meta.url));
 const ARTIFACTS = process.env.ARTIFACTS || join(root, "target/bench");
 
 // row key -> [scorecard row name, nbench DO-flag or null, higher-is-better]
