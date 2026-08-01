@@ -157,6 +157,48 @@ Use alternating fresh-page runs with at least five valid repetitions. Report
 the median and dispersion. A result below 10% is a tie for default-selection
 purposes.
 
+The initial Node harness is `tests/boot-profile.mjs`:
+
+```sh
+node tests/boot-profile.mjs fast --reps 5 --out target/boot-fast.json
+node --max-old-space-size=2048 tests/boot-profile.mjs modern --reps 5 \
+  --out target/boot-modern.json
+```
+
+It records asset loading separately, then reports Wasm creation, machine
+assembly, milestone wall time, and retired instructions. Browser automation
+must use the same schema so Node and browser results remain comparable.
+
+### Initial Node baseline (2026-08-01)
+
+Five fresh-instance repetitions on Node 26.5.0, an AMD Threadripper PRO
+5975WX, and Wasm SHA-256 `22c45e31abf366c…` produced:
+
+| Milestone/phase | Fast legacy guest | Modern `riscv-virt` guest |
+|---|---:|---:|
+| Asset reads (outside boot) | 5.0 ms | 330.4 ms |
+| Wasm creation | 7.6 ms | 6.7 ms |
+| Machine assembly/image copies | 57.9 ms | 620.0 ms |
+| OpenSBI first output | n/a | 651.3 ms / 1.70 Minsns |
+| OpenSBI complete/kernel entry | n/a | 729.0 ms / 5.90 Minsns |
+| Kernel console banner | not observable | 10,533.5 ms / 501.48 Minsns |
+| Root mounted | 999.6 ms / 35.38 Minsns | 11,774.5 ms / 555.48 Minsns |
+| Guest ready | 1,275.3 ms / 42.03 Minsns | 12,706.5 ms / 593.13 Minsns |
+
+OpenSBI execution after its first output takes a median 75.8 ms and 4.2
+million instructions. From machine assembly completing to kernel entry is
+about 109 ms total. The kernel then spends about 9.81 seconds and 495.6 million
+instructions before its buffered banner becomes visible. Direct boot can
+remove a real stage and remains required, but on this workload its theoretical
+firmware-only saving is below the 10% materiality threshold. The dominant
+speed project is the modern kernel's silent early initialization, followed by
+machine assembly/copying and post-console guest initialization.
+
+The raw local reports are generated under `target/` and are intentionally not
+versioned; rerun the commands above for comparisons. PC sampling uses the
+diagnostic `virtPc()` API to identify actual kernel entry rather than assuming
+that delayed console output marks the handoff.
+
 The no-firmware mode remains a required supported option even if its measured
 gain is below 10%. It becomes the default only if it is at least as reliable as
 the OpenSBI path and either materially faster or materially simpler for users.

@@ -1530,6 +1530,13 @@ pub extern "C" fn virt_insn_count() -> u64 {
     unsafe { VIRT.as_ref().map(|m| m.cpu.insn_count).unwrap_or(0) }
 }
 
+/// Current modern-machine guest PC (diagnostic: boot and workload profiling).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_pc() -> u64 {
+    unsafe { VIRT.as_ref().map_or(0, |m| m.cpu.pc) }
+}
+
 /// Give the next-booted machine a virtio-net NIC. Frames the guest sends arrive
 /// via the `host_net_send` import; feed inbound frames back with
 /// `sys_net_input`. The page supplies the transport (a WebSocket to a relay) —

@@ -671,6 +671,11 @@ RV64.prototype.virtInsnCount = function () {
   return this.ex.virt_insn_count();
 };
 
+/** Current modern-machine PC. Diagnostic API; not part of the stable facade. */
+RV64.prototype.virtPc = function () {
+  return this.ex.virt_pc();
+};
+
 // ---- in-process HTTP proxy ------------------------------------------------
 //
 // The guest points http_proxy at the emulated network's gateway and speaks
