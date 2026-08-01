@@ -722,24 +722,33 @@ pub extern "C" fn jit_set_multi_latch(on: u32) {
     unsafe { MULTI_LATCH = on != 0 }
 }
 
-
 #[allow(static_mut_refs)]
 fn mem_profile_layout() -> Option<[u32; 17]> {
     unsafe {
-        if MEMPROF_MODE & 3 == 0 { return None; }
+        if MEMPROF_MODE & 3 == 0 {
+            return None;
+        }
         let base = MEMPROF.as_ptr() as u32;
         let mem = MEMPROF_MODE & 1 != 0;
         let regs = MEMPROF_MODE & 2 != 0;
         Some([
-            if mem { base } else { 0 }, if mem { base + 8 } else { 0 },
-            if mem { base + 16 } else { 0 }, if mem { base + 24 } else { 0 },
-            if mem { base + 32 } else { 0 }, if regs { base + 40 } else { 0 },
-            if regs { base + 48 } else { 0 }, if regs { base + 56 } else { 0 },
+            if mem { base } else { 0 },
+            if mem { base + 8 } else { 0 },
+            if mem { base + 16 } else { 0 },
+            if mem { base + 24 } else { 0 },
+            if mem { base + 32 } else { 0 },
+            if regs { base + 40 } else { 0 },
+            if regs { base + 48 } else { 0 },
+            if regs { base + 56 } else { 0 },
             if regs { base + 64 } else { 0 },
-            if regs { base + 152 } else { 0 }, if regs { base + 160 } else { 0 },
-            if regs { base + 168 } else { 0 }, if regs { base + 176 } else { 0 },
-            if regs { base + 184 } else { 0 }, if regs { base + 192 } else { 0 },
-            if regs { base + 200 } else { 0 }, if regs { base + 208 } else { 0 },
+            if regs { base + 152 } else { 0 },
+            if regs { base + 160 } else { 0 },
+            if regs { base + 168 } else { 0 },
+            if regs { base + 176 } else { 0 },
+            if regs { base + 184 } else { 0 },
+            if regs { base + 192 } else { 0 },
+            if regs { base + 200 } else { 0 },
+            if regs { base + 208 } else { 0 },
         ])
     }
 }
@@ -927,8 +936,7 @@ fn dprof_hit(pc: u64, retired: u64) {
 #[allow(static_mut_refs)]
 fn eprof_hit(src: u64, dst: u64, retired: u64) {
     unsafe {
-        let h = ((src >> 1) ^ (src >> 13) ^ (dst >> 3) ^ (dst >> 17)) as usize
-            & (DPROF_N - 1);
+        let h = ((src >> 1) ^ (src >> 13) ^ (dst >> 3) ^ (dst >> 17)) as usize & (DPROF_N - 1);
         if EPROF_SRC[h] != src || EPROF_DST[h] != dst {
             if EPROF_CNT[h] != 0 {
                 return; // collision: first hot edge keeps the slot
@@ -1283,8 +1291,8 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     fuel_addr: fuel_addr(),
                     mstatus_addr: 0, // user mode: no privileged FP state
                     copystat_addr: 0,
-            chain_off_addr: 0,
-            batch_base_addr: 0,
+                    chain_off_addr: 0,
+                    batch_base_addr: 0,
                     dispatch_base: 0,
                     dispatch_mask: 0,
                     map_gen_addr: 0,
@@ -2093,11 +2101,11 @@ fn drain_ext_queue(m: &mut rv64_system::Machine, jit: &mut JitState) {
     }
     unsafe { SB_EXT_DRAIN_VISITS += 1 };
     let aspace = m.cpu.sys.as_ref().map_or(0, |c| c.satp);
-    if let Some(i) = jit
-        .ext_queue
-        .iter()
-        .position(|idx| jit.region_exits.get(idx).is_some_and(|r| r.aspace == aspace))
-    {
+    if let Some(i) = jit.ext_queue.iter().position(|idx| {
+        jit.region_exits
+            .get(idx)
+            .is_some_and(|r| r.aspace == aspace)
+    }) {
         let idx = jit.ext_queue.remove(i);
         try_extend_region(m, jit, idx);
     } else {
@@ -2132,7 +2140,11 @@ fn try_extend_region(m: &mut rv64_system::Machine, jit: &mut JitState, idx: i32)
     let avg_stay = r.stay_sum / r.samples.max(1) as u64;
     let regs_in_memory = avg_stay < EXT_MEMORY_MODE_STAY;
     // Build cooldown keyed to the REGION (its lead page), not each member.
-    let (_, compiles, when) = jit.sb_gen.get(&(aspace, lead)).copied().unwrap_or((0, 0, 0));
+    let (_, compiles, when) = jit
+        .sb_gen
+        .get(&(aspace, lead))
+        .copied()
+        .unwrap_or((0, 0, 0));
     let cooldown = SB_PAGE_COOLDOWN << compiles.min(6);
     if m.cpu.insn_count < when.wrapping_add(cooldown) || compiles >= SB_RECOMPILE_CAP {
         // Not yet (or allowance spent): let the counters re-arm — the next
@@ -2191,10 +2203,7 @@ fn try_extend_region(m: &mut rv64_system::Machine, jit: &mut JitState, idx: i32)
     // regions pa-verify entry) but stops sampling; the superset starts a
     // fresh profile when it lands.
     jit.region_exits.remove(&idx);
-    let n_entries = jit
-        .page_entries
-        .get(&(aspace, lead))
-        .map_or(0, |e| e.len());
+    let n_entries = jit.page_entries.get(&(aspace, lead)).map_or(0, |e| e.len());
     if issue_region(
         m,
         jit,
@@ -2467,16 +2476,14 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                 }
                                 DPROF_TRACE_MIX[0] += retired.saturating_sub(attributed);
                                 for i in 0..10 {
-                                    DPROF_TRACE_MEM[i] +=
-                                        retired * b.mem[i] as u64 / b.n as u64;
+                                    DPROF_TRACE_MEM[i] += retired * b.mem[i] as u64 / b.n as u64;
                                 }
                                 for i in 0..3 {
                                     DPROF_TRACE_CONTROL[i] +=
                                         retired * b.control[i] as u64 / b.n as u64;
                                 }
                                 for i in 0..5 {
-                                    DPROF_TRACE_ALU[i] +=
-                                        retired * b.alu[i] as u64 / b.n as u64;
+                                    DPROF_TRACE_ALU[i] += retired * b.alu[i] as u64 / b.n as u64;
                                 }
                             }
                         }
@@ -2832,8 +2839,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             blay.batch_base_addr = batch_cell_addr(cell);
                             let cache = &jit.cache;
                             let hotmap = &jit.hot;
-                            let hot =
-                                |t: u64| matches!(cache.get(&t), Some(Some(b)) if b.idx >= 0);
+                            let hot = |t: u64| matches!(cache.get(&t), Some(Some(b)) if b.idx >= 0);
                             let wlo = w.first_va;
                             let whi = w.first_va + (TRACE_WIN_PAGES * 0x1000);
                             let pages = &w.pages;
@@ -3002,8 +3008,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             // Hotness oracle for branch-direction bias: a
                             // compiled (non-blacklisted) target is proven-hot.
                             let cache = &jit.cache;
-                            let hot =
-                                |t: u64| matches!(cache.get(&t), Some(Some(b)) if b.idx >= 0);
+                            let hot = |t: u64| matches!(cache.get(&t), Some(Some(b)) if b.idx >= 0);
                             // Inline-cache oracle: the target this pc's
                             // indirect jump was last observed to take.
                             let succ = &jit.succ;
@@ -3032,8 +3037,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             let mut spanned: Vec<(u64, u64)> = Vec::new();
                             let mut va = lo & !0xfff;
                             while va <= (hi - 1) & !0xfff {
-                                let Some(&(_, pp)) =
-                                    winpages.iter().find(|&&(v, _)| v == va)
+                                let Some(&(_, pp)) = winpages.iter().find(|&&(v, _)| v == va)
                                 else {
                                     return None; // span escaped the window (impossible)
                                 };
@@ -3119,7 +3123,16 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             None => {
                                 m.bus.jit_mark_page(pa);
                                 m.cpu.clear_store_jtlb();
-                                let jb = JitBlock { fp: false, idx: -1, n: 0, mix: [0; 5], mem: [0; 10], control: [0; 3], alu: [0; 5], pa };
+                                let jb = JitBlock {
+                                    fp: false,
+                                    idx: -1,
+                                    n: 0,
+                                    mix: [0; 5],
+                                    mem: [0; 10],
+                                    control: [0; 3],
+                                    alu: [0; 5],
+                                    pa,
+                                };
                                 if jit.cache.insert(pc, Some(jb)).is_none() {
                                     jit.page_blocks
                                         .entry((pa - rv64_system::RAM_BASE) >> 12)
@@ -3402,7 +3415,16 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
                 continue;
             }
             let epa = p.pages[pi].1 + (e & 0xfff);
-            let jb = JitBlock { fp: false, idx, n: 0, mix: [0; 5], mem: [0; 10], control: [0; 3], alu: [0; 5], pa: epa };
+            let jb = JitBlock {
+                fp: false,
+                idx,
+                n: 0,
+                mix: [0; 5],
+                mem: [0; 10],
+                control: [0; 3],
+                alu: [0; 5],
+                pa: epa,
+            };
             let prev = jit.cache.insert(e, Some(jb));
             SB_ENTRIES_IN += 1;
             if e == TRACE_PC {
@@ -3474,8 +3496,8 @@ pub extern "C" fn sb_analyze(vpage: u64, which: u32) -> u64 {
             fuel_addr: fuel_addr(),
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),
-        chain_off_addr: chain_off_addr(),
-        batch_base_addr: 0,
+            chain_off_addr: chain_off_addr(),
+            batch_base_addr: 0,
             dispatch_base: 0,
             dispatch_mask: 0,
             map_gen_addr: 0,
@@ -3563,8 +3585,8 @@ pub extern "C" fn sb_analyze_pc(pc: u64, which: u32) -> u64 {
             fuel_addr: fuel_addr(),
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),
-        chain_off_addr: chain_off_addr(),
-        batch_base_addr: 0,
+            chain_off_addr: chain_off_addr(),
+            batch_base_addr: 0,
             dispatch_base: 0,
             dispatch_mask: 0,
             map_gen_addr: 0,
@@ -3807,8 +3829,7 @@ fn chain_ctl_boundary(retired_total: u64) {
             0 | 1 => {
                 if ctl.quanta >= PROBE_QUANTA {
                     let insns = retired_total.wrapping_sub(ctl.retired0).max(1);
-                    ctl.ns_per_insn[ctl.state as usize] =
-                        (now - ctl.t0_ms) * 1e6 / insns as f64;
+                    ctl.ns_per_insn[ctl.state as usize] = (now - ctl.t0_ms) * 1e6 / insns as f64;
                     if ctl.state == 0 {
                         ctl.state = 1;
                         CHAIN_OFF_CELL = 1;
@@ -3925,7 +3946,15 @@ pub extern "C" fn jit_out_len() -> u32 {
             let len = JIT_OUT.len() as u64;
             MEMPROF[9] += len;
             MEMPROF[10] += 1;
-            let bucket = if len <= 1024 { 0 } else if len <= 4096 { 1 } else if len <= 16384 { 2 } else { 3 };
+            let bucket = if len <= 1024 {
+                0
+            } else if len <= 4096 {
+                1
+            } else if len <= 16384 {
+                2
+            } else {
+                3
+            };
             MEMPROF[11 + bucket] += 1;
             MEMPROF[15 + bucket] += len;
         }

@@ -19,7 +19,9 @@ enum Body {
     File(Vec<u8>),
     Link(String),
     /// Device or fifo: metadata only.
-    Special { rdev: u64 },
+    Special {
+        rdev: u64,
+    },
     /// Removed. Nodes are tombstoned rather than compacted so that inode
     /// numbers (which the client caches in qids) are never reused.
     Freed,
@@ -620,11 +622,15 @@ mod host {
         }
 
         fn read(&mut self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-            self.handle(path, false)?.read_at(buf, offset).map_err(errno)
+            self.handle(path, false)?
+                .read_at(buf, offset)
+                .map_err(errno)
         }
 
         fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<usize, i32> {
-            self.handle(path, true)?.write_at(data, offset).map_err(errno)
+            self.handle(path, true)?
+                .write_at(data, offset)
+                .map_err(errno)
         }
 
         fn create(&mut self, path: &str, flags: u32, mode: u32) -> Result<Attr, i32> {
@@ -768,7 +774,9 @@ mod host {
     }
 
     fn last_errno() -> i32 {
-        std::io::Error::last_os_error().raw_os_error().unwrap_or(EIO)
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(EIO)
     }
 
     fn cpath(p: &Path) -> Result<std::ffi::CString, i32> {
@@ -861,10 +869,8 @@ mod tests {
         struct Tmp(std::path::PathBuf);
         impl Tmp {
             fn new(name: &str) -> Tmp {
-                let p = std::env::temp_dir().join(format!(
-                    "rv64-p9fs-{}-{name}",
-                    std::process::id()
-                ));
+                let p =
+                    std::env::temp_dir().join(format!("rv64-p9fs-{}-{name}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&p);
                 std::fs::create_dir_all(&p).expect("create temp dir");
                 Tmp(p)
@@ -889,7 +895,10 @@ mod tests {
             assert_eq!(fs.lstat("/note.txt").unwrap().size, 10);
             // Offsets address the file directly — no seek state per handle.
             assert_eq!(fs.write("/note.txt", 6, b"world").unwrap(), 5);
-            assert_eq!(std::fs::read(tmp.0.join("note.txt")).unwrap(), b"hello world");
+            assert_eq!(
+                std::fs::read(tmp.0.join("note.txt")).unwrap(),
+                b"hello world"
+            );
 
             // Trenameat, which the ancient TinyEMU guest userland cannot issue.
             fs.mkdir("/sub", 0o755).unwrap();

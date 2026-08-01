@@ -260,7 +260,13 @@ fn guest_pings_a_host_over_virtio_net() {
         .sent
         .iter()
         .find(|f| f.len() >= 42 && f[12..14] == [0x08, 0x06] && f[38..42] == HOST_IP)
-        .unwrap_or_else(|| panic!("no ARP request for {} among {} frames", fmt_ip(&HOST_IP), g.sent.len()));
+        .unwrap_or_else(|| {
+            panic!(
+                "no ARP request for {} among {} frames",
+                fmt_ip(&HOST_IP),
+                g.sent.len()
+            )
+        });
     assert_eq!(&arp[6..12], &virtio::DEFAULT_MAC, "ARP sender MAC");
     assert_eq!(&arp[0..6], &[0xff; 6], "ARP requests are broadcast");
     // And that we saw echo requests, not just ARP.
@@ -269,7 +275,10 @@ fn guest_pings_a_host_over_virtio_net() {
         .iter()
         .filter(|f| f.len() > 34 && f[12..14] == [0x08, 0x00] && f[23] == 1 && f[34] == 8)
         .count();
-    assert!(echoes >= 2, "expected 2 echo requests on the wire, saw {echoes}");
+    assert!(
+        echoes >= 2,
+        "expected 2 echo requests on the wire, saw {echoes}"
+    );
 }
 
 fn fmt_ip(ip: &[u8; 4]) -> String {

@@ -104,7 +104,10 @@ fn parse_client_frame(b: &[u8]) -> Option<(u8, Vec<u8>, usize)> {
     let len7 = (b[1] & 0x7f) as usize;
     let (len, mut off) = match len7 {
         126 => (u16::from_be_bytes([*b.get(2)?, *b.get(3)?]) as usize, 4),
-        127 => (u64::from_be_bytes(b.get(2..10)?.try_into().unwrap()) as usize, 10),
+        127 => (
+            u64::from_be_bytes(b.get(2..10)?.try_into().unwrap()) as usize,
+            10,
+        ),
         n => (n, 2),
     };
     let mask: [u8; 4] = b.get(off..off + 4)?.try_into().unwrap();
@@ -190,7 +193,10 @@ fn a_bad_accept_header_is_refused() {
     // happened to answer the port.
     let url = spawn_echo_server(ServerBehaviour::WrongAccept);
     let err = ws::Relay::connect(&url).expect_err("must not accept a wrong hash");
-    assert!(err.contains("not a WebSocket server"), "unhelpful error: {err}");
+    assert!(
+        err.contains("not a WebSocket server"),
+        "unhelpful error: {err}"
+    );
 }
 
 #[test]

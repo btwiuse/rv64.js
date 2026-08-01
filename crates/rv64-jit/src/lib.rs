@@ -232,9 +232,8 @@ impl TraceFacts {
             match op {
                 0x37 => self.known[d] = Known::Proven((insn & 0xffff_f000) as i32 as i64 as u64),
                 0x17 => {
-                    self.known[d] = Known::Proven(
-                        pc.wrapping_add((insn & 0xffff_f000) as i32 as i64 as u64),
-                    )
+                    self.known[d] =
+                        Known::Proven(pc.wrapping_add((insn & 0xffff_f000) as i32 as i64 as u64))
                 }
                 0x03 => {
                     if let Some(v) = loaded {
@@ -498,7 +497,9 @@ impl Ctx {
     }
 
     fn memprof_inc(&self, m: &mut WasmModule, index: usize) {
-        let Some(addrs) = self.lay.mem_profile else { return };
+        let Some(addrs) = self.lay.mem_profile else {
+            return;
+        };
         Self::memprof_addr_inc(m, addrs[index]);
     }
 
@@ -509,7 +510,15 @@ impl Ctx {
     }
 
     fn reg_width_bucket(n: u32) -> usize {
-        if n <= 4 { 0 } else if n <= 8 { 1 } else if n <= 16 { 2 } else { 3 }
+        if n <= 4 {
+            0
+        } else if n <= 8 {
+            1
+        } else if n <= 16 {
+            2
+        } else {
+            3
+        }
     }
     /// Emit `push x[r]` (reads the register; x0 is constant 0). Reads the
     /// cached local if the register has one, else falls back to memory.
@@ -637,7 +646,16 @@ impl Ctx {
     /// FADD/FSUB/FMUL/FDIV.S under the same eligibility as the double path:
     /// finite operands, no division by zero, normal result.
     #[allow(clippy::too_many_arguments)]
-    fn fp_arith_s(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, d: usize, pc: u64, n: u32) {
+    fn fp_arith_s(
+        &self,
+        m: &mut WasmModule,
+        op: u32,
+        s1: usize,
+        s2: usize,
+        d: usize,
+        pc: u64,
+        n: u32,
+    ) {
         self.f32_finite_guard(m, s1, pc, n);
         self.f32_finite_guard(m, s2, pc, n);
         if op == 3 {
@@ -686,7 +704,16 @@ impl Ctx {
 
     /// FLE/FLT/FEQ.S into x[d]; inf/NaN operands bail (they carry NV).
     #[allow(clippy::too_many_arguments)]
-    fn fp_cmp_s(&self, m: &mut WasmModule, f3: u32, s1: usize, s2: usize, d: usize, pc: u64, n: u32) {
+    fn fp_cmp_s(
+        &self,
+        m: &mut WasmModule,
+        f3: u32,
+        s1: usize,
+        s2: usize,
+        d: usize,
+        pc: u64,
+        n: u32,
+    ) {
         self.f32_finite_guard(m, s1, pc, n);
         self.f32_finite_guard(m, s2, pc, n);
         if self.store_pre(m, d) {
@@ -705,10 +732,22 @@ impl Ctx {
     /// FSGNJ/FSGNJN/FSGNJX.S — the single-precision sign ops, on the boxed
     /// low half (an improperly boxed operand bails, as elsewhere).
     #[allow(clippy::too_many_arguments)]
-    fn fp_sgnj_s(&self, m: &mut WasmModule, f3: u32, s1: usize, s2: usize, d: usize, pc: u64, n: u32) {
+    fn fp_sgnj_s(
+        &self,
+        m: &mut WasmModule,
+        f3: u32,
+        s1: usize,
+        s2: usize,
+        d: usize,
+        pc: u64,
+        n: u32,
+    ) {
         const SIGN: i64 = 0x8000_0000;
         self.push_freg(m, s1);
-        m.i64_const(32).op(I64_SHR_U).i64_const(0xffff_ffff).op(I64_NE);
+        m.i64_const(32)
+            .op(I64_SHR_U)
+            .i64_const(0xffff_ffff)
+            .op(I64_NE);
         m.op(IF).op(VOID);
         self.bail(m, pc, n);
         m.op(END);
@@ -736,7 +775,12 @@ impl Ctx {
     /// FCVT.S.D (rounds, guarded) and FCVT.D.S (exact widening).
     fn fp_cvt_s_d(&self, m: &mut WasmModule, s1: usize, d: usize, pc: u64, n: u32) {
         self.push_freg(m, s1);
-        m.i64_const(52).op(I64_SHR_U).i64_const(0x7ff).op(I64_AND).i64_const(0x7ff).op(I64_EQ);
+        m.i64_const(52)
+            .op(I64_SHR_U)
+            .i64_const(0x7ff)
+            .op(I64_AND)
+            .i64_const(0x7ff)
+            .op(I64_EQ);
         m.op(IF).op(VOID);
         self.bail(m, pc, n);
         m.op(END);
@@ -793,7 +837,9 @@ impl Ctx {
         self.push_reg(m, s1);
         match v {
             0 => {
-                m.op(I32_WRAP_I64).op(I64_EXTEND_I32_S).op(F32_CONVERT_I64_S);
+                m.op(I32_WRAP_I64)
+                    .op(I64_EXTEND_I32_S)
+                    .op(F32_CONVERT_I64_S);
             }
             1 => {
                 m.i64_const(0xffff_ffff).op(I64_AND).op(F32_CONVERT_I64_S);
@@ -817,7 +863,8 @@ impl Ctx {
         if self.fp_local[r] != 0 {
             m.local_get(self.fp_local[r]);
         } else {
-            m.i32_const(0).i64_load(self.lay.f_base as u64 + r as u64 * 8);
+            m.i32_const(0)
+                .i64_load(self.lay.f_base as u64 + r as u64 * 8);
         }
     }
 
@@ -887,7 +934,11 @@ impl Ctx {
     /// rounding mode, unless frm == RNE (the only mode wasm f64 implements).
     fn fp_eligibility(&self, m: &mut WasmModule, dyn_rm: bool, pc: u64, n: u32) {
         let fcsr = self.lay.fcsr_addr as u64;
-        m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
+        m.i32_const(0)
+            .i64_load(fcsr)
+            .i64_const(1)
+            .op(I64_AND)
+            .op(I64_EQZ);
         if dyn_rm {
             m.i32_const(0)
                 .i64_load(fcsr)
@@ -980,7 +1031,15 @@ impl Ctx {
     }
 
     /// Single-precision twin of fp_result_guard (Cpu::fp_fast32).
-    fn fp_result_guard_s(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, pc: u64, n: u32) {
+    fn fp_result_guard_s(
+        &self,
+        m: &mut WasmModule,
+        op: u32,
+        s1: usize,
+        s2: usize,
+        pc: u64,
+        n: u32,
+    ) {
         if op <= 1 {
             m.local_get(VAL)
                 .i64_const(23)
@@ -1070,9 +1129,17 @@ impl Ctx {
     /// variants are EXACT (no flags, any rounding mode) and need no guards at
     /// all; the 64-bit ones round (NX for |v| > 2^53) — wasm's converts are
     /// exactly rounded RNE, so sticky-NX eligibility makes them bit-exact.
-    fn fp_cvt_d_int(&self, m: &mut WasmModule, s1: usize, d: usize, v: u32, _dyn_rm: bool, _pc: u64, _n: u32) {
-        if v >= 2 {
-            }
+    fn fp_cvt_d_int(
+        &self,
+        m: &mut WasmModule,
+        s1: usize,
+        d: usize,
+        v: u32,
+        _dyn_rm: bool,
+        _pc: u64,
+        _n: u32,
+    ) {
+        if v >= 2 {}
         self.store_freg_pre(m, d);
         self.push_reg(m, s1);
         match v {
@@ -1101,14 +1168,29 @@ impl Ctx {
     /// eligibility, operand/product exponent bands, t+e underflow-to-zero,
     /// non-normal result. Scratch: 8 i64 locals at Ctx::fma_scratch.
     #[allow(clippy::too_many_arguments)]
-    fn fp_fmadd_d(&self, m: &mut WasmModule, s1: usize, s2: usize, s3: usize, d: usize,
-                  neg_prod: bool, neg_c: bool, _dyn_rm: bool, pc: u64, n: u32) {
+    fn fp_fmadd_d(
+        &self,
+        m: &mut WasmModule,
+        s1: usize,
+        s2: usize,
+        s3: usize,
+        d: usize,
+        neg_prod: bool,
+        neg_c: bool,
+        _dyn_rm: bool,
+        pc: u64,
+        n: u32,
+    ) {
         debug_assert!(self.fma_scratch != 0);
         let fs = self.fma_scratch;
         let (fa, fb, fc, fp, f4, f5, f6, f7l) =
             (fs, fs + 1, fs + 2, fs + 3, fs + 4, fs + 5, fs + 6, fs + 7);
-        let getf = |m: &mut WasmModule, l: u32| { m.local_get(l).op(F64_REINTERPRET_I64); };
-        let setf = |m: &mut WasmModule, l: u32| { m.op(I64_REINTERPRET_F64).local_set(l); };
+        let getf = |m: &mut WasmModule, l: u32| {
+            m.local_get(l).op(F64_REINTERPRET_I64);
+        };
+        let setf = |m: &mut WasmModule, l: u32| {
+            m.op(I64_REINTERPRET_F64).local_set(l);
+        };
         let fconst = |m: &mut WasmModule, v: f64| {
             m.i64_const(v.to_bits() as i64).op(F64_REINTERPRET_I64);
         };
@@ -1147,7 +1229,11 @@ impl Ctx {
                 .op(I64_SUB)
                 .i64_const(0x5ff)
                 .op(I64_GT_U);
-            m.local_get(l).i64_const(1).op(I64_SHL).op(I64_EQZ).op(I32_EQZ);
+            m.local_get(l)
+                .i64_const(1)
+                .op(I64_SHL)
+                .op(I64_EQZ)
+                .op(I32_EQZ);
             m.op(I32_AND);
             if i > 0 {
                 m.op(I32_OR);
@@ -1180,7 +1266,11 @@ impl Ctx {
                 .op(I64_SUB)
                 .i64_const(0x7fd)
                 .op(I64_GT_U);
-            m.local_get(VAL).i64_const(1).op(I64_SHL).op(I64_EQZ).op(I32_EQZ);
+            m.local_get(VAL)
+                .i64_const(1)
+                .op(I64_SHL)
+                .op(I64_EQZ)
+                .op(I32_EQZ);
             m.op(I32_AND);
             m.op(IF).op(VOID);
             self.bail(m, pc, n);
@@ -1206,13 +1296,17 @@ impl Ctx {
             .op(I64_GT_U);
         // ...unless the product is exactly zero, which only a zero operand can
         // produce here (both operands are in-band, so no underflow).
-        m.local_get(fp).i64_const(1).op(I64_SHL).op(I64_EQZ).op(I32_EQZ);
+        m.local_get(fp)
+            .i64_const(1)
+            .op(I64_SHL)
+            .op(I64_EQZ)
+            .op(I32_EQZ);
         m.op(I32_AND);
         m.op(IF).op(VOID);
         self.bail(m, pc, n);
         m.op(END);
         const CSPLIT: f64 = 134217729.0; // 2^27 + 1 (Dekker)
-        // ah = a1 - (a1 - a), al = a - ah   (a1 = a*CSPLIT, staged in f4)
+                                         // ah = a1 - (a1 - a), al = a - ah   (a1 = a*CSPLIT, staged in f4)
         getf(m, fa);
         fconst(m, CSPLIT);
         m.op(F64_MUL);
@@ -1226,7 +1320,7 @@ impl Ctx {
         getf(m, f4);
         m.op(F64_SUB);
         setf(m, f5); // al
-        // bh (f6), bl (f7l)
+                     // bh (f6), bl (f7l)
         getf(m, fb);
         fconst(m, CSPLIT);
         m.op(F64_MUL);
@@ -1240,7 +1334,7 @@ impl Ctx {
         getf(m, f6);
         m.op(F64_SUB);
         setf(m, f7l); // bl
-        // e = ((ah*bh - p) + ah*bl + al*bh) + al*bl   -> f4 (ah dead after)
+                      // e = ((ah*bh - p) + ah*bl + al*bh) + al*bl   -> f4 (ah dead after)
         getf(m, f4);
         getf(m, f6);
         m.op(F64_MUL);
@@ -1259,7 +1353,7 @@ impl Ctx {
         m.op(F64_MUL);
         m.op(F64_ADD);
         setf(m, f4); // e
-        // s = p + c -> f5 ; TwoSum tail t -> f6 (z staged in VAL)
+                     // s = p + c -> f5 ; TwoSum tail t -> f6 (z staged in VAL)
         getf(m, fp);
         getf(m, fc);
         m.op(F64_ADD);
@@ -1278,7 +1372,7 @@ impl Ctx {
         m.op(F64_SUB); // c - z
         m.op(F64_ADD);
         setf(m, f6); // t
-        // u = t + e -> f7l ; TwoSum tail d -> fp (p dead; z2 staged in VAL)
+                     // u = t + e -> f7l ; TwoSum tail d -> fp (p dead; z2 staged in VAL)
         getf(m, f6);
         getf(m, f4);
         m.op(F64_ADD);
@@ -1297,7 +1391,7 @@ impl Ctx {
         m.op(F64_SUB); // e - z2
         m.op(F64_ADD);
         setf(m, fp); // d
-        // round-to-odd: if d != 0 { if u == 0 bail; if even(u) nudge toward d }
+                     // round-to-odd: if d != 0 { if u == 0 bail; if even(u) nudge toward d }
         getf(m, fp);
         fconst(m, 0.0);
         m.op(F64_NE);
@@ -1350,7 +1444,11 @@ impl Ctx {
             .op(I64_SUB)
             .i64_const(0x7fd)
             .op(I64_GT_U);
-        m.local_get(VAL).i64_const(1).op(I64_SHL).op(I64_EQZ).op(I32_EQZ);
+        m.local_get(VAL)
+            .i64_const(1)
+            .op(I64_SHL)
+            .op(I64_EQZ)
+            .op(I32_EQZ);
         m.op(I32_AND);
         m.op(IF).op(VOID);
         self.bail(m, pc, n);
@@ -1360,7 +1458,17 @@ impl Ctx {
         self.store_freg_post(m, d);
     }
 
-    fn fp_arith_d(&self, m: &mut WasmModule, op: u32, s1: usize, s2: usize, d: usize, _dyn_rm: bool, pc: u64, n: u32) {
+    fn fp_arith_d(
+        &self,
+        m: &mut WasmModule,
+        op: u32,
+        s1: usize,
+        s2: usize,
+        d: usize,
+        _dyn_rm: bool,
+        pc: u64,
+        n: u32,
+    ) {
         // r = f[s1] <op> f[s2]  (as f64), reinterpreted back to i64 bits.
         self.push_freg(m, s1);
         m.op(F64_REINTERPRET_I64);
@@ -1384,7 +1492,16 @@ impl Ctx {
     /// f64 compare into GPR x[d]. `f3`: 0=FLE 1=FLT 2=FEQ. Bails to the
     /// interpreter if either operand is inf/nan (the exact-flag/NV cases);
     /// finite operands compare exactly with no flag change.
-    fn fp_cmp_d(&self, m: &mut WasmModule, f3: u32, s1: usize, s2: usize, d: usize, pc: u64, n: u32) {
+    fn fp_cmp_d(
+        &self,
+        m: &mut WasmModule,
+        f3: u32,
+        s1: usize,
+        s2: usize,
+        d: usize,
+        pc: u64,
+        n: u32,
+    ) {
         for &s in &[s1, s2] {
             self.push_freg(m, s);
             m.i64_const(52)
@@ -1591,14 +1708,7 @@ impl Ctx {
 
     /// Fused-TLB index computation + tag compare; bails on miss. Leaves
     /// IDXB holding the entry index for the caller's off-load.
-    fn tlb_idx_tag_check(
-        &self,
-        m: &mut WasmModule,
-        sys: &SysMem,
-        tag_base: u32,
-        pc: u64,
-        n: u32,
-    ) {
+    fn tlb_idx_tag_check(&self, m: &mut WasmModule, sys: &SysMem, tag_base: u32, pc: u64, n: u32) {
         // IDXB (i32) = ((page & mask) << 3)
         m.local_get(PAGE)
             .op(I32_WRAP_I64)
@@ -1932,7 +2042,7 @@ fn scan_regs(
         n += 1;
     }
     let _ = uses; // per-block hoist filtering measured neutral: a block's
-    // prologue is not where its dispatch cost lives (see BLOCK_HOIST_MIN).
+                  // prologue is not where its dispatch cost lives (see BLOCK_HOIST_MIN).
     if mem_ops >= 3 {
         read |= 1; // bit 0: allocate scratch (memory page-cache; see build_ctx)
     }
@@ -1952,24 +2062,24 @@ fn fp_handled(insn: u32) -> bool {
     let f7 = funct7(insn);
     let f3 = funct3(insn);
     match (f7 >> 2, f7 & 3, f3) {
-        (0..=3, 1, 0 | 7) => true,        // FADD/FSUB/FMUL/FDIV.D (rne | dyn)
-        (4, 1, 0..=2) => true,            // FSGNJ/FSGNJN/FSGNJX.D (bit ops)
+        (0..=3, 1, 0 | 7) => true, // FADD/FSUB/FMUL/FDIV.D (rne | dyn)
+        (4, 1, 0..=2) => true,     // FSGNJ/FSGNJN/FSGNJX.D (bit ops)
         // --- F extension (single precision, NaN-boxed in the low 32 bits) ---
-        (0..=3, 0, 0 | 7) => true,        // FADD/FSUB/FMUL/FDIV.S
-        (4, 0, 0..=2) => true,            // FSGNJ/FSGNJN/FSGNJX.S
-        (0x14, 0, 0..=2) => true,         // FLE/FLT/FEQ.S
+        (0..=3, 0, 0 | 7) => true,          // FADD/FSUB/FMUL/FDIV.S
+        (4, 0, 0..=2) => true,              // FSGNJ/FSGNJN/FSGNJX.S
+        (0x14, 0, 0..=2) => true,           // FLE/FLT/FEQ.S
         (0x0b, 0, 0 | 7) => rs2(insn) == 0, // FSQRT.S
-        (0x1e, 0, 0) => rs2(insn) == 0,   // FMV.W.X
-        (0x1c, 0, 0) => rs2(insn) == 0,   // FMV.X.W
-        (8, 0, 0 | 7) => rs2(insn) == 1,  // FCVT.S.D
-        (8, 1, 0 | 7) => rs2(insn) == 0,  // FCVT.D.S
-        (0x18, 0, 1) => rs2(insn) == 0,   // FCVT.W.S (rtz)
+        (0x1e, 0, 0) => rs2(insn) == 0,     // FMV.W.X
+        (0x1c, 0, 0) => rs2(insn) == 0,     // FMV.X.W
+        (8, 0, 0 | 7) => rs2(insn) == 1,    // FCVT.S.D
+        (8, 1, 0 | 7) => rs2(insn) == 0,    // FCVT.D.S
+        (0x18, 0, 1) => rs2(insn) == 0,     // FCVT.W.S (rtz)
         (0x1a, 0, 0 | 7) => rs2(insn) <= 3, // FCVT.S.{W,WU,L,LU}
-        (0x14, 1, 0..=2) => true,         // FLE/FLT/FEQ.D
-        (0x1e, 1, 0) => rs2(insn) == 0,   // FMV.D.X (rs2 is a fixed field)
-        (0x1c, 1, 0) => rs2(insn) == 0,   // FMV.X.D (rs2 is a fixed field)
+        (0x14, 1, 0..=2) => true,           // FLE/FLT/FEQ.D
+        (0x1e, 1, 0) => rs2(insn) == 0,     // FMV.D.X (rs2 is a fixed field)
+        (0x1c, 1, 0) => rs2(insn) == 0,     // FMV.X.D (rs2 is a fixed field)
         (0x0b, 1, 0 | 7) => rs2(insn) == 0, // FSQRT.D (rs2 is a fixed field)
-        (0x18, 1, 1) => rs2(insn) == 0,   // FCVT.W.D rtz only (signed 32)
+        (0x18, 1, 1) => rs2(insn) == 0,     // FCVT.W.D rtz only (signed 32)
         (0x1a, 1, 0 | 7) => rs2(insn) <= 3, // FCVT.D.{W,WU,L,LU} (rne | dyn)
         _ => false,
     }
@@ -2155,7 +2265,10 @@ fn loop_region_mode(
             }
             0x6f if extend => {
                 let t = pc.wrapping_add(imm_j(insn) as u64);
-                let continues = branches.iter().filter(|&&(_, bt, _)| bt == start_pc).count();
+                let continues = branches
+                    .iter()
+                    .filter(|&&(_, bt, _)| bt == start_pc)
+                    .count();
                 if rd(insn) != 0
                     || t != start_pc
                     || continues < 2
@@ -2248,7 +2361,11 @@ fn loop_region_mode(
     if loops.is_empty() {
         return None;
     }
-    Some(LoopRegion { end_pc, loops, unconditional_latch })
+    Some(LoopRegion {
+        end_pc,
+        loops,
+        unconditional_latch,
+    })
 }
 
 /// Register scan over a whole loop region `[start_pc, end_pc)` (linear; every
@@ -2477,7 +2594,11 @@ fn build_ctx_load(
         idxb: N_I64_LOCALS + n_reg + n_fp + n_fma + n_flags + 1,
         fp_local,
         fp_write_mask: fp_write,
-        fma_scratch: if want_fma { N_I64_LOCALS + 1 + n_reg + n_fp } else { 0 },
+        fma_scratch: if want_fma {
+            N_I64_LOCALS + 1 + n_reg + n_fp
+        } else {
+            0
+        },
         retired_local: None,
         defined: std::cell::Cell::new(match load {
             Some((g, _)) => g & !1,
@@ -2508,39 +2629,39 @@ fn build_ctx_load(
     while t != 0 {
         let r = t.trailing_zeros() as usize;
         t &= t - 1;
+        m.i32_const(0)
+            .i64_load(lay.x_base as u64 + r as u64 * 8)
+            .local_set(reg_local[r]);
+        if lay.reg_stress {
             m.i32_const(0)
                 .i64_load(lay.x_base as u64 + r as u64 * 8)
                 .local_set(reg_local[r]);
-            if lay.reg_stress {
-                m.i32_const(0)
-                    .i64_load(lay.x_base as u64 + r as u64 * 8)
-                    .local_set(reg_local[r]);
-            }
-            Ctx::regprof_inc(&mut m, lay.reg_profile_base, r - 1);
-            if let Some(addrs) = lay.mem_profile {
-                let addr = addrs[5] as u64;
-                if addr != 0 {
+        }
+        Ctx::regprof_inc(&mut m, lay.reg_profile_base, r - 1);
+        if let Some(addrs) = lay.mem_profile {
+            let addr = addrs[5] as u64;
+            if addr != 0 {
                 m.i32_const(0);
                 m.i32_const(0).i64_load(addr).i64_const(1).op(I64_ADD);
                 m.i64_store(addr);
-                }
             }
+        }
     }
     let mut t = load_f;
     while t != 0 {
         let r = t.trailing_zeros() as usize;
         t &= t - 1;
-            m.i32_const(0)
-                .i64_load(lay.f_base as u64 + r as u64 * 8)
-                .local_set(fp_local[r]);
-            if let Some(addrs) = lay.mem_profile {
-                let addr = addrs[6] as u64;
-                if addr != 0 {
+        m.i32_const(0)
+            .i64_load(lay.f_base as u64 + r as u64 * 8)
+            .local_set(fp_local[r]);
+        if let Some(addrs) = lay.mem_profile {
+            let addr = addrs[6] as u64;
+            if addr != 0 {
                 m.i32_const(0);
                 m.i32_const(0).i64_load(addr).i64_const(1).op(I64_ADD);
                 m.i64_store(addr);
-                }
             }
+        }
     }
     if want_fma {
         // memory page-cache locals ([8]=load pg, [10]=store pg) must start
@@ -2661,10 +2782,15 @@ fn build_chain_helper(lay: &JitLayout) -> Vec<u8> {
     h.local_get(1).i64_load_at(lay.dispatch_base as u64);
     h.local_get(0).op(I64_NE);
     h.op(IF).op(VOID).i32_const(-1).op(RETURN).op(END);
-    h.local_get(1).i32_load(lay.dispatch_base as u64 + 8).local_set(2);
+    h.local_get(1)
+        .i32_load(lay.dispatch_base as u64 + 8)
+        .local_set(2);
     h.local_get(2).i32_const(0).op(I32_LT_S);
     h.op(IF).op(VOID).i32_const(-1).op(RETURN).op(END);
-    h.local_get(2).i32_const(!SB_IDX_BIT).op(I32_AND).local_set(2);
+    h.local_get(2)
+        .i32_const(!SB_IDX_BIT)
+        .op(I32_AND)
+        .local_set(2);
     h.local_get(1).i32_load(lay.dispatch_base as u64 + 12);
     h.i32_const(0).i32_load(lay.map_gen_addr as u64);
     h.op(I32_NE);
@@ -2716,11 +2842,7 @@ fn emit_chain_exit_helper(c: &Ctx, m: &mut WasmModule) {
 /// site megamorphic and ran 2.9x slower chained than host-dispatched.
 fn emit_chain_exit(c: &Ctx, m: &mut WasmModule, iter_guard: bool) {
     let lay = &c.lay;
-    if !chain_enabled()
-        || lay.sys.is_none()
-        || lay.dispatch_base == 0
-        || lay.fuel_addr == 0
-    {
+    if !chain_enabled() || lay.sys.is_none() || lay.dispatch_base == 0 || lay.fuel_addr == 0 {
         return;
     }
     // Live kill switch: one i32 load per chain attempt.
@@ -2747,7 +2869,8 @@ fn emit_chain_exit(c: &Ctx, m: &mut WasmModule, iter_guard: bool) {
         .op(I32_SHL)
         .local_set_i32(c.idxb);
     // line.pc == pc?
-    m.local_get_i32(c.idxb).i64_load_at(lay.dispatch_base as u64);
+    m.local_get_i32(c.idxb)
+        .i64_load_at(lay.dispatch_base as u64);
     m.local_get(CPC).op(I64_NE);
     m.op(IF).op(VOID).op(RETURN).op(END);
     // idx >= 0 (blacklist sentinels carry -1)?
@@ -2762,7 +2885,8 @@ fn emit_chain_exit(c: &Ctx, m: &mut WasmModule, iter_guard: bool) {
         .op(I32_AND)
         .local_set_i32(idx2);
     // line verified under the current address-space generation?
-    m.local_get_i32(c.idxb).i32_load(lay.dispatch_base as u64 + 12);
+    m.local_get_i32(c.idxb)
+        .i32_load(lay.dispatch_base as u64 + 12);
     m.i32_const(0).i32_load(lay.map_gen_addr as u64);
     m.op(I32_NE);
     m.op(IF).op(VOID).op(RETURN).op(END);
@@ -2782,7 +2906,11 @@ fn emit_fp_flags(c: &Ctx, m: &mut WasmModule) {
     };
     let fcsr = c.lay.fcsr_addr as u64;
     // round_bad = NX not sticky || frm != RNE
-    m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
+    m.i32_const(0)
+        .i64_load(fcsr)
+        .i64_const(1)
+        .op(I64_AND)
+        .op(I64_EQZ);
     m.i32_const(0)
         .i64_load(fcsr)
         .i64_const(5)
@@ -2825,7 +2953,11 @@ fn emit_block_fp_gate(c: &Ctx, m: &mut WasmModule, start_pc: u64, n: u32, round:
     let fcsr = c.lay.fcsr_addr as u64;
     if round {
         // bad = (fcsr & 1) == 0  ||  ((fcsr >> 5) & 7) != 0
-        m.i32_const(0).i64_load(fcsr).i64_const(1).op(I64_AND).op(I64_EQZ);
+        m.i32_const(0)
+            .i64_load(fcsr)
+            .i64_const(1)
+            .op(I64_AND)
+            .op(I64_EQZ);
         m.i32_const(0)
             .i64_load(fcsr)
             .i64_const(5)
@@ -3044,7 +3176,11 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                         c.push_reg(m, s1);
                         m.i64_const(i64::MIN).op(I64_EQ);
                         c.push_reg(m, s2);
-                        m.i64_const(-1).op(I64_EQ).op(I32_AND).op(I32_EQZ).op(SELECT);
+                        m.i64_const(-1)
+                            .op(I64_EQ)
+                            .op(I32_AND)
+                            .op(I32_EQZ)
+                            .op(SELECT);
                         // zero divisor -> -1
                         m.i64_const(-1);
                         c.push_reg(m, s2);
@@ -3177,7 +3313,11 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                         push_s(m, c, s1);
                         m.i64_const(MIN32).op(I64_EQ);
                         push_s(m, c, s2);
-                        m.i64_const(-1).op(I64_EQ).op(I32_AND).op(I32_EQZ).op(SELECT);
+                        m.i64_const(-1)
+                            .op(I64_EQ)
+                            .op(I32_AND)
+                            .op(I32_EQZ)
+                            .op(SELECT);
                         m.i64_const(-1);
                         push_s(m, c, s2);
                         m.op(I64_EQZ).op(I32_EQZ).op(SELECT);
@@ -3459,12 +3599,12 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
                 (0x1a, 0, 0 | 7) => c.fp_cvt_s_int(m, s1, d, s2 as u32),
                 (0x14, 1, 0..=2) => c.fp_cmp_d(m, f3, s1, s2, d, pc, n),
                 (0x1e, 1, 0) => {
-                            c.store_freg_pre(m, d);
+                    c.store_freg_pre(m, d);
                     c.push_reg(m, s1);
                     c.store_freg_post(m, d);
                 }
                 (0x1c, 1, 0) => {
-                            if c.store_pre(m, d) {
+                    if c.store_pre(m, d) {
                         c.push_freg(m, s1);
                         c.store_post(m, d);
                     }
@@ -3559,7 +3699,9 @@ fn detect_copy_loop(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
             // loads: ld (f3=3) and lbu (f3=4)
             0x03 if matches!(funct3(insn), 3 | 4) => {
                 let sz = if funct3(insn) == 3 { 8 } else { 1 };
-                let Val::Affine(b, c) = val[s1] else { return None };
+                let Val::Affine(b, c) = val[s1] else {
+                    return None;
+                };
                 if b == 0 {
                     return None;
                 }
@@ -3579,7 +3721,9 @@ fn detect_copy_loop(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
             // stores: sd (f3=3) and sb (f3=0)
             0x23 if matches!(funct3(insn), 0 | 3) => {
                 let sz = if funct3(insn) == 3 { 8 } else { 1 };
-                let Val::Affine(b, c) = val[s1] else { return None };
+                let Val::Affine(b, c) = val[s1] else {
+                    return None;
+                };
                 if b == 0 {
                     return None;
                 }
@@ -3589,7 +3733,9 @@ fn detect_copy_loop(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
                     return None;
                 }
                 let off = c + imm_s(insn);
-                let Val::Loaded(lo) = val[s2] else { return None };
+                let Val::Loaded(lo) = val[s2] else {
+                    return None;
+                };
                 if lo != off {
                     return None; // value must come from the same window slot
                 }
@@ -3694,8 +3840,7 @@ fn detect_copy_loop(code: &[u8], base: u64, start_pc: u64) -> Option<CopyLoop> {
                     return None;
                 }
                 // temp/clobber set: everything written except S, D, N
-                let t_mask =
-                    written & !(1u32 << s_reg) & !(1 << d_reg) & !(1 << n_reg);
+                let t_mask = written & !(1u32 << s_reg) & !(1 << d_reg) & !(1 << n_reg);
                 if t_mask & (1 << l_reg) != 0 && l_reg != 0 {
                     return None;
                 }
@@ -3736,8 +3881,7 @@ fn translate_copy_loop(
     lay: JitLayout,
 ) -> Option<Block> {
     let sys = lay.sys?;
-    let read_mask =
-        (1u32 << cl.s) | (1 << cl.d) | (1 << cl.n) | (1 << cl.l) | cl.t_mask | 1; // bit 0: scratch
+    let read_mask = (1u32 << cl.s) | (1 << cl.d) | (1 << cl.n) | (1 << cl.l) | cl.t_mask | 1; // bit 0: scratch
     let write_mask = (1u32 << cl.s) | (1 << cl.d) | (1 << cl.n) | cl.t_mask;
     let (mut c, mut m) = build_ctx(lay, read_mask, write_mask, 0, 0);
     c.retired_local = Some(ITER);
@@ -3763,7 +3907,7 @@ fn translate_copy_loop(
     m.i64_const(0).local_set(ITER);
     emit_fuel_base(&c, &mut m);
     m.op(LOOP).op(VOID); // $head
-    // fuel guard (safe yield at the loop head)
+                         // fuel guard (safe yield at the loop head)
     m.local_get(ITER);
     m.local_get(BASE);
     m.op(I64_GE_U);
@@ -3772,7 +3916,9 @@ fn translate_copy_loop(
     c.set_pc_const(&mut m, start_pc);
     m.i32_const(0);
     m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    m.local_get(ITER)
+        .op(I64_ADD)
+        .i64_store(lay.retired_addr as u64);
     emit_chain_next(&c, &mut m, true);
     m.op(RETURN);
     m.op(END);
@@ -3860,10 +4006,12 @@ fn translate_copy_loop(
             .i32_const(3)
             .op(I32_SHL)
             .local_set_i32(c.idxb);
-        m.local_get_i32(c.idxb).i64_load_at(sys.ftlb_load_tag as u64);
+        m.local_get_i32(c.idxb)
+            .i64_load_at(sys.ftlb_load_tag as u64);
         m.local_get(PAGE).op(I64_NE).br_if(0);
         m.local_get(VA);
-        m.local_get_i32(c.idxb).i64_load_at(sys.ftlb_load_off as u64);
+        m.local_get_i32(c.idxb)
+            .i64_load_at(sys.ftlb_load_off as u64);
         m.op(I64_ADD).local_set(srci);
         // probe dst range START (store class); miss -> $normal
         m.local_get(rd_);
@@ -3882,10 +4030,12 @@ fn translate_copy_loop(
             .i32_const(3)
             .op(I32_SHL)
             .local_set_i32(c.idxb);
-        m.local_get_i32(c.idxb).i64_load_at(sys.ftlb_store_tag as u64);
+        m.local_get_i32(c.idxb)
+            .i64_load_at(sys.ftlb_store_tag as u64);
         m.local_get(PAGE).op(I64_NE).br_if(0);
         m.local_get(VA);
-        m.local_get_i32(c.idxb).i64_load_at(sys.ftlb_store_off as u64);
+        m.local_get_i32(c.idxb)
+            .i64_load_at(sys.ftlb_store_off as u64);
         m.op(I64_ADD).local_set(dsti);
         if lay.copystat_addr != 0 {
             // diagnostic: accumulate BYTES bulk-copied (kb holds bytes here)
@@ -3939,7 +4089,9 @@ fn translate_copy_loop(
     c.set_pc_const(&mut m, cl.end_pc);
     m.i32_const(0);
     m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    m.local_get(ITER)
+        .op(I64_ADD)
+        .i64_store(lay.retired_addr as u64);
     emit_chain_next(&c, &mut m, true);
     m.op(RETURN);
     m.op(END); // loop
@@ -4002,10 +4154,10 @@ pub fn fma_fastpath_ref(ab: u64, bb: u64, cb: u64) -> Option<u64> {
     let u = t + e;
     let z2 = u - t;
     let d = (t - (u - z2)) + (e - z2); // u + d == t + e exactly
-    // Round-to-odd correction (Boldo-Melquiond): when t + e rounded (d != 0),
-    // replace u by its neighbor with an ODD last mantissa bit, on the side of
-    // the true value. The final RNE add of s + RO(t+e) is then provably the
-    // correctly rounded a*b + c — no double rounding, for ALL inputs in band.
+                                       // Round-to-odd correction (Boldo-Melquiond): when t + e rounded (d != 0),
+                                       // replace u by its neighbor with an ODD last mantissa bit, on the side of
+                                       // the true value. The final RNE add of s + RO(t+e) is then provably the
+                                       // correctly rounded a*b + c — no double rounding, for ALL inputs in band.
     let v = if d != 0.0 {
         let ub = u.to_bits();
         if u == 0.0 {
@@ -4384,13 +4536,11 @@ pub fn translate_block_ic(
                                     .local_set(SCR);
                                 m.local_get(SCR).i64_const(target as i64).op(I64_NE);
                                 m.op(IF).op(VOID);
-                                m.i32_const(0)
-                                    .local_get(SCR)
-                                    .i64_store(lay.pc_addr as u64);
+                                m.i32_const(0).local_get(SCR).i64_store(lay.pc_addr as u64);
                                 c.flush_writes(&mut m);
                                 c.set_retired(&mut m, n + 1);
-                emit_chain_next(&c, &mut m, false);
-                                                m.op(RETURN);
+                                emit_chain_next(&c, &mut m, false);
+                                m.op(RETURN);
                                 m.op(END);
                             }
                             tf.step(insn, pc);
@@ -4426,9 +4576,8 @@ pub fn translate_block_ic(
                 // chain lets one compile thread several indirect edges
                 // instead of needing a recompile per edge.
                 let ic = if tl >= 3 {
-                    next(seg_entry).filter(|&t| {
-                        t != pc && t >= base && t < base + code.len() as u64
-                    })
+                    next(seg_entry)
+                        .filter(|&t| t != pc && t >= base && t < base + code.len() as u64)
                 } else {
                     None
                 };
@@ -4500,11 +4649,12 @@ pub fn translate_block_ic(
                     // both measured net-negative: displaced loop regions cost
                     // more than the saved dispatches.)
                     let t_in = target >= base && target < base + code.len() as u64;
-                    let (follow_pc, exit_pc, op) = if t_in && target > pc && hot(target) && !hot(next_pc) {
-                        (target, next_pc, cmp_inv)
-                    } else {
-                        (next_pc, target, cmp)
-                    };
+                    let (follow_pc, exit_pc, op) =
+                        if t_in && target > pc && hot(target) && !hot(next_pc) {
+                            (target, next_pc, cmp_inv)
+                        } else {
+                            (next_pc, target, cmp)
+                        };
                     seed(&mut seeds, exit_pc);
                     c.push_reg(&mut m, s1);
                     c.push_reg(&mut m, s2);
@@ -4652,9 +4802,11 @@ fn translate_loop(
             c.flush_writes(&mut m);
             c.set_pc_const(&mut m, h);
             m.i32_const(0);
-    m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
-    emit_chain_next(c, &mut m, true);
+            m.i32_const(0).i64_load(lay.retired_addr as u64);
+            m.local_get(ITER)
+                .op(I64_ADD)
+                .i64_store(lay.retired_addr as u64);
+            emit_chain_next(c, &mut m, true);
             m.op(RETURN);
             m.op(END);
         }
@@ -4673,7 +4825,9 @@ fn translate_loop(
                 .op(I64_ADD)
                 .local_set(ITER);
             seg = 0;
-            let li = scopes.iter().rposition(|&(k, _, h)| k == 1 && h == target)?;
+            let li = scopes
+                .iter()
+                .rposition(|&(k, _, h)| k == 1 && h == target)?;
             let depth = (scopes.len() - 1 - li) as u32;
             m.br(depth);
             pc = next;
@@ -4727,13 +4881,18 @@ fn translate_loop(
         }
         if target < pc {
             // back-edge → continue the loop whose header == target.
-            let li = scopes.iter().rposition(|&(k, _, h)| k == 1 && h == target)?;
+            let li = scopes
+                .iter()
+                .rposition(|&(k, _, h)| k == 1 && h == target)?;
             let depth = (scopes.len() - 1 - li) as u32;
             c.push_reg(&mut m, s1);
             c.push_reg(&mut m, s2);
             m.op(cmp);
             m.br_if(depth);
-        } else if let Some(bi) = scopes.iter().rposition(|&(k, cp, _)| k == 0 && cp == target) {
+        } else if let Some(bi) = scopes
+            .iter()
+            .rposition(|&(k, cp, _)| k == 0 && cp == target)
+        {
             // forward branch to an enclosing loop's exit → break.
             let depth = (scopes.len() - 1 - bi) as u32;
             c.push_reg(&mut m, s1);
@@ -4772,7 +4931,9 @@ fn translate_loop(
     c.set_pc_const(&mut m, region.end_pc);
     m.i32_const(0);
     m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    m.local_get(ITER)
+        .op(I64_ADD)
+        .i64_store(lay.retired_addr as u64);
     emit_chain_next(c, &mut m, true);
     Some(Block {
         wasm: m.finish(),
@@ -4829,10 +4990,7 @@ fn scan_regs_super(
         }
     };
     for &e in entries {
-        let Some(pi) = page_vas
-            .iter()
-            .position(|&va| e.wrapping_sub(va) < 0x1000)
-        else {
+        let Some(pi) = page_vas.iter().position(|&va| e.wrapping_sub(va) < 0x1000) else {
             continue;
         };
         let base = page_vas[pi] - (pi as u64) * 0x1000;
@@ -5025,22 +5183,22 @@ fn scan_regs_super(
         }
     }
     let _ = mem_ops; // super coalescing measured net-negative: multi-array
-    // superblocks thrash a 1-page cache (IDEA 1768->1670); basic/region only.
-    //
-    // Hoist only registers the function actually leans on. EVERY entry into a
-    // superblock loads the hoisted read set and every exit stores the hoisted
-    // write set, so a register touched twice in one cold body costs two memory
-    // ops on every single entry and saves at most one. Leaving it in memory
-    // (the emitter reads/writes x_base directly when a register has no local)
-    // makes entry/exit proportional to the hot core instead of to the size of
-    // the page. Measured on nbench: superblock pages carried unions of 25 GPRs
-    // + 15 FP registers — 60 memory ops per entry against ~15 retired
-    // instructions on FOURIER's cross-page libm calls, which is why whole-page
-    // superblocks were LOSING to individual blocks there.
-    // The FP gate must key off whether the region CONTAINS FP work, never off
-    // the hoisted mask — filtering every FP register into memory would
-    // otherwise silently drop the gate and run FP without its FS/frm/NX
-    // checks.
+                     // superblocks thrash a 1-page cache (IDEA 1768->1670); basic/region only.
+                     //
+                     // Hoist only registers the function actually leans on. EVERY entry into a
+                     // superblock loads the hoisted read set and every exit stores the hoisted
+                     // write set, so a register touched twice in one cold body costs two memory
+                     // ops on every single entry and saves at most one. Leaving it in memory
+                     // (the emitter reads/writes x_base directly when a register has no local)
+                     // makes entry/exit proportional to the hot core instead of to the size of
+                     // the page. Measured on nbench: superblock pages carried unions of 25 GPRs
+                     // + 15 FP registers — 60 memory ops per entry against ~15 retired
+                     // instructions on FOURIER's cross-page libm calls, which is why whole-page
+                     // superblocks were LOSING to individual blocks there.
+                     // The FP gate must key off whether the region CONTAINS FP work, never off
+                     // the hoisted mask — filtering every FP register into memory would
+                     // otherwise silently drop the gate and run FP without its FS/frm/NX
+                     // checks.
     let uses_fp = (fr | fw) != 0;
     for x in 1..32 {
         if uses[x] < SB_HOIST_MIN {
@@ -5301,12 +5459,12 @@ pub fn discover_page_leaders_ext(
                 break;
             };
             let next = pc.wrapping_add(ilen);
-            let mut add = |t: u64, leaders: &mut std::collections::BTreeSet<u64>,
-                           pending: &mut Vec<u64>| {
-                if in_page(t) && leaders.len() < max_leaders && leaders.insert(t) {
-                    pending.push(t);
-                }
-            };
+            let mut add =
+                |t: u64, leaders: &mut std::collections::BTreeSet<u64>, pending: &mut Vec<u64>| {
+                    if in_page(t) && leaders.len() < max_leaders && leaders.insert(t) {
+                        pending.push(t);
+                    }
+                };
             match opcode(insn) {
                 // conditional branch: target + fallthrough are leaders; block ends
                 0x63 => {
@@ -5383,7 +5541,9 @@ pub fn translate_superblock(
     lay: JitLayout,
 ) -> Option<Block> {
     let _ = base;
-    let vas: Vec<u64> = (0..page_span / 0x1000).map(|k| page_base + k * 0x1000).collect();
+    let vas: Vec<u64> = (0..page_span / 0x1000)
+        .map(|k| page_base + k * 0x1000)
+        .collect();
     translate_superblock_sparse(code, &vas, entries, lay, false)
 }
 
@@ -5487,10 +5647,7 @@ pub fn translate_superblock_sparse(
         m.op(BLOCK).op(VOID);
     }
     // idx = offset >> 1 (i32); dispatch.
-    m.local_get(SCR)
-        .i64_const(1)
-        .op(I64_SHR_U)
-        .op(I32_WRAP_I64);
+    m.local_get(SCR).i64_const(1).op(I64_SHR_U).op(I32_WRAP_I64);
     m.br_table(&slot_depth, n as u32);
 
     // Close $e_0..$e_{n-1}, emitting each entry body after its block's end.
@@ -5521,7 +5678,7 @@ pub fn translate_superblock_sparse(
         );
     }
     m.op(END); // close $default
-    // default: TPC wasn't a known entry in-page -> exit ($exit at depth 1).
+               // default: TPC wasn't a known entry in-page -> exit ($exit at depth 1).
     m.br(1);
 
     m.op(END); // close loop $L
@@ -5532,7 +5689,9 @@ pub fn translate_superblock_sparse(
     m.i32_const(0).local_get(TPC).i64_store(lay.pc_addr as u64);
     m.i32_const(0);
     m.i32_const(0).i64_load(lay.retired_addr as u64);
-    m.local_get(ITER).op(I64_ADD).i64_store(lay.retired_addr as u64);
+    m.local_get(ITER)
+        .op(I64_ADD)
+        .i64_store(lay.retired_addr as u64);
     emit_chain_next(&c, &mut m, true);
 
     Some(Block {
@@ -5550,7 +5709,6 @@ pub fn translate_superblock_sparse(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5563,7 +5721,7 @@ mod tests {
         assert!(!alu_handled(0x13, 0x10, 1));
         assert!(alu_handled(0x13, 0x00, 1));
         assert!(alu_handled(0x13, 0x01, 1)); // shamt[5]=1 is VALID on rv64
-        // SRxI reserved funct7
+                                             // SRxI reserved funct7
         assert!(!alu_handled(0x13, 0x10, 5));
         assert!(alu_handled(0x13, 0x21, 5));
         // SLLIW/SRLIW/SRAIW: imm[5] reserved
@@ -5601,7 +5759,7 @@ mod tests {
         let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         code.extend_from_slice(&0x873eu16.to_le_bytes()); // c.mv a4,a5
         code.extend_from_slice(&0x86aeu16.to_le_bytes()); // c.mv a3,a1
-        // bltu a6,a2, back to start: offset = -(len so far)
+                                                          // bltu a6,a2, back to start: offset = -(len so far)
         let off = -(code.len() as i64);
         let imm = off as u32;
         let bltu = 0x63
@@ -5660,7 +5818,7 @@ mod tests {
         code.extend_from_slice(&0x00178713u32.to_le_bytes());
         code.extend_from_slice(&0x00d78023u32.to_le_bytes());
         code.extend_from_slice(&0x87bau16.to_le_bytes()); // c.mv a5,a4
-        // bne a2, x0 -> start
+                                                          // bne a2, x0 -> start
         let off = -(code.len() as i64);
         let imm = off as u32;
         let bne = 0x63
@@ -5765,7 +5923,10 @@ mod tests {
             checked += 1;
             passed += check(rnd(), rnd(), rnd());
         }
-        println!("hit rates: libm-like {libm_rate}%, near-cancel {cancel_rate}%, total {}%", passed * 100 / checked);
+        println!(
+            "hit rates: libm-like {libm_rate}%, near-cancel {cancel_rate}%, total {}%",
+            passed * 100 / checked
+        );
         // the fast path must be worth emitting: solid hit rate on libm-like values
         assert!(libm_rate >= 90, "libm-like hit rate too low: {libm_rate}%");
     }
@@ -5781,8 +5942,7 @@ mod tests {
 
     fn branch(f3: u32, rs1: u32, rs2: u32, off: i32) -> u32 {
         let imm = off as u32;
-        0x63
-            | (f3 << 12)
+        0x63 | (f3 << 12)
             | (rs1 << 15)
             | (rs2 << 20)
             | (((imm >> 11) & 1) << 7)
@@ -5793,8 +5953,7 @@ mod tests {
 
     fn jal(rd: u32, off: i32) -> u32 {
         let imm = off as u32;
-        0x6f
-            | (rd << 7)
+        0x6f | (rd << 7)
             | (((imm >> 12) & 0xff) << 12)
             | (((imm >> 11) & 1) << 20)
             | (((imm >> 1) & 0x3ff) << 21)
@@ -5814,7 +5973,12 @@ mod tests {
         assert_eq!(actual.end_pc, expected.end_pc);
         assert_eq!(actual.loops, expected.loops);
         assert!(!actual.unconditional_latch);
-        assert_eq!(translate_block(&code, 0x1000, 0x100c, enabled).unwrap().n_insns, 3);
+        assert_eq!(
+            translate_block(&code, 0x1000, 0x100c, enabled)
+                .unwrap()
+                .n_insns,
+            3
+        );
     }
 
     #[test]
@@ -5893,7 +6057,6 @@ mod tests {
         assert_eq!(b.trace_mem, [0, 0, 0, 1, 0, 0, 0, 1, 1, 1]);
     }
 }
-
 
 /// One member of a compiled batch: its entry pc and how many instructions
 /// its body retires (the host caches these like ordinary blocks).

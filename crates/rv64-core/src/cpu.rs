@@ -165,7 +165,9 @@ impl Cpu {
     }
 
     pub fn jit_mstatus_ptr(&self) -> usize {
-        self.sys.as_ref().map_or(0, |s| &s.mstatus as *const u64 as usize)
+        self.sys
+            .as_ref()
+            .map_or(0, |s| &s.mstatus as *const u64 as usize)
     }
 
     pub fn jit_ftlb_ptrs(&self) -> (usize, usize, usize, usize) {
@@ -1124,13 +1126,13 @@ impl Cpu {
                     }
                     self.flush_tlb();
                     self.map_gen += 1; // cached translations must re-verify
-                    // NOTE: do NOT bump jit_flush_gen here. SFENCE.VMA is
-                    // issued on every page-table change — including the
-                    // frequent data mmaps of a malloc-heavy process (a
-                    // compiler!) — which would flush the whole JIT block
-                    // cache and keep coverage at ~0% on realistic workloads.
-                    // Stale *code* mappings are instead caught cheaply by
-                    // the dispatcher's per-block pa re-verification.
+                                       // NOTE: do NOT bump jit_flush_gen here. SFENCE.VMA is
+                                       // issued on every page-table change — including the
+                                       // frequent data mmaps of a malloc-heavy process (a
+                                       // compiler!) — which would flush the whole JIT block
+                                       // cache and keep coverage at ~0% on realistic workloads.
+                                       // Stale *code* mappings are instead caught cheaply by
+                                       // the dispatcher's per-block pa re-verification.
                 }
                 // Zicsr
                 (_, f3 @ 1..=3) | (_, f3 @ 5..=7) => {
@@ -1909,7 +1911,10 @@ mod tests {
         // Any exception must too (page fault, ecall, ...).
         cpu.reservation = Some(0x8000_1000);
         cpu.take_trap(8, 0, false); // ecall from U-mode
-        assert_eq!(cpu.reservation, None, "exception must invalidate LR reservation");
+        assert_eq!(
+            cpu.reservation, None,
+            "exception must invalidate LR reservation"
+        );
     }
 
     #[test]
@@ -1929,7 +1934,7 @@ mod tests {
         assert_eq!(cpu.csr_read(TIME), Some(5)); // 0/10 + 5
         cpu.insn_count = 100;
         assert_eq!(cpu.csr_read(TIME), Some(15)); // 100/10 + 5
-        // time_scale == 0 falls back to the mirrored mtime (legacy machine).
+                                                  // time_scale == 0 falls back to the mirrored mtime (legacy machine).
         {
             let sys = cpu.sys.as_mut().unwrap();
             sys.time_scale = 0;

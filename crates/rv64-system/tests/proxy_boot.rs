@@ -220,7 +220,8 @@ fn guest_fetches_through_the_in_process_proxy() {
     );
     // The offer itself must have come from us, with the address we serve.
     assert!(
-        h.out.contains(&format!("Lease of {} obtained", ip(&cfg.guest_ip))),
+        h.out
+            .contains(&format!("Lease of {} obtained", ip(&cfg.guest_ip))),
         "udhcpc did not take our lease:\n{}",
         tail(&h.out)
     );
@@ -242,7 +243,11 @@ fn guest_fetches_through_the_in_process_proxy() {
     // The proxy is on-link, so ARP alone should reach it. Prove that before
     // blaming HTTP for anything that follows.
     assert!(
-        h.run(&format!("ping -c 1 -W 5 {}", ip(&cfg.host_ip)), "1 packets received", 3000),
+        h.run(
+            &format!("ping -c 1 -W 5 {}", ip(&cfg.host_ip)),
+            "1 packets received",
+            3000
+        ),
         "the proxy host is not reachable at all:\n{}",
         tail(&h.out)
     );
@@ -256,7 +261,11 @@ fn guest_fetches_through_the_in_process_proxy() {
 
     // The actual thing: an unmodified client fetching a URL through the proxy.
     assert!(
-        h.run("wget -q -O- http://example.test/hello", "PROXY-BODY-OK", 3000),
+        h.run(
+            "wget -q -O- http://example.test/hello",
+            "PROXY-BODY-OK",
+            3000
+        ),
         "fetch through the proxy failed:\n{}",
         tail(&h.out)
     );
@@ -267,16 +276,15 @@ fn guest_fetches_through_the_in_process_proxy() {
     // The client sent absolute-URI form because it was talking to a proxy, and
     // the hop-by-hop headers it adds for the proxy hop were stripped.
     let names: Vec<String> = req.headers.iter().map(|(n, _)| n.to_lowercase()).collect();
-    assert!(!names.contains(&"proxy-connection".to_string()), "got {names:?}");
+    assert!(
+        !names.contains(&"proxy-connection".to_string()),
+        "got {names:?}"
+    );
     assert!(!names.contains(&"connection".to_string()), "got {names:?}");
 
     // A response larger than one segment must reassemble byte-exact in the guest.
     assert!(
-        h.run(
-            "wget -q -O- http://example.test/big | wc -c",
-            "20000",
-            4000
-        ),
+        h.run("wget -q -O- http://example.test/big | wc -c", "20000", 4000),
         "a multi-segment response did not arrive intact:\n{}",
         tail(&h.out)
     );
@@ -384,10 +392,7 @@ fn md5_hex(data: &[u8]) -> String {
             let tmp = d;
             d = c;
             c = b;
-            let sum = a
-                .wrapping_add(f)
-                .wrapping_add(k[i])
-                .wrapping_add(m[g]);
+            let sum = a.wrapping_add(f).wrapping_add(k[i]).wrapping_add(m[g]);
             b = b.wrapping_add(sum.rotate_left(s[i]));
             a = tmp;
         }

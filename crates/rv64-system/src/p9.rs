@@ -771,13 +771,16 @@ impl<'a> Rd<'a> {
         self.take(1).map(|s| s[0])
     }
     fn u16(&mut self) -> Option<u16> {
-        self.take(2).map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+        self.take(2)
+            .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
     }
     fn u32(&mut self) -> Option<u32> {
-        self.take(4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        self.take(4)
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
     }
     fn u64(&mut self) -> Option<u64> {
-        self.take(8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+        self.take(8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
     }
     fn str(&mut self) -> Option<String> {
         let n = self.u16()? as usize;
@@ -1099,7 +1102,10 @@ mod tests {
         msg.extend_from_slice(&[0, 0]); // fid cut short
         let r = c.srv.handle(&msg);
         assert_eq!(r[4], R_LERROR);
-        assert_eq!(u32::from_le_bytes(r[7..11].try_into().unwrap()) as i32, EPROTO);
+        assert_eq!(
+            u32::from_le_bytes(r[7..11].try_into().unwrap()) as i32,
+            EPROTO
+        );
         // xattrwalk is answered, but as "unsupported" — v9fs probes it on
         // mount and must get an errno userspace can map (not TinyEMU's 524).
         let mut b = Wr::default();

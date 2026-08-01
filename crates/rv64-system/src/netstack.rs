@@ -165,7 +165,11 @@ impl NetStack {
 
     /// `http_proxy` value the guest should use.
     pub fn proxy_url(&self) -> String {
-        format!("http://{}:{}", fmt_ip(&self.cfg.host_ip), self.cfg.proxy_port)
+        format!(
+            "http://{}:{}",
+            fmt_ip(&self.cfg.host_ip),
+            self.cfg.proxy_port
+        )
     }
 
     /// Frames to hand to the guest's NIC.
@@ -356,10 +360,10 @@ impl NetStack {
         opt(51, &3600u32.to_be_bytes(), &mut m); // lease time
         opt(1, &self.cfg.netmask, &mut m);
         opt(3, &self.cfg.host_ip, &mut m); // router
-        // Offer ourselves as the DNS server so the guest's resolv.conf is
-        // populated and name lookups fail fast rather than hanging on a
-        // nonexistent server. Nothing here answers DNS: with a proxy the guest
-        // never needs to resolve anything, because it hands us the hostname.
+                                           // Offer ourselves as the DNS server so the guest's resolv.conf is
+                                           // populated and name lookups fail fast rather than hanging on a
+                                           // nonexistent server. Nothing here answers DNS: with a proxy the guest
+                                           // never needs to resolve anything, because it hands us the hostname.
         opt(6, &self.cfg.host_ip, &mut m);
         m.push(255);
 
@@ -438,7 +442,15 @@ impl NetStack {
         self.emit_flags(i, TCP_SYN | TCP_ACK, iss);
     }
 
-    fn on_segment(&mut self, i: usize, seq: u32, ack: u32, flags: u16_flags, window: u16, payload: &[u8]) {
+    fn on_segment(
+        &mut self,
+        i: usize,
+        seq: u32,
+        ack: u32,
+        flags: u16_flags,
+        window: u16,
+        payload: &[u8],
+    ) {
         let flags = flags;
         if flags & TCP_RST != 0 {
             let id = self.conns[i].id;
@@ -750,7 +762,12 @@ mod tests {
         let dst: [u8; 4] = ip[16..20].try_into().unwrap();
         assert_eq!(tcp_checksum(&src, &dst, seg), 0, "TCP checksum");
         let off = (seg[12] >> 4) as usize * 4;
-        (seg[13], be32(&seg[4..8]), be32(&seg[8..12]), seg[off..].to_vec())
+        (
+            seg[13],
+            be32(&seg[4..8]),
+            be32(&seg[8..12]),
+            seg[off..].to_vec(),
+        )
     }
 
     /// Complete a handshake on `port`; returns (conn id, our ISS+1).
@@ -847,7 +864,11 @@ mod tests {
             let dhcp = &ip[28..];
             assert_eq!(dhcp[0], 2, "BOOTREPLY");
             assert_eq!(&dhcp[4..8], &[0xde, 0xad, 0xbe, 0xef], "xid echoed");
-            assert_eq!(&dhcp[16..20], &cfg.guest_ip, "yiaddr is the offered address");
+            assert_eq!(
+                &dhcp[16..20],
+                &cfg.guest_ip,
+                "yiaddr is the offered address"
+            );
             // Option 53 must carry the matching reply type, and the gateway and
             // netmask must be present or the guest cannot route to us.
             let opts = &dhcp[240..];
@@ -900,7 +921,14 @@ mod tests {
             IP_PROTO_TCP,
             cfg.guest_ip,
             cfg.host_ip,
-            &tcp_seg(40000, 8080, 1001, our_seq, TCP_ACK | TCP_PSH, b"hello proxy"),
+            &tcp_seg(
+                40000,
+                8080,
+                1001,
+                our_seq,
+                TCP_ACK | TCP_PSH,
+                b"hello proxy",
+            ),
         ));
         assert_eq!(
             s.take_events(),
@@ -959,21 +987,14 @@ mod tests {
 
         s.send(id, &vec![0x42u8; 500]);
         let out = s.take_output();
-        let total: usize = out
-            .iter()
-            .map(|f| parse_tcp(f).3.len())
-            .sum();
+        let total: usize = out.iter().map(|f| parse_tcp(f).3.len()).sum();
         assert_eq!(total, 100, "must not exceed the advertised window");
 
         // Acknowledging the first 100 bytes opens the window for the next 100.
         let mut more = tcp_seg(40002, 8080, 901, iss.wrapping_add(1 + 100), TCP_ACK, &[]);
         more[14..16].copy_from_slice(&100u16.to_be_bytes());
         s.input(&ip_frame(IP_PROTO_TCP, cfg.guest_ip, cfg.host_ip, &more));
-        let total: usize = s
-            .take_output()
-            .iter()
-            .map(|f| parse_tcp(f).3.len())
-            .sum();
+        let total: usize = s.take_output().iter().map(|f| parse_tcp(f).3.len()).sum();
         assert_eq!(total, 100, "window reopens as data is acknowledged");
     }
 
@@ -1053,7 +1074,14 @@ mod tests {
             IP_PROTO_TCP,
             cfg.guest_ip,
             cfg.host_ip,
-            &tcp_seg(40006, 8080, 9999, our_seq, TCP_ACK | TCP_PSH, b"from the future"),
+            &tcp_seg(
+                40006,
+                8080,
+                9999,
+                our_seq,
+                TCP_ACK | TCP_PSH,
+                b"from the future",
+            ),
         ));
         assert!(s.take_events().is_empty(), "gap must not be delivered");
         let (flags, _, ack, _) = parse_tcp(&s.take_output()[0]);

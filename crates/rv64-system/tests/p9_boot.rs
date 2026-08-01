@@ -226,7 +226,10 @@ fn listing(dir: &std::path::Path) -> Vec<String> {
         out.push(p.strip_prefix(dir).unwrap().display().to_string());
         if p.is_dir() {
             for sub in listing(&p) {
-                out.push(format!("{}/{sub}", p.file_name().unwrap().to_string_lossy()));
+                out.push(format!(
+                    "{}/{sub}",
+                    p.file_name().unwrap().to_string_lossy()
+                ));
             }
         }
     }

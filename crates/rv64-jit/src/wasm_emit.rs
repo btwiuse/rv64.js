@@ -412,8 +412,7 @@ impl WasmModule {
         // The parameter is the emulator-state pointer: the host passes it so
         // the pointer visibly escapes into the generated code, which stops
         // LLVM from caching CPU state in registers across block calls.
-        let n_types =
-            1 + u8::from(self.wants_tlb_fill) + u8::from(self.helper.is_some());
+        let n_types = 1 + u8::from(self.wants_tlb_fill) + u8::from(self.helper.is_some());
         let mut sec = vec![n_types]; // count
         sec.extend_from_slice(&[0x60, 1, 0x7f, 0]);
         if self.wants_tlb_fill {
@@ -472,8 +471,7 @@ impl WasmModule {
         }
 
         // export section: "run" -> the body function (after func imports)
-        let n_func_imports =
-            u8::from(self.wants_tlb_fill) + u8::from(self.wants_chain_next);
+        let n_func_imports = u8::from(self.wants_tlb_fill) + u8::from(self.wants_chain_next);
         let mut sec = vec![1u8];
         sec.push(3);
         sec.extend_from_slice(b"run");
@@ -524,7 +522,6 @@ fn section(m: &mut Vec<u8>, id: u8, payload: &[u8]) {
     uleb(m, payload.len() as u64);
     m.extend_from_slice(payload);
 }
-
 
 /// Assemble a BATCH module: N trace bodies (each with its own locals) in one
 /// module, exported "r0".."rN-1". Direct tail calls between bodies transfer
