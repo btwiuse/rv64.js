@@ -198,6 +198,11 @@ With `PROFILE=1`, the JIT stats additionally split calls and retired guest
 instructions between ordinary trace blocks and region/superblock functions.
 Those four counters are exact (not sampled); the detailed per-PC and edge
 tables remain sampled according to `PROFILE_SHIFT`.
+Ordinary traces also carry a five-bucket static mix (ALU, load, store/AMO,
+control, FP). The profiler scales that mix by each call's actual retired count
+and assigns integer-rounding residue to ALU. This is execution-weighted but
+approximate when a trace takes an early side exit; use it to select a broad
+lowering category, not to claim instruction-exact dynamic frequencies.
 
 Never use wall time from the first two modes as score evidence.
 

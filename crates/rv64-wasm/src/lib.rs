@@ -251,6 +251,8 @@ struct JitBlock {
     idx: i32,
     /// Guest instructions it retires.
     n: u32,
+    /// Static ordinary-trace mix (ALU/load/store/control/FP).
+    mix: [u16; 5],
     /// Physical address of the code (full-system: verified per dispatch).
     pa: u64,
 }
@@ -776,6 +778,7 @@ static mut DPROF_BLOCK_CALLS: u64 = 0;
 static mut DPROF_BLOCK_INSNS: u64 = 0;
 static mut DPROF_REGION_CALLS: u64 = 0;
 static mut DPROF_REGION_INSNS: u64 = 0;
+static mut DPROF_TRACE_MIX: [u64; 5] = [0; 5];
 
 #[no_mangle]
 pub extern "C" fn dprof_set(on: u32) {
@@ -794,6 +797,7 @@ pub extern "C" fn dprof_set(on: u32) {
             DPROF_BLOCK_INSNS = 0;
             DPROF_REGION_CALLS = 0;
             DPROF_REGION_INSNS = 0;
+            DPROF_TRACE_MIX = [0; 5];
         }
     }
 }
@@ -982,6 +986,7 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             47 => DPROF_BLOCK_INSNS,
             48 => DPROF_REGION_CALLS,
             49 => DPROF_REGION_INSNS,
+            50..=54 => DPROF_TRACE_MIX[(which - 50) as usize],
             _ => 0,
         }
     }
@@ -1281,6 +1286,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                             fp: false,
                             idx,
                             n: blk.n_insns,
+                            mix: blk.trace_mix,
                             pa: pc,
                         })
                     });
@@ -2436,6 +2442,17 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                     } else {
                         DPROF_BLOCK_CALLS += 1;
                         DPROF_BLOCK_INSNS += retired;
+                        if let Some(Some(b)) = jit.cache.get(&pc) {
+                            if b.n != 0 {
+                                let mut attributed = 0u64;
+                                for i in 1..5 {
+                                    let count = retired * b.mix[i] as u64 / b.n as u64;
+                                    DPROF_TRACE_MIX[i] += count;
+                                    attributed += count;
+                                }
+                                DPROF_TRACE_MIX[0] += retired.saturating_sub(attributed);
+                            }
+                        }
                     }
                 }
             }
@@ -2923,6 +2940,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                             fp: mb.uses_fp,
                                             idx,
                                             n: mb.n_insns,
+                                            mix: mb.trace_mix,
                                             pa: mpa,
                                         };
                                         if jit.cache.insert(mb.pc, Some(b)).is_none() {
@@ -3010,6 +3028,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                                     fp: blk.uses_fp,
                                     idx,
                                     n: blk.n_insns,
+                                    mix: blk.trace_mix,
                                     pa,
                                 },
                                 spanned,
@@ -3067,7 +3086,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                             None => {
                                 m.bus.jit_mark_page(pa);
                                 m.cpu.clear_store_jtlb();
-                                let jb = JitBlock { fp: false, idx: -1, n: 0, pa };
+                                let jb = JitBlock { fp: false, idx: -1, n: 0, mix: [0; 5], pa };
                                 if jit.cache.insert(pc, Some(jb)).is_none() {
                                     jit.page_blocks
                                         .entry((pa - rv64_system::RAM_BASE) >> 12)
@@ -3350,7 +3369,7 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
                 continue;
             }
             let epa = p.pages[pi].1 + (e & 0xfff);
-            let jb = JitBlock { fp: false, idx, n: 0, pa: epa };
+            let jb = JitBlock { fp: false, idx, n: 0, mix: [0; 5], pa: epa };
             let prev = jit.cache.insert(e, Some(jb));
             SB_ENTRIES_IN += 1;
             if e == TRACE_PC {

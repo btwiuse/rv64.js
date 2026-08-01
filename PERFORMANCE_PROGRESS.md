@@ -485,6 +485,19 @@ asynchronous large-module tuning cannot materially change the row. The next
 diagnostic is trace-only and must attribute execution-weighted instruction
 categories within ordinary traces.
 
+**E021 trace lowering mix:** every ordinary trace now carries a compact static
+five-category mix; under `PROFILE=1` only, the dispatcher scales it by actual
+retirement for each call. Pinned Compile attributed 160.68M instructions to
+ALU (49.8%), 74.34M to loads (23.0%), 52.92M to stores/AMO (16.4%), and 34.75M
+to control flow (10.8%); FP was zero. The buckets sum exactly to 322.69M trace
+instructions, although side exits make the category split approximate. The
+diagnostic's cache lookup/accounting perturbed wall time and that timing is
+excluded. Memory is the only large complex lowering category at 39.4%; ALU is
+larger by count but mostly direct Wasm integer operations, while control flow
+is too small for isolated elimination to meet the gate. Next attribute memory
+operations by width and base-register identity, especially stack-relative
+traffic, before proposing another system-memory lowering.
+
 ### P4 — Python coverage stability
 
 Work on Python only if replicated candidate-relative trials still show a loss.
@@ -541,6 +554,7 @@ must add one row immediately after its decision.
 | E018 | 2026-08-01 | LANDED | Non-destructive LD+LHU multi-latch lookahead with unchanged ordinary-loop fallback | Assignment one-pair `ab-2026-08-01T00-31-22.json` (+64.8%); valid three-pair `00-32-46` (+59.4%, 0.4%/0.4% MAD); guards `00-36-58` plus valid Fourier retry `00-38-04`; valid authoritative reports `scorecard-2026-08-01T00-57-47.json` and `01-18-18`, both 11/13; direct Python `ab-2026-08-01T00-59-00.json` tied with candidate 7.7% faster; exact detector/fallback unit tests and all eight correctness stages passed; promoted Wasm `91ab401df4b6…`. | Assignment flips from loss to 1.29× win without reproducing E017's regressions. Score remains 11/13 because bimodal Python was independently slow in both scorecards; current losses are Python and Compile. Default enabled; retain the setter for controlled diagnostics. |
 | E019 | 2026-08-01 | DIAGNOSTIC | Expose existing host JIT registration timings and inspect Compile fallback concentration | Pinned Compile: 2,898.4 ms total; 3,764 synchronous modules / 17.07 MB; 188.9 ms module compilation; 234.3 ms complete registration. `PROFILE=1` reproduced aggregate counters and attributed 17.31M interpreted instructions; largest starting-instruction bucket was 313k (1.8%). | Synchronous registration has an impossible-elimination ceiling of 8.1%, below the gate, and fallback work is fragmented. Close both bounded axes. Next measure execution-weighted generated lowering categories. |
 | E020 | 2026-08-01 | DIAGNOSTIC | Exact ordinary-trace versus region-function execution split under `PROFILE=1` | Pinned Compile: ordinary traces 16,615,572 calls / 322,691,608 retired instructions; regions 632 / 3,556; total JIT retired 322,695,164; aggregate counters reproduce E019. | Ordinary traces execute 99.9989% of JIT instructions. Close all Compile superblock/region tuning; perform the next lowering-category attribution only in the trace backend. |
+| E021 | 2026-08-01 | DIAGNOSTIC | Execution-weighted ordinary-trace static mix | Pinned Compile: ALU 160.68M (49.8%), loads 74.34M (23.0%), stores/AMO 52.92M (16.4%), control 34.75M (10.8%), FP 0; 322.69M total. Scaling uses actual retirement but category proportions are approximate for side exits; diagnostic wall time is excluded. | Memory is the only large complex lowering category (39.4%). Attribute widths and base registers before selecting a memory candidate; do not pursue superblocks, FP, or a control-only change. |
 
 ### Required record for new experiments
 
