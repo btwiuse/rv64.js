@@ -94,9 +94,9 @@ async function start(presetName) {
   term.textContent = "";
   write(`[host] loading ${preset.label}…\n`);
   try {
+    if (active) await active.destroy();
+    active = null;
     const wasm = await loadWasm();
-    const vm = await RV64.create(wasm);
-    vm.onWrite = (_fd, data) => write(data);
     const images = [];
     for (let i = 0; i < preset.local.length; i++) {
       const name = preset.release[i];
@@ -106,31 +106,44 @@ async function start(presetName) {
       }));
     }
     if (myGeneration !== generation) return;
-    if (presetName === "fast") {
-      vm.bootLinux({ bios: images[0], kernel: images[1], disk: images[2], ramMB: preset.ramMB });
-      active = { vm, run: () => vm.runSystem(3_000_000n), input: (b) => vm.consoleInput(b), count: () => vm.sysInsnCount() };
-    } else {
-      vm.bootVirtLinux({
-        opensbi: images[0], kernel: images[1], disk: images[2], ramMB: preset.ramMB,
-        cmdline: "console=ttyS0 root=/dev/vda rw init=/binit.sh",
-      });
-      active = { vm, run: () => vm.runVirtSystem(2_000_000n), input: (b) => vm.virtConsoleInput(b), count: () => vm.virtInsnCount() };
-    }
+    const bootConfig = presetName === "fast"
+      ? { mode: "firmware", firmware: images[0], kernel: images[1], disk: images[2] }
+      : {
+          mode: "firmware",
+          firmware: images[0],
+          kernel: images[1],
+          disk: images[2],
+          cmdline: "console=ttyS0 root=/dev/vda rw init=/binit.sh",
+        };
+    const vm = await RV64.create({
+      wasm,
+      memoryMB: preset.ramMB,
+      boot: bootConfig,
+      events: {
+        console: (data) => write(data),
+        stop: ({ reason }) => {
+          if (reason === "powered-off") write("\n[host] guest powered off\n");
+          status.textContent = reason === "powered-off" ? "Powered off" : "Stopped";
+        },
+      },
+    });
+    active = vm;
     const started = performance.now();
     let lastStatus = 0;
     const frame = () => {
       if (myGeneration !== generation || !active) return;
-      if (active.run()) { write("\n[host] guest powered off\n"); status.textContent = "Powered off"; return; }
+      if (!active.running) return;
       const now = performance.now();
       if (now - lastStatus > 500) {
         lastStatus = now;
-        const insns = Number(active.count());
+        const insns = Number(active.instructions);
         status.textContent = `${(insns / 1e6).toFixed(0)} Minsns · ${(insns / (now - started) / 1000).toFixed(1)} Minsn/s`;
       }
       setTimeout(frame, 0);
     };
     title.textContent = `${preset.label} console`;
     term.focus();
+    await vm.start();
     frame();
   } catch (error) {
     write(`\n[host] unable to boot: ${error.message}\n\n`);
@@ -154,11 +167,11 @@ document.querySelector("#clear").addEventListener("click", () => { term.textCont
 term.addEventListener("keydown", (event) => {
   if (!active) return;
   if (event.ctrlKey && event.key.length === 1) {
-    active.input(new Uint8Array([event.key.toUpperCase().charCodeAt(0) - 64]));
+    active.console.send(new Uint8Array([event.key.toUpperCase().charCodeAt(0) - 64]));
     event.preventDefault();
     return;
   }
   const keys = { Enter: "\r", Backspace: "\x7f", Tab: "\t", Escape: "\x1b", ArrowUp: "\x1b[A", ArrowDown: "\x1b[B", ArrowRight: "\x1b[C", ArrowLeft: "\x1b[D" };
   const text = keys[event.key] ?? (event.key.length === 1 ? event.key : null);
-  if (text) { active.input(encoder.encode(text)); event.preventDefault(); }
+  if (text) { active.console.send(encoder.encode(text)); event.preventDefault(); }
 });

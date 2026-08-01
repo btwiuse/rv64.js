@@ -12,7 +12,7 @@ const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
 const V86DIR = process.env.V86DIR || (ARTIFACTS && join(ARTIFACTS, "v86"));
 const REPS = +(process.env.REPS || 3);
 
-const { RV64 } = await import(join(root, "web/rv64.js"));
+const { RV64Debug: RV64 } = await import(join(root, "web/rv64.js"));
 const wasm = await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"));
 const imgs = await Promise.all(
   ["bbl64.bin", "kernel-riscv64.bin", "root-riscv64.bin"].map(async (f) =>

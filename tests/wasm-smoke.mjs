@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const { RV64, Stop } = await import(join(root, "web/rv64.js"));
+const { RV64Debug: RV64, Stop } = await import(join(root, "web/rv64.js"));
 const wasmBytes = await readFile(
   join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"),
 );

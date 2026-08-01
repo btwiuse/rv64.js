@@ -15,7 +15,7 @@ import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const disk = process.env.ROOT_NBENCH || join(process.env.ARTIFACTS || "", "root-nbench.bin");
-const { RV64 } = await import(join(root, "web/rv64.js"));
+const { RV64Debug: RV64 } = await import(join(root, "web/rv64.js"));
 const wasm = await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"));
 const img = (f) => readFile(f).then((b) => new Uint8Array(b));
 const [bios, kernel, diskImg] = await Promise.all([

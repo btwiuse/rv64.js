@@ -11,7 +11,10 @@ export const Stop = Object.freeze({
   EXITED: 4,
 });
 
-export class RV64 {
+// Low-level bindings used by rv64.js itself and the repository's architecture
+// and differential tests. This is intentionally not the supported embedding
+// API; applications should use RV64 below.
+export class RV64Debug {
   /** @param {WebAssembly.Instance} instance */
   constructor(instance) {
     this.ex = instance.exports;
@@ -181,7 +184,7 @@ export class RV64 {
       wasmSource instanceof Response || wasmSource instanceof Promise
         ? await WebAssembly.instantiateStreaming(wasmSource, imports)
         : await WebAssembly.instantiate(wasmSource, imports);
-    vm = new RV64(instance);
+    vm = new RV64Debug(instance);
     // Hardware FMA: use f64x2.relaxed_madd for the guest's FMADD family iff
     // the engine validates it AND it is fused on this hardware (the spec
     // allows unfused; only fused is bit-exact). Probe empirically:
@@ -343,7 +346,7 @@ export class RV64 {
  * `net: true` adds a NIC — call `connectNet(url)` to give its frames somewhere
  * to go.
  */
-RV64.prototype.bootLinux = function ({
+RV64Debug.prototype.bootLinux = function ({
   bios,
   kernel,
   disk,
@@ -385,7 +388,7 @@ RV64.prototype.bootLinux = function ({
  * The relay is what makes guest networking possible without privileges — it
  * holds them and does the NAT, so the emulator stays a pure layer-2 device.
  */
-RV64.prototype.connectNet = function (url) {
+RV64Debug.prototype.connectNet = function (url) {
   const ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
   // Frames sent before the socket opens would throw; drop them the way a NIC
@@ -402,7 +405,7 @@ RV64.prototype.connectNet = function (url) {
 };
 
 /** Deliver one inbound Ethernet frame to the guest's NIC. */
-RV64.prototype.netInput = function (frame) {
+RV64Debug.prototype.netInput = function (frame) {
   const ptr = this.ex.staging_alloc(frame.length);
   new Uint8Array(this.ex.memory.buffer, ptr, frame.length).set(frame);
   this.ex.sys_net_input();
@@ -472,7 +475,7 @@ function requestOrigin(url) {
  * origin needs the relay, later requests to that origin route there directly.
  * Call routeHttpViaRelay(origin) to opt an origin in before its first request.
  */
-RV64.prototype.connectHttpRelay = function (url, options = {}) {
+RV64Debug.prototype.connectHttpRelay = function (url, options = {}) {
   const WebSocketImpl = options.WebSocket ?? globalThis.WebSocket;
   if (!WebSocketImpl) throw new Error("WebSocket is unavailable");
   this.disconnectHttpRelay();
@@ -583,7 +586,7 @@ RV64.prototype.connectHttpRelay = function (url, options = {}) {
   return ws;
 };
 
-RV64.prototype.disconnectHttpRelay = function () {
+RV64Debug.prototype.disconnectHttpRelay = function () {
   const relay = this.httpRelay;
   this.httpRelay = null;
   if (relay) {
@@ -596,13 +599,13 @@ RV64.prototype.disconnectHttpRelay = function () {
 };
 
 /** Route an origin directly through the request relay, or remove that choice. */
-RV64.prototype.routeHttpViaRelay = function (origin, enabled = true) {
+RV64Debug.prototype.routeHttpViaRelay = function (origin, enabled = true) {
   const normalized = requestOrigin(origin) || origin.replace(/\/+$/, "");
   if (enabled) this.httpRelayOrigins.add(normalized);
   else this.httpRelayOrigins.delete(normalized);
 };
 
-RV64.prototype.performHttpViaRelay = async function (id, encodedRequest) {
+RV64Debug.prototype.performHttpViaRelay = async function (id, encodedRequest) {
   const relay = this.httpRelay;
   if (!relay) throw new Error("HTTP relay is not connected");
   await relay.ready;
@@ -617,23 +620,23 @@ RV64.prototype.performHttpViaRelay = async function (id, encodedRequest) {
 };
 
 /** Run a slice of the booted system. Returns true when powered off. */
-RV64.prototype.runSystem = function (maxInsns = 10_000_000n) {
+RV64Debug.prototype.runSystem = function (maxInsns = 10_000_000n) {
   return this.ex.sys_run(BigInt(maxInsns)) === 1;
 };
 
 /** Send keyboard input to the guest console. */
-RV64.prototype.consoleInput = function (bytes) {
+RV64Debug.prototype.consoleInput = function (bytes) {
   const ptr = this.ex.staging_alloc(bytes.length);
   new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
   this.ex.sys_console_input();
 };
 
-RV64.prototype.sysInsnCount = function () {
+RV64Debug.prototype.sysInsnCount = function () {
   return this.ex.sys_insn_count();
 };
 
 /** Boot the modern OpenSBI/Linux virt machine. */
-RV64.prototype.bootVirtLinux = function ({
+RV64Debug.prototype.bootVirtLinux = function ({
   opensbi,
   kernel,
   initrd,
@@ -656,23 +659,23 @@ RV64.prototype.bootVirtLinux = function ({
 };
 
 /** Run a slice of the modern virt machine. Returns true when powered off. */
-RV64.prototype.runVirtSystem = function (maxInsns = 2_000_000n) {
+RV64Debug.prototype.runVirtSystem = function (maxInsns = 2_000_000n) {
   return this.ex.virt_run(BigInt(maxInsns)) === 1;
 };
 
 /** Send keyboard input to the modern machine's 8250 UART. */
-RV64.prototype.virtConsoleInput = function (bytes) {
+RV64Debug.prototype.virtConsoleInput = function (bytes) {
   const ptr = this.ex.staging_alloc(bytes.length);
   new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
   this.ex.virt_console_input();
 };
 
-RV64.prototype.virtInsnCount = function () {
+RV64Debug.prototype.virtInsnCount = function () {
   return this.ex.virt_insn_count();
 };
 
 /** Current modern-machine PC. Diagnostic API; not part of the stable facade. */
-RV64.prototype.virtPc = function () {
+RV64Debug.prototype.virtPc = function () {
   return this.ex.virt_pc();
 };
 
@@ -686,7 +689,7 @@ RV64.prototype.virtPc = function () {
 // optional request relay. fetch remains the zero-infrastructure fast path.
 
 /** The http_proxy URL to set in the guest, or "" when the proxy is off. */
-RV64.prototype.proxyURL = function () {
+RV64Debug.prototype.proxyURL = function () {
   const len = this.ex.sys_proxy_url();
   if (!len) return "";
   // staging_ptr, not staging_alloc: the latter is the write path and clears the
@@ -708,7 +711,7 @@ const FORBIDDEN_HEADERS = new Set([
 ]);
 
 /** Perform one guest request, streaming the response back as it arrives. */
-RV64.prototype.performHttp = async function (id, req, encodedRequest) {
+RV64Debug.prototype.performHttp = async function (id, req, encodedRequest) {
   const origin = requestOrigin(req.url);
   if (
     encodedRequest &&
@@ -783,7 +786,7 @@ RV64.prototype.performHttp = async function (id, req, encodedRequest) {
 };
 
 /** Copy bytes into the wasm staging buffer for the next sys_http_* call. */
-RV64.prototype.stageFor = function (bytes) {
+RV64Debug.prototype.stageFor = function (bytes) {
   const ptr = this.ex.staging_alloc(bytes.length);
   new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
 };
@@ -835,4 +838,276 @@ function encodeHead(status, headers) {
     off += b.length;
   }
   return out;
+}
+
+const PUBLIC_EVENTS = new Set([
+  "ready",
+  "start",
+  "stop",
+  "error",
+  "console",
+  "networkTransmit",
+  "downloadProgress",
+]);
+
+async function imageBytes(source, name, emit) {
+  if (source instanceof Uint8Array) return source;
+  if (ArrayBuffer.isView(source)) {
+    return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+  }
+  if (source instanceof ArrayBuffer) return new Uint8Array(source);
+
+  let response;
+  if (source instanceof Response) response = source;
+  else if (source && typeof source === "object" && typeof source.url === "string") {
+    response = await fetch(source.url);
+  } else {
+    throw new TypeError(`${name} must be an ImageSource`);
+  }
+  if (!response.ok) throw new Error(`${name}: ${response.status} ${response.statusText}`);
+  const total = response.headers.has("content-encoding")
+    ? undefined
+    : Number(response.headers.get("content-length")) || undefined;
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    emit("downloadProgress", { image: name, loaded: bytes.length, total });
+    return bytes;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.length;
+    emit("downloadProgress", { image: name, loaded, total });
+  }
+  const bytes = new Uint8Array(loaded);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
+}
+
+function hostYield(callback) {
+  if (typeof setImmediate === "function") return setImmediate(callback);
+  return setTimeout(callback, 0);
+}
+
+function isOpenSBI(bytes) {
+  const needle = new TextEncoder().encode("OpenSBI");
+  outer: for (let i = 0; i <= bytes.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (bytes[i + j] !== needle[j]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
+/** Stable embedding API. Raw Wasm and instruction slicing stay private. */
+export class RV64 {
+  #core;
+  #boot;
+  #listeners = new Map();
+  #running = false;
+  #destroyed = false;
+  #generation = 0;
+  #runSlice;
+  #input;
+  #instructions;
+
+  constructor(core, boot, listeners) {
+    this.#core = core;
+    this.#boot = boot;
+    for (const [event, listener] of Object.entries(listeners ?? {})) {
+      this.on(event, listener);
+    }
+    this.console = Object.freeze({ send: (data) => this.#sendConsole(data) });
+  }
+
+  /** Resolve images, instantiate Wasm, and assemble a stopped machine. */
+  static async create(options) {
+    if (!options || typeof options !== "object") {
+      throw new TypeError("RV64.create expects an options object");
+    }
+    const { wasm, boot, memoryMB, events } = options;
+    if (!wasm) throw new TypeError("RV64.create requires wasm");
+    if (!boot?.mode) throw new TypeError("RV64.create requires boot.mode");
+
+    // Register creation-time listeners before fetching any image.
+    const pending = new Map();
+    for (const [event, listener] of Object.entries(events ?? {})) {
+      if (!PUBLIC_EVENTS.has(event) || typeof listener !== "function") {
+        throw new TypeError(`invalid ${event} event listener`);
+      }
+      pending.set(event, new Set([listener]));
+    }
+    const emit = (event, detail) => {
+      for (const listener of pending.get(event) ?? []) listener(detail);
+    };
+
+    const wasmBytes = await imageBytes(wasm, "wasm", emit);
+    const resolved = { ...boot };
+    for (const key of ["firmware", "kernel", "initrd", "disk", "image"]) {
+      const source = boot[key];
+      if (source !== undefined && source !== "default") {
+        resolved[key] = await imageBytes(source, key, emit);
+      }
+    }
+    const core = await RV64Debug.create(wasmBytes);
+    const vm = new RV64(core, { ...resolved, memoryMB }, events);
+    vm.#assemble();
+    vm.#emit("ready", undefined);
+    return vm;
+  }
+
+  get running() {
+    return this.#running;
+  }
+
+  get instructions() {
+    this.#assertLive();
+    return this.#instructions();
+  }
+
+  on(event, listener) {
+    if (!PUBLIC_EVENTS.has(event)) throw new TypeError(`unknown event: ${event}`);
+    if (typeof listener !== "function") throw new TypeError("listener must be a function");
+    let listeners = this.#listeners.get(event);
+    if (!listeners) this.#listeners.set(event, (listeners = new Set()));
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  async start() {
+    this.#assertLive();
+    if (this.#running) return;
+    this.#running = true;
+    const generation = ++this.#generation;
+    this.#emit("start", undefined);
+    hostYield(() => this.#tick(generation));
+  }
+
+  async stop() {
+    this.#assertLive();
+    if (!this.#running) return;
+    this.#running = false;
+    ++this.#generation;
+    this.#emit("stop", { reason: "requested" });
+  }
+
+  async reset() {
+    this.#assertLive();
+    const restart = this.#running;
+    if (restart) await this.stop();
+    this.#assemble();
+    this.#emit("ready", undefined);
+    if (restart) await this.start();
+  }
+
+  async destroy() {
+    if (this.#destroyed) return;
+    if (this.#running) await this.stop();
+    this.#destroyed = true;
+    ++this.#generation;
+    this.#listeners.clear();
+    this.#core = null;
+  }
+
+  #assemble() {
+    const boot = this.#boot;
+    const memoryMB = boot.memoryMB;
+    if (boot.mode === "firmware") {
+      if (boot.firmware === "default") {
+        throw new Error("packaged default firmware is not available yet");
+      }
+      if (!(boot.firmware instanceof Uint8Array)) {
+        throw new TypeError("firmware mode requires a firmware image");
+      }
+      if (isOpenSBI(boot.firmware)) {
+        this.#core.bootVirtLinux({
+          opensbi: boot.firmware,
+          kernel: boot.kernel,
+          initrd: boot.initrd,
+          disk: boot.disk,
+          cmdline: boot.cmdline,
+          ramMB: memoryMB ?? 512,
+        });
+        this.#runSlice = () => this.#core.runVirtSystem(2_000_000n);
+        this.#input = (bytes) => this.#core.virtConsoleInput(bytes);
+        this.#instructions = () => this.#core.virtInsnCount();
+      } else {
+        if (boot.initrd) throw new Error("this firmware does not support a separate initrd");
+        this.#core.bootLinux({
+          bios: boot.firmware,
+          kernel: boot.kernel,
+          disk: boot.disk,
+          cmdline: boot.cmdline,
+          ramMB: memoryMB ?? 128,
+        });
+        this.#runSlice = () => this.#core.runSystem(3_000_000n);
+        this.#input = (bytes) => this.#core.consoleInput(bytes);
+        this.#instructions = () => this.#core.sysInsnCount();
+      }
+    } else if (boot.mode === "bare-metal") {
+      if (!(boot.image instanceof Uint8Array)) {
+        throw new TypeError("bare-metal mode requires an image");
+      }
+      if (boot.privilege && boot.privilege !== "machine") {
+        throw new Error("bare-metal supervisor entry is not implemented");
+      }
+      const loadAddress = BigInt(boot.loadAddress);
+      this.#core.init(loadAddress, (memoryMB ?? 16) << 20);
+      this.#core.load(Number(loadAddress), boot.image);
+      this.#core.pc = boot.entry === undefined ? loadAddress : BigInt(boot.entry);
+      this.#runSlice = () => {
+        const stop = this.#core.run(250_000n);
+        return stop !== Stop.BUDGET;
+      };
+      this.#input = null;
+      this.#instructions = () => this.#core.insnCount();
+    } else if (boot.mode === "linux-direct") {
+      throw new Error("linux-direct boot is not implemented yet");
+    } else {
+      throw new TypeError(`unknown boot mode: ${boot.mode}`);
+    }
+    this.#core.onWrite = (_fd, bytes) => this.#emit("console", bytes);
+    this.#core.onNetSend = (frame) => this.#emit("networkTransmit", frame);
+  }
+
+  #tick(generation) {
+    if (!this.#running || generation !== this.#generation) return;
+    try {
+      if (this.#runSlice()) {
+        this.#running = false;
+        this.#emit("stop", { reason: "powered-off" });
+        return;
+      }
+      hostYield(() => this.#tick(generation));
+    } catch (error) {
+      this.#running = false;
+      this.#emit("error", error);
+      this.#emit("stop", { reason: "error" });
+    }
+  }
+
+  #sendConsole(data) {
+    this.#assertLive();
+    if (!this.#input) throw new Error("this boot mode has no console input");
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    if (!(bytes instanceof Uint8Array)) throw new TypeError("console data must be a string or Uint8Array");
+    this.#input(bytes);
+  }
+
+  #emit(event, detail) {
+    for (const listener of [...(this.#listeners.get(event) ?? [])]) listener(detail);
+  }
+
+  #assertLive() {
+    if (this.#destroyed) throw new Error("RV64 instance has been destroyed");
+  }
 }

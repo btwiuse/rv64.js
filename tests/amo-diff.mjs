@@ -16,7 +16,7 @@ if (!ARTIFACTS || !existsSync(binPath)) {
   console.log("SKIP amo-diff (need ARTIFACTS with xbench/amo.rv64)");
   process.exit(process.env.REQUIRE_ALL === "1" ? 2 : 0);
 }
-const { RV64 } = await import(join(root, "web/rv64.js"));
+const { RV64Debug: RV64 } = await import(join(root, "web/rv64.js"));
 const wasm = await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"));
 const img = (f) => readFile(join(root, "web/images", f)).then((b) => new Uint8Array(b));
 const [bios, kernel, disk] = await Promise.all([

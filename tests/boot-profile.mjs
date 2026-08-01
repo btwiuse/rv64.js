@@ -10,7 +10,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
-import { RV64 } from "../web/rv64.js";
+import { RV64Debug as RV64 } from "../web/rv64.js";
 import { BootTimeline, summarizeTrials } from "./boot-profile-lib.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -49,7 +49,7 @@ const presets = {
   modern: {
     files: [
       "web/images/modern/opensbi.bin",
-      "web/images/modern/Image",
+      process.env.RV64_MODERN_KERNEL || "web/images/modern/Image",
       "web/images/modern/debian.ext4",
     ],
     markers: {
@@ -81,7 +81,7 @@ if (!preset) throw new Error("preset must be 'fast' or 'modern'");
 const loadStarted = performance.now();
 const [wasm, ...images] = await Promise.all([
   readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm")),
-  ...preset.files.map((file) => readFile(join(root, file))),
+  ...preset.files.map((file) => readFile(resolve(root, file))),
 ]);
 const assetLoadMs = performance.now() - loadStarted;
 const decoder = new TextDecoder();

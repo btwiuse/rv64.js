@@ -32,7 +32,7 @@ const WASM = process.env.WASM || join(ROOT, "target/wasm32-unknown-unknown/relea
 const JIT_REPS = +(process.env.JIT_REPS || 3);
 const RUN_INTERP = !+process.env.SKIP_INTERP;
 
-const { RV64, Stop } = await import(join(ROOT, "web/rv64.js"));
+const { RV64Debug: RV64, Stop } = await import(join(ROOT, "web/rv64.js"));
 const wasmBytes = new Uint8Array(await readFile(WASM));
 
 // Matched workloads: identical source, per-ISA binary. Checksums are printed

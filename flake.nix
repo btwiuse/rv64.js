@@ -64,10 +64,47 @@
           };
           ignoreConfigErrors = true;
         };
+        # A single-hart kernel for the hardware rv64.js actually implements.
+        # Keep the Debian demo's disk, network and 9p paths built in, but remove
+        # broad distro hardware support and expensive debug/tracing startup.
+        # The stock-derived virtKernel remains the conformance oracle.
+        virtKernelFast = pkgs.pkgsCross.riscv64.linux_latest.override {
+          structuredExtraConfig = with pkgs.lib.kernel; {
+            VIRTIO = yes;
+            VIRTIO_MMIO = yes;
+            VIRTIO_BLK = yes;
+            VIRTIO_NET = yes;
+            EXT4_FS = yes;
+            PACKET = yes;
+            NET_9P = yes;
+            NET_9P_VIRTIO = yes;
+            "9P_FS" = yes;
+
+            SMP = pkgs.lib.mkForce no;
+            NUMA = pkgs.lib.mkForce no;
+            EFI = pkgs.lib.mkForce no;
+            ACPI = pkgs.lib.mkForce no;
+            IPV6 = pkgs.lib.mkForce no;
+            CMA = pkgs.lib.mkForce no;
+            HUGETLBFS = pkgs.lib.mkForce no;
+            HUGETLB_PAGE = pkgs.lib.mkForce no;
+            AUDIT = pkgs.lib.mkForce no;
+            PERF_EVENTS = pkgs.lib.mkForce no;
+            FTRACE = pkgs.lib.mkForce no;
+            FUNCTION_TRACER = pkgs.lib.mkForce no;
+            DEBUG_KERNEL = pkgs.lib.mkForce no;
+            DEBUG_VM_PGTABLE = pkgs.lib.mkForce no;
+            KFENCE = pkgs.lib.mkForce no;
+            TASKS_RUDE_RCU = pkgs.lib.mkForce no;
+            TASKS_TRACE_RCU = pkgs.lib.mkForce no;
+          };
+          ignoreConfigErrors = true;
+        };
         virtOpensbi = pkgs.pkgsCross.riscv64.opensbi;
       in
       {
         packages.virt-kernel = virtKernel;
+        packages.virt-kernel-fast = virtKernelFast;
         packages.virt-opensbi = virtOpensbi;
 
         devShells.default = pkgs.mkShell {

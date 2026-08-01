@@ -2,52 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>rv64.js — user-mode Linux</title>
-  <style>
-    body { font-family: ui-monospace, monospace; max-width: 60rem; margin: 2rem auto; }
-    pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; min-height: 8rem; }
-    .err { color: #c00; }
-    @media (prefers-color-scheme: dark) {
-      body { background: #111; color: #ddd; }
-      pre { background: #1c1c1c; }
-      .err { color: #f66; }
-    }
-  </style>
+  <meta http-equiv="refresh" content="0; url=./" />
+  <title>rv64.js</title>
 </head>
-<body>
-  <h1>rv64.js — user-mode Linux</h1>
-  <p>Runs a static riscv64 Rust-std binary (built for musl) in the browser.</p>
-  <pre id="out">loading…</pre>
-  <script type="module">
-    import { RV64, Stop } from "./rv64.js";
-
-    const out = document.getElementById("out");
-    out.textContent = "";
-    const append = (text, cls) => {
-      const span = document.createElement("span");
-      if (cls) span.className = cls;
-      span.textContent = text;
-      out.appendChild(span);
-    };
-
-    const vm = await RV64.create(fetch("../target/wasm32-unknown-unknown/release/rv64_wasm.wasm"));
-    vm.onWrite = (fd, bytes) =>
-      append(new TextDecoder().decode(bytes), fd === 2 ? "err" : "");
-
-    const elfUrl = "../guests/hello-std/target/riscv64gc-unknown-linux-musl/release/hello-std";
-    const elf = new Uint8Array(await (await fetch(elfUrl)).arrayBuffer());
-
-    if (!vm.loadElf(elf, ["hello-std", "from", "the", "browser"])) {
-      append("ELF load failed\n", "err");
-    } else {
-      const t0 = performance.now();
-      const stop = vm.runUser();
-      const ms = performance.now() - t0;
-      const insns = vm.userInsnCount();
-      append(`\n--- ${Object.keys(Stop)[stop]}, exit code ${vm.userExitCode()}, ` +
-             `${insns} insns in ${ms.toFixed(1)}ms ` +
-             `(${(Number(insns) / ms / 1000).toFixed(1)} Minsn/s)\n`);
-    }
-  </script>
-</body>
+<body><p>This experimental demo was retired. See <a href="./">the full-system Linux demo</a>.</p></body>
 </html>

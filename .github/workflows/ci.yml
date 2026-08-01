@@ -48,6 +48,7 @@ jobs:
 
       - name: Test self-contained JavaScript harnesses
         run: |
+          node tests/public-api.mjs
           node tests/vs-v86/harness-selftest.mjs
           node tests/http-relay.mjs
           node tests/boot-profile-selftest.mjs

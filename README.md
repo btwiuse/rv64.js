@@ -76,6 +76,34 @@ RV64_UNTIL='~ #' node examples/boot-linux.mjs fast
 RV64_UNTIL=BENCH_READY node --max-old-space-size=2048 examples/boot-linux.mjs modern
 ```
 
+The browser and Node example uses the typed public API from `web/rv64.js`:
+
+```js
+import { RV64 } from "./rv64.js";
+
+const vm = await RV64.create({
+  wasm: { url: "./rv64_wasm.wasm" },
+  memoryMB: 512,
+  boot: {
+    mode: "firmware",
+    firmware: { url: "./opensbi.bin" },
+    kernel: { url: "./Image" },
+    disk: { url: "./debian.ext4" },
+    cmdline: "console=ttyS0 root=/dev/vda rw",
+  },
+  events: { console: (bytes) => terminal.write(bytes) },
+});
+await vm.start();
+vm.console.send("uname -a\n");
+```
+
+The library owns the execution loop. Its lifecycle is `start()`, `stop()`,
+`reset()`, and `destroy()`; `on()` provides typed events and returns an
+unsubscribe function. See [web/rv64.d.ts](web/rv64.d.ts) and
+[API_DESIGN.md](API_DESIGN.md). `linux-direct` is part of the declared boot
+model but currently rejects with a clear not-implemented error while its SBI
+boundary is being built.
+
 ### Native full-system emulator
 
 ```sh
@@ -112,27 +140,20 @@ wget -O- http://example.com/
 HTTPS uses CONNECT through an ephemeral local CA. The `--proxy` option exposes
 its public certificate as `/ca.der` on the read-only 9p tag `rv64-proxy`.
 
-### Browser HTTP relay
+### Browser HTTP relay internals
 
 ```sh
 node web/http-relay.mjs --port 8090
 ```
 
-Connect it before or after `bootLinux({ proxy: true })`:
-
-```js
-vm.connectHttpRelay("ws://127.0.0.1:8090");
-```
-
-The browser proxy tries `fetch()` first, retaining its zero-infrastructure
+The browser proxy implementation tries `fetch()` first, retaining its zero-infrastructure
 path. If a GET or HEAD fails before a response is exposed, an attached HTTP
 relay retries it and remembers that origin for later requests. Non-idempotent
-requests are never retried automatically; opt an origin in beforehand with
-`vm.routeHttpViaRelay("https://example.com")`. The relay accepts only local
-page origins by default; use `--allow-origin` explicitly for a remotely served
-page, and put it behind a `wss://` reverse proxy when the page itself uses
-HTTPS. See [web/HTTP_RELAY.md](web/HTTP_RELAY.md) for the wire protocol and
-deployment details.
+requests are never retried automatically. This transport is exercised by the
+repository tests but is not yet exposed by the stable JavaScript facade; it
+will return with the unified `riscv-virt` networking API. See
+[web/HTTP_RELAY.md](web/HTTP_RELAY.md) for the wire protocol and deployment
+details.
 
 ### Modern OpenSBI/Linux machine
 

@@ -16,7 +16,7 @@ const [imgPath, guestC, nativeMsArg, repsArg] = process.argv.slice(2);
 const nativeMs = Number(nativeMsArg);
 const reps = Number(repsArg || 3);
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const { RV64 } = await import(join(root, "web/rv64.js"));
+const { RV64Debug: RV64 } = await import(join(root, "web/rv64.js"));
 const wasm = await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"));
 const img = (f) => join(root, "web/images", f);
 const bios = new Uint8Array(await readFile(img("bbl64.bin")));

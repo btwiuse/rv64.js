@@ -5,7 +5,7 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("../..", import.meta.url));
-const { RV64 } = await import(root + "/web/rv64.js");
+const { RV64Debug: RV64 } = await import(root + "/web/rv64.js");
 const wasm = await readFile(root + "/target/wasm32-unknown-unknown/release/rv64_wasm.wasm");
 const img = f => readFile(f).then(b => new Uint8Array(b));
 const [bios,kernel,disk] = await Promise.all([

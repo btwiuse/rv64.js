@@ -73,7 +73,7 @@ async function baseline() {
 }
 
 if (process.env.FLIP_CHILD) {
-  const { RV64 } = await import(join(root, "web/rv64.js"));
+  const { RV64Debug: RV64 } = await import(join(root, "web/rv64.js"));
   const wasm = await readFile(
     process.env.WASM || join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"),
   );

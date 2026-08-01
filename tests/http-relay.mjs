@@ -23,7 +23,7 @@ if (typeof WebSocket === "undefined") {
 
 import { createServer } from "node:http";
 import { startHttpRelay } from "../web/http-relay.mjs";
-import { RV64 } from "../web/rv64.js";
+import { RV64Debug as RV64 } from "../web/rv64.js";
 
 const encoder = new TextEncoder();
 const MAGIC = encoder.encode("RHR1");

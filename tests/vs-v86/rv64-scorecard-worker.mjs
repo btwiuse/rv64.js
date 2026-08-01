@@ -47,7 +47,7 @@ if (!row) {
   process.exit(2);
 }
 
-const { RV64 } = await import(join(root, "web/rv64.js"));
+const { RV64Debug: RV64 } = await import(join(root, "web/rv64.js"));
 const wasmPath =
   (process.env.WASM ? resolve(process.env.WASM) : null) ||
   join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm");

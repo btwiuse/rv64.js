@@ -1,9 +1,8 @@
 # JavaScript API and boot design
 
-Status: accepted direction, implementation pending. This document records the
-public-API and boot decisions made during release preparation. It is the design
-target; `web/rv64.js` remains the current compatibility API until the migration
-steps below land.
+Status: stable facade implemented; direct Linux boot and demo migration remain
+in progress. This document records the public-API and boot decisions made
+during release preparation.
 
 ## Goals
 
@@ -87,6 +86,7 @@ export type BootConfig =
     };
 
 const vm = await RV64.create({
+  wasm: { url: "./rv64_wasm.wasm" },
   memoryMB: 512,
   boot: {
     mode: "linux-direct",
@@ -106,8 +106,10 @@ await vm.destroy();
 
 The primary lifecycle is `start`, `stop`, `reset`, `destroy`, and `running`.
 The library owns instruction slicing and scheduling. Machine-specific
-`runSystem`/`runVirtSystem` and console methods remain temporarily as
-compatibility wrappers, then move to an explicitly unstable debug interface.
+`runSystem`/`runVirtSystem`, machine-specific console methods, and raw Wasm
+exports are not present on the public `RV64` class. Repository architecture,
+differential, and performance harnesses explicitly use `RV64Debug`; it is not
+an application compatibility API.
 
 The event map should cover at least `ready`, `start`, `stop`, `error`,
 `console`, `networkTransmit`, and `downloadProgress`. Listener registration
@@ -206,14 +208,24 @@ If OpenSBI time is negligible, keep direct boot available but pursue the real
 time-to-shell costs: kernel configuration, initramfs/rootfs policy, device
 probing, guest init, JIT warm-up, and image delivery.
 
+The first platform-specific kernel pass confirms that priority. Across five
+fresh Node runs with the same OpenSBI, Debian root, command line, and Wasm, the
+median readiness time fell from 12,706.5 ms to 8,919.8 ms (29.8%) and retired
+instructions fell from 593.13 million to 372.99 million (37.1%). The kernel
+entry-to-console phase fell from 9,806.4 ms to 6,531.3 ms. This first package
+keeps the required disk, network, and 9p paths but disables SMP/NUMA,
+EFI/ACPI, tracing/debug/KFENCE, audit, huge pages/CMA, perf, and IPv6. The next
+iteration replaces the inherited distro config with an explicit rv64.js-only
+config so unused module and hardware selections are absent rather than merely
+irrelevant at boot.
+
 ## Implementation sequence
 
 1. Add timestamped boot markers and a repeatable browser/Node comparison for
    external OpenSBI, separating downloads from execution.
-2. Add `rv64.d.ts` for the current supported API and mark user mode and raw
-   debug access experimental.
-3. Add typed events, image sources, and lifecycle ownership without removing
-   existing calls.
+2. Add `rv64.d.ts`, typed events, image sources, and lifecycle ownership.
+3. Remove the former public calls immediately; migrate repository-only CPU and
+   performance harnesses to an explicitly named low-level test binding.
 4. Unify the two Rust system machines behind common run, console, networking,
    power, and instruction-count operations; expose one Wasm system ABI.
 5. Make `riscv-virt` the default and keep `legacy-tinyemu` behind an explicit
@@ -233,8 +245,9 @@ probing, guest init, JIT warm-up, and image delivery.
 
 ## Compatibility policy
 
-The existing `RV64.create(wasm)`, `bootLinux`, `bootVirtLinux`, slice-running,
-and machine-specific console methods remain functional during migration.
-Documentation and examples move to the new API first. Deprecation begins only
-after equivalent tests cover the new surface; removal waits for a versioned
-release boundary.
+There is no pre-release JavaScript compatibility period. The former
+`RV64.create(wasm)`, `bootLinux`, `bootVirtLinux`, caller-driven slice-running,
+and machine-specific console methods were removed from `RV64` before the first
+package release. `tests/public-api.mjs` is the executable contract and asserts
+that those properties are absent. This lets the first release begin with the
+intended API instead of publishing a transition layer.

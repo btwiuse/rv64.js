@@ -314,10 +314,11 @@ lever now. Its two reverted attempts are documented in git history.
 
 ## Public API and fast boot
 
-- [ ] **14. Stable JavaScript facade and TypeScript declarations** — implement
-  the lifecycle, typed events, image sources, compatibility policy, and hidden
-  Wasm/debug boundary recorded in [API_DESIGN.md](API_DESIGN.md). Add
-  `web/rv64.d.ts` before advertising the API as stable.
+- [x] **14. Stable JavaScript facade and TypeScript declarations** *(done
+  2026-08-01)* — the
+  lifecycle, typed events, image sources, declarations, and executable API
+  contract are implemented. Both full-system examples use the facade and the
+  former methods are deliberately absent; see [API_DESIGN.md](API_DESIGN.md).
 - [ ] **15. One normal platform** — make `riscv-virt` the default public
   platform, unify the system Wasm/run/console surface, and retain the
   TinyEMU-compatible board as explicit `legacy-tinyemu` compatibility rather
@@ -331,8 +332,10 @@ lever now. Its two reverted attempts are documented in git history.
   even if the gain is below 10%.
 - [ ] **17. Fast `riscv-virt` guest** — rebuild the quick BusyBox preset for the
   standard platform so the fast and Debian demos differ by guest profile, not
-  virtual motherboard. Optimize the measured kernel/init path if firmware is
-  not the dominant boot cost.
+  virtual motherboard. The first single-hart rv64.js kernel configuration is
+  already 29.8% faster to Debian readiness and retires 37.1% fewer guest
+  instructions; replace its inherited distro base with an explicit
+  platform-only config and use it for the small guest.
 - [ ] **18. Release-quality terminal and package** — integrate xterm.js through
   the public console API, test both hosted presets end to end, then publish an
   ESM package containing JavaScript, Wasm, declarations, and source maps.
