@@ -45,7 +45,9 @@ function localAssetCandidates(local, release) {
 async function downloadAsset(candidate, progress) {
   const response = await fetch(candidate.url, { headers: candidate.headers });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  const total = Number(response.headers.get("content-length")) || 0;
+  const total = response.headers.has("content-encoding")
+    ? 0
+    : Number(response.headers.get("content-length")) || 0;
   if (!response.body) return new Uint8Array(await response.arrayBuffer());
   const reader = response.body.getReader();
   const chunks = [];
