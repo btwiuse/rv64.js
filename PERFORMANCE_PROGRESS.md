@@ -510,8 +510,19 @@ min/max `sp+imm` range during trace construction, guard once that the range is
 within one page, translate that stack page once, and let eligible accesses
 reuse the offset without their per-access page calculation/comparison. The
 fallback path must retain today's general lowering when the range crosses a
-page. Implement behind a default-off knob and gate first on one serial Compile
-pair; the affected population is large enough to justify that prototype.
+page. E023 first tests the safe subset that needs no speculative guard or
+fault reordering: seed the load cache from a successful stack store.
+
+**E023 stack store-to-load cache seeding:** a default-off candidate copied the
+already validated store-page mapping into the load-page cache after successful
+`sp`-relative stores. This is architecturally safe because a valid writable
+RISC-V leaf is readable and it never probes before the guest store executes.
+The valid one-pair Compile gate (`ab-2026-08-01T04-59-56.json`, host spread
+1.01×) moved 2899.01→2946.09 ms (0.984×), with dispatches and retirement
+effectively unchanged. It missed the replication gate and was removed along
+with its runtime knob. Static stack concentration alone does not imply
+profitable cross-class reuse; a full range-guarded design now requires a
+direct measurement of repeated same-page compare cost, not just access count.
 
 ### P4 — Python coverage stability
 
@@ -571,6 +582,7 @@ must add one row immediately after its decision.
 | E020 | 2026-08-01 | DIAGNOSTIC | Exact ordinary-trace versus region-function execution split under `PROFILE=1` | Pinned Compile: ordinary traces 16,615,572 calls / 322,691,608 retired instructions; regions 632 / 3,556; total JIT retired 322,695,164; aggregate counters reproduce E019. | Ordinary traces execute 99.9989% of JIT instructions. Close all Compile superblock/region tuning; perform the next lowering-category attribution only in the trace backend. |
 | E021 | 2026-08-01 | DIAGNOSTIC | Execution-weighted ordinary-trace static mix | Pinned Compile: ALU 160.68M (49.8%), loads 74.34M (23.0%), stores/AMO 52.92M (16.4%), control 34.75M (10.8%), FP 0; 322.69M total. Scaling uses actual retirement but category proportions are approximate for side exits; diagnostic wall time is excluded. | Memory is the only large complex lowering category (39.4%). Attribute widths and base registers before selecting a memory candidate; do not pursue superblocks, FP, or a control-only change. |
 | E022 | 2026-08-01 | DIAGNOSTIC | Trace memory widths and stack-relative share | Pinned Compile: 8-byte loads 56.71M/74.34M (76.3%); 8-byte stores/AMO 47.17M/52.92M (89.1%); `sp` loads 41.99M (56.5%); `sp` stores 39.09M (73.9%); 63.7% of memory combined. | Select a guarded once-per-trace stack-page translation prototype with the existing general path as fallback. Do not retry page-cache thresholds or removal. |
+| E023 | 2026-08-01 | TIE | Seed the load-page cache from a successful stack store | Valid one-pair Compile `ab-2026-08-01T04-59-56.json`: 2899.01→2946.09 ms (0.984×), unchanged aggregate execution, host spread 1.01×; unit/differential correctness passed before timing. | Below the 10% replication gate and slightly negative. Candidate and knob removed. Do not infer cross-class cache reuse from static stack share; require a direct bound on repeated page-compare cost before the larger range-guarded design. |
 
 ### Required record for new experiments
 
