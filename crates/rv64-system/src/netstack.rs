@@ -451,7 +451,6 @@ impl NetStack {
         window: u16,
         payload: &[u8],
     ) {
-        let flags = flags;
         if flags & TCP_RST != 0 {
             let id = self.conns[i].id;
             self.conns.remove(i);

@@ -443,7 +443,7 @@ macro_rules! softfp {
                 } else {
                     F_SIZE - (al.wrapping_sub(1)).leading_zeros()
                 };
-                let mut u: $ul = 1 << ((l + 1) / 2);
+                let mut u: $ul = 1 << l.div_ceil(2);
                 let mut s: $ul;
                 loop {
                     s = u;

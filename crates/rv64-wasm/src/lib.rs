@@ -479,15 +479,15 @@ static mut FUEL_CELL: u64 = 0;
 static mut COPY_CHUNKS: u64 = 0;
 
 fn retired_addr() -> u32 {
-    (&raw const RETIRED_CELL) as *const u64 as u32
+    (&raw const RETIRED_CELL) as u32
 }
 
 fn fuel_addr() -> u32 {
-    (&raw const FUEL_CELL) as *const u64 as u32
+    (&raw const FUEL_CELL) as u32
 }
 
 fn copystat_addr() -> u32 {
-    (&raw const COPY_CHUNKS) as *const u64 as u32
+    (&raw const COPY_CHUNKS) as u32
 }
 
 /// Wasm function-table entries are unreclaimable (invalidated blocks become
@@ -874,22 +874,6 @@ pub extern "C" fn ihist_get(which: u32, i: u32) -> u64 {
     }
 }
 
-#[allow(static_mut_refs)]
-fn ihist_slot(insn: u32) -> usize {
-    let key = if insn & 3 != 3 {
-        insn & 0xffff
-    } else {
-        insn & 0xfff0_707f
-    };
-    unsafe {
-        let h = ((key ^ (key >> 13)).wrapping_mul(0x9e37_79b9) >> 18) as usize & (IHIST_N - 1);
-        if IHIST_KEY[h] != key && IHIST_CNT[h] != 0 {
-            return usize::MAX;
-        }
-        h
-    }
-}
-
 /// Interpreted instructions charged to the fallback that started the stretch.
 static mut IHIST_INSNS: [u64; IHIST_N] = [0; IHIST_N];
 static mut IHIST_LAST: usize = usize::MAX;
@@ -1039,9 +1023,11 @@ pub extern "C" fn jit_set_enabled(on: u32) {
         // stay honest (PERFORMANCE_PROGRESS.md). (Wasm function-table entries are not
         // reclaimable, but they become unreachable.)
         if on == 0 {
+            #[allow(clippy::deref_addrof)]
             if let Some(j) = (*(&raw mut SYS_JIT)).as_mut() {
                 j.clear();
             }
+            #[allow(clippy::deref_addrof)]
             if let Some(j) = (*(&raw mut USER_JIT)).as_mut() {
                 j.clear();
             }
@@ -1654,17 +1640,6 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
     }
 }
 
-/// Run a slice with JIT tier-up; streams console output through
-/// host_write(1, ...). Returns 1 if the guest powered off, else 0.
-///
-/// Full-system blocks are keyed by virtual pc. Correctness of the va→pa
-/// code mapping is guarded cheaply: the whole cache is dropped when
-/// `cpu.jit_flush_gen` changes (bumped only on satp write / SFENCE.VMA —
-/// the actual remap events), so no per-dispatch pa re-verification is
-/// needed. Self-modifying code and recycled pages are caught by per-page
-/// store tracking (SystemBus.jit_dirty_pages). The hot path is a
-/// direct-mapped dispatch array (one read + compare), not a HashMap.
-
 /// The JIT's view of machine state (register file, fcsr, TLB tables, budget
 /// cells) — identical for every translation of the current machine.
 fn jit_layout(m: &rv64_system::Machine) -> rv64_jit::JitLayout {
@@ -2220,6 +2195,7 @@ fn try_extend_region(m: &mut rv64_system::Machine, jit: &mut JitState, idx: i32)
 
 #[no_mangle]
 #[allow(static_mut_refs)]
+#[allow(clippy::needless_range_loop)] // avoids references to mutable profiling statics
 pub extern "C" fn sys_run(max_insns: u64) -> i32 {
     let m = unsafe { SYS.as_mut().expect("call sys_boot() first") };
     m.set_rtc_unix_ns(unsafe { host_unix_ms() } as u64 * 1_000_000);
@@ -3409,7 +3385,7 @@ pub extern "C" fn sys_sb_ready(ticket: u64, idx: i32) {
             // dispatch, and the function entry would trade that for a
             // register-union load per visit (see TRACE_KEEP_MIN).
             if matches!(jit.cache.get(&e), Some(Some(b))
-                if b.n != 0 && !b.fp && b.n >= unsafe { TRACE_KEEP_MIN })
+                if b.n != 0 && !b.fp && b.n >= TRACE_KEEP_MIN)
             {
                 continue;
             }
@@ -3488,7 +3464,7 @@ pub extern "C" fn sb_analyze(vpage: u64, which: u32) -> u64 {
             mem_profile: mem_profile_layout(),
             reg_stress: reg_stress(),
             reg_profile_base: reg_profile_base(),
-            multi_latch: unsafe { MULTI_LATCH },
+            multi_latch: MULTI_LATCH,
             retired_addr: retired_addr(),
             f_base: m.cpu.f.as_ptr() as u32,
             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
@@ -3577,7 +3553,7 @@ pub extern "C" fn sb_analyze_pc(pc: u64, which: u32) -> u64 {
             mem_profile: mem_profile_layout(),
             reg_stress: reg_stress(),
             reg_profile_base: reg_profile_base(),
-            multi_latch: unsafe { MULTI_LATCH },
+            multi_latch: MULTI_LATCH,
             retired_addr: retired_addr(),
             f_base: m.cpu.f.as_ptr() as u32,
             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
@@ -3788,7 +3764,7 @@ fn batch_cell_addr(i: usize) -> u32 {
 static mut CHAIN_OFF_CELL: u32 = 0;
 static mut COMPILES_TICK: u64 = 0;
 fn chain_off_addr() -> u32 {
-    (&raw const CHAIN_OFF_CELL) as *const u32 as u32
+    (&raw const CHAIN_OFF_CELL) as u32
 }
 
 /// Online chain controller: no static rule separates workloads whose chain

@@ -94,6 +94,9 @@ struct Target {
     path: String,
 }
 
+// Boxing the TLS stream adds an allocation on every proxied TLS connection;
+// the enum is short-lived and intentionally keeps both streams inline.
+#[allow(clippy::large_enum_variant)]
 enum Upstream {
     Plain(TcpStream),
     Tls(StreamOwned<ClientConnection, TcpStream>),

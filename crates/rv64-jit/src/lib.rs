@@ -17,6 +17,10 @@
 //! to the interpreter — the tiering seam v86 uses. Compressed instructions
 //! are expanded through the same rv64-core expander before translation.
 
+// Translation routines receive explicit architectural state and emitter
+// operands. Bundling them would obscure the generated-code contract.
+#![allow(clippy::too_many_arguments)]
+
 pub mod wasm_emit;
 
 use rv64_core::compressed::expand;
@@ -36,6 +40,7 @@ const FUEL_GUARD_MIN: u32 = 48;
 const SB_HOIST_MIN: u32 = 8;
 /// Same idea for a basic block, whose prologue/epilogue is paid on every
 /// single dispatch.
+#[allow(dead_code)] // retained with the switchable block-hoisting experiment
 const BLOCK_HOIST_MIN: u32 = 3;
 /// Max iterations a compiled self-loop runs per block call before yielding to
 /// the dispatcher (so an infinite guest loop still honours budget/interrupts).
@@ -61,6 +66,7 @@ const SCR2: u32 = 7;
 /// cumulative contract). Loop/superblock yields compare ITER against this.
 const BASE: u32 = 8;
 /// i64 scratch for the chain stub (holds the next pc while it checks the line).
+#[allow(dead_code)] // scratch slot used by the retained chain-exit experiment
 const CPC: u32 = 9;
 
 /// Host-filled TLB misses inside compiled code (see tlb_idx_tag_fill).
@@ -633,6 +639,7 @@ impl Ctx {
     }
 
     /// Store an f32 bit pattern (i32 on the stack) NaN-boxed into f[d].
+    #[allow(dead_code)] // paired with experimental single-precision emitters
     fn store_boxed32(&self, m: &mut WasmModule, d: usize) {
         m.op(I64_EXTEND_I32_U)
             .i64_const(0xffff_ffff_0000_0000u64 as i64)
@@ -959,6 +966,7 @@ impl Ctx {
     /// FS=Off must trap (illegal instruction) and Initial/Clean must become
     /// Dirty — one interpreter step does both exactly, and once Dirty the
     /// fast path needs no writeback at all. No-op in user mode.
+    #[allow(dead_code)] // retained for the switchable system FP fast path
     fn fp_fs_guard(&self, m: &mut WasmModule, pc: u64, n: u32) {
         if self.lay.mstatus_addr == 0 {
             return;
@@ -2173,6 +2181,7 @@ fn loop_region(code: &[u8], base: u64, start_pc: u64, lay: &JitLayout) -> Option
     loop_region_mode(code, base, start_pc, lay, false)
 }
 
+#[allow(clippy::needless_range_loop)] // paired-range validation is clearer by index
 fn loop_region_mode(
     code: &[u8],
     base: u64,
@@ -2546,6 +2555,7 @@ fn build_ctx(
 /// only those registers (the rest start undefined and are tracked by
 /// Ctx::defined), `None` loads everything touched (the conservative form
 /// loops and superblocks require).
+#[allow(clippy::needless_range_loop)] // register numbers index fixed architectural arrays
 fn build_ctx_load(
     lay: JitLayout,
     read_mask: u32,
@@ -2837,6 +2847,7 @@ fn emit_chain_exit_helper(c: &Ctx, m: &mut WasmModule) {
 /// site stays monomorphic and costs ~2ns (probe, node 20.18.1). Trace
 /// blocks deliberately do NOT chain — tcc's 7.5k-block soup made every
 /// site megamorphic and ran 2.9x slower chained than host-dispatched.
+#[allow(dead_code)] // retained alongside the documented chain-controller experiment
 fn emit_chain_exit(c: &Ctx, m: &mut WasmModule, iter_guard: bool) {
     let lay = &c.lay;
     if !chain_enabled() || lay.sys.is_none() || lay.dispatch_base == 0 || lay.fuel_addr == 0 {
@@ -3626,10 +3637,6 @@ fn emit_simple(m: &mut WasmModule, c: &Ctx, lay: JitLayout, insn: u32, pc: u64, 
     }
     true
 }
-
-/// Translate a block starting at `start_pc`. `code` is the guest code bytes and
-/// `base` its guest address. Returns None if the first instruction isn't
-/// translatable (caller interprets it instead).
 
 /// A forward bulk-copyable self-loop — clang's musl memcpy/memmove(fwd) and
 /// fastmem shape: k pairs of `ld T, 8i(S); sd T, 8i(D)` at ascending offsets
@@ -5552,6 +5559,7 @@ pub fn translate_superblock(
 /// call_indirect, no pa-verify, and no per-block prologue. This is what a
 /// page-contiguous region could never give tcc-like code, where the hot call
 /// graph spans a few hundred KB (measured: 9 insns per host dispatch).
+#[allow(clippy::needless_range_loop)] // indices encode br_table depths as well as entries
 pub fn translate_superblock_sparse(
     code: &[u8],
     page_vas: &[u64],

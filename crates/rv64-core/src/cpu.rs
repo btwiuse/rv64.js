@@ -1192,12 +1192,14 @@ impl Cpu {
     /// an op whose only possible flag is NX changes nothing architectural).
     /// This function then excludes every operand/result shape that could
     /// raise NV/DZ/OF/UF:
-    /// - operands must be finite (no NaN/inf -> no NV; nonzero divisor -> no DZ)
-    /// - result must not be inf (no OF)
-    /// - UF: add/sub of finite values never underflows inexactly (a
-    ///   subnormal sum is exact — classic IEEE result), so any non-inf
-    ///   result is fine; mul/div require a *normal* result, or an exactly
-    ///   zero result forced by a zero operand.
+    ///
+    ///   - operands must be finite (no NaN/inf -> no NV; nonzero divisor -> no DZ)
+    ///   - result must not be inf (no OF)
+    ///   - UF: add/sub of finite values never underflows inexactly (a
+    ///     subnormal sum is exact — classic IEEE result), so any non-inf
+    ///     result is fine; mul/div require a *normal* result, or an exactly
+    ///     zero result forced by a zero operand.
+    ///
     /// Under those conditions the host op (native FPU, or wasm f32/f64
     /// instructions in the wasm build) is bit-exact IEEE RNE, and no flag
     /// computation is needed at all. Everything else falls to softfp.
@@ -1795,7 +1797,7 @@ mod tests {
     #[test]
     fn lui_auipc() {
         // lui x1, 0x12345 ; auipc x2, 0 ; ecall
-        let (cpu, _) = run_program(&[0x12345_0b7, 0x0000_0117, 0x00000073]);
+        let (cpu, _) = run_program(&[0x1234_50b7, 0x0000_0117, 0x0000_0073]);
         assert_eq!(cpu.x[1], 0x12345000);
         assert_eq!(cpu.x[2], BASE + 4);
     }

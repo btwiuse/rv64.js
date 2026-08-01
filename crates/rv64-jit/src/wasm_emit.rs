@@ -556,9 +556,7 @@ pub fn finish_batch(bodies: Vec<(Vec<u8>, u32, u32)>) -> Vec<u8> {
     // functions: n bodies of type 0
     let mut sec = Vec::new();
     uleb(&mut sec, n as u64);
-    for _ in 0..n {
-        sec.push(0);
-    }
+    sec.resize(sec.len() + n, 0);
     section(&mut m, 3, &sec);
 
     // exports: "r<i>" -> func 1 + i
