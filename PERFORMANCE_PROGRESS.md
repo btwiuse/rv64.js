@@ -17,6 +17,11 @@ retains the decisions that should guide future work.
 
 ## Current status
 
+- **Phase disposition:** complete/paused as of 2026-08-01. The current
+  scorecard is reproducible, every retained change has passed its promotion
+  gates, and no bounded evidence-backed experiment remains open. Reopen only
+  for a new workload regression, a materially changed Wasm engine, or a new
+  backend mechanism with an independent leverage measurement.
 - **Best known engineering baseline:** the current E018 working tree, built on
   `314e441` (E003 narrow-window default plus the promoted Assignment selector).
 - **Frozen performance control:** Wasm SHA-256

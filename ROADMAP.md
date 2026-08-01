@@ -8,6 +8,13 @@ priority order. Check items off as they land.
 
 ## Performance (the JIT's next tiers)
 
+**Phase paused 2026-08-01:** the authoritative scorecard is 11/13 and the
+Assignment loss is fixed. `PERFORMANCE_PROGRESS.md` records E001–E029,
+including the closure of registration, fallback, region, boundary, memory,
+control, ALU, and large multi-value ABI axes for Compile. No bounded
+performance experiment remains open. Items 2b and 4 below are deferred/optional
+research directions, not the next scheduled work.
+
 - [x] **1. Inline-TLB memory ops in full-system JIT blocks** *(done; the
   system-mode win)* — system JIT blocks translate guest loads/stores inline
   (TLB probe → direct RAM on hit, bail to interpreter on miss/MMIO/page-
@@ -314,7 +321,8 @@ lever now. Its two reverted attempts are documented in git history.
 
 ## Recommended sequencing
 
-1 → 2 → 3 (the perf trilogy) → 7 → 8/8b. All done. Next: **10** (snapshots),
+1 → 2 → 3 (the perf trilogy) → 7 → 8/8b. All done, and the extended measured
+performance phase is now paused. Next: **10** (snapshots),
 where two device-state wrinkles now apply — a 9p export carries live fid state
 pointing at host paths that may not exist on restore, and a relay socket cannot
 be serialized at all; both want an explicit reattach-on-restore step rather than
