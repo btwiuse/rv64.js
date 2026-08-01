@@ -776,11 +776,7 @@ impl Cpu {
                         }
                     }
                     (0x01, 5) => {
-                        if b == 0 {
-                            u64::MAX
-                        } else {
-                            a / b
-                        } // DIVU
+                        a.checked_div(b).unwrap_or(u64::MAX) // DIVU
                     }
                     (0x01, 6) => {
                         let (a, b) = (a as i64, b as i64);
@@ -822,11 +818,7 @@ impl Cpu {
                         } // DIVW
                     }
                     (0x01, 5) => {
-                        if b == 0 {
-                            u32::MAX
-                        } else {
-                            a / b
-                        } // DIVUW
+                        a.checked_div(b).unwrap_or(u32::MAX) // DIVUW
                     }
                     (0x01, 6) => {
                         let (a, b) = (a as i32, b as i32);
@@ -1483,11 +1475,10 @@ impl Cpu {
                     .wrapping_add(self.sys.as_ref().map_or(0, |s| s.minstret_off)),
             ),
             TIME => Some(self.sys.as_ref().map_or(self.insn_count, |s| {
-                if s.time_scale != 0 {
-                    (self.insn_count / s.time_scale).wrapping_add(s.time_offset)
-                } else {
-                    s.mtime
-                }
+                self.insn_count
+                    .checked_div(s.time_scale)
+                    .map(|time| time.wrapping_add(s.time_offset))
+                    .unwrap_or(s.mtime)
             })),
             // PMP: storage only, no enforcement (single-guest machine).
             0x3a0..=0x3af if csr & 1 == 0 => self

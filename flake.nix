@@ -21,7 +21,7 @@
         # Rust with the two cross targets the project needs:
         # - wasm32-unknown-unknown: the browser build (rv64-wasm)
         # - riscv64gc-unknown-linux-musl: guest test binaries (guests/*)
-        rust = pkgs.rust-bin.stable.latest.default.override {
+        rust = pkgs.rust-bin.stable."1.97.1".default.override {
           targets = [
             "wasm32-unknown-unknown"
             "riscv64gc-unknown-linux-musl"
