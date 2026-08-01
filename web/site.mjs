@@ -1,7 +1,6 @@
 import { RV64 } from "./rv64.js";
 
-export const RELEASE_API =
-  "https://api.github.com/repos/ibuildthecloud/rv64.js/releases/tags/demo-images-v1";
+export const PUBLISHED_ASSETS = "./assets/demo-images-v1";
 
 export const PRESETS = Object.freeze({
   fast: {
@@ -27,7 +26,6 @@ const encoder = new TextEncoder();
 let selected = "fast";
 let active = null;
 let generation = 0;
-let releaseAssetsPromise;
 
 function write(data) {
   let text = typeof data === "string" ? data : decoder.decode(data, { stream: true });
@@ -36,23 +34,12 @@ function write(data) {
   term.scrollTop = term.scrollHeight;
 }
 
-async function releaseAssets() {
-  if (!releaseAssetsPromise) {
-    releaseAssetsPromise = fetch(RELEASE_API, {
-      headers: { Accept: "application/vnd.github+json" },
-    }).then(async (response) => {
-      if (!response.ok) throw new Error(`release metadata: ${response.status} ${response.statusText}`);
-      const release = await response.json();
-      return new Map(release.assets.map((asset) => [asset.name, asset.url]));
-    });
-  }
-  return releaseAssetsPromise;
-}
-
 function localAssetCandidates(local, release) {
   const override = new URLSearchParams(location.search).get("assets");
   if (override) return [{ url: `${override.replace(/\/$/, "")}/${release}` }];
-  return (Array.isArray(local) ? local : [local]).map((url) => ({ url }));
+  const candidates = (Array.isArray(local) ? local : [local]).map((url) => ({ url }));
+  candidates.push({ url: `${PUBLISHED_ASSETS}/${release}` });
+  return candidates;
 }
 
 async function downloadAsset(candidate, progress) {
@@ -78,7 +65,6 @@ async function downloadAsset(candidate, progress) {
 
 async function fetchAsset(local, release, progress) {
   let last;
-  const override = new URLSearchParams(location.search).has("assets");
   const candidates = localAssetCandidates(local, release);
   for (const candidate of candidates) {
     try {
@@ -88,17 +74,6 @@ async function fetchAsset(local, release, progress) {
     }
   }
 
-  if (!override) {
-    const assets = await releaseAssets();
-    const url = assets.get(release);
-    if (!url) throw new Error(`${release} is missing from release demo-images-v1`);
-    const candidate = { url, headers: { Accept: "application/octet-stream" } };
-    try {
-      return await downloadAsset(candidate, progress);
-    } catch (error) {
-      last = new Error(`${candidate.url}: ${error.message}`);
-    }
-  }
   throw last;
 }
 

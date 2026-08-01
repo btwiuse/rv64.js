@@ -31,10 +31,18 @@ jobs:
       - name: Build WebAssembly core
         run: cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
       - name: Assemble static site
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir _site
           cp -R web/. _site/
           cp target/wasm32-unknown-unknown/release/rv64_wasm.wasm _site/
+          mkdir -p _site/assets/demo-images-v1
+          gh release download demo-images-v1 \
+            --repo ibuildthecloud/rv64.js \
+            --pattern 'fast-*' \
+            --pattern 'modern-*' \
+            --dir _site/assets/demo-images-v1
           touch _site/.nojekyll
       - uses: actions/upload-pages-artifact@v4
         with:
