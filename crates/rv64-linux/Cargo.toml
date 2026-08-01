@@ -5,6 +5,8 @@ edition = "2021"
 license = "MIT"
 description = "User-mode Linux emulation for rv64.js: ELF loader + syscall shim"
 publish = false
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 rv64-core = { path = "../rv64-core" }

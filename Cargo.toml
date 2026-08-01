@@ -2,6 +2,10 @@
 resolver = "2"
 members = ["crates/rv64-core", "crates/rv64-jit", "crates/rv64-linux", "crates/rv64-run", "crates/rv64-system", "crates/rv64-wasm"]
 
+[workspace.package]
+repository = "https://github.com/ibuildthecloud/rv64.js"
+homepage = "https://github.com/ibuildthecloud/rv64.js"
+
 [patch.crates-io]
 # Upstream's `web` clock uses wasm-bindgen. rv64.js intentionally exposes a
 # raw WebAssembly host ABI, so the vendored patch obtains Unix time through

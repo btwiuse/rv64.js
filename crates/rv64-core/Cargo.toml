@@ -5,5 +5,7 @@ edition = "2021"
 license = "MIT"
 description = "Portable RV64 CPU core (no_std-friendly, no I/O) for rv64.js"
 publish = false
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]

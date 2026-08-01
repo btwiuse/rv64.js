@@ -5,6 +5,8 @@ edition = "2021"
 license = "MIT"
 description = "Native user-mode runner (qemu-user style) for rv64.js development"
 publish = false
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "rv64-run"
