@@ -203,6 +203,9 @@ control, FP). The profiler scales that mix by each call's actual retired count
 and assigns integer-rounding residue to ALU. This is execution-weighted but
 approximate when a trace takes an early side exit; use it to select a broad
 lowering category, not to claim instruction-exact dynamic frequencies.
+The trace metadata further divides loads and stores/AMOs into 1/2/4/8-byte
+widths and records overlapping stack-pointer-relative totals. These use the
+same retirement scaling and therefore carry the same side-exit approximation.
 
 Never use wall time from the first two modes as score evidence.
 

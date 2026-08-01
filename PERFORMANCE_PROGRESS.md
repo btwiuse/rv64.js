@@ -498,6 +498,21 @@ is too small for isolated elimination to meet the gate. Next attribute memory
 operations by width and base-register identity, especially stack-relative
 traffic, before proposing another system-memory lowering.
 
+**E022 memory-shape attribution:** the trace metadata now subdivides memory
+operations by 1/2/4/8-byte width and records overlapping `sp`-relative totals.
+Pinned Compile attributed 56.71M 8-byte loads (76.3% of loads) and 47.17M
+8-byte stores/AMOs (89.1% of stores); stack-relative accesses were 41.99M
+loads (56.5%) and 39.09M stores (73.9%), or 63.7% of all attributed memory
+operations. The existing per-trace cache already handles repeated same-page
+accesses independently for loads and stores, so this does not reopen E005's
+threshold/removal sweep. It supports one distinct bounded design: derive the
+min/max `sp+imm` range during trace construction, guard once that the range is
+within one page, translate that stack page once, and let eligible accesses
+reuse the offset without their per-access page calculation/comparison. The
+fallback path must retain today's general lowering when the range crosses a
+page. Implement behind a default-off knob and gate first on one serial Compile
+pair; the affected population is large enough to justify that prototype.
+
 ### P4 — Python coverage stability
 
 Work on Python only if replicated candidate-relative trials still show a loss.
@@ -555,6 +570,7 @@ must add one row immediately after its decision.
 | E019 | 2026-08-01 | DIAGNOSTIC | Expose existing host JIT registration timings and inspect Compile fallback concentration | Pinned Compile: 2,898.4 ms total; 3,764 synchronous modules / 17.07 MB; 188.9 ms module compilation; 234.3 ms complete registration. `PROFILE=1` reproduced aggregate counters and attributed 17.31M interpreted instructions; largest starting-instruction bucket was 313k (1.8%). | Synchronous registration has an impossible-elimination ceiling of 8.1%, below the gate, and fallback work is fragmented. Close both bounded axes. Next measure execution-weighted generated lowering categories. |
 | E020 | 2026-08-01 | DIAGNOSTIC | Exact ordinary-trace versus region-function execution split under `PROFILE=1` | Pinned Compile: ordinary traces 16,615,572 calls / 322,691,608 retired instructions; regions 632 / 3,556; total JIT retired 322,695,164; aggregate counters reproduce E019. | Ordinary traces execute 99.9989% of JIT instructions. Close all Compile superblock/region tuning; perform the next lowering-category attribution only in the trace backend. |
 | E021 | 2026-08-01 | DIAGNOSTIC | Execution-weighted ordinary-trace static mix | Pinned Compile: ALU 160.68M (49.8%), loads 74.34M (23.0%), stores/AMO 52.92M (16.4%), control 34.75M (10.8%), FP 0; 322.69M total. Scaling uses actual retirement but category proportions are approximate for side exits; diagnostic wall time is excluded. | Memory is the only large complex lowering category (39.4%). Attribute widths and base registers before selecting a memory candidate; do not pursue superblocks, FP, or a control-only change. |
+| E022 | 2026-08-01 | DIAGNOSTIC | Trace memory widths and stack-relative share | Pinned Compile: 8-byte loads 56.71M/74.34M (76.3%); 8-byte stores/AMO 47.17M/52.92M (89.1%); `sp` loads 41.99M (56.5%); `sp` stores 39.09M (73.9%); 63.7% of memory combined. | Select a guarded once-per-trace stack-page translation prototype with the existing general path as fallback. Do not retry page-cache thresholds or removal. |
 
 ### Required record for new experiments
 

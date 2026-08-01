@@ -400,6 +400,9 @@ pub struct Block {
     /// Static instruction mix for ordinary traces: ALU, loads, stores/AMO,
     /// control flow, FP. Region producers leave this zero.
     pub trace_mix: [u16; 5],
+    /// Load widths, store/AMO widths (1/2/4/8 bytes), then stack-relative
+    /// load and store totals. Used only by the opt-in trace profiler.
+    pub trace_mem: [u16; 10],
     /// Exit-target pcs of a trace (side-exited branch arms, unfollowed jump
     /// targets, the fall-out continuation): demonstrably-on-the-hot-path
     /// block leaders the host should seed superblock discovery with. Trace
@@ -3943,6 +3946,7 @@ fn translate_copy_loop(
         seeds: Vec::new(),
         uses_fp: false,
         trace_mix: [0; 5],
+        trace_mem: [0; 10],
         locals: (0, 0),
         len: cl.end_pc - start_pc,
         n_insns: cl.body_n,
@@ -4205,6 +4209,7 @@ pub fn translate_block_ic(
     // Exit targets = hot-path block leaders (see Block::seeds).
     let mut seeds: Vec<u64> = Vec::new();
     let mut trace_mix = [0u16; 5];
+    let mut trace_mem = [0u16; 10];
     let mut seed = |seeds: &mut Vec<u64>, t: u64| {
         if seeds.len() < 48 && !seeds.contains(&t) {
             seeds.push(t);
@@ -4239,6 +4244,29 @@ pub fn translate_block_ic(
                 _ => 0,
             };
             trace_mix[bucket] = trace_mix[bucket].saturating_add(1);
+            if matches!(op, 0x03 | 0x07) {
+                let width = match funct3(insn) {
+                    0 | 4 => 0,
+                    1 | 5 => 1,
+                    2 | 6 => 2,
+                    _ => 3,
+                };
+                trace_mem[width] = trace_mem[width].saturating_add(1);
+                if s1 == 2 {
+                    trace_mem[8] = trace_mem[8].saturating_add(1);
+                }
+            } else if matches!(op, 0x23 | 0x27 | 0x2f) {
+                let width = match funct3(insn) {
+                    0 => 4,
+                    1 => 5,
+                    2 => 6,
+                    _ => 7,
+                };
+                trace_mem[width] = trace_mem[width].saturating_add(1);
+                if s1 == 2 {
+                    trace_mem[9] = trace_mem[9].saturating_add(1);
+                }
+            }
             tf.step(insn, pc);
             pc = next_pc;
             n += 1;
@@ -4291,6 +4319,7 @@ pub fn translate_block_ic(
                     seeds: core::mem::take(&mut seeds),
                     uses_fp: (fp_read | fp_write) != 0,
                     trace_mix,
+                    trace_mem,
                     len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
@@ -4413,6 +4442,7 @@ pub fn translate_block_ic(
                     seeds: core::mem::take(&mut seeds),
                     uses_fp: (fp_read | fp_write) != 0,
                     trace_mix,
+                    trace_mem,
                     len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
@@ -4483,6 +4513,7 @@ pub fn translate_block_ic(
                     seeds: core::mem::take(&mut seeds),
                     uses_fp: (fp_read | fp_write) != 0,
                     trace_mix,
+                    trace_mem,
                     len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
@@ -4511,6 +4542,7 @@ pub fn translate_block_ic(
         seeds: core::mem::take(&mut seeds),
         uses_fp: (fp_read | fp_write) != 0,
         trace_mix,
+        trace_mem,
         len: pc.saturating_sub(start_pc),
         n_insns: n,
     })
@@ -4714,6 +4746,7 @@ fn translate_loop(
         seeds: Vec::new(),
         uses_fp: false,
         trace_mix: [0; 5],
+        trace_mem: [0; 10],
         locals: (0, 0),
         len: region.end_pc - start_pc,
         n_insns: static_n.max(1),
@@ -5472,6 +5505,7 @@ pub fn translate_superblock_sparse(
         seeds: Vec::new(),
         uses_fp: false,
         trace_mix: [0; 5],
+        trace_mem: [0; 10],
         locals: (0, 0),
         len: (np * 0x1000) as u64,
         n_insns: 0,
@@ -5805,6 +5839,19 @@ mod tests {
         assert_eq!(b.n_insns, 3);
         assert_eq!(b.len, 6);
     }
+
+    #[test]
+    fn trace_memory_mix_tracks_width_and_stack_base() {
+        // ld t0,8(sp); sd t0,16(sp); ecall
+        let words = [0x0081_3283u32, 0x0051_3823, 0x0000_0073];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut lay = JitLayout::bare();
+        lay.mem = Some((0, 0x2000));
+        let b = translate_block(&code, 0, 0, lay).unwrap();
+        assert_eq!(b.n_insns, 2);
+        assert_eq!(b.trace_mix, [0, 1, 1, 0, 0]);
+        assert_eq!(b.trace_mem, [0, 0, 0, 1, 0, 0, 0, 1, 1, 1]);
+    }
 }
 
 
@@ -5816,6 +5863,7 @@ pub struct BatchMember {
     pub span: (u64, u64),
     pub uses_fp: bool,
     pub trace_mix: [u16; 5],
+    pub trace_mem: [u16; 10],
     pub seeds: Vec<u64>,
 }
 
@@ -5908,6 +5956,7 @@ pub fn translate_batch_obs(
                     span: b.span,
                     uses_fp: b.uses_fp,
                     trace_mix: b.trace_mix,
+                    trace_mem: b.trace_mem,
                     seeds: b.seeds,
                 });
             }

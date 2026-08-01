@@ -150,7 +150,8 @@ function configure(vm) {
 const STAT_IDS = [
   0, 1, 2, 3, 4, 5, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
   22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
-  40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
+  40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
+  57, 58, 59, 60, 61, 62, 63, 64,
 ];
 const STAT_NAMES = {
   0: "jit_retired",
@@ -205,6 +206,16 @@ const STAT_NAMES = {
   52: "profile_trace_store_amo",
   53: "profile_trace_control",
   54: "profile_trace_fp",
+  55: "profile_load_1",
+  56: "profile_load_2",
+  57: "profile_load_4",
+  58: "profile_load_8",
+  59: "profile_store_1",
+  60: "profile_store_2",
+  61: "profile_store_4",
+  62: "profile_store_8",
+  63: "profile_load_sp",
+  64: "profile_store_sp",
 };
 const GAUGES = new Set([2, 3, 17]);
 const readStats = (vm) =>
