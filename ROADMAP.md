@@ -314,9 +314,13 @@ lever now. Its two reverted attempts are documented in git history.
 
 ## Housekeeping
 
-- [ ] **11. Publish** — create the GitHub repo and push (no remote yet).
-- [ ] **12. CI** — run tests/run-all.sh in GitHub Actions via the nix
-  flake (`nix develop -c tests/run-all.sh`).
+- [x] **11. Publish** — public at
+  [ibuildthecloud/rv64.js](https://github.com/ibuildthecloud/rv64.js).
+- [x] **12. CI** — GitHub Actions enforces formatting, Clippy, guest builds,
+  debug/release tests, the Wasm build, and a real fast-Linux browser-API boot.
+  The image/oracle-heavy strict gate remains reproducible through Nix.
+- [x] **13. Browser demo** — GitHub Pages offers fast BusyBox and modern
+  OpenSBI/Linux Debian presets backed by versioned release assets.
 - [ ] Optionally rename the directory (`~/src/arm64.js` → `rv64.js`).
 
 ## Recommended sequencing

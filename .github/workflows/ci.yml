@@ -50,3 +50,5 @@ jobs:
         run: |
           node tests/vs-v86/harness-selftest.mjs
           node tests/http-relay.mjs
+          web/get-images.sh
+          RV64_UNTIL='~ #' node examples/boot-linux.mjs fast

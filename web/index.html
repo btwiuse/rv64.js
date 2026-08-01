@@ -2,49 +2,77 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>rv64.js — phase 0 demo</title>
-  <style>
-    body { font-family: ui-monospace, monospace; max-width: 60rem; margin: 2rem auto; }
-    pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; }
-    @media (prefers-color-scheme: dark) {
-      body { background: #111; color: #ddd; }
-      pre { background: #1c1c1c; }
-    }
-  </style>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Boot RISC-V Linux in your browser with rv64.js" />
+  <title>rv64.js — RISC-V Linux in your browser</title>
+  <link rel="stylesheet" href="./site.css" />
 </head>
 <body>
-  <h1>rv64.js — phase 0</h1>
-  <p>Runs a hand-assembled RV64I program (sum 1..10) on the Rust/wasm core.</p>
-  <pre id="out">loading…</pre>
-  <script type="module">
-    import { RV64, Stop } from "./rv64.js";
+  <header>
+    <a class="brand" href="https://github.com/ibuildthecloud/rv64.js">rv64.js</a>
+    <span>RISC-V Linux, entirely in your browser</span>
+  </header>
 
-    const out = document.getElementById("out");
-    const log = (s) => (out.textContent += s + "\n");
-    out.textContent = "";
+  <main>
+    <section class="hero">
+      <p class="eyebrow">Rust · WebAssembly · RV64GC</p>
+      <h1>Choose a Linux machine and boot it.</h1>
+      <p>
+        No server-side emulator. The CPU, devices, and JIT execute locally in
+        this tab. Image downloads are cached by your browser.
+      </p>
+    </section>
 
-    const BASE = 0x1000;
-    // sum 1..10 into x1, then ecall (same program as the Rust unit test)
-    const program = new Uint32Array([
-      0x00000093, // addi x1, x0, 0
-      0x00100113, // addi x2, x0, 1
-      0x00b00193, // addi x3, x0, 11
-      0x002080b3, // add  x1, x1, x2
-      0x00110113, // addi x2, x2, 1
-      0xfe311ce3, // bne  x2, x3, -8
-      0x00000073, // ecall
-    ]);
+    <section class="presets" aria-label="Linux presets">
+      <button class="preset selected" data-preset="fast" type="button">
+        <span class="tag">Quick start</span>
+        <strong>Fast BusyBox Linux</strong>
+        <span>Linux 4.15 · 128 MiB RAM · ~8 MiB download</span>
+        <small>Best for trying the emulator immediately.</small>
+      </button>
+      <button class="preset" data-preset="modern" type="button">
+        <span class="tag">Full system</span>
+        <strong>Modern Debian Linux</strong>
+        <span>OpenSBI · Linux 6.12 · 512 MiB RAM</span>
+        <small>Large download. Includes Python, a shell, and build tools.</small>
+      </button>
+    </section>
 
-    const vm = await RV64.create(fetch("../target/wasm32-unknown-unknown/release/rv64_wasm.wasm"));
-    vm.init(BASE, 64 * 1024);
-    vm.load(BASE, new Uint8Array(program.buffer));
+    <section class="controls">
+      <button id="boot" type="button">Boot Fast Linux</button>
+      <button id="clear" class="secondary" type="button">Clear terminal</button>
+      <span id="status" role="status">Ready</span>
+    </section>
 
-    const stop = vm.run();
-    log(`stop reason : ${Object.keys(Stop)[stop]} (${stop})`);
-    log(`insns       : ${vm.insnCount()}`);
-    log(`x1 (sum)    : ${vm.reg(1)}  (expected 55)`);
-    log(`pc          : 0x${vm.pc.toString(16)}`);
-    log(stop === Stop.ECALL && vm.reg(1) === 55n ? "\nPASS ✅" : "\nFAIL ❌");
-  </script>
+    <section class="terminal-wrap">
+      <div class="terminal-bar">
+        <span></span><span></span><span></span>
+        <b id="terminal-title">rv64.js console</b>
+      </div>
+      <pre id="terminal" tabindex="0" aria-label="Linux terminal">Select a machine and press Boot.</pre>
+    </section>
+
+    <section class="notes">
+      <h2>Run it locally</h2>
+      <pre><code>nix develop
+web/get-images.sh
+cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
+python3 -m http.server -d . 8000
+# open http://localhost:8000/web/</code></pre>
+      <p>
+        The modern preset additionally needs
+        <code>nix develop -c web/prepare-modern-images.sh</code>.
+        See the <a href="https://github.com/ibuildthecloud/rv64.js#quick-start">README</a>
+        for native and Node examples.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    <span>MIT licensed</span>
+    <a href="https://github.com/ibuildthecloud/rv64.js">Source on GitHub</a>
+  </footer>
+
+  <script type="module" src="./site.mjs"></script>
 </body>
 </html>

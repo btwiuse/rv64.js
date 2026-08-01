@@ -1455,6 +1455,81 @@ stage_into!(sys_stage_fs_tag, SYS_FS_TAG);
 // Optional 6-byte MAC override for the NIC.
 stage_into!(sys_stage_net_mac, SYS_NET_MAC);
 
+// ---- modern virt-machine API (OpenSBI + current Linux) -------------------
+
+static mut VIRT_OPENSBI: Vec<u8> = Vec::new();
+static mut VIRT_KERNEL: Vec<u8> = Vec::new();
+static mut VIRT_INITRD: Vec<u8> = Vec::new();
+static mut VIRT_DISK: Vec<u8> = Vec::new();
+static mut VIRT_CMDLINE: Vec<u8> = Vec::new();
+static mut VIRT: Option<rv64_system::virt::VirtMachine> = None;
+
+stage_into!(virt_stage_opensbi, VIRT_OPENSBI);
+stage_into!(virt_stage_kernel, VIRT_KERNEL);
+stage_into!(virt_stage_initrd, VIRT_INITRD);
+stage_into!(virt_stage_disk, VIRT_DISK);
+stage_into!(virt_stage_cmdline, VIRT_CMDLINE);
+
+/// Assemble and boot the modern virt machine from staged images.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_boot(ram_mb: u32) {
+    unsafe {
+        let cmdline = String::from_utf8_lossy(&VIRT_CMDLINE).into_owned();
+        let cmdline = if cmdline.is_empty() {
+            "console=ttyS0 root=/dev/vda rw"
+        } else {
+            &cmdline
+        };
+        let mut machine = rv64_system::virt::VirtMachine::new(
+            u64::from(ram_mb) << 20,
+            rv64_system::virt::VirtImages {
+                opensbi: &VIRT_OPENSBI,
+                kernel: &VIRT_KERNEL,
+                cmdline,
+                initrd: (!VIRT_INITRD.is_empty()).then_some(VIRT_INITRD.as_slice()),
+                disk: (!VIRT_DISK.is_empty()).then(|| core::mem::take(&mut VIRT_DISK)),
+                fs: Vec::new(),
+                net: None,
+            },
+        );
+        machine.set_rtc_unix_ns(host_unix_ms() as u64 * 1_000_000);
+        VIRT_OPENSBI.clear();
+        VIRT_KERNEL.clear();
+        VIRT_INITRD.clear();
+        VIRT_CMDLINE.clear();
+        VIRT = Some(machine);
+    }
+}
+
+/// Run one modern-machine slice and stream UART output to the host.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_run(max_insns: u64) -> i32 {
+    let machine = unsafe { VIRT.as_mut().expect("call virt_boot() first") };
+    machine.set_rtc_unix_ns(unsafe { host_unix_ms() } as u64 * 1_000_000);
+    machine.run_slice(max_insns);
+    let out = machine.console_output();
+    if !out.is_empty() {
+        unsafe { host_write(1, out.as_ptr(), out.len()) }
+    }
+    machine.power_off as i32
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_console_input() {
+    let machine = unsafe { VIRT.as_mut().expect("call virt_boot() first") };
+    let bytes = unsafe { core::mem::take(&mut STAGING) };
+    machine.console_input(&bytes);
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_insn_count() -> u64 {
+    unsafe { VIRT.as_ref().map(|m| m.cpu.insn_count).unwrap_or(0) }
+}
+
 /// Give the next-booted machine a virtio-net NIC. Frames the guest sends arrive
 /// via the `host_net_send` import; feed inbound frames back with
 /// `sys_net_input`. The page supplies the transport (a WebSocket to a relay) —

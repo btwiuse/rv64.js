@@ -17,9 +17,10 @@ Several correctness holes found by this audit have already been closed:
   differential test executes when the prepared artifact directory is supplied.
 - The HTTP relay has direct protocol coverage and runs in the Wasm suite.
 
-The structural work below remains open: strict test tiers and explicit
-PASS/FAIL/SKIP summaries, pinned and centralized assets, shared JavaScript
-harnesses, benchmark consolidation, CI, and documentation rationalization.
+The structural work below is a historical plan. Release hardening has since
+added a strict test gate, pinned demo assets, formatting and Clippy gates, CI,
+and release documentation. Shared harness and benchmark consolidation remain
+useful follow-up work.
 
 ## Current assessment
 
@@ -50,10 +51,9 @@ history management.
 - Heavy tests such as `tests/virt-proxy` are manual and easy to miss.
 - Some integration tests return successfully when their images or guest
   binaries are absent, so Cargo alone cannot prove that they actually ran.
-- There is no root CI workflow, formatting check, or Clippy stage.
-- A repository-wide `cargo fmt --all -- --check` currently reports formatting
-  drift in existing core/JIT files; establish and commit a deliberate baseline
-  before making that command a required gate.
+- GitHub Actions now runs formatting, Clippy, tests, Wasm build, and a real
+  Linux boot; the strict Nix gate covers the larger oracle/image matrix.
+- `cargo fmt --all -- --check` and Clippy with warnings denied are clean.
 
 ### Benchmark problems
 

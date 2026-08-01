@@ -1,58 +1,121 @@
 # rv64.js
 
-A RISC-V (RV64) emulator for the browser — [TinyEMU](https://bellard.org/tinyemu/)'s
-scope with [copy/v86](https://github.com/copy/v86)'s architecture: Rust CPU core
-compiled to WebAssembly, plain-JS device/browser layer.
+A RISC-V RV64 emulator for the browser: the scope of
+[TinyEMU](https://bellard.org/tinyemu/) with an architecture inspired by
+[copy/v86](https://github.com/copy/v86). The CPU core is Rust compiled to
+WebAssembly; devices and browser integration are plain JavaScript.
 
-**Status: boots Linux.** rv64gc interpreter (I/M/A/F/D/C + Zicsr + full
-privileged arch with sv39/sv48 MMU) boots TinyEMU's stock Linux 4.15 +
-buildroot image to an interactive busybox shell — natively (~50 Minsn/s)
-and in the browser. User-mode emulation (qemu-user style) runs static
-riscv64 musl binaries. The JIT is live in both run loops: hot blocks compile to wasm modules dispatched via call_indirect (~3x on hot code, with safe invalidation).
-Devices are virtio-mmio: console, block, **9p** for sharing a host directory (or
-an in-memory tree, in the browser) into the guest, and **net** — either over a
-WebSocket relay, or through an in-browser HTTP proxy that needs no external
-infrastructure at all (egress is the page's own `fetch`).
-See [DESIGN.md](DESIGN.md) for architecture,
-[ROADMAP.md](ROADMAP.md) for project-wide future work, and
-[PERFORMANCE_PROGRESS.md](PERFORMANCE_PROGRESS.md) for current JIT performance
-status, decisions, and experiments.
+**Status: boots Linux.** The RV64GC interpreter and WebAssembly JIT boot
+TinyEMU's Linux 4.15/buildroot image to an interactive BusyBox shell, both
+natively and in the browser. User-mode emulation also runs static riscv64 musl
+binaries.
+
+Features include:
+
+- RV64 I/M/A/F/D/C, Zicsr, and the privileged architecture
+- Sv39 and Sv48 virtual memory
+- WebAssembly JIT in both user-mode and full-system run loops
+- virtio console and block devices
+- virtio-9p host-directory and in-memory file sharing
+- virtio networking through WebSocket or an in-browser HTTP proxy
+
+Architecture details live in [DESIGN.md](DESIGN.md). See
+[ROADMAP.md](ROADMAP.md) for future work and
+[PERFORMANCE_PROGRESS.md](PERFORMANCE_PROGRESS.md) for measured JIT results.
+
+## Quick start
+
+### Browser
 
 ```sh
-# boot Linux in the browser
 web/get-images.sh
 cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
-python3 -m http.server -d . 8000    # open http://localhost:8000/web/system.html
+python3 -m http.server -d . 8000
+```
 
-# boot Linux natively
+Open <http://localhost:8000/web/>.
+
+The two-machine demo is at <http://localhost:8000/web/>. It offers the fast
+BusyBox machine above and a modern OpenSBI/Linux 6.12 Debian machine. Prepare
+the modern images once with:
+
+```sh
+nix develop -c web/prepare-modern-images.sh
+```
+
+The same boot paths are available as runnable Node examples. These commands
+forward the host terminal to the guest:
+
+```sh
+node examples/boot-linux.mjs fast
+node --max-old-space-size=2048 examples/boot-linux.mjs modern
+```
+
+For a non-interactive smoke test, stop after a known boot marker:
+
+```sh
+RV64_UNTIL='~ #' node examples/boot-linux.mjs fast
+RV64_UNTIL=BENCH_READY node --max-old-space-size=2048 examples/boot-linux.mjs modern
+```
+
+### Native full-system emulator
+
+```sh
 cargo build --release -p rv64-system
 target/release/rv64-boot web/images/bbl64.bin web/images/kernel-riscv64.bin web/images/root-riscv64.bin
+```
 
-# ...sharing a host directory over virtio-9p; in the guest:
-#   mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
+Share a host directory over virtio-9p:
+
+```sh
 target/release/rv64-boot web/images/*.bin --9p ~/src
+```
 
-# ...with networking through the in-process HTTP proxy; in the guest:
-#   ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
-#   export http_proxy=http://10.0.2.2:8080 && wget -O- http://example.com/
-# HTTPS uses CONNECT through an ephemeral local CA. `--proxy` exposes its public
-# certificate as /ca.der on the fixed 9p tag `rv64-proxy`; mount it read-only:
-#   mount -t 9p -o trans=virtio,version=9p2000.L,ro rv64-proxy /run/rv64-proxy
-# The Debian test image installs it into the system trust bundle during boot;
-# other guests can convert/install it according to their own trust policy.
-#   curl -x "$http_proxy" https://example.com/
+Then mount it in the guest:
+
+```sh
+mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
+```
+
+Enable networking through the in-process HTTP proxy:
+
+```sh
 target/release/rv64-boot web/images/*.bin --proxy
+```
 
-# optional browser CORS fallback (loopback-only by default)
+Configure the guest:
+
+```sh
+ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
+export http_proxy=http://10.0.2.2:8080
+wget -O- http://example.com/
+```
+
+HTTPS uses CONNECT through an ephemeral local CA. The `--proxy` option exposes
+its public certificate as `/ca.der` on the read-only 9p tag `rv64-proxy`.
+
+### Browser HTTP relay
+
+```sh
 node web/http-relay.mjs --port 8090
-# In the page, before or after bootLinux({ proxy: true }):
-#   vm.connectHttpRelay("ws://127.0.0.1:8090")
+```
 
-# boot the modern OpenSBI/Linux machine with the reusable Debian test disk
+Connect it before or after `bootLinux({ proxy: true })`:
+
+```js
+vm.connectHttpRelay("ws://127.0.0.1:8090");
+```
+
+### Modern OpenSBI/Linux machine
+
+```sh
 nix develop -c tests/vs-v86/mk-debian-rootfs.sh target/bench
 nix develop -c tests/virt-proxy/run.sh
+```
 
-# run a static riscv64 Linux binary (qemu-user style)
+### User-mode emulator
+
+```sh
 cargo run --release -p rv64-run -- <static-elf> [args...]
 ```
 

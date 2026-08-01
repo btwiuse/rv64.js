@@ -632,6 +632,45 @@ RV64.prototype.sysInsnCount = function () {
   return this.ex.sys_insn_count();
 };
 
+/** Boot the modern OpenSBI/Linux virt machine. */
+RV64.prototype.bootVirtLinux = function ({
+  opensbi,
+  kernel,
+  initrd,
+  disk,
+  cmdline,
+  ramMB = 512,
+}) {
+  const stage = (bytes, fn) => {
+    if (!bytes) return;
+    const ptr = this.ex.staging_alloc(bytes.length);
+    new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
+    fn();
+  };
+  stage(opensbi, () => this.ex.virt_stage_opensbi());
+  stage(kernel, () => this.ex.virt_stage_kernel());
+  stage(initrd, () => this.ex.virt_stage_initrd());
+  stage(disk, () => this.ex.virt_stage_disk());
+  if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.virt_stage_cmdline());
+  this.ex.virt_boot(ramMB);
+};
+
+/** Run a slice of the modern virt machine. Returns true when powered off. */
+RV64.prototype.runVirtSystem = function (maxInsns = 2_000_000n) {
+  return this.ex.virt_run(BigInt(maxInsns)) === 1;
+};
+
+/** Send keyboard input to the modern machine's 8250 UART. */
+RV64.prototype.virtConsoleInput = function (bytes) {
+  const ptr = this.ex.staging_alloc(bytes.length);
+  new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
+  this.ex.virt_console_input();
+};
+
+RV64.prototype.virtInsnCount = function () {
+  return this.ex.virt_insn_count();
+};
+
 // ---- in-process HTTP proxy ------------------------------------------------
 //
 // The guest points http_proxy at the emulated network's gateway and speaks
