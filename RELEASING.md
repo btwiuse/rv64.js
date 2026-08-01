@@ -17,6 +17,11 @@ release decision.
    REQUIRE_ALL=1 tests/run-all.sh
    ```
 
+   CI covers formatting, Clippy, guest fixtures, debug/release workspace
+   tests, the browser-module build, and self-contained JavaScript tests. The
+   strict local gate remains required for QEMU, Spike, architecture-signature,
+   image-dependent Wasm, and modern-system boot coverage.
+
 5. Run `cargo clippy --workspace --all-targets` and review every warning.
    Existing warning debt is tracked as release debt; do not introduce new
    warnings silently.

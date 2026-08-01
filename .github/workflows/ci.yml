@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust targets
+        run: |
+          rustup target add riscv64gc-unknown-linux-musl
+          rustup target add wasm32-unknown-unknown
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build guest fixtures
+        run: |
+          for guest in hello-nostd hello-std fpu-test bench; do
+            (cd "guests/$guest" && cargo build --release)
+          done
+
+      - name: Test debug workspace
+        run: cargo test --workspace
+
+      - name: Test release workspace
+        run: cargo test --workspace --release
+
+      - name: Build browser module
+        run: cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
+
+      - name: Test self-contained JavaScript harnesses
+        run: |
+          node tests/vs-v86/harness-selftest.mjs
+          node tests/http-relay.mjs
