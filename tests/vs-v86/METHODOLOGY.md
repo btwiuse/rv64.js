@@ -208,6 +208,9 @@ widths and records overlapping stack-pointer-relative totals. These use the
 same retirement scaling and therefore carry the same side-exit approximation.
 Control-flow metadata separately attributes conditional branches, direct JAL,
 and indirect JALR using the same execution-weighted approximation.
+ALU metadata splits 32-bit encodings into simple arithmetic/logical, shifts,
+comparisons, multiply, and divide/remainder. Compressed instructions remain in
+the broad ALU bucket but are not assigned a subtype.
 
 Never use wall time from the first two modes as score evidence.
 

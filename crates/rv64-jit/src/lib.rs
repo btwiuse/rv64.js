@@ -405,6 +405,8 @@ pub struct Block {
     pub trace_mem: [u16; 10],
     /// Conditional branch, JAL, and JALR counts for ordinary traces.
     pub trace_control: [u16; 3],
+    /// Simple arithmetic/logical, shifts, compares, multiply, divide/rem.
+    pub trace_alu: [u16; 5],
     /// Exit-target pcs of a trace (side-exited branch arms, unfollowed jump
     /// targets, the fall-out continuation): demonstrably-on-the-hot-path
     /// block leaders the host should seed superblock discovery with. Trace
@@ -3950,6 +3952,7 @@ fn translate_copy_loop(
         trace_mix: [0; 5],
         trace_mem: [0; 10],
         trace_control: [0; 3],
+        trace_alu: [0; 5],
         locals: (0, 0),
         len: cl.end_pc - start_pc,
         n_insns: cl.body_n,
@@ -4214,6 +4217,7 @@ pub fn translate_block_ic(
     let mut trace_mix = [0u16; 5];
     let mut trace_mem = [0u16; 10];
     let mut trace_control = [0u16; 3];
+    let mut trace_alu = [0u16; 5];
     let mut seed = |seeds: &mut Vec<u64>, t: u64| {
         if seeds.len() < 48 && !seeds.contains(&t) {
             seeds.push(t);
@@ -4248,6 +4252,19 @@ pub fn translate_block_ic(
                 _ => 0,
             };
             trace_mix[bucket] = trace_mix[bucket].saturating_add(1);
+            if bucket == 0 {
+                let f3 = funct3(insn);
+                let alu_bucket = match op {
+                    0x13 | 0x1b if matches!(f3, 1 | 5) => 1,
+                    0x13 if matches!(f3, 2 | 3) => 2,
+                    0x33 | 0x3b if funct7(insn) == 1 && f3 <= 3 => 3,
+                    0x33 | 0x3b if funct7(insn) == 1 && f3 >= 4 => 4,
+                    0x33 | 0x3b if matches!(f3, 1 | 5) => 1,
+                    0x33 if matches!(f3, 2 | 3) => 2,
+                    _ => 0,
+                };
+                trace_alu[alu_bucket] = trace_alu[alu_bucket].saturating_add(1);
+            }
             if matches!(op, 0x03 | 0x07) {
                 let width = match funct3(insn) {
                     0 | 4 => 0,
@@ -4326,6 +4343,7 @@ pub fn translate_block_ic(
                     trace_mix,
                     trace_mem,
                     trace_control,
+                    trace_alu,
                     len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
@@ -4451,6 +4469,7 @@ pub fn translate_block_ic(
                     trace_mix,
                     trace_mem,
                     trace_control,
+                    trace_alu,
                     len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
@@ -4526,6 +4545,7 @@ pub fn translate_block_ic(
                     trace_mix,
                     trace_mem,
                     trace_control,
+                    trace_alu,
                     len: next_pc.saturating_sub(start_pc),
                     n_insns: n + 1,
                 });
@@ -4556,6 +4576,7 @@ pub fn translate_block_ic(
         trace_mix,
         trace_mem,
         trace_control,
+        trace_alu,
         len: pc.saturating_sub(start_pc),
         n_insns: n,
     })
@@ -4761,6 +4782,7 @@ fn translate_loop(
         trace_mix: [0; 5],
         trace_mem: [0; 10],
         trace_control: [0; 3],
+        trace_alu: [0; 5],
         locals: (0, 0),
         len: region.end_pc - start_pc,
         n_insns: static_n.max(1),
@@ -5521,6 +5543,7 @@ pub fn translate_superblock_sparse(
         trace_mix: [0; 5],
         trace_mem: [0; 10],
         trace_control: [0; 3],
+        trace_alu: [0; 5],
         locals: (0, 0),
         len: (np * 0x1000) as u64,
         n_insns: 0,
@@ -5829,6 +5852,7 @@ mod tests {
         assert_eq!(b.n_insns, 6); // addi,addi,addi,add,addi,bne
         assert_eq!(b.trace_mix, [5, 0, 0, 1, 0]);
         assert_eq!(b.trace_control, [1, 0, 0]);
+        assert_eq!(b.trace_alu, [5, 0, 0, 0, 0]);
         assert!(b.wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d])); // \0asm
     }
 
@@ -5881,6 +5905,7 @@ pub struct BatchMember {
     pub trace_mix: [u16; 5],
     pub trace_mem: [u16; 10],
     pub trace_control: [u16; 3],
+    pub trace_alu: [u16; 5],
     pub seeds: Vec<u64>,
 }
 
@@ -5975,6 +6000,7 @@ pub fn translate_batch_obs(
                     trace_mix: b.trace_mix,
                     trace_mem: b.trace_mem,
                     trace_control: b.trace_control,
+                    trace_alu: b.trace_alu,
                     seeds: b.seeds,
                 });
             }

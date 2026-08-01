@@ -153,6 +153,7 @@ const STAT_IDS = [
   40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
   57, 58, 59, 60, 61, 62, 63, 64,
   65, 66, 67,
+  68, 69, 70, 71, 72,
 ];
 const STAT_NAMES = {
   0: "jit_retired",
@@ -220,6 +221,11 @@ const STAT_NAMES = {
   65: "profile_trace_branch",
   66: "profile_trace_jal",
   67: "profile_trace_jalr",
+  68: "profile_alu_simple",
+  69: "profile_alu_shift",
+  70: "profile_alu_compare",
+  71: "profile_alu_multiply",
+  72: "profile_alu_divrem",
 };
 const GAUGES = new Set([2, 3, 17]);
 const readStats = (vm) =>

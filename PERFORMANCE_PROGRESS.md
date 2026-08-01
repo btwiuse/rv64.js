@@ -560,6 +560,20 @@ knob. Conditional comparisons have no measurable leverage, direct jumps are
 smaller still, and historical inline-cache/dispatch work already covers the
 indirect-control axis. Close isolated control lowering for Compile.
 
+**E028 ALU subtype attribution:** the trace profiler now subdivides 32-bit ALU
+encodings into simple arithmetic/logical operations, shifts, comparisons,
+multiply, and divide/remainder. Pinned Compile attributed 103.03M simple ops,
+8.43M shifts, 4.05M comparisons, 64.7k multiplies, and 4.8k divides/remainders.
+Compressed instructions remain only in the 160.68M broad ALU bucket, explaining
+most of the subtype gap. Expensive integer multiply/divide is negligible;
+shifts and comparisons are small; the dominant classified population maps
+directly to one or a few Wasm integer operations. No distinct ALU family has
+either complexity and sufficient population for a 10% candidate. Together
+with the memory, control, boundary, registration, fallback, and region bounds,
+Compile currently has no bounded evidence-backed optimization remaining. A
+next attempt requires a qualitatively broader backend mechanism or a new
+measurement source, not another local emitter change.
+
 ### P4 — Python coverage stability
 
 Work on Python only if replicated candidate-relative trials still show a loss.
@@ -623,6 +637,7 @@ must add one row immediately after its decision.
 | E025 | 2026-08-01 | TIE | Duplicate the fused-TLB index/tag hit probe to bound full-probe leverage | Valid one-pair Compile `ab-2026-08-01T05-16-06.json`: 3016.71→3107.30 ms (0.971×), identical aggregate execution, host spread 1.04×; correctness passed before timing. | Doubling the full-probe work costs only 2.9%; elimination cannot meet the gate. Knob removed; current memory-lowering axes are closed. |
 | E026 | 2026-08-01 | DIAGNOSTIC | Execution-weighted ordinary-trace control subtypes | Pinned Compile: conditional branch 18.76M, JAL 2.86M, JALR 8.67M; broad control bucket 34.75M. | Branches dominate attributed control subtypes but are only about 5.8% of all trace instructions. Bound their lowering cost before any change. |
 | E027 | 2026-08-01 | TIE | Duplicate conditional-branch operand reads and comparison | Valid one-pair Compile `ab-2026-08-01T05-33-18.json`: 2883.78→2867.15 ms (1.006×), identical aggregate execution, host spread 1.12×; correctness passed before timing. | Timing-neutral when doubled. Knob removed; close isolated control lowering. |
+| E028 | 2026-08-01 | DIAGNOSTIC | Execution-weighted 32-bit ALU subtype attribution | Pinned Compile: simple 103.03M, shifts 8.43M, compares 4.05M, multiply 64.7k, divide/rem 4.8k; broad ALU 160.68M, with compressed instructions intentionally unsubtyped. | Expensive ALU families are negligible and the dominant classified operations already lower directly. Close local ALU emitter work; no bounded Compile candidate remains. |
 
 ### Required record for new experiments
 
