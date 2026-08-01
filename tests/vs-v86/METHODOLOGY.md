@@ -214,6 +214,17 @@ the broad ALU bucket but are not assigned a subtype.
 
 Never use wall time from the first two modes as score evidence.
 
+The cross-module ABI feasibility test is diagnostic-only and checksum-bearing:
+
+```sh
+nix develop -c node tests/vs-v86/abi-microbench.mjs
+```
+
+It compares typed indirect calls carrying 8, 16, or 31 `i64` values with the
+same calls loading/storing those values through linear memory. It reports seven
+warm samples, MAD, module size/build time, and a common fixed-work checksum.
+This is a backend rejection gate, never a scorecard substitute.
+
 ## 4. Authoritative cross-emulator promotion
 
 Only a candidate that clears the serial A/B gate runs this:
