@@ -534,6 +534,18 @@ its complete elimination has no credible 10% leverage. Remove the stress knob
 and close the once-per-trace stack-page design; its extra guards and fallback
 branch would target work that this bound shows is not material.
 
+**E025 fused-TLB hit-path leverage bound:** a semantics-preserving stress
+candidate duplicated the complete fused-TLB index computation, tag load, and
+tag comparison before every real full probe. Its valid one-pair Compile gate
+(`ab-2026-08-01T05-16-06.json`, host spread 1.04×) slowed
+3016.71→3107.30 ms, only 2.9%, with identical dispatch and retirement
+counters. Thus even eliminating the entire full-hit probe has a whole-row
+ceiling far below 10%. Remove the knob. Together E005, E011, E024, and E025
+close the current memory translation design: page-cache policy, misses,
+page-hit comparisons, and full TLB-hit probes all lack sufficient isolated
+leverage. A future memory attempt needs a qualitatively different mechanism
+with a new measurement, not another rearrangement of these paths.
+
 ### P4 — Python coverage stability
 
 Work on Python only if replicated candidate-relative trials still show a loss.
@@ -594,6 +606,7 @@ must add one row immediately after its decision.
 | E022 | 2026-08-01 | DIAGNOSTIC | Trace memory widths and stack-relative share | Pinned Compile: 8-byte loads 56.71M/74.34M (76.3%); 8-byte stores/AMO 47.17M/52.92M (89.1%); `sp` loads 41.99M (56.5%); `sp` stores 39.09M (73.9%); 63.7% of memory combined. | Select a guarded once-per-trace stack-page translation prototype with the existing general path as fallback. Do not retry page-cache thresholds or removal. |
 | E023 | 2026-08-01 | TIE | Seed the load-page cache from a successful stack store | Valid one-pair Compile `ab-2026-08-01T04-59-56.json`: 2899.01→2946.09 ms (0.984×), unchanged aggregate execution, host spread 1.01×; unit/differential correctness passed before timing. | Below the 10% replication gate and slightly negative. Candidate and knob removed. Do not infer cross-class cache reuse from static stack share; require a direct bound on repeated page-compare cost before the larger range-guarded design. |
 | E024 | 2026-08-01 | TIE | Duplicate every coalesced-access page calculation and cache comparison to bound stack-page leverage | Valid one-pair Compile `ab-2026-08-01T05-08-49.json`: 2907.71→2899.36 ms (1.003×), identical aggregate execution, host spread 1.01×; correctness passed before timing. | Doubling the targeted work is neutral, so eliminating it cannot meet the gate. Stress knob removed; close the guarded once-per-trace stack-page design. |
+| E025 | 2026-08-01 | TIE | Duplicate the fused-TLB index/tag hit probe to bound full-probe leverage | Valid one-pair Compile `ab-2026-08-01T05-16-06.json`: 3016.71→3107.30 ms (0.971×), identical aggregate execution, host spread 1.04×; correctness passed before timing. | Doubling the full-probe work costs only 2.9%; elimination cannot meet the gate. Knob removed; current memory-lowering axes are closed. |
 
 ### Required record for new experiments
 
