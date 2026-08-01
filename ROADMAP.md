@@ -308,9 +308,34 @@ lever now. Its two reverted attempts are documented in git history.
   bugs — the 8250 THRE transmit interrupt, LR/SC reservation-on-trap, and
   live rdtime; see the smoke harness below and `tests/virt-smoke/README.md`.
 
-- [ ] **10. Snapshot save/restore** — serialize machine state (CPU + RAM +
-  devices are all plain data) for v86-style instant-boot-from-snapshot in
-  the browser. Small-medium effort.
+- **10. Snapshot save/restore — declined/not planned.** The project has
+  explicitly chosen not to pursue snapshot/restore for the current release
+  direction.
+
+## Public API and fast boot
+
+- [ ] **14. Stable JavaScript facade and TypeScript declarations** — implement
+  the lifecycle, typed events, image sources, compatibility policy, and hidden
+  Wasm/debug boundary recorded in [API_DESIGN.md](API_DESIGN.md). Add
+  `web/rv64.d.ts` before advertising the API as stable.
+- [ ] **15. One normal platform** — make `riscv-virt` the default public
+  platform, unify the system Wasm/run/console surface, and retain the
+  TinyEMU-compatible board as explicit `legacy-tinyemu` compatibility rather
+  than a peer user-facing Linux mode.
+- [ ] **16. No-firmware direct Linux boot** — load a kernel/initrd/DTB directly,
+  enter Linux in S-mode, and provide the required SBI boundary inside rv64.js,
+  with no caller-supplied or executed firmware image. This is a required
+  supported option whose primary goal is lower time-to-kernel and
+  time-to-shell. Benchmark it against identical OpenSBI boots using the gates
+  in `API_DESIGN.md`; select the default from evidence, but retain direct boot
+  even if the gain is below 10%.
+- [ ] **17. Fast `riscv-virt` guest** — rebuild the quick BusyBox preset for the
+  standard platform so the fast and Debian demos differ by guest profile, not
+  virtual motherboard. Optimize the measured kernel/init path if firmware is
+  not the dominant boot cost.
+- [ ] **18. Release-quality terminal and package** — integrate xterm.js through
+  the public console API, test both hosted presets end to end, then publish an
+  ESM package containing JavaScript, Wasm, declarations, and source maps.
 
 ## Housekeeping
 
@@ -326,9 +351,8 @@ lever now. Its two reverted attempts are documented in git history.
 ## Recommended sequencing
 
 1 → 2 → 3 (the perf trilogy) → 7 → 8/8b. All done, and the extended measured
-performance phase is now paused. Next: **10** (snapshots),
-where two device-state wrinkles now apply — a 9p export carries live fid state
-pointing at host paths that may not exist on restore, and a relay socket cannot
-be serialized at all; both want an explicit reattach-on-restore step rather than
-being captured verbatim. 11/12 any time. Validation items 5–6 run as suite
-stages 5–6.
+performance phase is now paused. Snapshot/restore is not planned. The active
+release direction is **14 → 15 → 16 → 17 → 18**: define the stable API, converge
+on `riscv-virt`, deliver measured no-firmware direct Linux boot, rebuild the
+fast guest on that platform, and finish the terminal/package integration.
+Validation items 5–6 remain suite stages 5–6.

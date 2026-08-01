@@ -34,6 +34,8 @@ Implemented and tested paths include:
 Architecture details live in [DESIGN.md](DESIGN.md). See
 [ROADMAP.md](ROADMAP.md) for future work and
 [PERFORMANCE_PROGRESS.md](PERFORMANCE_PROGRESS.md) for measured JIT results.
+The planned stable JavaScript API and direct-Linux boot contract are recorded
+in [API_DESIGN.md](API_DESIGN.md).
 Claims here describe the current test coverage, not complete RISC-V or Linux
 compatibility.
 
