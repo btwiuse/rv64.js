@@ -546,6 +546,20 @@ page-hit comparisons, and full TLB-hit probes all lack sufficient isolated
 leverage. A future memory attempt needs a qualitatively different mechanism
 with a new measurement, not another rearrangement of these paths.
 
+**E026–E027 control attribution and leverage bound:** the trace profiler now
+subdivides control flow into conditional branches, direct JAL, and indirect
+JALR. Pinned Compile attributed 18.76M branches, 2.86M JALs, and 8.67M JALRs;
+rounding under the retirement scaling leaves their subtotal below the broader
+34.75M control bucket, but branches clearly dominate the subtype population
+and are only about 5.8% of all trace instructions. A semantics-preserving
+candidate then duplicated every conditional branch's operand reads and
+comparison, discarding the result. Its valid one-pair gate
+(`ab-2026-08-01T05-33-18.json`, host spread 1.12×) was a 1.006× tie:
+2883.78→2867.15 ms with identical aggregate execution. Remove the stress
+knob. Conditional comparisons have no measurable leverage, direct jumps are
+smaller still, and historical inline-cache/dispatch work already covers the
+indirect-control axis. Close isolated control lowering for Compile.
+
 ### P4 — Python coverage stability
 
 Work on Python only if replicated candidate-relative trials still show a loss.
@@ -607,6 +621,8 @@ must add one row immediately after its decision.
 | E023 | 2026-08-01 | TIE | Seed the load-page cache from a successful stack store | Valid one-pair Compile `ab-2026-08-01T04-59-56.json`: 2899.01→2946.09 ms (0.984×), unchanged aggregate execution, host spread 1.01×; unit/differential correctness passed before timing. | Below the 10% replication gate and slightly negative. Candidate and knob removed. Do not infer cross-class cache reuse from static stack share; require a direct bound on repeated page-compare cost before the larger range-guarded design. |
 | E024 | 2026-08-01 | TIE | Duplicate every coalesced-access page calculation and cache comparison to bound stack-page leverage | Valid one-pair Compile `ab-2026-08-01T05-08-49.json`: 2907.71→2899.36 ms (1.003×), identical aggregate execution, host spread 1.01×; correctness passed before timing. | Doubling the targeted work is neutral, so eliminating it cannot meet the gate. Stress knob removed; close the guarded once-per-trace stack-page design. |
 | E025 | 2026-08-01 | TIE | Duplicate the fused-TLB index/tag hit probe to bound full-probe leverage | Valid one-pair Compile `ab-2026-08-01T05-16-06.json`: 3016.71→3107.30 ms (0.971×), identical aggregate execution, host spread 1.04×; correctness passed before timing. | Doubling the full-probe work costs only 2.9%; elimination cannot meet the gate. Knob removed; current memory-lowering axes are closed. |
+| E026 | 2026-08-01 | DIAGNOSTIC | Execution-weighted ordinary-trace control subtypes | Pinned Compile: conditional branch 18.76M, JAL 2.86M, JALR 8.67M; broad control bucket 34.75M. | Branches dominate attributed control subtypes but are only about 5.8% of all trace instructions. Bound their lowering cost before any change. |
+| E027 | 2026-08-01 | TIE | Duplicate conditional-branch operand reads and comparison | Valid one-pair Compile `ab-2026-08-01T05-33-18.json`: 2883.78→2867.15 ms (1.006×), identical aggregate execution, host spread 1.12×; correctness passed before timing. | Timing-neutral when doubled. Knob removed; close isolated control lowering. |
 
 ### Required record for new experiments
 

@@ -206,6 +206,8 @@ lowering category, not to claim instruction-exact dynamic frequencies.
 The trace metadata further divides loads and stores/AMOs into 1/2/4/8-byte
 widths and records overlapping stack-pointer-relative totals. These use the
 same retirement scaling and therefore carry the same side-exit approximation.
+Control-flow metadata separately attributes conditional branches, direct JAL,
+and indirect JALR using the same execution-weighted approximation.
 
 Never use wall time from the first two modes as score evidence.
 

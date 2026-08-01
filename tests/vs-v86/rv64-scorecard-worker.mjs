@@ -152,6 +152,7 @@ const STAT_IDS = [
   22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
   40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
   57, 58, 59, 60, 61, 62, 63, 64,
+  65, 66, 67,
 ];
 const STAT_NAMES = {
   0: "jit_retired",
@@ -216,6 +217,9 @@ const STAT_NAMES = {
   62: "profile_store_8",
   63: "profile_load_sp",
   64: "profile_store_sp",
+  65: "profile_trace_branch",
+  66: "profile_trace_jal",
+  67: "profile_trace_jalr",
 };
 const GAUGES = new Set([2, 3, 17]);
 const readStats = (vm) =>
