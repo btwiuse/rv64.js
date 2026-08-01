@@ -1,9 +1,9 @@
 # Releasing rv64.js
 
-This repository currently ships as source rather than as independently
-published crates or an npm package. The Rust crates use path dependencies and
-the web package is marked `private`; changing either policy is a separate
-release decision.
+This repository ships as source rather than as independently published crates
+or an npm package. Every Rust crate sets `publish = false`, the crates use path
+dependencies, and the web package is marked `private`; changing that policy
+requires a deliberate manifest and release-process change.
 
 ## Release checklist
 

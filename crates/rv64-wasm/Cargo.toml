@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "wasm32 export surface for rv64.js — plain extern \"C\" ABI, v86-style (no wasm-bindgen)"
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
