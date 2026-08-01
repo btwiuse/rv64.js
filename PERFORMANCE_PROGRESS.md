@@ -459,6 +459,21 @@ timing-neutral when disabled: frozen-control report
 `ab-2026-07-31T23-43-25.json` is a 1.003× tie with identical counters,
 0.3%/0.0% MAD, and 1.02× host spread.
 
+**E019 host-compilation and fallback bound:** normal loader counters are now
+reported per measured row as synchronous module count/bytes, V8 module-build
+time, and total compile/instantiate/table-install time. A pinned Compile
+diagnostic measured 3,764 synchronous modules / 17.07 MB, 188.9 ms in
+`WebAssembly.Module`, and 234.3 ms for the complete registration path within a
+2,898.4 ms row (8.1%). Even impossible elimination is below the 10% gate;
+large superblocks compile asynchronously and cannot supply the missing direct
+wall-time leverage. The existing fallback histogram also showed no isolated
+interpreter boundary: its largest bucket began only 313k of 17.31M interpreted
+instructions (1.8%), with the leading population fragmented across loads,
+system/privileged boundaries, compressed control flow, and fences. Close
+synchronous registration and single-fallback-opcode work. The next Compile
+diagnostic must attribute execution cost inside generated code by lowering
+category; do not infer it from static module bytes alone.
+
 ### P4 — Python coverage stability
 
 Work on Python only if replicated candidate-relative trials still show a loss.
@@ -513,6 +528,7 @@ must add one row immediately after its decision.
 | E016 | 2026-07-31 | TIE | Multi-latch selector requiring an LD+LHU occupancy scan, two conditional continues, and a final unconditional backedge | Fixed-work checksum passed but its rotated secondary latch did not match. Valid canonical one-pair Assignment report `ab-2026-07-31T23-48-51.json`: 9.86→10.06, dispatches 252.9M→247.8M, host spread 1.03×. | +2.0% is below the replication gate. The two obvious occupancy scans are not the source of E010's broad gain; candidate removed. Attribute additional profitable shapes before another selector. |
 | E017 | 2026-08-01 | REJECTED | Corrected multi-latch reconstruction plus LD+LHU scan-only selector | Broad `ab-2026-07-31T23-55-10.json`: Assignment +74.5%. Scan-only `23-55-49`: +69.5%; other-only `23-56-13`: −27.1%. Scan-only three-pair `23-58-08`: +60.7%. Focused guard `00-01-14` was invalid only for unstable Fourier control; valid Fourier retry `00-02-32` tied. Valid authoritative 3×/3× `scorecard-2026-08-01T00-23-49.json`, host spread 1.05×. | Score fell to 7/13. Assignment flipped to a 1.33× win, but ALU, Python, String Sort, Bitfield, and Fourier were losses; Compile remained a loss. Reject and remove all candidate/runtime-mode code. Baseline stays 11/13. |
 | E018 | 2026-08-01 | LANDED | Non-destructive LD+LHU multi-latch lookahead with unchanged ordinary-loop fallback | Assignment one-pair `ab-2026-08-01T00-31-22.json` (+64.8%); valid three-pair `00-32-46` (+59.4%, 0.4%/0.4% MAD); guards `00-36-58` plus valid Fourier retry `00-38-04`; valid authoritative reports `scorecard-2026-08-01T00-57-47.json` and `01-18-18`, both 11/13; direct Python `ab-2026-08-01T00-59-00.json` tied with candidate 7.7% faster; exact detector/fallback unit tests and all eight correctness stages passed; promoted Wasm `91ab401df4b6…`. | Assignment flips from loss to 1.29× win without reproducing E017's regressions. Score remains 11/13 because bimodal Python was independently slow in both scorecards; current losses are Python and Compile. Default enabled; retain the setter for controlled diagnostics. |
+| E019 | 2026-08-01 | DIAGNOSTIC | Expose existing host JIT registration timings and inspect Compile fallback concentration | Pinned Compile: 2,898.4 ms total; 3,764 synchronous modules / 17.07 MB; 188.9 ms module compilation; 234.3 ms complete registration. `PROFILE=1` reproduced aggregate counters and attributed 17.31M interpreted instructions; largest starting-instruction bucket was 313k (1.8%). | Synchronous registration has an impossible-elimination ceiling of 8.1%, below the gate, and fallback work is fragmented. Close both bounded axes. Next measure execution-weighted generated lowering categories. |
 
 ### Required record for new experiments
 

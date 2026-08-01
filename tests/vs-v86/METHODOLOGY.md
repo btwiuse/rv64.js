@@ -189,6 +189,12 @@ instrumentation does not contaminate unrelated measurements:
 - `REGSTRESS=1`: duplicate every GPR prologue load and exit spill without
   changing semantics, to bound the wall-time leverage of boundary traffic.
 
+Every worker result also reports `host_jit.sync_modules`, `emitted_bytes`,
+`module_compile_ms`, and `register_total_ms`. These are deltas of loader
+counters that are already maintained in normal runs, so they add no
+generated-code instrumentation and bound both synchronous V8 compilation and
+complete compile/instantiate/table-install shares of a row's wall time.
+
 Never use wall time from the first two modes as score evidence.
 
 ## 4. Authoritative cross-emulator promotion

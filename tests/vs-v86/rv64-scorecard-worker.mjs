@@ -292,12 +292,28 @@ function beginMeasurement(vm) {
     }
     vm.ex.dprof_set(1);
   }
-  return { stats: readStats(vm), sampleShift };
+  return {
+    stats: readStats(vm),
+    sampleShift,
+    hostJit: {
+      sync_modules: vm.jitRegCount ?? 0,
+      emitted_bytes: vm.jitRegBytes ?? 0,
+      module_compile_ms: vm.jitRegMs ?? 0,
+      register_total_ms: vm.jitRegTotalMs ?? 0,
+    },
+  };
 }
 
 function finishMeasurement(vm, before) {
   return {
     jit: statDelta(before.stats, readStats(vm)),
+    host_jit: {
+      sync_modules: (vm.jitRegCount ?? 0) - before.hostJit.sync_modules,
+      emitted_bytes: (vm.jitRegBytes ?? 0) - before.hostJit.emitted_bytes,
+      module_compile_ms: (vm.jitRegMs ?? 0) - before.hostJit.module_compile_ms,
+      register_total_ms:
+        (vm.jitRegTotalMs ?? 0) - before.hostJit.register_total_ms,
+    },
     profile: readProfile(vm, before.sampleShift),
     memory_profile: (memProfile || regProfile || sizeProfile) ? (() => {
       const emittedWasmBytes = Number(vm.ex.memprof_get(9));

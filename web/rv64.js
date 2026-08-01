@@ -103,6 +103,7 @@ export class RV64 {
             if (vm.tableNext >= table.length) table.grow(4096);
             const idx = vm.tableNext++;
             table.set(idx, inst.exports.run);
+            vm.jitRegTotalMs = (vm.jitRegTotalMs ?? 0) + (performance.now() - t0);
             vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
             return idx;
           } catch (e) {
