@@ -572,6 +572,34 @@ fn guest_slice_mut(ram: &mut [u8], ram_base: u64, addr: u64, len: u32) -> Option
     ram.get_mut(off..off.checked_add(len as usize)?)
 }
 
+fn set_lo(v: &mut u64, val: u32) {
+    *v = (*v & !0xffff_ffff) | val as u64;
+}
+fn set_hi(v: &mut u64, val: u32) {
+    *v = (*v & 0xffff_ffff) | ((val as u64) << 32);
+}
+
+fn read16(ram: &[u8], base: u64, addr: u64) -> u16 {
+    let o = (addr - base) as usize;
+    u16::from_le_bytes(ram[o..o + 2].try_into().unwrap())
+}
+fn read32(ram: &[u8], base: u64, addr: u64) -> u32 {
+    let o = (addr - base) as usize;
+    u32::from_le_bytes(ram[o..o + 4].try_into().unwrap())
+}
+fn read64(ram: &[u8], base: u64, addr: u64) -> u64 {
+    let o = (addr - base) as usize;
+    u64::from_le_bytes(ram[o..o + 8].try_into().unwrap())
+}
+fn write16(ram: &mut [u8], base: u64, addr: u64, v: u16) {
+    let o = (addr - base) as usize;
+    ram[o..o + 2].copy_from_slice(&v.to_le_bytes());
+}
+fn write32(ram: &mut [u8], base: u64, addr: u64, v: u32) {
+    let o = (addr - base) as usize;
+    ram[o..o + 4].copy_from_slice(&v.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,32 +1016,4 @@ mod tests {
         dev.net_input(&vec![0u8; NET_MAX_FRAME]);
         assert!(dev.net_rx_pending(), "a frame at the limit is accepted");
     }
-}
-
-fn set_lo(v: &mut u64, val: u32) {
-    *v = (*v & !0xffff_ffff) | val as u64;
-}
-fn set_hi(v: &mut u64, val: u32) {
-    *v = (*v & 0xffff_ffff) | ((val as u64) << 32);
-}
-
-fn read16(ram: &[u8], base: u64, addr: u64) -> u16 {
-    let o = (addr - base) as usize;
-    u16::from_le_bytes(ram[o..o + 2].try_into().unwrap())
-}
-fn read32(ram: &[u8], base: u64, addr: u64) -> u32 {
-    let o = (addr - base) as usize;
-    u32::from_le_bytes(ram[o..o + 4].try_into().unwrap())
-}
-fn read64(ram: &[u8], base: u64, addr: u64) -> u64 {
-    let o = (addr - base) as usize;
-    u64::from_le_bytes(ram[o..o + 8].try_into().unwrap())
-}
-fn write16(ram: &mut [u8], base: u64, addr: u64, v: u16) {
-    let o = (addr - base) as usize;
-    ram[o..o + 2].copy_from_slice(&v.to_le_bytes());
-}
-fn write32(ram: &mut [u8], base: u64, addr: u64, v: u32) {
-    let o = (addr - base) as usize;
-    ram[o..o + 4].copy_from_slice(&v.to_le_bytes());
 }

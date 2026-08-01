@@ -478,17 +478,16 @@ static mut FUEL_CELL: u64 = 0;
 /// chunk (the emitter receives its address via JitLayout.copystat_addr).
 static mut COPY_CHUNKS: u64 = 0;
 
-#[allow(static_mut_refs)]
 fn retired_addr() -> u32 {
-    unsafe { &RETIRED_CELL as *const u64 as u32 }
+    (&raw const RETIRED_CELL) as *const u64 as u32
 }
 
 fn fuel_addr() -> u32 {
-    unsafe { &FUEL_CELL as *const u64 as u32 }
+    (&raw const FUEL_CELL) as *const u64 as u32
 }
 
 fn copystat_addr() -> u32 {
-    unsafe { &COPY_CHUNKS as *const u64 as u32 }
+    (&raw const COPY_CHUNKS) as *const u64 as u32
 }
 
 /// Wasm function-table entries are unreclaimable (invalidated blocks become
@@ -1040,10 +1039,10 @@ pub extern "C" fn jit_set_enabled(on: u32) {
         // stay honest (PERFORMANCE_PROGRESS.md). (Wasm function-table entries are not
         // reclaimable, but they become unreachable.)
         if on == 0 {
-            if let Some(j) = SYS_JIT.as_mut() {
+            if let Some(j) = (*(&raw mut SYS_JIT)).as_mut() {
                 j.clear();
             }
-            if let Some(j) = USER_JIT.as_mut() {
+            if let Some(j) = (*(&raw mut USER_JIT)).as_mut() {
                 j.clear();
             }
         }
@@ -1755,7 +1754,7 @@ fn build_superblock(
             .is_some_and(|e| !e.is_empty())
     };
     let mut pages: Vec<(u64, u64)> = vec![(vpage, pa_page)];
-    let mut probe_add = |m: &mut rv64_system::Machine, pages: &mut Vec<(u64, u64)>, va: u64| {
+    let probe_add = |m: &mut rv64_system::Machine, pages: &mut Vec<(u64, u64)>, va: u64| {
         if pages.len() >= MAX_REGION_PAGES || pages.iter().any(|&(v, _)| v == va) {
             return;
         }
@@ -2363,7 +2362,7 @@ pub extern "C" fn sys_run(max_insns: u64) -> i32 {
                         let self_ok = matches!(
                             m.cpu.jit_probe_fetch(&mut m.bus, pc), Some(pa) if pa == b.pa
                         );
-                        let region_ok = region.map_or(true, |pgs| {
+                        let region_ok = region.is_none_or(|pgs| {
                             pgs.iter().all(|&(va, pp)| {
                                 matches!(
                                     m.cpu.jit_probe_fetch(&mut m.bus, va),
@@ -3789,7 +3788,7 @@ fn batch_cell_addr(i: usize) -> u32 {
 static mut CHAIN_OFF_CELL: u32 = 0;
 static mut COMPILES_TICK: u64 = 0;
 fn chain_off_addr() -> u32 {
-    unsafe { &CHAIN_OFF_CELL as *const u32 as u32 }
+    (&raw const CHAIN_OFF_CELL) as *const u32 as u32
 }
 
 /// Online chain controller: no static rule separates workloads whose chain

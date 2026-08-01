@@ -705,7 +705,7 @@ mod host {
             let md = std::fs::symlink_metadata(self.real(path)).map_err(errno)?;
             // A no-op chown must succeed even unprivileged: the guest issues
             // one on some file creations, and failing it would fail the create.
-            if uid.map_or(true, |u| u == md.uid()) && gid.map_or(true, |g| g == md.gid()) {
+            if uid.is_none_or(|u| u == md.uid()) && gid.is_none_or(|g| g == md.gid()) {
                 return Ok(());
             }
             let c = cpath(&self.real(path))?;

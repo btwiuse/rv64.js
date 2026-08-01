@@ -111,7 +111,7 @@ impl Plic {
             // enables: 0x2000 + ctx*0x80
             _ if (0x2000..0x2000 + (PLIC_CONTEXTS as u64) * 0x80).contains(&off) => {
                 let ctx = ((off - 0x2000) / 0x80) as usize;
-                if (off - 0x2000) % 0x80 == 0 {
+                if (off - 0x2000).is_multiple_of(0x80) {
                     self.enable[ctx]
                 } else {
                     0
@@ -159,7 +159,7 @@ impl Plic {
             }
             _ if (0x2000..0x2000 + (PLIC_CONTEXTS as u64) * 0x80).contains(&off) => {
                 let ctx = ((off - 0x2000) / 0x80) as usize;
-                if (off - 0x2000) % 0x80 == 0 {
+                if (off - 0x2000).is_multiple_of(0x80) {
                     if plic_dbg() {
                         eprintln!("[plic] enable[ctx{ctx}]={val:#x}");
                     }
@@ -756,17 +756,14 @@ impl VirtMachine {
         let start = self.cpu.insn_count;
         self.bus.poll_virtio();
         self.sync_devices();
-        match self.cpu.run(&mut self.bus, max_insns) {
-            StopReason::Wfi => {
-                // Halted: fast-forward the guest clock to the next timer
-                // deadline via `idle_ticks` (not `insn_count`, which must
-                // stay a true retired-instruction count for budgets/perf).
-                let next = self.bus.mtimecmp;
-                if next != u64::MAX && next > self.bus.mtime {
-                    self.idle_ticks += next - self.bus.mtime;
-                }
+        if self.cpu.run(&mut self.bus, max_insns) == StopReason::Wfi {
+            // Halted: fast-forward the guest clock to the next timer
+            // deadline via `idle_ticks` (not `insn_count`, which must
+            // stay a true retired-instruction count for budgets/perf).
+            let next = self.bus.mtimecmp;
+            if next != u64::MAX && next > self.bus.mtime {
+                self.idle_ticks += next - self.bus.mtime;
             }
-            _ => {}
         }
         self.sync_devices();
         self.power_off = self.bus.power_off;

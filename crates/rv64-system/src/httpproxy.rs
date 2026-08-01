@@ -1118,9 +1118,7 @@ mod tests {
             assert!(parse(raw).is_err(), "must reject: {raw:?}");
         }
         let trailers = "POST http://h/ HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nDigest: value\r\n\r\n";
-        let err = parse(trailers)
-            .err()
-            .expect("trailers are not representable");
+        let err = parse(trailers).expect_err("trailers are not representable");
         assert_eq!(err.status, 501);
 
         let declared_too_large = format!(
@@ -1128,8 +1126,7 @@ mod tests {
             MAX_BODY + 1
         );
         let err = parse(&declared_too_large)
-            .err()
-            .expect("oversized declared chunk must fail before buffering it");
+            .expect_err("oversized declared chunk must fail before buffering it");
         assert_eq!(err.status, 413);
     }
 
@@ -1143,9 +1140,8 @@ mod tests {
 
     #[test]
     fn rejects_what_it_cannot_yet_do() {
-        let err = parse("GET nonsense HTTP/1.1\r\n\r\n")
-            .err()
-            .expect("unproxyable target must be refused");
+        let err =
+            parse("GET nonsense HTTP/1.1\r\n\r\n").expect_err("unproxyable target must be refused");
         assert_eq!(err.status, 400);
     }
 
@@ -1161,8 +1157,7 @@ mod tests {
             .unwrap();
         assert_eq!(host, "127.0.0.1");
         let err = parse_connect(b"CONNECT missing-port HTTP/1.1\r\n\r\n")
-            .err()
-            .expect("CONNECT requires an authority port");
+            .expect_err("CONNECT requires an authority port");
         assert_eq!(err.status, 400);
     }
 

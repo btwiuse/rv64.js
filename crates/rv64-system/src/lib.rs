@@ -301,7 +301,7 @@ impl SystemBus {
     pub fn jit_page_marked(&self, page: u64) -> bool {
         self.jit_pages
             .get(page as usize / 64)
-            .map_or(false, |w| w & (1 << (page % 64)) != 0)
+            .is_some_and(|w| w & (1 << (page % 64)) != 0)
     }
 
     pub fn jit_unmark_page(&mut self, page: u64) {

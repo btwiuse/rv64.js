@@ -223,7 +223,7 @@ pub fn handle(m: &mut Machine, host: &mut dyn Host) -> Option<i32> {
 }
 
 fn sys_write(m: &mut Machine, host: &mut dyn Host, fd: i32, buf: u64, len: u64) -> i64 {
-    if fd < 1 || fd > 2 {
+    if !(1..=2).contains(&fd) {
         return EBADF;
     }
     let (s, e) = (buf as usize, (buf + len) as usize);

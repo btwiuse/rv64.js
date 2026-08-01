@@ -342,7 +342,7 @@ macro_rules! softfp {
                 if shift >= 2 * F_SIZE as i32 {
                     c0 = ((c0 | c1) != 0) as $u;
                     c1 = 0;
-                } else if shift >= F_SIZE as i32 + 1 {
+                } else if shift > F_SIZE as i32 {
                     c0 = rshift_rnd(c1, shift - F_SIZE as i32);
                     c1 = 0;
                 } else if shift == F_SIZE as i32 {

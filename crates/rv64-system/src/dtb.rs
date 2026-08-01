@@ -13,6 +13,12 @@ const FDT_END_NODE: u32 = 2;
 const FDT_PROP: u32 = 3;
 const FDT_END: u32 = 9;
 
+impl Default for Fdt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Fdt {
     pub fn new() -> Fdt {
         Fdt {
@@ -41,7 +47,7 @@ impl Fdt {
         self.u32(FDT_BEGIN_NODE);
         self.struct_.extend_from_slice(name.as_bytes());
         self.struct_.push(0);
-        while self.struct_.len() % 4 != 0 {
+        while !self.struct_.len().is_multiple_of(4) {
             self.struct_.push(0);
         }
     }
@@ -56,7 +62,7 @@ impl Fdt {
         self.u32(data.len() as u32);
         self.u32(off);
         self.struct_.extend_from_slice(data);
-        while self.struct_.len() % 4 != 0 {
+        while !self.struct_.len().is_multiple_of(4) {
             self.struct_.push(0);
         }
     }

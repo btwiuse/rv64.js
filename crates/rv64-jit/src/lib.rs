@@ -1139,7 +1139,6 @@ impl Ctx {
         _pc: u64,
         _n: u32,
     ) {
-        if v >= 2 {}
         self.store_freg_pre(m, d);
         self.push_reg(m, s1);
         match v {
@@ -2256,11 +2255,9 @@ fn loop_region_mode(
                 }
                 let t = pc.wrapping_add(imm_b(insn) as u64);
                 branches.push((pc, t, next));
-                if t == start_pc {
-                    if !extend {
-                        end_pc = Some(next);
-                        break;
-                    }
+                if t == start_pc && !extend {
+                    end_pc = Some(next);
+                    break;
                 }
             }
             0x6f if extend => {
@@ -4217,7 +4214,7 @@ fn seal(m: WasmModule) -> (Vec<u8>, (u32, u32)) {
 }
 
 fn emit_batch_link(m: &mut WasmModule, lay: &JitLayout, target: u64, j: u32) {
-    let off = ((target >> 1) as u64 & lay.dispatch_mask as u64) << 4;
+    let off = ((target >> 1) & lay.dispatch_mask as u64) << 4;
     let line = lay.dispatch_base as u64 + off;
     // line.pc == target?
     m.i32_const(0).i64_load(line);
@@ -4370,7 +4367,7 @@ pub fn translate_block_ic(
     let mut trace_mem = [0u16; 10];
     let mut trace_control = [0u16; 3];
     let mut trace_alu = [0u16; 5];
-    let mut seed = |seeds: &mut Vec<u64>, t: u64| {
+    let seed = |seeds: &mut Vec<u64>, t: u64| {
         if seeds.len() < 48 && !seeds.contains(&t) {
             seeds.push(t);
         }
@@ -5459,7 +5456,7 @@ pub fn discover_page_leaders_ext(
                 break;
             };
             let next = pc.wrapping_add(ilen);
-            let mut add =
+            let add =
                 |t: u64, leaders: &mut std::collections::BTreeSet<u64>, pending: &mut Vec<u64>| {
                     if in_page(t) && leaders.len() < max_leaders && leaders.insert(t) {
                         pending.push(t);
@@ -5709,6 +5706,128 @@ pub fn translate_superblock_sparse(
     })
 }
 
+/// One member of a compiled batch: its entry pc and how many instructions
+/// its body retires (the host caches these like ordinary blocks).
+pub struct BatchMember {
+    pub pc: u64,
+    pub n_insns: u32,
+    pub span: (u64, u64),
+    pub uses_fp: bool,
+    pub trace_mix: [u16; 5],
+    pub trace_mem: [u16; 10],
+    pub trace_control: [u16; 3],
+    pub trace_alu: [u16; 5],
+    pub seeds: Vec<u64>,
+}
+
+/// Compile a hot pc AND its fixed-target successors as ONE module whose
+/// members transfer by direct tail call (~2ns), with no table import and
+/// therefore none of the O(importing instances) table.set cost that killed
+/// every earlier chaining design. Discovery is breadth-first over each
+/// trace's own exit seeds, bounded by `cap`; only pcs the caller's `want`
+/// predicate accepts (in-window, not already compiled, ...) join.
+///
+/// Returns the module bytes plus one BatchMember per exported body, in
+/// export order — member j is export "r{j}" and table index base + j.
+pub fn translate_batch(
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+    want: &dyn Fn(u64) -> bool,
+    cap: usize,
+) -> Option<(Vec<u8>, Vec<BatchMember>)> {
+    translate_batch_obs(code, base, start_pc, lay, hot, want, &|_| None, cap)
+}
+
+/// translate_batch with an OBSERVED-SUCCESSOR oracle: `next(pc)` is the pc
+/// execution was last seen to take after `pc`. Members are discovered along
+/// that chain FIRST (the next-executing-tail of trace-tree JITs) and only
+/// then from static exit seeds — a batch built from where control actually
+/// goes keeps far more exits inside the module than one built from where
+/// the instruction stream textually leads.
+#[allow(clippy::too_many_arguments)]
+pub fn translate_batch_obs(
+    code: &[u8],
+    base: u64,
+    start_pc: u64,
+    lay: JitLayout,
+    hot: &dyn Fn(u64) -> bool,
+    want: &dyn Fn(u64) -> bool,
+    next: &dyn Fn(u64) -> Option<u64>,
+    cap: usize,
+) -> Option<(Vec<u8>, Vec<BatchMember>)> {
+    // Pass 1 (no links): discover the member set breadth-first from the
+    // seed pc's exits. Bodies are re-emitted in pass 2 once every member's
+    // index is known, so a link can name a member discovered after it.
+    RAW_BODY.store(true, std::sync::atomic::Ordering::Relaxed);
+    let no_link = |_: u64| None;
+    let mut pcs: Vec<u64> = vec![start_pc];
+    let mut probed = 0usize;
+    // A loop header keeps its structured region: never pull one into a
+    // batch as a plain trace.
+    let is_loop_hdr = |t: u64| is_loop_at(code, base, t, lay);
+    while probed < pcs.len() && pcs.len() < cap {
+        let p = pcs[probed];
+        probed += 1;
+        // Members are compiled WITH the inline cache oracle: a batch member
+        // that still ended at every indirect jump would defeat the point —
+        // the two mechanisms compose (IC extends a member through an edge,
+        // links carry the exits that remain to co-members).
+        let Some(b) = translate_block_ic(code, base, p, lay, hot, &no_link, next) else {
+            continue;
+        };
+        // Observed successor first: it is where execution goes, so the link
+        // that matters most is the one that reaches it.
+        if let Some(nx) = next(p) {
+            if pcs.len() < cap && !pcs.contains(&nx) && want(nx) && !is_loop_hdr(nx) {
+                pcs.push(nx);
+            }
+        }
+        for sd in b.seeds {
+            if pcs.len() >= cap {
+                break;
+            }
+            if !pcs.contains(&sd) && want(sd) && !is_loop_hdr(sd) {
+                pcs.push(sd);
+            }
+        }
+    }
+    // Pass 2: emit every member with links resolved against the final set.
+    let index_of = |t: u64| pcs.iter().position(|&q| q == t).map(|k| k as u32);
+    let mut bodies: Vec<(Vec<u8>, u32, u32)> = Vec::new();
+    let mut members: Vec<BatchMember> = Vec::new();
+    let mut ok = true;
+    for &p in &pcs {
+        match translate_block_ic(code, base, p, lay, hot, &index_of, next) {
+            Some(b) => {
+                bodies.push((b.wasm, b.locals.0, b.locals.1));
+                members.push(BatchMember {
+                    pc: p,
+                    n_insns: b.n_insns,
+                    span: b.span,
+                    uses_fp: b.uses_fp,
+                    trace_mix: b.trace_mix,
+                    trace_mem: b.trace_mem,
+                    trace_control: b.trace_control,
+                    trace_alu: b.trace_alu,
+                    seeds: b.seeds,
+                });
+            }
+            None => {
+                ok = false;
+                break;
+            }
+        }
+    }
+    RAW_BODY.store(false, std::sync::atomic::Ordering::Relaxed);
+    if !ok || bodies.is_empty() {
+        return None;
+    }
+    Some((wasm_emit::finish_batch(bodies), members))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5729,12 +5848,12 @@ mod tests {
         assert!(!alu_handled(0x1b, 0x21, 5));
         assert!(alu_handled(0x1b, 0x20, 5));
         // FMV.D.X with rs2 != 0 (fixed field violated): f7=0x79, f3=0, rs2=1
-        let bad_fmv = 0x53 | (0 << 12) | (0x79 << 25) | (1 << 20);
+        let bad_fmv = 0x53 | (0x79 << 25) | (1 << 20);
         assert!(!fp_handled(bad_fmv));
-        let good_fmv = 0x53 | (0 << 12) | (0x79 << 25);
+        let good_fmv = 0x53 | (0x79 << 25);
         assert!(fp_handled(good_fmv));
         // FSQRT.D with rs2 != 0: f7=0x2d
-        let bad_sqrt = 0x53 | (0 << 12) | (0x2d << 25) | (2 << 20);
+        let bad_sqrt = 0x53 | (0x2d << 25) | (2 << 20);
         assert!(!fp_handled(bad_sqrt));
     }
 
@@ -5821,10 +5940,9 @@ mod tests {
                                                           // bne a2, x0 -> start
         let off = -(code.len() as i64);
         let imm = off as u32;
-        let bne = 0x63
+        let bne = (0x63
             | (1 << 12)
-            | (12 << 15) // rs1 = a2
-            | (0 << 20)  // rs2 = x0
+            | (12 << 15))  // rs2 = x0
             | (((imm >> 11) & 1) << 7)
             | (((imm >> 1) & 0xf) << 8)
             | (((imm >> 5) & 0x3f) << 25)
@@ -5852,7 +5970,7 @@ mod tests {
         };
         let mut checked = 0u64;
         let mut passed = 0u64;
-        let mut check = |ab: u64, bb: u64, cb: u64| {
+        let check = |ab: u64, bb: u64, cb: u64| {
             if let Some(r) = fma_fastpath_ref(ab, bb, cb) {
                 let mut fl = 0u32;
                 let want = sf64::fma(ab, bb, cb, 0, &mut fl);
@@ -6056,126 +6174,4 @@ mod tests {
         assert_eq!(b.trace_mix, [0, 1, 1, 0, 0]);
         assert_eq!(b.trace_mem, [0, 0, 0, 1, 0, 0, 0, 1, 1, 1]);
     }
-}
-
-/// One member of a compiled batch: its entry pc and how many instructions
-/// its body retires (the host caches these like ordinary blocks).
-pub struct BatchMember {
-    pub pc: u64,
-    pub n_insns: u32,
-    pub span: (u64, u64),
-    pub uses_fp: bool,
-    pub trace_mix: [u16; 5],
-    pub trace_mem: [u16; 10],
-    pub trace_control: [u16; 3],
-    pub trace_alu: [u16; 5],
-    pub seeds: Vec<u64>,
-}
-
-/// Compile a hot pc AND its fixed-target successors as ONE module whose
-/// members transfer by direct tail call (~2ns), with no table import and
-/// therefore none of the O(importing instances) table.set cost that killed
-/// every earlier chaining design. Discovery is breadth-first over each
-/// trace's own exit seeds, bounded by `cap`; only pcs the caller's `want`
-/// predicate accepts (in-window, not already compiled, ...) join.
-///
-/// Returns the module bytes plus one BatchMember per exported body, in
-/// export order — member j is export "r{j}" and table index base + j.
-pub fn translate_batch(
-    code: &[u8],
-    base: u64,
-    start_pc: u64,
-    lay: JitLayout,
-    hot: &dyn Fn(u64) -> bool,
-    want: &dyn Fn(u64) -> bool,
-    cap: usize,
-) -> Option<(Vec<u8>, Vec<BatchMember>)> {
-    translate_batch_obs(code, base, start_pc, lay, hot, want, &|_| None, cap)
-}
-
-/// translate_batch with an OBSERVED-SUCCESSOR oracle: `next(pc)` is the pc
-/// execution was last seen to take after `pc`. Members are discovered along
-/// that chain FIRST (the next-executing-tail of trace-tree JITs) and only
-/// then from static exit seeds — a batch built from where control actually
-/// goes keeps far more exits inside the module than one built from where
-/// the instruction stream textually leads.
-#[allow(clippy::too_many_arguments)]
-pub fn translate_batch_obs(
-    code: &[u8],
-    base: u64,
-    start_pc: u64,
-    lay: JitLayout,
-    hot: &dyn Fn(u64) -> bool,
-    want: &dyn Fn(u64) -> bool,
-    next: &dyn Fn(u64) -> Option<u64>,
-    cap: usize,
-) -> Option<(Vec<u8>, Vec<BatchMember>)> {
-    // Pass 1 (no links): discover the member set breadth-first from the
-    // seed pc's exits. Bodies are re-emitted in pass 2 once every member's
-    // index is known, so a link can name a member discovered after it.
-    RAW_BODY.store(true, std::sync::atomic::Ordering::Relaxed);
-    let no_link = |_: u64| None;
-    let mut pcs: Vec<u64> = vec![start_pc];
-    let mut probed = 0usize;
-    // A loop header keeps its structured region: never pull one into a
-    // batch as a plain trace.
-    let is_loop_hdr = |t: u64| is_loop_at(code, base, t, lay);
-    while probed < pcs.len() && pcs.len() < cap {
-        let p = pcs[probed];
-        probed += 1;
-        // Members are compiled WITH the inline cache oracle: a batch member
-        // that still ended at every indirect jump would defeat the point —
-        // the two mechanisms compose (IC extends a member through an edge,
-        // links carry the exits that remain to co-members).
-        let Some(b) = translate_block_ic(code, base, p, lay, hot, &no_link, next) else {
-            continue;
-        };
-        // Observed successor first: it is where execution goes, so the link
-        // that matters most is the one that reaches it.
-        if let Some(nx) = next(p) {
-            if pcs.len() < cap && !pcs.contains(&nx) && want(nx) && !is_loop_hdr(nx) {
-                pcs.push(nx);
-            }
-        }
-        for sd in b.seeds {
-            if pcs.len() >= cap {
-                break;
-            }
-            if !pcs.contains(&sd) && want(sd) && !is_loop_hdr(sd) {
-                pcs.push(sd);
-            }
-        }
-    }
-    // Pass 2: emit every member with links resolved against the final set.
-    let index_of = |t: u64| pcs.iter().position(|&q| q == t).map(|k| k as u32);
-    let mut bodies: Vec<(Vec<u8>, u32, u32)> = Vec::new();
-    let mut members: Vec<BatchMember> = Vec::new();
-    let mut ok = true;
-    for &p in &pcs {
-        match translate_block_ic(code, base, p, lay, hot, &index_of, next) {
-            Some(b) => {
-                bodies.push((b.wasm, b.locals.0, b.locals.1));
-                members.push(BatchMember {
-                    pc: p,
-                    n_insns: b.n_insns,
-                    span: b.span,
-                    uses_fp: b.uses_fp,
-                    trace_mix: b.trace_mix,
-                    trace_mem: b.trace_mem,
-                    trace_control: b.trace_control,
-                    trace_alu: b.trace_alu,
-                    seeds: b.seeds,
-                });
-            }
-            None => {
-                ok = false;
-                break;
-            }
-        }
-    }
-    RAW_BODY.store(false, std::sync::atomic::Ordering::Relaxed);
-    if !ok || bodies.is_empty() {
-        return None;
-    }
-    Some((wasm_emit::finish_batch(bodies), members))
 }

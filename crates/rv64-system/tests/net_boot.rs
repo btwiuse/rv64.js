@@ -92,7 +92,7 @@ fn icmp_reply(frame: &[u8]) -> Option<Vec<u8>> {
     let ip_start = 14;
     let ihl = ((frame.get(ip_start)? & 0x0f) as usize) * 4;
     let total_len = u16::from_be_bytes([frame[ip_start + 2], frame[ip_start + 3]]) as usize;
-    if frame[ip_start + 9] != 1 || &frame[ip_start + 16..ip_start + 20] != HOST_IP {
+    if frame[ip_start + 9] != 1 || frame[ip_start + 16..ip_start + 20] != HOST_IP {
         return None; // not ICMP, or not addressed to us
     }
     let icmp_start = ip_start + ihl;
