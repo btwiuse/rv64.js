@@ -106,6 +106,59 @@ without loading or executing a firmware image. Use `mode: "linux-direct"` and
 omit `firmware`; the kernel, disk/initrd, command line, and lifecycle are
 otherwise unchanged.
 
+### JavaScript and TypeScript API
+
+`web/rv64.js` is a standard ES module. Its adjacent `web/rv64.d.ts` declaration
+provides the same API to TypeScript without a separate `@types` package:
+
+```ts
+import { RV64, type RV64Options } from "./web/rv64.js";
+
+const options: RV64Options = {
+  wasm: { url: "./rv64_wasm.wasm" },
+  memoryMB: 512,
+  boot: {
+    mode: "linux-direct",
+    kernel: { url: "./Image" },
+    disk: { url: "./alpine.ext4" },
+    cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
+  },
+  network: { mode: "fetch", relayURL: "wss://relay.example/relay" },
+  events: {
+    downloadProgress: ({ image, loaded, total }) => {
+      console.log(image, loaded, total);
+    },
+    console: bytes => terminal.write(bytes),
+    error: error => console.error(error),
+  },
+};
+
+const vm = await RV64.create(options); // created and assembled, but stopped
+const unsubscribe = vm.on("stop", ({ reason }) => console.log(reason));
+await vm.start();
+vm.console.send("uname -a\n");
+await vm.stop();
+await vm.reset();
+unsubscribe();
+await vm.destroy();
+```
+
+Images may be `{ url }`, `Response`, `Uint8Array`, `ArrayBuffer`, or another
+array-buffer view. `RV64.create()` resolves all images and emits download
+progress before the `ready` event. `start()` runs cooperative execution slices;
+calling it repeatedly is harmless. Always call `destroy()` when the VM is no
+longer needed so sockets, channels, and listeners are closed.
+
+The supported boot configurations are:
+
+- `linux-direct`: boot a Linux kernel in supervisor mode using rv64.js's SBI.
+- `firmware`: boot through an explicitly supplied firmware image.
+- `bare-metal`: load an image at an explicit address without Linux devices.
+
+The stable facade intentionally does not expose raw Wasm exports or JIT control
+methods. Architecture and emulator tests use the separately named
+`RV64Debug` API; applications should not depend on it.
+
 Linux machines use the `fetch` HTTP/HTTPS backend by default. The Alpine image
 configures `http_proxy`/`https_proxy` only when that backend is selected,
 attaches the NIC at `10.0.2.15`, and trusts the per-VM proxy CA automatically.

@@ -1,0 +1,80 @@
+name: Demo images release
+
+on:
+  push:
+    tags:
+      - "demo-images-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: demo-images-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^demo-images-v[0-9]+$ ]]; then
+            echo "tag must have the form demo-images-vN" >&2
+            exit 2
+          fi
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-24.05
+
+      - name: Build release assets
+        run: nix develop --command tools/build-demo-assets.sh "target/$GITHUB_REF_NAME"
+
+      - name: Verify checksums
+        working-directory: target/${{ github.ref_name }}
+        run: sha256sum -c SHA256SUMS
+
+      - name: Validate fast and Alpine guests
+        run: |
+          nix develop --command bash -c \
+            "RV64_UNTIL='~ #' node examples/boot-linux.mjs fast"
+          nix develop --command node tests/alpine-boot.mjs
+
+      - name: Verify release contents
+        shell: bash
+        run: |
+          dir="target/$GITHUB_REF_NAME"
+          expected=(
+            SHA256SUMS
+            rv64_wasm.wasm
+            fast-bbl64.bin
+            fast-kernel-riscv64.bin
+            fast-root-riscv64.bin
+            modern-Image
+            modern-alpine.ext4
+          )
+          for name in "${expected[@]}"; do
+            test -s "$dir/$name" || {
+              echo "missing or empty release asset: $name" >&2
+              exit 1
+            }
+          done
+          test "$(find "$dir" -maxdepth 1 -type f | wc -l)" -eq "${#expected[@]}"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          dir="target/$GITHUB_REF_NAME"
+          mapfile -t assets < <(find "$dir" -maxdepth 1 -type f -print | sort)
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Browser demo images ${GITHUB_REF_NAME#demo-images-}" \
+            --notes "Reproducibly built and validated by GitHub Actions from commit $GITHUB_SHA."

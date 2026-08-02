@@ -48,15 +48,20 @@ The GitHub Pages site is code-only. Guest firmware, kernels, disks, and the
 compiled Wasm core are published under the versioned `demo-images-v2` release
 tag so large generated binaries never enter Git history.
 
-Build and verify the complete asset set before creating or replacing that
-release:
+Demo assets are built and published only by GitHub Actions from a pushed tag.
+Do not upload locally built images. After the release-source commit is on
+`main`, create and push the next versioned tag:
 
 ```sh
-nix develop -c tools/build-demo-assets.sh
-RV64_UNTIL='~ #' node examples/boot-linux.mjs fast
-RV64_UNTIL=ALPINE_READY node examples/boot-linux.mjs modern
+git tag demo-images-v2
+git push origin demo-images-v2
 ```
 
-Upload every file in `target/demo-images-v2/`, including `SHA256SUMS`. The
-fixed tag is part of the page's public configuration; use a new tag when an
-asset change is not backward-compatible.
+The `Demo images release` workflow builds the kernel, Alpine disk, legacy fast
+images, and Wasm module in a clean runner; verifies checksums; boots both guest
+profiles; runs a real Alpine `apk update`; and creates the GitHub Release for
+that exact tag. A failed build or validation does not create a release.
+
+Tags and releases are immutable inputs to the Pages site. Never move or replace
+an existing `demo-images-vN` tag. Use a new version when any asset changes, and
+update `web/site.mjs` plus the Pages workflow to consume it.

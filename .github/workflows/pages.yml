@@ -12,6 +12,8 @@ on:
       - "Cargo.toml"
       - "rust-toolchain.toml"
   workflow_dispatch:
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -24,6 +26,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name != 'release' || github.event.release.tag_name == 'demo-images-v2'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

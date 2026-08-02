@@ -4,6 +4,7 @@ set -euo pipefail
 
 OUT="${1:-$PWD}"
 VERSION="${ALPINE_VERSION:-3.24.1}"
+EXPECTED_SHA256="${ALPINE_SHA256:-7201513262d851f39105102cf95519410100259bd7996fca13bade517838d7b7}"
 BRANCH="v${VERSION%.*}"
 MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 ROOT="$OUT/alpine-riscv64"
@@ -15,8 +16,8 @@ mkdir -p "$OUT"
 if [ ! -f "$TARBALL" ]; then
     wget -O "$TARBALL" "$URL"
 fi
-wget -qO "$TARBALL.sha256" "$URL.sha256"
-(cd "$OUT" && sha256sum -c "$(basename "$TARBALL").sha256")
+printf '%s  %s\n' "$EXPECTED_SHA256" "$(basename "$TARBALL")" \
+    | (cd "$OUT" && sha256sum -c -)
 
 rm -rf "$ROOT"
 mkdir -p "$ROOT"
