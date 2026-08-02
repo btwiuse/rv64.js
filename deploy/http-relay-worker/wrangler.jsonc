@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rv64-http-relay",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-31",
+  "vars": {
+    "ALLOWED_ORIGINS": "https://ibuildthecloud.github.io,http://localhost,http://127.0.0.1,http://[::1]",
+    "ALLOWED_HOSTS": "dl-cdn.alpinelinux.org",
+    "MAX_CONCURRENT": "16"
+  }
+}
