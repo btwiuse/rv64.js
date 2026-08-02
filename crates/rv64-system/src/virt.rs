@@ -19,7 +19,7 @@
 use crate::dtb::Fdt;
 use crate::rtc::GoldfishRtc;
 use crate::virtio::{Backend, VirtioDev};
-use rv64_core::csr::{IRQ_MEIP, IRQ_MSIP, IRQ_MTIP, IRQ_SEIP};
+use rv64_core::csr::{Mode, IRQ_MEIP, IRQ_MSIP, IRQ_MTIP, IRQ_SEIP, IRQ_SSIP, IRQ_STIP};
 use rv64_core::{Bus, Cpu, Exception, StopReason};
 
 fn plic_dbg() -> bool {
@@ -304,6 +304,7 @@ pub struct VirtBus {
     uart: Uart,
     pub virtio: Vec<VirtioDev>,
     pub power_off: bool,
+    direct_sbi: bool,
     // JIT support (mirrors crate::SystemBus)
     pub jit_pages: Vec<u64>,
     pub jit_dirty_pages: Vec<u64>,
@@ -506,7 +507,7 @@ impl Bus for VirtBus {
     fn irq_lines(&mut self) -> u64 {
         self.refresh_plic();
         let mut lines = 0u64;
-        if self.mtime >= self.mtimecmp {
+        if !self.direct_sbi && self.mtime >= self.mtimecmp {
             lines |= IRQ_MTIP;
         }
         if self.msip {
@@ -544,10 +545,19 @@ pub struct VirtMachine {
     pub idle_ticks: u64,
     pub power_off: bool,
     pub dtb: Vec<u8>,
+    pub unsupported_sbi: Option<(u64, u64)>,
 }
 
 impl VirtMachine {
     pub fn new(ram_bytes: u64, images: VirtImages) -> VirtMachine {
+        Self::new_inner(ram_bytes, images, false)
+    }
+
+    pub fn new_direct(ram_bytes: u64, images: VirtImages) -> VirtMachine {
+        Self::new_inner(ram_bytes, images, true)
+    }
+
+    fn new_inner(ram_bytes: u64, images: VirtImages, direct_sbi: bool) -> VirtMachine {
         let ram_size = ram_bytes;
         let mut ram = vec![0u8; ram_size as usize];
 
@@ -631,10 +641,23 @@ impl VirtMachine {
         // a2=&fw_dynamic_info.
         let mut cpu = Cpu::new();
         cpu.enable_system(0);
-        cpu.pc = RAM_BASE;
+        cpu.pc = if direct_sbi {
+            RAM_BASE + KERNEL_OFFSET
+        } else {
+            RAM_BASE
+        };
         cpu.x[10] = 0; // a0 = hartid
         cpu.x[11] = dtb_addr; // a1 = dtb
         cpu.x[12] = dyn_addr; // a2 = fw_dynamic_info
+        if direct_sbi {
+            let sys = cpu.sys.as_mut().unwrap();
+            sys.mode = Mode::Supervisor;
+            sys.medeleg = 0xb109;
+            sys.mideleg = IRQ_SSIP | IRQ_STIP | IRQ_SEIP;
+            sys.mcounteren = 0x7;
+            sys.satp = 0;
+            cpu.enable_host_sbi();
+        }
 
         VirtMachine {
             cpu,
@@ -648,6 +671,7 @@ impl VirtMachine {
                 uart: Uart::new(),
                 virtio,
                 power_off: false,
+                direct_sbi,
                 jit_pages: vec![0u64; (ram_size as usize >> 12).div_ceil(64)],
                 jit_dirty_pages: Vec::new(),
             },
@@ -655,6 +679,7 @@ impl VirtMachine {
             idle_ticks: 0,
             power_off: false,
             dtb,
+            unsupported_sbi: None,
         }
     }
 
@@ -693,12 +718,80 @@ impl VirtMachine {
         self.bus.mtime = self.cpu.insn_count / self.insns_per_tick + self.idle_ticks;
         if let Some(sys) = self.cpu.sys.as_mut() {
             sys.mtime = self.bus.mtime;
+            if self.bus.direct_sbi {
+                if self.bus.mtime >= self.bus.mtimecmp {
+                    sys.mip |= IRQ_STIP;
+                } else {
+                    sys.mip &= !IRQ_STIP;
+                }
+            }
             // Let rdtime advance every instruction (not just per slice) so
             // busy-wait loops reading `time` make progress: same clock as the
             // CLINT, derived live from insn_count.
             sys.time_scale = self.insns_per_tick;
             sys.time_offset = self.idle_ticks;
         }
+    }
+
+    fn service_sbi(&mut self) {
+        const NOT_SUPPORTED: u64 = (-2i64) as u64;
+        const INVALID_PARAM: u64 = (-3i64) as u64;
+        const ALREADY_STARTED: u64 = (-7i64) as u64;
+        const BASE: u64 = 0x10;
+        const TIME: u64 = 0x5449_4d45;
+        const IPI: u64 = 0x0073_5049;
+        const RFENCE: u64 = 0x5246_4e43;
+        const HSM: u64 = 0x48_53_4d;
+        const SRST: u64 = 0x5352_5354;
+
+        let ext = self.cpu.x[17];
+        let function = self.cpu.x[16];
+        let arg0 = self.cpu.x[10];
+        let arg1 = self.cpu.x[11];
+        let mut error = 0;
+        let mut value = 0;
+        match (ext, function) {
+            (BASE, 0) => value = 2 << 24,     // SBI 2.0
+            (BASE, 1) => value = 0x5256_3634, // "RV64"
+            (BASE, 2) => value = 1,
+            (BASE, 3) => {
+                value = matches!(arg0, BASE | TIME | IPI | RFENCE | HSM | SRST) as u64;
+            }
+            (BASE, 4 | 5) => value = 0,
+            (BASE, 6) => value = 1,
+            (TIME, 0) => self.bus.mtimecmp = arg0,
+            (IPI, 0) => {
+                if arg1 != 0 && arg1 != u64::MAX {
+                    error = INVALID_PARAM;
+                }
+            }
+            (RFENCE, 0..=6) => {}
+            (HSM, 0) => error = ALREADY_STARTED,
+            (HSM, 1) => error = INVALID_PARAM,
+            (HSM, 2) if arg0 == 0 => value = 0, // STARTED
+            (HSM, 2) => error = INVALID_PARAM,
+            (HSM, 3) => error = NOT_SUPPORTED,
+            (SRST, 0) if arg0 <= 2 => {
+                self.bus.power_off = true;
+                self.power_off = true;
+            }
+            (SRST, 0) => error = INVALID_PARAM,
+            // Legacy SBI 0.1, useful for older kernels.
+            (0, _) => self.bus.mtimecmp = arg0,
+            (1, _) => self.bus.uart.write(0, arg0 as u8),
+            (2, _) => value = u64::MAX,
+            (3..=7, _) => {}
+            (8, _) => {
+                self.bus.power_off = true;
+                self.power_off = true;
+            }
+            _ => {
+                error = NOT_SUPPORTED;
+                self.unsupported_sbi = Some((ext, function));
+            }
+        }
+        self.cpu.x[10] = error;
+        self.cpu.x[11] = value;
     }
 
     /// Read a u16 from guest RAM (little-endian), for ring inspection.
@@ -756,7 +849,23 @@ impl VirtMachine {
         let start = self.cpu.insn_count;
         self.bus.poll_virtio();
         self.sync_devices();
-        if self.cpu.run(&mut self.bus, max_insns) == StopReason::Wfi {
+        let mut remaining = max_insns;
+        let mut stop = StopReason::Budget;
+        while remaining != 0 && !self.power_off {
+            let before = self.cpu.insn_count;
+            stop = self.cpu.run(&mut self.bus, remaining);
+            remaining = remaining.saturating_sub(self.cpu.insn_count - before);
+            if stop == StopReason::Ecall && self.bus.direct_sbi {
+                self.service_sbi();
+                if self.unsupported_sbi.is_some() {
+                    self.power_off = true;
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        if stop == StopReason::Wfi {
             // Halted: fast-forward the guest clock to the next timer
             // deadline via `idle_ticks` (not `insn_count`, which must
             // stay a true retired-instruction count for budgets/perf).
@@ -908,4 +1017,70 @@ fn build_virt_fdt(
     f.end_node(); // soc
     f.end_node(); // root
     f.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn direct_machine() -> VirtMachine {
+        VirtMachine::new_direct(
+            8 << 20,
+            VirtImages {
+                opensbi: &[],
+                kernel: &[],
+                cmdline: "console=ttyS0",
+                initrd: None,
+                disk: None,
+                fs: Vec::new(),
+                net: None,
+            },
+        )
+    }
+
+    fn sbi(machine: &mut VirtMachine, ext: u64, function: u64, arg0: u64, arg1: u64) {
+        machine.cpu.x[17] = ext;
+        machine.cpu.x[16] = function;
+        machine.cpu.x[10] = arg0;
+        machine.cpu.x[11] = arg1;
+        machine.service_sbi();
+    }
+
+    #[test]
+    fn direct_boot_enters_linux_in_supervisor_mode() {
+        let machine = direct_machine();
+        assert_eq!(machine.cpu.pc, RAM_BASE + KERNEL_OFFSET);
+        assert_eq!(machine.cpu.x[10], 0);
+        assert_ne!(machine.cpu.x[11], 0);
+        let sys = machine.cpu.sys.as_ref().unwrap();
+        assert_eq!(sys.mode, Mode::Supervisor);
+        assert_eq!(sys.satp, 0);
+        assert_eq!(sys.mideleg & (IRQ_SSIP | IRQ_STIP | IRQ_SEIP), 0x222);
+    }
+
+    #[test]
+    fn direct_sbi_base_time_and_unknown_calls() {
+        let mut machine = direct_machine();
+        sbi(&mut machine, 0x10, 0, 0, 0);
+        assert_eq!((machine.cpu.x[10], machine.cpu.x[11]), (0, 2 << 24));
+        sbi(&mut machine, 0x10, 3, 0x5449_4d45, 0);
+        assert_eq!((machine.cpu.x[10], machine.cpu.x[11]), (0, 1));
+        sbi(&mut machine, 0x5449_4d45, 0, 1234, 0);
+        assert_eq!(machine.bus.mtimecmp, 1234);
+        sbi(&mut machine, 0x48_53_4d, 2, 0, 0);
+        assert_eq!((machine.cpu.x[10], machine.cpu.x[11]), (0, 0));
+        sbi(&mut machine, 0x5246_4e43, 0, 1, 0);
+        assert_eq!(machine.cpu.x[10], 0);
+        sbi(&mut machine, 0xdead_beef, 7, 0, 0);
+        assert_eq!(machine.cpu.x[10], (-2i64) as u64);
+        assert_eq!(machine.unsupported_sbi, Some((0xdead_beef, 7)));
+    }
+
+    #[test]
+    fn direct_sbi_reset_powers_off() {
+        let mut machine = direct_machine();
+        sbi(&mut machine, 0x5352_5354, 0, 0, 0);
+        assert!(machine.power_off);
+        assert!(machine.bus.power_off);
+    }
 }

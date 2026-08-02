@@ -1,10 +1,11 @@
 //! Minimal host-side network stack, sitting behind virtio-net.
 //!
-//! This is *not* a NAT or a router. Its entire job is to let a guest open TCP
-//! connections to **one** address — the proxy — and hand those connections up as
-//! byte streams. Everything a general slirp needs and this does not: no DNS (the
-//! guest passes hostnames to the proxy, so nothing here resolves anything), no
-//! forwarding, no UDP beyond DHCP, no connection tracking per destination.
+//! In its default mode its entire job is to let a guest open TCP connections to
+//! one address — the request proxy — and hand those connections up as byte
+//! streams. Transparent mode additionally identifies arbitrary TCP peers and
+//! UDP flows for a stream relay such as WISP. It remains much smaller than a
+//! general NAT: routing and retransmission beyond the virtual guest link belong
+//! to the relay.
 //!
 //! That reduction is the whole reason the proxy design is cheap. Compare
 //! TinyEMU's `slirp/` at ~8.5k lines.
@@ -77,6 +78,9 @@ pub struct NetConfig {
     pub netmask: [u8; 4],
     /// TCP port the proxy listens on.
     pub proxy_port: u16,
+    /// Accept TCP for every destination rather than only `host_ip:proxy_port`.
+    /// Used by stream relays such as WISP.
+    pub transparent: bool,
 }
 
 impl Default for NetConfig {
@@ -87,6 +91,7 @@ impl Default for NetConfig {
             guest_ip: [10, 0, 2, 15],
             netmask: [255, 255, 255, 0],
             proxy_port: 8080,
+            transparent: false,
         }
     }
 }
@@ -98,11 +103,21 @@ pub type ConnId = u64;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
     /// A guest connection to the proxy port completed its handshake.
-    Opened(ConnId),
+    Opened {
+        id: ConnId,
+        address: [u8; 4],
+        port: u16,
+    },
     /// Bytes arrived from the guest.
     Data(ConnId, Vec<u8>),
     /// The guest finished sending (FIN) or reset the connection.
     Closed(ConnId),
+    Datagram {
+        id: ConnId,
+        address: [u8; 4],
+        port: u16,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -118,6 +133,8 @@ enum State {
 struct Conn {
     id: ConnId,
     guest_port: u16,
+    remote_ip: [u8; 4],
+    remote_port: u16,
     state: State,
     /// Next sequence number we expect from the guest.
     rcv_nxt: u32,
@@ -137,11 +154,19 @@ struct Conn {
     stalled: u32,
 }
 
+struct UdpFlow {
+    id: ConnId,
+    guest_port: u16,
+    remote_ip: [u8; 4],
+    remote_port: u16,
+}
+
 pub struct NetStack {
     cfg: NetConfig,
     /// Learned from the guest's own frames; until then we cannot address it.
     guest_mac: Option<[u8; 6]>,
     conns: Vec<Conn>,
+    udp: Vec<UdpFlow>,
     next_id: ConnId,
     out: Vec<Vec<u8>>,
     events: Vec<Event>,
@@ -153,6 +178,7 @@ impl NetStack {
             cfg,
             guest_mac: None,
             conns: Vec::new(),
+            udp: Vec::new(),
             next_id: 1,
             out: Vec::new(),
             events: Vec::new(),
@@ -195,6 +221,21 @@ impl NetStack {
         if let Some(c) = self.conns.iter_mut().find(|c| c.id == id) {
             c.fin_pending = true;
         }
+    }
+
+    pub fn send_udp(&mut self, id: ConnId, data: &[u8]) {
+        let Some(flow) = self.udp.iter().find(|flow| flow.id == id) else {
+            return;
+        };
+        let (remote_port, guest_port, remote_ip) =
+            (flow.remote_port, flow.guest_port, flow.remote_ip);
+        let mut udp = Vec::with_capacity(8 + data.len());
+        udp.extend_from_slice(&remote_port.to_be_bytes());
+        udp.extend_from_slice(&guest_port.to_be_bytes());
+        udp.extend_from_slice(&((8 + data.len()) as u16).to_be_bytes());
+        udp.extend_from_slice(&[0, 0]);
+        udp.extend_from_slice(data);
+        self.emit_ip_from(IP_PROTO_UDP, remote_ip, self.cfg.guest_ip, &udp);
     }
 
     // ---- inbound ----------------------------------------------------------
@@ -267,8 +308,14 @@ impl NetStack {
         let payload = &ip[ihl..total];
         match proto {
             IP_PROTO_ICMP => self.on_icmp(src, payload),
-            IP_PROTO_UDP => self.on_udp(payload),
-            IP_PROTO_TCP => self.on_tcp(src, payload),
+            IP_PROTO_UDP => {
+                let dst = ip[16..20].try_into().unwrap();
+                self.on_udp(dst, payload)
+            }
+            IP_PROTO_TCP => {
+                let dst = ip[16..20].try_into().unwrap();
+                self.on_tcp(src, dst, payload)
+            }
             _ => {}
         }
     }
@@ -287,7 +334,7 @@ impl NetStack {
 
     // ---- DHCP -------------------------------------------------------------
 
-    fn on_udp(&mut self, udp: &[u8]) {
+    fn on_udp(&mut self, dst: [u8; 4], udp: &[u8]) {
         if udp.len() < 8 {
             return;
         }
@@ -296,6 +343,28 @@ impl NetStack {
         // itself instead of needing a hand-written ifconfig.
         if (sport, dport) == (68, 67) {
             self.on_dhcp(&udp[8..]);
+        } else if self.cfg.transparent {
+            let id = if let Some(flow) = self.udp.iter().find(|flow| {
+                flow.guest_port == sport && flow.remote_ip == dst && flow.remote_port == dport
+            }) {
+                flow.id
+            } else {
+                let id = self.next_id;
+                self.next_id += 1;
+                self.udp.push(UdpFlow {
+                    id,
+                    guest_port: sport,
+                    remote_ip: dst,
+                    remote_port: dport,
+                });
+                id
+            };
+            self.events.push(Event::Datagram {
+                id,
+                address: dst,
+                port: dport,
+                bytes: udp[8..].to_vec(),
+            });
         }
     }
 
@@ -364,7 +433,12 @@ impl NetStack {
                                            // populated and name lookups fail fast rather than hanging on a
                                            // nonexistent server. Nothing here answers DNS: with a proxy the guest
                                            // never needs to resolve anything, because it hands us the hostname.
-        opt(6, &self.cfg.host_ip, &mut m);
+        let dns = if self.cfg.transparent {
+            [1, 1, 1, 1]
+        } else {
+            self.cfg.host_ip
+        };
+        opt(6, &dns, &mut m);
         m.push(255);
 
         // UDP 67 -> 68, broadcast: the guest has no address yet.
@@ -380,7 +454,7 @@ impl NetStack {
 
     // ---- TCP --------------------------------------------------------------
 
-    fn on_tcp(&mut self, src: [u8; 4], seg: &[u8]) {
+    fn on_tcp(&mut self, src: [u8; 4], dst: [u8; 4], seg: &[u8]) {
         if seg.len() < 20 {
             return;
         }
@@ -398,18 +472,21 @@ impl NetStack {
 
         // Anything not aimed at the proxy port gets a reset, so the guest fails
         // fast instead of retrying a black hole.
-        if dport != self.cfg.proxy_port {
+        if !self.cfg.transparent && (dst != self.cfg.host_ip || dport != self.cfg.proxy_port) {
             if flags & TCP_SYN != 0 {
                 self.emit_rst(src, sport, dport, seq, payload.len());
             }
             return;
         }
 
-        let existing = self.conns.iter().position(|c| c.guest_port == sport);
+        let existing = self
+            .conns
+            .iter()
+            .position(|c| c.guest_port == sport && c.remote_ip == dst && c.remote_port == dport);
         match existing {
             None => {
                 if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
-                    self.accept(sport, seq, window);
+                    self.accept(sport, dst, dport, seq, window);
                 } else if flags & TCP_RST == 0 {
                     self.emit_rst(src, sport, dport, seq, payload.len());
                 }
@@ -418,7 +495,14 @@ impl NetStack {
         }
     }
 
-    fn accept(&mut self, guest_port: u16, seq: u32, window: u16) {
+    fn accept(
+        &mut self,
+        guest_port: u16,
+        remote_ip: [u8; 4],
+        remote_port: u16,
+        seq: u32,
+        window: u16,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
         // A per-connection ISS. Deliberately deterministic: this stack talks to
@@ -428,6 +512,8 @@ impl NetStack {
         self.conns.push(Conn {
             id,
             guest_port,
+            remote_ip,
+            remote_port,
             state: State::SynReceived,
             rcv_nxt: seq.wrapping_add(1),
             snd_una: iss,
@@ -473,7 +559,11 @@ impl NetStack {
             if c.state == State::SynReceived {
                 c.state = State::Established;
                 let id = c.id;
-                self.events.push(Event::Opened(id));
+                self.events.push(Event::Opened {
+                    id,
+                    address: c.remote_ip,
+                    port: c.remote_port,
+                });
             }
             if c.state == State::LastAck && c.unacked.is_empty() {
                 self.conns.remove(i);
@@ -577,7 +667,7 @@ impl NetStack {
     fn emit_segment(&mut self, i: usize, flags: u8, seq: u32, payload: &[u8]) {
         let c = &self.conns[i];
         let mut seg = Vec::with_capacity(20 + payload.len());
-        seg.extend_from_slice(&self.cfg.proxy_port.to_be_bytes());
+        seg.extend_from_slice(&c.remote_port.to_be_bytes());
         seg.extend_from_slice(&c.guest_port.to_be_bytes());
         seg.extend_from_slice(&seq.to_be_bytes());
         seg.extend_from_slice(&c.rcv_nxt.to_be_bytes());
@@ -595,10 +685,10 @@ impl NetStack {
             seg.extend_from_slice(&(MSS as u16).to_be_bytes());
         }
         seg.extend_from_slice(payload);
-        let sum = tcp_checksum(&self.cfg.host_ip, &self.cfg.guest_ip, &seg);
+        let sum = tcp_checksum(&c.remote_ip, &self.cfg.guest_ip, &seg);
         seg[16..18].copy_from_slice(&sum.to_be_bytes());
         let dst = self.guest_mac.unwrap_or(BROADCAST);
-        let frame = self.build_ip(dst, IP_PROTO_TCP, self.cfg.guest_ip, &seg);
+        let frame = self.build_ip_from(dst, IP_PROTO_TCP, c.remote_ip, self.cfg.guest_ip, &seg);
         self.out.push(frame);
     }
 
@@ -622,12 +712,27 @@ impl NetStack {
     // ---- framing ----------------------------------------------------------
 
     fn emit_ip(&mut self, proto: u8, dst_ip: [u8; 4], payload: &[u8]) {
+        self.emit_ip_from(proto, self.cfg.host_ip, dst_ip, payload);
+    }
+
+    fn emit_ip_from(&mut self, proto: u8, src_ip: [u8; 4], dst_ip: [u8; 4], payload: &[u8]) {
         let dst = self.guest_mac.unwrap_or(BROADCAST);
-        let frame = self.build_ip(dst, proto, dst_ip, payload);
+        let frame = self.build_ip_from(dst, proto, src_ip, dst_ip, payload);
         self.out.push(frame);
     }
 
     fn build_ip(&self, dst_mac: [u8; 6], proto: u8, dst_ip: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        self.build_ip_from(dst_mac, proto, self.cfg.host_ip, dst_ip, payload)
+    }
+
+    fn build_ip_from(
+        &self,
+        dst_mac: [u8; 6],
+        proto: u8,
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        payload: &[u8],
+    ) -> Vec<u8> {
         let total = 20 + payload.len();
         let mut f = Vec::with_capacity(ETH_HDR + total);
         f.extend_from_slice(&dst_mac);
@@ -642,7 +747,7 @@ impl NetStack {
         f.push(64); // TTL
         f.push(proto);
         f.extend_from_slice(&[0, 0]); // checksum, filled below
-        f.extend_from_slice(&self.cfg.host_ip);
+        f.extend_from_slice(&src_ip);
         f.extend_from_slice(&dst_ip);
         let sum = checksum(&f[ip_start..ip_start + 20]);
         f[ip_start + 10..ip_start + 12].copy_from_slice(&sum.to_be_bytes());
@@ -792,7 +897,7 @@ mod tests {
         let events = s.take_events();
         assert_eq!(events.len(), 1);
         let id = match events[0] {
-            Event::Opened(id) => id,
+            Event::Opened { id, .. } => id,
             ref e => panic!("expected Opened, got {e:?}"),
         };
         (id, seq.wrapping_add(1))
@@ -980,7 +1085,7 @@ mod tests {
         ack[14..16].copy_from_slice(&100u16.to_be_bytes());
         s.input(&ip_frame(IP_PROTO_TCP, cfg.guest_ip, cfg.host_ip, &ack));
         let id = match s.take_events()[0] {
-            Event::Opened(id) => id,
+            Event::Opened { id, .. } => id,
             ref e => panic!("{e:?}"),
         };
 
@@ -1040,6 +1145,70 @@ mod tests {
         assert_eq!(flags, TCP_RST | TCP_ACK);
         assert_eq!(ack, 2);
         assert!(s.take_events().is_empty());
+    }
+
+    #[test]
+    fn transparent_tcp_reports_and_replies_as_the_remote_peer() {
+        let cfg = NetConfig {
+            transparent: true,
+            ..NetConfig::default()
+        };
+        let mut s = NetStack::new(cfg);
+        let remote = [93, 184, 216, 34];
+        s.input(&ip_frame(
+            IP_PROTO_TCP,
+            cfg.guest_ip,
+            remote,
+            &tcp_seg(41000, 443, 100, 0, TCP_SYN, &[]),
+        ));
+        let syn_ack = s.take_output().remove(0);
+        assert_eq!(&syn_ack[ETH_HDR + 12..ETH_HDR + 16], &remote);
+        let (_, seq, _, _) = parse_tcp(&syn_ack);
+        s.input(&ip_frame(
+            IP_PROTO_TCP,
+            cfg.guest_ip,
+            remote,
+            &tcp_seg(41000, 443, 101, seq + 1, TCP_ACK, &[]),
+        ));
+        assert!(matches!(
+            s.take_events().as_slice(),
+            [Event::Opened { address, port: 443, .. }] if *address == remote
+        ));
+    }
+
+    #[test]
+    fn transparent_udp_round_trips_one_datagram() {
+        let cfg = NetConfig {
+            transparent: true,
+            ..NetConfig::default()
+        };
+        let mut s = NetStack::new(cfg);
+        let mut udp = Vec::new();
+        udp.extend_from_slice(&53000u16.to_be_bytes());
+        udp.extend_from_slice(&53u16.to_be_bytes());
+        udp.extend_from_slice(&11u16.to_be_bytes());
+        udp.extend_from_slice(&[0, 0]);
+        udp.extend_from_slice(b"dns");
+        s.input(&ip_frame(IP_PROTO_UDP, cfg.guest_ip, [1, 1, 1, 1], &udp));
+        let events = s.take_events();
+        let id = match events.as_slice() {
+            [Event::Datagram {
+                id,
+                address: [1, 1, 1, 1],
+                port: 53,
+                bytes,
+            }] => {
+                assert_eq!(bytes, b"dns");
+                *id
+            }
+            other => panic!("unexpected events: {other:?}"),
+        };
+        s.send_udp(id, b"answer");
+        let frame = s.take_output().remove(0);
+        let ip = &frame[ETH_HDR..];
+        assert_eq!(&ip[12..16], &[1, 1, 1, 1]);
+        assert_eq!(&ip[16..20], &cfg.guest_ip);
+        assert_eq!(&ip[28..], b"answer");
     }
 
     #[test]

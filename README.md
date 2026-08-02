@@ -13,7 +13,7 @@ inspired by [copy/v86](https://github.com/copy/v86).
 **Project status: pre-release, with working Linux boots.** The native Rust
 interpreter and the browser's WebAssembly interpreter/JIT boot Linux to an
 interactive shell. The browser demo offers a small Linux 4.15/BusyBox system
-and a larger OpenSBI/Linux 6.12/Debian system.
+and an Alpine 3.24/Linux 6.12 system with working `apk` networking.
 
 The separate Linux user-mode runner is **experimental**. It can load static
 riscv64 ELF executables and supports enough of the Linux syscall ABI for the
@@ -29,7 +29,7 @@ Implemented and tested paths include:
 - WebAssembly JIT in both user-mode and full-system browser run loops
 - virtio console and block devices
 - virtio-9p host-directory and in-memory file sharing
-- virtio networking through WebSocket or an in-browser HTTP proxy
+- virtio networking through fetch, WISP, wsproxy, or a browser-local LAN
 
 Architecture details live in [DESIGN.md](DESIGN.md). See
 [ROADMAP.md](ROADMAP.md) for future work and
@@ -54,7 +54,7 @@ python3 -m http.server -d . 8000
 
 Open <http://localhost:8000/web/>.
 
-The page offers a fast BusyBox machine and a modern OpenSBI/Linux 6.12 Debian
+The page offers a fast BusyBox machine and a modern Alpine 3.24/Linux 6.12
 machine. Prepare the modern images once with:
 
 ```sh
@@ -66,14 +66,14 @@ forward the host terminal to the guest:
 
 ```sh
 node examples/boot-linux.mjs fast
-node --max-old-space-size=2048 examples/boot-linux.mjs modern
+node examples/boot-linux.mjs modern
 ```
 
 For a non-interactive smoke test, stop after a known boot marker:
 
 ```sh
 RV64_UNTIL='~ #' node examples/boot-linux.mjs fast
-RV64_UNTIL=BENCH_READY node --max-old-space-size=2048 examples/boot-linux.mjs modern
+RV64_UNTIL=ALPINE_READY node examples/boot-linux.mjs modern
 ```
 
 The browser and Node example uses the typed public API from `web/rv64.js`:
@@ -85,24 +85,55 @@ const vm = await RV64.create({
   wasm: { url: "./rv64_wasm.wasm" },
   memoryMB: 512,
   boot: {
-    mode: "firmware",
-    firmware: { url: "./opensbi.bin" },
+    mode: "linux-direct",
     kernel: { url: "./Image" },
-    disk: { url: "./debian.ext4" },
-    cmdline: "console=ttyS0 root=/dev/vda rw",
+    disk: { url: "./alpine.ext4" },
+    cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
   },
   events: { console: (bytes) => terminal.write(bytes) },
 });
 await vm.start();
 vm.console.send("uname -a\n");
+vm.console.send("apk update\n");
 ```
 
 The library owns the execution loop. Its lifecycle is `start()`, `stop()`,
 `reset()`, and `destroy()`; `on()` provides typed events and returns an
 unsubscribe function. See [web/rv64.d.ts](web/rv64.d.ts) and
 [API_DESIGN.md](API_DESIGN.md). `linux-direct` is part of the declared boot
-model but currently rejects with a clear not-implemented error while its SBI
-boundary is being built.
+model and boots Linux in supervisor mode through the emulator-provided SBI,
+without loading or executing a firmware image. Use `mode: "linux-direct"` and
+omit `firmware`; the kernel, disk/initrd, command line, and lifecycle are
+otherwise unchanged.
+
+Linux machines use the `fetch` HTTP/HTTPS backend by default. The Alpine image
+configures `http_proxy`/`https_proxy` only when that backend is selected,
+attaches the NIC at `10.0.2.15`, and trusts the per-VM proxy CA automatically.
+`apk update` works directly in Node
+and native builds. Browsers can fetch CORS-enabled destinations directly;
+Alpine's package CDN currently requires the optional request relay, supplied as
+`relayURL` or to the demo as `?relay=wss://your-relay.example`.
+Networking can also be selected explicitly:
+
+```js
+network: { mode: "fetch" }                            // Linux default
+network: { mode: "fetch", relayURL: "wss://…" }      // CORS fallback
+network: { mode: "wisp", url: "wisps://…" }          // TCP/UDP relay
+network: { mode: "wsproxy", url: "wss://…" }         // layer-2 relay
+network: { mode: "inbrowser", channel: "my-lan" }    // browser-local LAN
+network: { mode: "external" }                         // advanced frame API
+network: { mode: "none" }
+```
+
+`fetch` translates guest HTTP requests to the host's `fetch()` API. `wisp`
+provides outbound TCP and UDP through a WISP v1 relay. `wsproxy` carries raw
+Ethernet frames to a websockproxy-compatible relay. `inbrowser` joins VMs in
+the same browser to a local Ethernet segment using `BroadcastChannel` and has
+no Internet access.
+
+`vm.network.proxyURL` reports the guest proxy address in `fetch` mode. In
+`external` mode, outbound frames arrive through `networkTransmit` and inbound
+frames are passed to `vm.network.receive(frame)`.
 
 ### Native full-system emulator
 
@@ -150,16 +181,15 @@ The browser proxy implementation tries `fetch()` first, retaining its zero-infra
 path. If a GET or HEAD fails before a response is exposed, an attached HTTP
 relay retries it and remembers that origin for later requests. Non-idempotent
 requests are never retried automatically. This transport is exercised by the
-repository tests but is not yet exposed by the stable JavaScript facade; it
-will return with the unified `riscv-virt` networking API. See
+repository tests and is exposed as `network: { mode: "fetch", relayURL }`. See
 [web/HTTP_RELAY.md](web/HTTP_RELAY.md) for the wire protocol and deployment
 details.
 
-### Modern OpenSBI/Linux machine
+### Modern Alpine/Linux machine
 
 ```sh
-nix develop -c tests/vs-v86/mk-debian-rootfs.sh target/bench
-nix develop -c tests/virt-proxy/run.sh
+nix develop -c tests/virt-smoke/mk-alpine-rootfs.sh target/bench
+node tests/alpine-boot.mjs
 ```
 
 ### User-mode emulator

@@ -37,12 +37,12 @@ jobs:
           mkdir _site
           cp -R web/. _site/
           cp target/wasm32-unknown-unknown/release/rv64_wasm.wasm _site/
-          mkdir -p _site/assets/demo-images-v1
-          gh release download demo-images-v1 \
+          mkdir -p _site/assets/demo-images-v2
+          gh release download demo-images-v2 \
             --repo ibuildthecloud/rv64.js \
             --pattern 'fast-*' \
             --pattern 'modern-*' \
-            --dir _site/assets/demo-images-v1
+            --dir _site/assets/demo-images-v2
           touch _site/.nojekyll
       - uses: actions/upload-pages-artifact@v4
         with:

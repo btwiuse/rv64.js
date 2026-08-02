@@ -46,6 +46,11 @@ extern "C" {
     /// calls `sys_http_response` when it completes — asynchronously, so this
     /// returns immediately and the guest's TCP connection stays open meanwhile.
     fn host_http_request(id: u64, ptr: *const u8, len: usize);
+    /// Transparent guest TCP stream events for a WISP transport.
+    fn host_wisp_open(id: u64, address: *const u8, port: u32);
+    fn host_wisp_data(id: u64, ptr: *const u8, len: usize);
+    fn host_wisp_close(id: u64);
+    fn host_wisp_datagram(id: u64, address: *const u8, port: u32, ptr: *const u8, len: usize);
     /// Async variant for large modules (page superblocks): compiles on V8
     /// background threads; sys_sb_ready(ticket, idx) fires between runSystem
     /// calls when the function is in the table (idx -1 = failed).
@@ -1401,6 +1406,7 @@ static mut SYS_CMDLINE: Vec<u8> = Vec::new();
 /// that reaches the network with no external infrastructure at all.
 static mut SYS_NETSTACK: Option<rv64_system::netstack::NetStack> = None;
 static mut SYS_PROXY: Option<rv64_system::httpproxy::Proxy> = None;
+static mut SYS_WISP: bool = false;
 static mut SYS_EGRESS: FetchEgress = FetchEgress { done: Vec::new() };
 
 /// Hands requests to the page and collects what the `sys_http_*` exports
@@ -1462,6 +1468,8 @@ static mut VIRT_KERNEL: Vec<u8> = Vec::new();
 static mut VIRT_INITRD: Vec<u8> = Vec::new();
 static mut VIRT_DISK: Vec<u8> = Vec::new();
 static mut VIRT_CMDLINE: Vec<u8> = Vec::new();
+static mut VIRT_NET_ON: bool = false;
+static mut VIRT_NET_MAC: Vec<u8> = Vec::new();
 static mut VIRT: Option<rv64_system::virt::VirtMachine> = None;
 
 stage_into!(virt_stage_opensbi, VIRT_OPENSBI);
@@ -1469,11 +1477,30 @@ stage_into!(virt_stage_kernel, VIRT_KERNEL);
 stage_into!(virt_stage_initrd, VIRT_INITRD);
 stage_into!(virt_stage_disk, VIRT_DISK);
 stage_into!(virt_stage_cmdline, VIRT_CMDLINE);
+stage_into!(virt_stage_net_mac, VIRT_NET_MAC);
+
+/// Give the next modern virt machine a virtio-net NIC.
+#[no_mangle]
+pub extern "C" fn virt_net_enable(on: u32) {
+    unsafe { VIRT_NET_ON = on != 0 }
+}
 
 /// Assemble and boot the modern virt machine from staged images.
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn virt_boot(ram_mb: u32) {
+    boot_virt(ram_mb, false);
+}
+
+/// Assemble the modern virt machine and enter Linux directly in S-mode.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_boot_direct(ram_mb: u32) {
+    boot_virt(ram_mb, true);
+}
+
+#[allow(static_mut_refs)]
+fn boot_virt(ram_mb: u32, direct: bool) {
     unsafe {
         let cmdline = String::from_utf8_lossy(&VIRT_CMDLINE).into_owned();
         let cmdline = if cmdline.is_empty() {
@@ -1481,18 +1508,29 @@ pub extern "C" fn virt_boot(ram_mb: u32) {
         } else {
             &cmdline
         };
-        let mut machine = rv64_system::virt::VirtMachine::new(
-            u64::from(ram_mb) << 20,
-            rv64_system::virt::VirtImages {
-                opensbi: &VIRT_OPENSBI,
-                kernel: &VIRT_KERNEL,
-                cmdline,
-                initrd: (!VIRT_INITRD.is_empty()).then_some(VIRT_INITRD.as_slice()),
-                disk: (!VIRT_DISK.is_empty()).then(|| core::mem::take(&mut VIRT_DISK)),
-                fs: Vec::new(),
-                net: None,
-            },
-        );
+        let mut fs = Vec::new();
+        if let Some(proxy) = SYS_PROXY.as_mut() {
+            if let Ok(ca_fs) = proxy.ca_9p_server() {
+                fs.push(ca_fs);
+            }
+        }
+        let net = VIRT_NET_ON.then(|| {
+            <[u8; 6]>::try_from(VIRT_NET_MAC.as_slice()).unwrap_or(rv64_system::virtio::DEFAULT_MAC)
+        });
+        let images = rv64_system::virt::VirtImages {
+            opensbi: &VIRT_OPENSBI,
+            kernel: &VIRT_KERNEL,
+            cmdline,
+            initrd: (!VIRT_INITRD.is_empty()).then_some(VIRT_INITRD.as_slice()),
+            disk: (!VIRT_DISK.is_empty()).then(|| core::mem::take(&mut VIRT_DISK)),
+            fs,
+            net,
+        };
+        let mut machine = if direct {
+            rv64_system::virt::VirtMachine::new_direct(u64::from(ram_mb) << 20, images)
+        } else {
+            rv64_system::virt::VirtMachine::new(u64::from(ram_mb) << 20, images)
+        };
         machine.set_rtc_unix_ns(host_unix_ms() as u64 * 1_000_000);
         VIRT_OPENSBI.clear();
         VIRT_KERNEL.clear();
@@ -1513,6 +1551,7 @@ pub extern "C" fn virt_run(max_insns: u64) -> i32 {
     if !out.is_empty() {
         unsafe { host_write(1, out.as_ptr(), out.len()) }
     }
+    pump_virt_net(machine);
     machine.power_off as i32
 }
 
@@ -1522,6 +1561,70 @@ pub extern "C" fn virt_console_input() {
     let machine = unsafe { VIRT.as_mut().expect("call virt_boot() first") };
     let bytes = unsafe { core::mem::take(&mut STAGING) };
     machine.console_input(&bytes);
+}
+
+/// Deliver one inbound Ethernet frame to the modern machine's NIC.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_net_input() {
+    let machine = unsafe { VIRT.as_mut().expect("call virt_boot() first") };
+    let frame = unsafe { core::mem::take(&mut STAGING) };
+    machine.net_input(&frame);
+}
+
+#[allow(static_mut_refs)]
+fn pump_virt_net(machine: &mut rv64_system::virt::VirtMachine) {
+    unsafe {
+        match SYS_NETSTACK.as_mut() {
+            Some(stack) => {
+                for frame in machine.net_take_output() {
+                    stack.input(&frame);
+                }
+                if let Some(proxy) = SYS_PROXY.as_mut() {
+                    proxy.pump(stack, &mut SYS_EGRESS);
+                } else if SYS_WISP {
+                    pump_wisp(stack);
+                }
+                for frame in stack.take_output() {
+                    machine.net_input(&frame);
+                }
+            }
+            None => {
+                for frame in machine.net_take_output() {
+                    host_net_send(frame.as_ptr(), frame.len())
+                }
+            }
+        }
+    }
+}
+
+#[allow(static_mut_refs)]
+fn pump_wisp(stack: &mut rv64_system::netstack::NetStack) {
+    for event in stack.take_events() {
+        match event {
+            rv64_system::netstack::Event::Opened { id, address, port } => unsafe {
+                host_wisp_open(id, address.as_ptr(), u32::from(port));
+            },
+            rv64_system::netstack::Event::Data(id, bytes) => unsafe {
+                host_wisp_data(id, bytes.as_ptr(), bytes.len());
+            },
+            rv64_system::netstack::Event::Closed(id) => unsafe { host_wisp_close(id) },
+            rv64_system::netstack::Event::Datagram {
+                id,
+                address,
+                port,
+                bytes,
+            } => unsafe {
+                host_wisp_datagram(
+                    id,
+                    address.as_ptr(),
+                    u32::from(port),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                );
+            },
+        }
+    }
 }
 
 #[no_mangle]
@@ -1535,6 +1638,27 @@ pub extern "C" fn virt_insn_count() -> u64 {
 #[allow(static_mut_refs)]
 pub extern "C" fn virt_pc() -> u64 {
     unsafe { VIRT.as_ref().map_or(0, |m| m.cpu.pc) }
+}
+
+/// Unsupported direct-boot SBI extension/function, or zero when none.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_unsupported_sbi_ext() -> u64 {
+    unsafe {
+        VIRT.as_ref()
+            .and_then(|m| m.unsupported_sbi)
+            .map_or(0, |v| v.0)
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_unsupported_sbi_function() -> u64 {
+    unsafe {
+        VIRT.as_ref()
+            .and_then(|m| m.unsupported_sbi)
+            .map_or(0, |v| v.1)
+    }
 }
 
 /// Give the next-booted machine a virtio-net NIC. Frames the guest sends arrive
@@ -1558,7 +1682,9 @@ pub extern "C" fn sys_net_enable(on: u32) {
 pub extern "C" fn sys_proxy_enable(on: u32, upgrade_https: u32) {
     unsafe {
         if on != 0 {
+            SYS_WISP = false;
             SYS_NET_ON = true;
+            VIRT_NET_ON = true;
             SYS_NETSTACK = Some(rv64_system::netstack::NetStack::new(
                 rv64_system::netstack::NetConfig::default(),
             ));
@@ -1571,6 +1697,60 @@ pub extern "C" fn sys_proxy_enable(on: u32, upgrade_https: u32) {
         } else {
             SYS_NETSTACK = None;
             SYS_PROXY = None;
+        }
+    }
+}
+
+/// Run a transparent TCP stack behind the NIC for the JavaScript WISP client.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_wisp_enable(on: u32) {
+    unsafe {
+        SYS_WISP = on != 0;
+        if SYS_WISP {
+            SYS_NET_ON = true;
+            VIRT_NET_ON = true;
+            let cfg = rv64_system::netstack::NetConfig {
+                transparent: true,
+                ..rv64_system::netstack::NetConfig::default()
+            };
+            SYS_NETSTACK = Some(rv64_system::netstack::NetStack::new(cfg));
+            SYS_PROXY = None;
+        } else if SYS_PROXY.is_none() {
+            SYS_NETSTACK = None;
+        }
+    }
+}
+
+/// Deliver bytes received from a WISP stream (bytes staged first).
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_wisp_data(id: u64) {
+    unsafe {
+        if let Some(stack) = SYS_NETSTACK.as_mut() {
+            let bytes = core::mem::take(&mut STAGING);
+            stack.send(id, &bytes);
+        }
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_wisp_close(id: u64) {
+    unsafe {
+        if let Some(stack) = SYS_NETSTACK.as_mut() {
+            stack.close(id);
+        }
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn sys_wisp_datagram(id: u64) {
+    unsafe {
+        if let Some(stack) = SYS_NETSTACK.as_mut() {
+            let bytes = core::mem::take(&mut STAGING);
+            stack.send_udp(id, &bytes);
         }
     }
 }
@@ -3311,6 +3491,8 @@ fn pump_net(m: &mut rv64_system::Machine) {
                 }
                 if let Some(proxy) = SYS_PROXY.as_mut() {
                     proxy.pump(stack, &mut SYS_EGRESS);
+                } else if SYS_WISP {
+                    pump_wisp(stack);
                 }
                 for frame in stack.take_output() {
                     m.net_input(&frame);

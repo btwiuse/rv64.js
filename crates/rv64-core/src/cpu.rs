@@ -8,8 +8,8 @@ use crate::exception::Exception;
 pub enum StopReason {
     /// Instruction budget exhausted; just call run() again.
     Budget,
-    /// ECALL executed (user-mode emulation only: the host services a
-    /// syscall and resumes; full-system routes ecall to the guest kernel).
+    /// ECALL executed. The host services user-mode syscalls and may opt into
+    /// servicing supervisor-mode SBI calls for direct Linux boot.
     Ecall,
     /// EBREAK executed (user-mode emulation only).
     Break,
@@ -60,6 +60,9 @@ pub struct Cpu {
     pub fcsr: u32,
     /// Privileged state; None = pure user-mode emulation (no MMU/traps).
     pub sys: Option<SysCsrs>,
+    /// Return supervisor ECALLs to the machine instead of trapping to M-mode.
+    /// Used by firmware-free Linux boot, where the emulator is the SBI layer.
+    pub host_sbi: bool,
     /// Diagnostics: exception counts by cause, interrupt counts by cause.
     pub exc_counts: [u64; 16],
     pub irq_counts: [u64; 16],
@@ -120,6 +123,7 @@ impl Cpu {
             f: [0; 32],
             fcsr: 0,
             sys: None,
+            host_sbi: false,
             exc_counts: [0; 16],
             irq_counts: [0; 16],
             jit_flush_gen: 0,
@@ -138,6 +142,11 @@ impl Cpu {
         let mut sys = SysCsrs::new();
         sys.mhartid = hartid;
         self.sys = Some(sys);
+    }
+
+    /// Route supervisor-mode ECALLs to the host as [`StopReason::Ecall`].
+    pub fn enable_host_sbi(&mut self) {
+        self.host_sbi = true;
     }
 
     pub fn flush_tlb(&mut self) {
@@ -1025,16 +1034,22 @@ impl Cpu {
             0x73 => match (insn, funct3(insn)) {
                 (0x0000_0073, _) => {
                     if let Some(sys) = self.sys.as_ref() {
-                        let cause = match sys.mode {
-                            Mode::User => 8,
-                            Mode::Supervisor => 9,
-                            Mode::Machine => 11,
-                        };
-                        self.take_trap(cause, 0, false);
-                        self.insn_count += 1;
-                        return Ok(None); // pc set by take_trap
+                        if self.host_sbi && sys.mode == Mode::Supervisor {
+                            stop = Some(StopReason::Ecall);
+                        } else {
+                            let cause = match sys.mode {
+                                Mode::User => 8,
+                                Mode::Supervisor => 9,
+                                Mode::Machine => 11,
+                            };
+                            self.take_trap(cause, 0, false);
+                            self.insn_count += 1;
+                            return Ok(None); // pc set by take_trap
+                        }
                     }
-                    stop = Some(StopReason::Ecall);
+                    if self.sys.is_none() {
+                        stop = Some(StopReason::Ecall);
+                    }
                 }
                 (0x0010_0073, _) => {
                     if self.sys.is_some() {
@@ -1768,6 +1783,22 @@ mod tests {
         let stop = cpu.run(&mut bus, 10_000);
         assert_eq!(stop, StopReason::Ecall, "program should end in ecall");
         (cpu, mem)
+    }
+
+    #[test]
+    fn host_sbi_returns_supervisor_ecall_without_machine_trap() {
+        let mut mem = vec![0u8; 0x1000];
+        mem[..4].copy_from_slice(&0x0000_0073u32.to_le_bytes());
+        let mut bus = FlatMemory::new(BASE, &mut mem);
+        let mut cpu = Cpu::new();
+        cpu.enable_system(0);
+        cpu.enable_host_sbi();
+        cpu.sys.as_mut().unwrap().mode = Mode::Supervisor;
+        cpu.pc = BASE;
+        assert_eq!(cpu.run(&mut bus, 1), StopReason::Ecall);
+        assert_eq!(cpu.pc, BASE + 4);
+        assert_eq!(cpu.sys.as_ref().unwrap().mode, Mode::Supervisor);
+        assert_eq!(cpu.insn_count, 1);
     }
 
     #[test]

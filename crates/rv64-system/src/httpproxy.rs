@@ -311,7 +311,7 @@ impl Proxy {
     pub fn pump(&mut self, stack: &mut NetStack, egress: &mut dyn Egress) {
         for event in stack.take_events() {
             match event {
-                Event::Opened(id) => {
+                Event::Opened { id, .. } => {
                     self.conns.insert(id, ConnBuf::default());
                 }
                 Event::Data(id, bytes) => self.on_data(id, bytes, stack, egress),
@@ -320,6 +320,7 @@ impl Proxy {
                     // when it arrives, since the guest is gone.
                     self.conns.remove(&id);
                 }
+                Event::Datagram { .. } => {}
             }
         }
         for completion in egress.poll() {
@@ -619,14 +620,32 @@ impl Proxy {
     }
 
     fn send_bytes(&mut self, conn: ConnId, bytes: &[u8], stack: &mut NetStack) {
-        let Some(state) = self.conns.get_mut(&conn) else {
+        let Some(state) = self.conns.get(&conn) else {
             return;
         };
-        if let Some(tls) = state.tls.as_mut() {
-            if tls.writer().write_all(bytes).is_err() {
-                return;
+        if state.tls.is_some() {
+            // rustls deliberately bounds buffered plaintext. A single large
+            // Body completion can therefore be only partially accepted; drain
+            // ciphertext between writes instead of treating WriteZero as a
+            // successfully truncated response.
+            let mut remaining = bytes;
+            while !remaining.is_empty() {
+                let written = {
+                    let Some(tls) = self
+                        .conns
+                        .get_mut(&conn)
+                        .and_then(|state| state.tls.as_mut())
+                    else {
+                        return;
+                    };
+                    match tls.writer().write(remaining) {
+                        Ok(0) | Err(_) => return,
+                        Ok(written) => written,
+                    }
+                };
+                remaining = &remaining[written..];
+                self.drain_tls(conn, stack);
             }
-            self.drain_tls(conn, stack);
         } else {
             stack.send(conn, bytes);
         }

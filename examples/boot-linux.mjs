@@ -26,24 +26,25 @@ if (preset === "fast") {
   ]);
   boot = { mode: "firmware", firmware, kernel, disk };
   memoryMB = 128;
-} else if (preset === "modern") {
-  const [firmware, kernel, disk] = await Promise.all([
-    bytes("web/images/modern/opensbi.bin"),
+} else if (preset === "modern" || preset === "modern-direct") {
+  const [kernel, disk] = await Promise.all([
     process.env.RV64_MODERN_KERNEL
       ? new Uint8Array(await readFile(process.env.RV64_MODERN_KERNEL))
       : bytes("web/images/modern/Image"),
-    bytes("web/images/modern/debian.ext4"),
+    bytes("web/images/modern/alpine.ext4"),
   ]);
   boot = {
-    mode: "firmware",
-    firmware,
+    mode: preset === "modern-direct" ? "linux-direct" : "firmware",
     kernel,
     disk,
-    cmdline: "console=ttyS0 root=/dev/vda rw init=/binit.sh",
+    cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
   };
+  if (preset === "modern") {
+    boot.firmware = await bytes("web/images/modern/opensbi.bin");
+  }
   memoryMB = 512;
 } else {
-  throw new Error("preset must be 'fast' or 'modern'");
+  throw new Error("preset must be 'fast', 'modern', or 'modern-direct'");
 }
 
 const vm = await RV64.create({

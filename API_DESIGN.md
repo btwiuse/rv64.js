@@ -1,8 +1,8 @@
 # JavaScript API and boot design
 
-Status: stable facade implemented; direct Linux boot and demo migration remain
-in progress. This document records the public-API and boot decisions made
-during release preparation.
+Status: stable facade and direct Linux boot implemented. The fast-guest and
+terminal/package work remains in progress. This document records the
+public-API and boot decisions made during release preparation.
 
 ## Goals
 
@@ -85,6 +85,14 @@ export type BootConfig =
       privilege?: "machine" | "supervisor";
     };
 
+export type NetworkConfig =
+  | { mode: "none" }
+  | { mode: "fetch"; upgradeHttps?: boolean; relayURL?: string; mac?: Uint8Array }
+  | { mode: "wsproxy"; url: string; protocols?: string | string[]; mac?: Uint8Array }
+  | { mode: "wisp"; url: string; protocols?: string | string[]; mac?: Uint8Array }
+  | { mode: "inbrowser"; channel?: string; mac?: Uint8Array }
+  | { mode: "external"; mac?: Uint8Array };
+
 const vm = await RV64.create({
   wasm: { url: "./rv64_wasm.wasm" },
   memoryMB: 512,
@@ -94,6 +102,7 @@ const vm = await RV64.create({
     disk: { url: "./root.ext4" },
     cmdline: "console=ttyS0 root=/dev/vda rw",
   },
+  network: { mode: "fetch" },
 });
 
 const unsubscribe = vm.on("console", bytes => terminal.write(bytes));
@@ -115,6 +124,16 @@ The event map should cover at least `ready`, `start`, `stop`, `error`,
 `console`, `networkTransmit`, and `downloadProgress`. Listener registration
 returns an unsubscribe function. The xterm.js integration belongs in a small
 adapter or the demo, not in the emulator core.
+
+Linux defaults to `fetch`: the guest receives a virtio NIC and reaches the
+host-side request proxy at `http://10.0.2.2:8080`. `wsproxy` connects the NIC
+to a websockproxy-compatible layer-2 relay, `wisp` maps guest TCP/UDP payloads
+to WISP v1 streams, `inbrowser` provides a BroadcastChannel LAN, and `external`
+exposes outbound frames through `networkTransmit` and accepts inbound frames through
+`vm.network.receive()`, and `none` omits the NIC. The optional HTTP
+`relayURL` is a request-level CORS fallback and is deliberately distinct from
+the layer-2 WebSocket mode. `vm.network.proxyURL` reports the configured proxy
+address without callers hardcoding it.
 
 The public surface must not include raw Wasm exports, staging helpers, HTTP
 implementation helpers, relay internals, or JIT experiment counters. Tests may
@@ -213,11 +232,21 @@ fresh Node runs with the same OpenSBI, Debian root, command line, and Wasm, the
 median readiness time fell from 12,706.5 ms to 8,919.8 ms (29.8%) and retired
 instructions fell from 593.13 million to 372.99 million (37.1%). The kernel
 entry-to-console phase fell from 9,806.4 ms to 6,531.3 ms. This first package
-keeps the required disk, network, and 9p paths but disables SMP/NUMA,
-EFI/ACPI, tracing/debug/KFENCE, audit, huge pages/CMA, perf, and IPv6. The next
+keeps the required disk, network, and 9p paths but disables SMP/NUMA, ACPI,
+ftrace/function tracing, debug page-table validation, KFENCE, rude-task RCU,
+huge pages, perf, and IPv6. The next
 iteration replaces the inherited distro config with an explicit rv64.js-only
 config so unused module and hardware selections are absent rather than merely
 irrelevant at boot.
+
+Direct boot now enters the same kernel at `0x80200000` in S-mode and provides
+SBI 2.0 Base, TIME, IPI, RFENCE, HSM, and SRST services in the emulator. Five
+fresh direct runs reached the identical Debian readiness marker with exactly
+365.78 million instructions each. Median readiness was 8,536.7 ms versus
+8,919.8 ms through OpenSBI (4.3% faster), and 365.78 million versus 372.99
+million instructions (1.9% fewer). That confirms the expected sub-10% result:
+direct boot remains a supported artifact/API simplification, while kernel and
+guest configuration remain the important performance work.
 
 ## Implementation sequence
 

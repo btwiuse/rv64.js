@@ -1,6 +1,7 @@
 import { RV64 } from "./rv64.js";
+import { defaultRelayURL } from "./site-config.js";
 
-export const PUBLISHED_ASSETS = "./assets/demo-images-v1";
+export const PUBLISHED_ASSETS = "./assets/demo-images-v2";
 
 export const PRESETS = Object.freeze({
   fast: {
@@ -10,10 +11,10 @@ export const PRESETS = Object.freeze({
     release: ["fast-bbl64.bin", "fast-kernel-riscv64.bin", "fast-root-riscv64.bin"],
   },
   modern: {
-    label: "Modern Debian",
+    label: "Alpine Linux",
     ramMB: 512,
-    local: ["images/modern/opensbi.bin", "images/modern/Image", "images/modern/debian.ext4"],
-    release: ["modern-opensbi.bin", "modern-Image", "modern-debian.ext4"],
+    local: ["images/modern/Image", "images/modern/alpine.ext4"],
+    release: ["modern-Image", "modern-alpine.ext4"],
   },
 });
 
@@ -109,16 +110,21 @@ async function start(presetName) {
     const bootConfig = presetName === "fast"
       ? { mode: "firmware", firmware: images[0], kernel: images[1], disk: images[2] }
       : {
-          mode: "firmware",
-          firmware: images[0],
-          kernel: images[1],
-          disk: images[2],
-          cmdline: "console=ttyS0 root=/dev/vda rw init=/binit.sh",
+          mode: "linux-direct",
+          kernel: images[0],
+          disk: images[1],
+          cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
         };
     const vm = await RV64.create({
       wasm,
       memoryMB: preset.ramMB,
       boot: bootConfig,
+      network: presetName === "modern"
+        ? {
+            mode: "fetch",
+            relayURL: new URLSearchParams(location.search).get("relay") || defaultRelayURL || undefined,
+          }
+        : undefined,
       events: {
         console: (data) => write(data),
         stop: ({ reason }) => {
@@ -159,7 +165,7 @@ document.querySelectorAll(".preset").forEach((button) => {
   button.addEventListener("click", () => {
     selected = button.dataset.preset;
     document.querySelectorAll(".preset").forEach((item) => item.classList.toggle("selected", item === button));
-    boot.textContent = selected === "fast" ? "Boot Fast Linux" : "Boot Modern Debian";
+    boot.textContent = selected === "fast" ? "Boot Fast Linux" : "Boot Alpine Linux";
   });
 });
 boot.addEventListener("click", () => start(selected));

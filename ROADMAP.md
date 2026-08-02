@@ -323,22 +323,34 @@ lever now. Its two reverted attempts are documented in git history.
   platform, unify the system Wasm/run/console surface, and retain the
   TinyEMU-compatible board as explicit `legacy-tinyemu` compatibility rather
   than a peer user-facing Linux mode.
-- [ ] **16. No-firmware direct Linux boot** — load a kernel/initrd/DTB directly,
+- [x] **16. No-firmware direct Linux boot** *(done 2026-08-01)* — load a kernel/initrd/DTB directly,
   enter Linux in S-mode, and provide the required SBI boundary inside rv64.js,
   with no caller-supplied or executed firmware image. This is a required
   supported option whose primary goal is lower time-to-kernel and
   time-to-shell. Benchmark it against identical OpenSBI boots using the gates
   in `API_DESIGN.md`; select the default from evidence, but retain direct boot
-  even if the gain is below 10%.
+  even if the gain is below 10%. Implemented with emulator-provided SBI 2.0
+  Base/TIME/IPI/RFENCE/HSM/SRST. The five-run lean-kernel comparison improved
+  readiness 4.3% and retired 1.9% fewer instructions, so it remains an option
+  but kernel configuration remains the primary speed path.
 - [ ] **17. Fast `riscv-virt` guest** — rebuild the quick BusyBox preset for the
-  standard platform so the fast and Debian demos differ by guest profile, not
+  standard platform so the fast and Alpine demos differ by guest profile, not
   virtual motherboard. The first single-hart rv64.js kernel configuration is
   already 29.8% faster to Debian readiness and retires 37.1% fewer guest
-  instructions; replace its inherited distro base with an explicit
-  platform-only config and use it for the small guest.
+  instructions. A first `allnoconfig` platform-only attempt was rejected after
+  native/Wasm and early-console incompatibilities; build the small guest and
+  its kernel together rather than pruning the full Debian kernel further. The
+  modern release guest is now Alpine 3.24 on direct `riscv-virt`, with default
+  HTTP/HTTPS proxy setup and a real `apk update` native/Wasm integration gate;
+  replacing the remaining legacy fast preset is the unfinished part.
 - [ ] **18. Release-quality terminal and package** — integrate xterm.js through
   the public console API, test both hosted presets end to end, then publish an
   ESM package containing JavaScript, Wasm, declarations, and source maps.
+- [ ] **19. Persistent browser disks** — move VM execution into a dedicated
+  worker and add a block-backend abstraction. Support OPFS through a synchronous
+  access handle in that worker, preferably as a read-only base image plus a
+  sparse copy-on-write overlay; retain the in-memory byte-backed backend for
+  ephemeral and unsupported environments.
 
 ## Housekeeping
 
@@ -348,7 +360,7 @@ lever now. Its two reverted attempts are documented in git history.
   debug/release tests, the Wasm build, and a real fast-Linux browser-API boot.
   The image/oracle-heavy strict gate remains reproducible through Nix.
 - [x] **13. Browser demo** — GitHub Pages offers fast BusyBox and modern
-  OpenSBI/Linux Debian presets backed by versioned release assets.
+  direct-boot Alpine/Linux presets backed by versioned release assets.
 - [ ] Optionally rename the directory (`~/src/arm64.js` → `rv64.js`).
 
 ## Recommended sequencing

@@ -4,6 +4,7 @@
 //!
 //! Usage:
 //!   rv64-vboot <opensbi.bin> <kernel-Image> [--initrd FILE] [--disk FILE]
+//!   rv64-vboot --direct <kernel-Image> [--initrd FILE] [--disk FILE]
 //!              [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT] [--net-mac MAC]
 //!              [--ram GB] [-- <cmdline...>]
 //!
@@ -34,6 +35,7 @@ fn main() {
     let mut proxy_mode = false;
     let mut mac = rv64_system::virtio::DEFAULT_MAC;
     let mut ram_gb = 2.0f64;
+    let mut direct = false;
     let mut positional = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -51,11 +53,12 @@ fn main() {
                 })
             }
             "--ram" => ram_gb = it.next().and_then(|v| v.parse().ok()).unwrap_or(2.0),
+            "--direct" => direct = true,
             _ => positional.push(a),
         }
     }
-    if positional.len() < 2 {
-        eprintln!("usage: rv64-vboot <opensbi.bin> <kernel> [--initrd F] [--disk F] [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT | --proxy] [--net-mac MAC] [--ram GB] [-- cmdline]");
+    if positional.len() < if direct { 1 } else { 2 } {
+        eprintln!("usage: rv64-vboot [--direct] [<opensbi.bin>] <kernel> [--initrd F] [--disk F] [--9p DIR] [--9p-tag TAG] [--net ws://HOST:PORT | --proxy] [--net-mac MAC] [--ram GB] [-- cmdline]");
         std::process::exit(2);
     }
     if relay_url.is_some() && proxy_mode {
@@ -69,8 +72,15 @@ fn main() {
         );
         std::process::exit(2);
     }
-    let opensbi = std::fs::read(&positional[0]).expect("read opensbi");
-    let kernel = std::fs::read(&positional[1]).expect("read kernel");
+    let (opensbi, kernel_path) = if direct {
+        (Vec::new(), &positional[0])
+    } else {
+        (
+            std::fs::read(&positional[0]).expect("read opensbi"),
+            &positional[1],
+        )
+    };
+    let kernel = std::fs::read(kernel_path).expect("read kernel");
     let initrd = initrd_path.map(|p| std::fs::read(p).expect("read initrd"));
     let disk = disk_path.map(|p| std::fs::read(p).expect("read disk"));
     let mut fs = Vec::new();
@@ -128,18 +138,20 @@ fn main() {
         cmdline,
     );
 
-    let mut m = VirtMachine::new(
-        ram_bytes,
-        VirtImages {
-            opensbi: &opensbi,
-            kernel: &kernel,
-            cmdline: &cmdline,
-            initrd: initrd.as_deref(),
-            disk,
-            fs,
-            net,
-        },
-    );
+    let images = VirtImages {
+        opensbi: &opensbi,
+        kernel: &kernel,
+        cmdline: &cmdline,
+        initrd: initrd.as_deref(),
+        disk,
+        fs,
+        net,
+    };
+    let mut m = if direct {
+        VirtMachine::new_direct(ram_bytes, images)
+    } else {
+        VirtMachine::new(ram_bytes, images)
+    };
 
     let _raw = RawTerm::enable();
     let mut stdin = {
@@ -194,6 +206,12 @@ fn main() {
             std::io::stdout().flush().unwrap();
         }
         if m.power_off {
+            if let Some((extension, function)) = m.unsupported_sbi {
+                eprintln!(
+                    "\r\n[vboot] unsupported SBI extension={extension:#x} function={function}"
+                );
+                std::process::exit(1);
+            }
             eprintln!("\r\n[vboot] powered off");
             break;
         }

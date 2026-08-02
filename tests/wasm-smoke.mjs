@@ -33,6 +33,10 @@ function check(name, ok, detail = "") {
     "host_now_ms",
     "host_random",
     "host_unix_ms",
+    "host_wisp_close",
+    "host_wisp_data",
+    "host_wisp_datagram",
+    "host_wisp_open",
     "host_write",
   ];
   const imports = WebAssembly.Module.imports(new WebAssembly.Module(wasmBytes));

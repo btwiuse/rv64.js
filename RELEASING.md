@@ -34,7 +34,7 @@ requires a deliberate manifest and release-process change.
 ## Required manual checks
 
 - Boot the stock browser image to a shell.
-- Boot the modern OpenSBI/Debian image.
+- Boot the modern direct-boot Alpine image and run `apk update`.
 - Exercise virtio block, console, 9p, and HTTP/HTTPS proxy paths.
 - Confirm that no credentials, generated disk images, benchmark artifacts, or
   machine-specific paths are tracked.
@@ -45,7 +45,7 @@ license and notices.
 ## Browser demo assets
 
 The GitHub Pages site is code-only. Guest firmware, kernels, disks, and the
-compiled Wasm core are published under the versioned `demo-images-v1` release
+compiled Wasm core are published under the versioned `demo-images-v2` release
 tag so large generated binaries never enter Git history.
 
 Build and verify the complete asset set before creating or replacing that
@@ -54,9 +54,9 @@ release:
 ```sh
 nix develop -c tools/build-demo-assets.sh
 RV64_UNTIL='~ #' node examples/boot-linux.mjs fast
-RV64_UNTIL=BENCH_READY node --max-old-space-size=2048 examples/boot-linux.mjs modern
+RV64_UNTIL=ALPINE_READY node examples/boot-linux.mjs modern
 ```
 
-Upload every file in `target/demo-images-v1/`, including `SHA256SUMS`. The
+Upload every file in `target/demo-images-v2/`, including `SHA256SUMS`. The
 fixed tag is part of the page's public configuration; use a new tag when an
 asset change is not backward-compatible.

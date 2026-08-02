@@ -75,8 +75,31 @@ const presets = {
     pc(vm) { return vm.virtPc(); },
   },
 };
+presets["modern-direct"] = {
+  files: [
+    process.env.RV64_MODERN_KERNEL || "web/images/modern/Image",
+    "web/images/modern/debian.ext4",
+  ],
+  markers: {
+    firstOutput: /./s,
+    kernel: /Linux version/,
+    rootMounted: /VFS: Mounted root/,
+    ready: /BENCH_READY/,
+  },
+  boot(vm, [kernel, disk]) {
+    vm.bootVirtLinuxDirect({
+      kernel,
+      disk,
+      ramMB: 512,
+      cmdline: "console=ttyS0 root=/dev/vda rw init=/binit.sh",
+    });
+  },
+  run(vm) { return vm.runVirtSystem(2_000_000n); },
+  instructions(vm) { return vm.virtInsnCount(); },
+  pc(vm) { return vm.virtPc(); },
+};
 const preset = presets[presetName];
-if (!preset) throw new Error("preset must be 'fast' or 'modern'");
+if (!preset) throw new Error("preset must be 'fast', 'modern', or 'modern-direct'");
 
 const loadStarted = performance.now();
 const [wasm, ...images] = await Promise.all([
@@ -102,6 +125,9 @@ for (let repetition = 1; repetition <= repetitions; repetition++) {
   const buildStarted = performance.now();
   preset.boot(vm, images.map((image) => new Uint8Array(image)));
   const machineBuildMs = performance.now() - buildStarted;
+  if (preset.pc && preset.pc(vm) >= 0x8020_0000n) {
+    timeline.mark("kernelEntry", () => preset.instructions(vm));
+  }
   const deadline = performance.now() + 180_000;
   let poweredOff = false;
   while (!timeline.reached("ready") && !poweredOff && performance.now() < deadline) {

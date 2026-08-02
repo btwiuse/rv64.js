@@ -27,6 +27,10 @@ export class RV64Debug {
     this.onNetSend = () => {};
     /** Optional request-level WebSocket fallback configured by connectHttpRelay. */
     this.httpRelay = null;
+    this.onWispOpen = () => {};
+    this.onWispData = () => {};
+    this.onWispClose = () => {};
+    this.onWispDatagram = () => {};
     /** Origins known to require the relay, avoiding a failed fetch every time. */
     this.httpRelayOrigins = new Set();
   }
@@ -55,6 +59,20 @@ export class RV64Debug {
           const bytes = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
           if (vm.onHttpRequest) vm.onHttpRequest(id, bytes);
           else vm.performHttp(id, decodeRequest(bytes), bytes);
+        },
+        host_wisp_open: (id, ptr, port) => {
+          const address = new Uint8Array(vm.ex.memory.buffer, ptr, 4).slice();
+          vm.onWispOpen(id, address, port);
+        },
+        host_wisp_data: (id, ptr, len) => {
+          const bytes = new Uint8Array(vm.ex.memory.buffer, ptr, len).slice();
+          vm.onWispData(id, bytes);
+        },
+        host_wisp_close: (id) => vm.onWispClose(id),
+        host_wisp_datagram: (id, addressPtr, port, dataPtr, len) => {
+          const address = new Uint8Array(vm.ex.memory.buffer, addressPtr, 4).slice();
+          const bytes = new Uint8Array(vm.ex.memory.buffer, dataPtr, len).slice();
+          vm.onWispDatagram(id, address, port, bytes);
         },
         host_now_ms: () =>
           typeof performance !== "undefined" ? performance.now() : Date.now(),
@@ -643,6 +661,10 @@ RV64Debug.prototype.bootVirtLinux = function ({
   disk,
   cmdline,
   ramMB = 512,
+  net = false,
+  netMac,
+  proxy = false,
+  proxyUpgradeHttps = true,
 }) {
   const stage = (bytes, fn) => {
     if (!bytes) return;
@@ -655,7 +677,38 @@ RV64Debug.prototype.bootVirtLinux = function ({
   stage(initrd, () => this.ex.virt_stage_initrd());
   stage(disk, () => this.ex.virt_stage_disk());
   if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.virt_stage_cmdline());
+  if (netMac) stage(new Uint8Array(netMac), () => this.ex.virt_stage_net_mac());
+  this.ex.virt_net_enable(net || proxy ? 1 : 0);
+  this.ex.sys_proxy_enable(proxy ? 1 : 0, proxyUpgradeHttps ? 1 : 0);
   this.ex.virt_boot(ramMB);
+};
+
+/** Assemble riscv-virt and enter Linux directly in S-mode. */
+RV64Debug.prototype.bootVirtLinuxDirect = function ({
+  kernel,
+  initrd,
+  disk,
+  cmdline,
+  ramMB = 512,
+  net = false,
+  netMac,
+  proxy = false,
+  proxyUpgradeHttps = true,
+}) {
+  const stage = (bytes, fn) => {
+    if (!bytes) return;
+    const ptr = this.ex.staging_alloc(bytes.length);
+    new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
+    fn();
+  };
+  stage(kernel, () => this.ex.virt_stage_kernel());
+  stage(initrd, () => this.ex.virt_stage_initrd());
+  stage(disk, () => this.ex.virt_stage_disk());
+  if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.virt_stage_cmdline());
+  if (netMac) stage(new Uint8Array(netMac), () => this.ex.virt_stage_net_mac());
+  this.ex.virt_net_enable(net || proxy ? 1 : 0);
+  this.ex.sys_proxy_enable(proxy ? 1 : 0, proxyUpgradeHttps ? 1 : 0);
+  this.ex.virt_boot_direct(ramMB);
 };
 
 /** Run a slice of the modern virt machine. Returns true when powered off. */
@@ -668,6 +721,30 @@ RV64Debug.prototype.virtConsoleInput = function (bytes) {
   const ptr = this.ex.staging_alloc(bytes.length);
   new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
   this.ex.virt_console_input();
+};
+
+RV64Debug.prototype.virtNetInput = function (frame) {
+  const ptr = this.ex.staging_alloc(frame.length);
+  new Uint8Array(this.ex.memory.buffer, ptr, frame.length).set(frame);
+  this.ex.virt_net_input();
+};
+
+RV64Debug.prototype.wispEnable = function (enabled) {
+  this.ex.sys_wisp_enable(enabled ? 1 : 0);
+};
+
+RV64Debug.prototype.wispData = function (id, bytes) {
+  this.stageFor(bytes);
+  this.ex.sys_wisp_data(BigInt(id));
+};
+
+RV64Debug.prototype.wispClose = function (id) {
+  this.ex.sys_wisp_close(BigInt(id));
+};
+
+RV64Debug.prototype.wispDatagram = function (id, bytes) {
+  this.stageFor(bytes);
+  this.ex.sys_wisp_datagram(BigInt(id));
 };
 
 RV64Debug.prototype.virtInsnCount = function () {
@@ -908,6 +985,157 @@ function isOpenSBI(bytes) {
   return false;
 }
 
+// WISP v1 transports stream payloads in binary WebSocket messages. The guest
+// side TCP state machine lives in Rust; this class is deliberately only the
+// WISP wire protocol and flow control.
+class WispClient {
+  constructor(url, protocols, core) {
+    this.core = core;
+    this.nextStream = 1;
+    this.credit = 0;
+    this.byGuest = new Map();
+    this.byStream = new Map();
+    this.queue = [];
+    const transportURL = url.replace(/^wisp:/, "ws:").replace(/^wisps:/, "wss:");
+    this.socket = new WebSocket(transportURL, protocols);
+    this.socket.binaryType = "arraybuffer";
+    this.socket.onopen = () => this.#flush();
+    this.socket.onmessage = ({ data }) => {
+      if (typeof data !== "string") this.#receive(new Uint8Array(data));
+    };
+    this.socket.onclose = () => {
+      for (const guest of this.byGuest.keys()) core.wispClose(guest);
+      this.byGuest.clear();
+      this.byStream.clear();
+    };
+  }
+
+  open(guest, address, port, transport = 1) {
+    const stream = this.nextStream++ >>> 0;
+    const host = Array.from(address).join(".");
+    const hostname = new TextEncoder().encode(host);
+    const packet = new Uint8Array(8 + hostname.length);
+    const view = new DataView(packet.buffer);
+    packet[0] = 1; // CONNECT
+    view.setUint32(1, stream, true);
+    packet[5] = transport;
+    view.setUint16(6, port, true);
+    packet.set(hostname, 8);
+    const state = { guest, stream, transport, credit: this.credit, pending: [] };
+    this.byGuest.set(guest, state);
+    this.byStream.set(stream, state);
+    this.#send(packet);
+  }
+
+  data(guest, bytes) {
+    const state = this.byGuest.get(guest);
+    if (!state) return;
+    const packet = new Uint8Array(5 + bytes.length);
+    packet[0] = 2; // DATA
+    new DataView(packet.buffer).setUint32(1, state.stream, true);
+    packet.set(bytes, 5);
+    if (state.credit > 0) {
+      state.credit--;
+      this.#send(packet);
+    } else {
+      state.pending.push(packet);
+    }
+  }
+
+  datagram(guest, address, port, bytes) {
+    if (!this.byGuest.has(guest)) this.open(guest, address, port, 2);
+    this.data(guest, bytes);
+  }
+
+  closeGuest(guest) {
+    const state = this.byGuest.get(guest);
+    if (!state) return;
+    const packet = new Uint8Array(6);
+    packet[0] = 4; // CLOSE
+    new DataView(packet.buffer).setUint32(1, state.stream, true);
+    packet[5] = 2; // voluntary closure
+    this.#send(packet);
+    this.#forget(state);
+  }
+
+  close() {
+    this.socket.onclose = null;
+    this.socket.close();
+    this.byGuest.clear();
+    this.byStream.clear();
+  }
+
+  #receive(packet) {
+    if (packet.length < 5) return;
+    const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
+    const type = packet[0];
+    const stream = view.getUint32(1, true);
+    const state = this.byStream.get(stream);
+    if (type === 2 && state) {
+      if (state.transport === 2) this.core.wispDatagram(state.guest, packet.subarray(5));
+      else this.core.wispData(state.guest, packet.subarray(5));
+    } else if (type === 3 && packet.length >= 9) {
+      if (stream === 0) {
+        this.credit = view.getUint32(5, true);
+        for (const connection of this.byStream.values()) {
+          if (connection.credit === 0) connection.credit = this.credit;
+          this.#drain(connection);
+        }
+        return;
+      }
+      if (!state) return;
+      state.credit = view.getUint32(5, true);
+      this.#drain(state);
+    } else if (type === 4 && state) {
+      this.core.wispClose(state.guest);
+      this.#forget(state);
+    }
+  }
+
+  #forget(state) {
+    this.byGuest.delete(state.guest);
+    this.byStream.delete(state.stream);
+  }
+
+  #drain(state) {
+    while (state.credit > 0 && state.pending.length) {
+      state.credit--;
+      this.#send(state.pending.shift());
+    }
+  }
+
+  #send(packet) {
+    if (this.socket.readyState === WebSocket.OPEN) this.socket.send(packet);
+    else this.queue.push(packet);
+  }
+
+  #flush() {
+    for (const packet of this.queue) this.socket.send(packet);
+    this.queue.length = 0;
+  }
+}
+
+function normalizeNetwork(network, bootMode) {
+  const value = network ?? { mode: bootMode === "bare-metal" ? "none" : "fetch" };
+  if (!value || typeof value !== "object") throw new TypeError("network must be an object");
+  if (!["none", "fetch", "wsproxy", "wisp", "inbrowser", "external"].includes(value.mode)) {
+    throw new TypeError(`unknown network mode: ${value.mode}`);
+  }
+  if (bootMode === "bare-metal" && value.mode !== "none") {
+    throw new Error("bare-metal networking is not implemented");
+  }
+  if (["wsproxy", "wisp"].includes(value.mode) && typeof value.url !== "string") {
+    throw new TypeError(`${value.mode} networking requires url`);
+  }
+  if (value.mode === "inbrowser" && value.channel !== undefined && typeof value.channel !== "string") {
+    throw new TypeError("inbrowser network.channel must be a string");
+  }
+  if (value.mac !== undefined && (!(value.mac instanceof Uint8Array) || value.mac.length !== 6)) {
+    throw new TypeError("network.mac must be a 6-byte Uint8Array");
+  }
+  return { ...value };
+}
+
 /** Stable embedding API. Raw Wasm and instruction slicing stay private. */
 export class RV64 {
   #core;
@@ -919,14 +1147,25 @@ export class RV64 {
   #runSlice;
   #input;
   #instructions;
+  #networkConfig;
+  #networkInput;
+  #networkSocket;
+  #networkChannel;
+  #wisp;
 
-  constructor(core, boot, listeners) {
+  constructor(core, boot, network, listeners) {
     this.#core = core;
     this.#boot = boot;
+    this.#networkConfig = network;
     for (const [event, listener] of Object.entries(listeners ?? {})) {
       this.on(event, listener);
     }
     this.console = Object.freeze({ send: (data) => this.#sendConsole(data) });
+    this.network = Object.freeze({
+      mode: network.mode,
+      get proxyURL() { return network.mode === "fetch" ? core.proxyURL() : undefined; },
+      receive: (frame) => this.#receiveNetwork(frame),
+    });
   }
 
   /** Resolve images, instantiate Wasm, and assemble a stopped machine. */
@@ -958,8 +1197,9 @@ export class RV64 {
         resolved[key] = await imageBytes(source, key, emit);
       }
     }
+    const network = normalizeNetwork(options.network, boot.mode);
     const core = await RV64Debug.create(wasmBytes);
-    const vm = new RV64(core, { ...resolved, memoryMB }, events);
+    const vm = new RV64(core, { ...resolved, memoryMB }, network, events);
     vm.#assemble();
     vm.#emit("ready", undefined);
     return vm;
@@ -1014,6 +1254,13 @@ export class RV64 {
     if (this.#running) await this.stop();
     this.#destroyed = true;
     ++this.#generation;
+    this.#networkSocket?.close();
+    this.#networkSocket = null;
+    this.#networkChannel?.close();
+    this.#networkChannel = null;
+    this.#wisp?.close();
+    this.#wisp = null;
+    this.#core.disconnectHttpRelay();
     this.#listeners.clear();
     this.#core = null;
   }
@@ -1021,6 +1268,17 @@ export class RV64 {
   #assemble() {
     const boot = this.#boot;
     const memoryMB = boot.memoryMB;
+    const network = this.#networkConfig;
+    const net = network.mode !== "none";
+    const proxy = network.mode === "fetch";
+    const networkOptions = {
+      net,
+      netMac: network.mac,
+      proxy,
+      proxyUpgradeHttps: network.upgradeHttps ?? true,
+    };
+    const modernCmdline = `${boot.cmdline ?? "console=ttyS0 root=/dev/vda rw"} rv64.network=${network.mode}`;
+    const legacyCmdline = `${boot.cmdline ?? "console=hvc0 root=/dev/vda rw"} rv64.network=${network.mode}`;
     if (boot.mode === "firmware") {
       if (boot.firmware === "default") {
         throw new Error("packaged default firmware is not available yet");
@@ -1034,11 +1292,13 @@ export class RV64 {
           kernel: boot.kernel,
           initrd: boot.initrd,
           disk: boot.disk,
-          cmdline: boot.cmdline,
+          cmdline: modernCmdline,
           ramMB: memoryMB ?? 512,
+          ...networkOptions,
         });
         this.#runSlice = () => this.#core.runVirtSystem(2_000_000n);
         this.#input = (bytes) => this.#core.virtConsoleInput(bytes);
+        this.#networkInput = (frame) => this.#core.virtNetInput(frame);
         this.#instructions = () => this.#core.virtInsnCount();
       } else {
         if (boot.initrd) throw new Error("this firmware does not support a separate initrd");
@@ -1046,11 +1306,13 @@ export class RV64 {
           bios: boot.firmware,
           kernel: boot.kernel,
           disk: boot.disk,
-          cmdline: boot.cmdline,
+          cmdline: legacyCmdline,
           ramMB: memoryMB ?? 128,
+          ...networkOptions,
         });
         this.#runSlice = () => this.#core.runSystem(3_000_000n);
         this.#input = (bytes) => this.#core.consoleInput(bytes);
+        this.#networkInput = (frame) => this.#core.netInput(frame);
         this.#instructions = () => this.#core.sysInsnCount();
       }
     } else if (boot.mode === "bare-metal") {
@@ -1071,12 +1333,33 @@ export class RV64 {
       this.#input = null;
       this.#instructions = () => this.#core.insnCount();
     } else if (boot.mode === "linux-direct") {
-      throw new Error("linux-direct boot is not implemented yet");
+      this.#core.bootVirtLinuxDirect({
+        kernel: boot.kernel,
+        initrd: boot.initrd,
+        disk: boot.disk,
+        cmdline: modernCmdline,
+        ramMB: memoryMB ?? 512,
+        ...networkOptions,
+      });
+      this.#runSlice = () => {
+        const poweredOff = this.#core.runVirtSystem(2_000_000n);
+        const ext = this.#core.ex.virt_unsupported_sbi_ext();
+        if (ext !== 0n) {
+          const fn = this.#core.ex.virt_unsupported_sbi_function();
+          throw new Error(`unsupported SBI call extension=${ext.toString(16)} function=${fn}`);
+        }
+        return poweredOff;
+      };
+      this.#input = (bytes) => this.#core.virtConsoleInput(bytes);
+      this.#networkInput = (frame) => this.#core.virtNetInput(frame);
+      this.#instructions = () => this.#core.virtInsnCount();
     } else {
       throw new TypeError(`unknown boot mode: ${boot.mode}`);
     }
+    this.#core.wispEnable(network.mode === "wisp");
     this.#core.onWrite = (_fd, bytes) => this.#emit("console", bytes);
-    this.#core.onNetSend = (frame) => this.#emit("networkTransmit", frame);
+    this.#core.onNetSend = (frame) => this.#transmitNetwork(frame);
+    this.#connectNetwork();
   }
 
   #tick(generation) {
@@ -1101,6 +1384,63 @@ export class RV64 {
     const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
     if (!(bytes instanceof Uint8Array)) throw new TypeError("console data must be a string or Uint8Array");
     this.#input(bytes);
+  }
+
+  #connectNetwork() {
+    const network = this.#networkConfig;
+    this.#networkSocket?.close();
+    this.#networkSocket = null;
+    this.#networkChannel?.close();
+    this.#networkChannel = null;
+    this.#wisp?.close();
+    this.#wisp = null;
+    this.#core.disconnectHttpRelay();
+    if (network.mode === "wsproxy") {
+      const socket = new WebSocket(network.url, network.protocols);
+      socket.binaryType = "arraybuffer";
+      socket.onmessage = (event) => {
+        if (typeof event.data !== "string") this.#networkInput?.(new Uint8Array(event.data));
+      };
+      this.#networkSocket = socket;
+    } else if (network.mode === "inbrowser") {
+      if (typeof BroadcastChannel === "undefined") {
+        throw new Error("inbrowser networking requires BroadcastChannel");
+      }
+      const channel = new BroadcastChannel(network.channel ?? "rv64.js-network");
+      channel.onmessage = ({ data }) => {
+        if (data instanceof ArrayBuffer) this.#networkInput?.(new Uint8Array(data));
+        else if (ArrayBuffer.isView(data)) {
+          this.#networkInput?.(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+        }
+      };
+      this.#networkChannel = channel;
+    } else if (network.mode === "wisp") {
+      const wisp = new WispClient(network.url, network.protocols, this.#core);
+      this.#core.onWispOpen = (id, address, port) => wisp.open(id, address, port);
+      this.#core.onWispData = (id, bytes) => wisp.data(id, bytes);
+      this.#core.onWispClose = (id) => wisp.closeGuest(id);
+      this.#core.onWispDatagram = (id, address, port, bytes) =>
+        wisp.datagram(id, address, port, bytes);
+      this.#wisp = wisp;
+    } else if (network.mode === "fetch" && network.relayURL) {
+      this.#core.connectHttpRelay(network.relayURL);
+    }
+  }
+
+  #transmitNetwork(frame) {
+    if (this.#networkChannel) this.#networkChannel.postMessage(frame);
+    const socket = this.#networkSocket;
+    if (socket?.readyState === WebSocket.OPEN) socket.send(frame);
+    this.#emit("networkTransmit", frame);
+  }
+
+  #receiveNetwork(frame) {
+    this.#assertLive();
+    if (this.#networkConfig.mode !== "external") {
+      throw new Error("network.receive is only available in external mode");
+    }
+    const bytes = frame instanceof Uint8Array ? frame : new Uint8Array(frame);
+    this.#networkInput(bytes);
   }
 
   #emit(event, detail) {

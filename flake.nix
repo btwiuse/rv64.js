@@ -143,6 +143,7 @@
 
             # Debian rootfs bring-up (build-essential in the guest)
             debootstrap # build a riscv64 Debian rootfs (--foreign)
+            apk-tools # install Alpine riscv64 packages into an offline root
             fakeroot # run debootstrap without real root
             dpkg # dpkg-deb -x for offline .deb extraction
             gnutar
