@@ -137,9 +137,39 @@ function v86Spawn(script, env) {
   });
 }
 const v86Compute = (bin, jit) => v86Spawn("v86-compute.mjs", { BIN: bin, DISABLE_JIT: jit ? "0" : "1" });
-const v86Boot = (jit) => v86Spawn("v86-boottime.mjs", { DISABLE_JIT: jit ? "0" : "1" });
 const v86Python = (jit) => v86Spawn("deb-v86.mjs", { DISABLE_JIT: jit ? "0" : "1" });
 const v86Compile = (jit) => v86Spawn("v86-compile.mjs", { DISABLE_JIT: jit ? "0" : "1" });
+function matchedBoot(side, jit) {
+  return new Promise((resolveResult) => {
+    const p = spawn(
+      process.execPath,
+      ["--max-old-space-size=4096", join(root, "tests/vs-v86/matched-boot-worker.mjs"), side],
+      { cwd: root, env: { ...process.env, ARTIFACTS, V86DIR, DISABLE_JIT: jit ? "0" : "1" } },
+    );
+    let stdout = "";
+    let stderr = "";
+    p.stdout.on("data", (data) => (stdout += data));
+    p.stderr.on("data", (data) => (stderr += data));
+    p.on("close", (code) => {
+      try {
+        if (code !== 0) throw new Error(stderr || stdout);
+        const result = JSON.parse(stdout.trim().split("\n").at(-1));
+        resolveResult(side === "rv64"
+          ? {
+              value: result.milestones.ready,
+              jit: result.jit,
+              profile: result.milestones,
+              input_sha256: result.inputSha256,
+              wasm_sha256: result.wasmSha256,
+            }
+          : { ms: result.milestones.ready, input_sha256: result.inputSha256 });
+      } catch (error) {
+        log(`\n[matched ${side} boot failed: exit=${code}] ${error.message}\n`);
+        resolveResult(null);
+      }
+    });
+  });
+}
 // v86 nbench: parse its self-timed per-kernel iterations/sec from the raw output.
 function v86Nbench() {
   return new Promise((resolve) => {
@@ -221,7 +251,12 @@ const WALL_ROWS = [
     worker: "mixed",
     v86: (jit) => v86Compute("rvbench_fs.i386", jit),
   },
-  { name: "Boot", worker: "boot", v86: v86Boot },
+  {
+    name: "Boot",
+    worker: "boot",
+    rv: (jit) => matchedBoot("rv64", jit),
+    v86: (jit) => matchedBoot("v86", jit),
+  },
   {
     name: "python fib(30)",
     worker: "python",
@@ -250,6 +285,7 @@ const normalizeV86 = (result) =>
     value: result.ms,
     checksum: result.chk?.replace(/^checksum=/, "") ?? null,
     md5: result.md5 ?? null,
+    input_sha256: result.input_sha256 ?? null,
   };
 async function measuredTrial({ side, kind, row, rep, jit, run }) {
   const label = `${kind}:${row}:jit${+jit}:rep${rep + 1}:${side}`;
@@ -300,7 +336,9 @@ for (const jit of FULL ? [false, true] : [true]) {
               row: spec.name,
               rep,
               jit,
-              run: async () => normalizeRv(await rvSpawn(spec.worker, jit)),
+              run: async () => normalizeRv(await (spec.rv
+                ? spec.rv(jit)
+                : rvSpawn(spec.worker, jit))),
             }),
           );
         } else {

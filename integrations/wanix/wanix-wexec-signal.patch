@@ -1,0 +1,26 @@
+diff --git a/extras/wexec/main.go b/extras/wexec/main.go
+--- a/extras/wexec/main.go
++++ b/extras/wexec/main.go
+@@ -7,6 +7,7 @@ import (
+ 	"io"
+ 	"log"
+ 	"os"
++	"os/signal"
+ 	"path/filepath"
+ 	"strconv"
+ 	"strings"
+@@ -60,6 +61,14 @@ func main() {
+ 		log.Fatal(err)
+ 	}
+ 	pid := strings.TrimSpace(string(pidRaw))
++	if taskKind == "js" {
++		signals := make(chan os.Signal, 1)
++		signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
++		go func() {
++			<-signals
++			_ = appendFile(fmt.Sprintf("/task/%s/exit", pid), []byte("130"))
++		}()
++	}
+ 	stdoutPath := fmt.Sprintf("/task/%s/fd/1", pid)
+ 	stderrPath := fmt.Sprintf("/task/%s/fd/2", pid)
+ 	if taskKind == "js" {

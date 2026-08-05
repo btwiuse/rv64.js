@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="description" content="Boot RISC-V Linux in your browser with rv64.js" />
   <title>rv64.js — RISC-V Linux in your browser</title>
-  <link rel="stylesheet" href="./site.css" />
+  <link rel="stylesheet" href="./site.css?v=2" />
 </head>
 <body>
   <header>
@@ -41,7 +41,10 @@
     <section class="controls">
       <button id="boot" type="button">Boot Fast Linux</button>
       <button id="clear" class="secondary" type="button">Clear terminal</button>
-      <span id="status" role="status">Ready</span>
+      <div class="telemetry" aria-label="Virtual machine telemetry">
+        <div><span class="telemetry-label">CPU</span><span id="status" role="status">Ready · worker</span></div>
+        <div><span class="telemetry-label">NET</span><span id="network-status" role="status">Network idle</span></div>
+      </div>
     </section>
 
     <section class="terminal-wrap">
@@ -73,6 +76,6 @@ python3 -m http.server -d . 8000
     <a href="https://github.com/ibuildthecloud/rv64.js">Source on GitHub</a>
   </footer>
 
-  <script type="module" src="./site.mjs?v=3"></script>
+  <script type="module" src="./site.mjs?v=9"></script>
 </body>
 </html>

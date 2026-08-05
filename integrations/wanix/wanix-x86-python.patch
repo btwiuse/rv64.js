@@ -1,0 +1,19 @@
+diff --git a/Dockerfile b/Dockerfile
+index 2469963..e0cfb8c 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -56,6 +56,7 @@ FROM --platform=$LINUX_AMD64 ghcr.io/tractordev/apptron:kernel AS kernel
+ # RUN make ARCH=i386 CROSS_COMPILE=i686-linux-gnu- oldconfig < /dev/null && \
+ #     make ARCH=i386 CROSS_COMPILE=i686-linux-gnu- bzImage -j$(nproc)
+ FROM --platform=$LINUX_386 docker.io/i386/alpine:$ALPINE_VERSION AS alpine-root
++RUN apk add --no-cache python3
+ 
+ FROM tinygo-buildbase AS wexec
+ RUN GOOS=linux GOARCH=386 tinygo build -o wexec ./extras/wexec/main.go
+@@ -90,4 +91,4 @@ WORKDIR /dist
+ COPY --from=build /build/dist/* .
+ COPY --from=build /build/.local/bin/wanix ./wanix
+ COPY --from=wasm-tinygo /build/dist/wanix.wasm ./wanix.wasm
+-CMD ["true"]
+\ No newline at end of file
++CMD ["true"]

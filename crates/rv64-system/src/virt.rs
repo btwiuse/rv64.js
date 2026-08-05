@@ -531,6 +531,11 @@ pub struct VirtImages<'a> {
     pub disk: Option<Vec<u8>>,
     /// Host filesystems exported over virtio-9p; see [`crate::BootImages::fs`].
     pub fs: Vec<crate::p9::Server>,
+    /// Optional 9P transport whose request/reply handling is delegated to the
+    /// embedder (for example WANIX's namespace server).
+    pub external_fs: Option<&'a str>,
+    /// Add a virtio console for an independent host/guest byte channel.
+    pub virtio_console: bool,
     /// MAC for a virtio-net device; see [`crate::BootImages::net`].
     pub net: Option<[u8; 6]>,
 }
@@ -543,9 +548,15 @@ pub struct VirtMachine {
     /// separate from `insn_count` so idle time advances the guest clock
     /// without inflating the (real) retired-instruction count.
     pub idle_ticks: u64,
+    /// Host-monotonic timer ticks elapsed since boot. When present, browser
+    /// execution follows wall time instead of fast-forwarding every WFI.
+    pub realtime_ticks: Option<u64>,
     pub power_off: bool,
     pub dtb: Vec<u8>,
     pub unsupported_sbi: Option<(u64, u64)>,
+    /// Diagnostic call counts: total, BASE, TIME, IPI, RFENCE, HSM, SRST,
+    /// and legacy/other. These do not participate in guest behavior.
+    pub sbi_calls: [u64; 8],
 }
 
 impl VirtMachine {
@@ -570,8 +581,11 @@ impl VirtMachine {
 
         let _ = kend;
         // One mmio slot per device we will instantiate below, in the same order.
-        let n_virtio =
-            images.disk.is_some() as usize + images.fs.len() + images.net.is_some() as usize;
+        let n_virtio = images.disk.is_some() as usize
+            + images.fs.len()
+            + images.external_fs.is_some() as usize
+            + images.virtio_console as usize
+            + images.net.is_some() as usize;
         // Place initrd + DTB near the TOP of RAM (as QEMU/U-Boot do) so the
         // kernel's early allocations near the Image don't clobber them.
         // Layout from the top down: [DTB][initrd][fw_dynamic_info], each
@@ -604,11 +618,25 @@ impl VirtMachine {
         // Virtio: blk if a disk is given, then 9p if a filesystem is exported.
         // Slot i takes PLIC source VIRTIO_IRQ_BASE + i, matching the DTB above.
         let mut virtio = Vec::new();
+        if images.virtio_console {
+            virtio.push(VirtioDev::new(Backend::Console {
+                rx_buf: Vec::new(),
+                tx_out: Vec::new(),
+            }));
+        }
         if let Some(disk) = images.disk {
             virtio.push(VirtioDev::new(Backend::Block { disk }));
         }
         for srv in images.fs {
             virtio.push(VirtioDev::new(Backend::Fs { srv }));
+        }
+        if let Some(tag) = images.external_fs {
+            virtio.push(VirtioDev::new(Backend::FsExternal {
+                tag: tag.into(),
+                request: None,
+                reply: None,
+                awaiting_reply: false,
+            }));
         }
         if let Some(mac) = images.net {
             virtio.push(VirtioDev::new(Backend::Net {
@@ -677,9 +705,11 @@ impl VirtMachine {
             },
             insns_per_tick: 100,
             idle_ticks: 0,
+            realtime_ticks: None,
             power_off: false,
             dtb,
             unsupported_sbi: None,
+            sbi_calls: [0; 8],
         }
     }
 
@@ -709,13 +739,64 @@ impl VirtMachine {
             .unwrap_or_default()
     }
 
+    pub fn fs_external_take_request(&mut self) -> Option<Vec<u8>> {
+        self.bus
+            .virtio
+            .iter_mut()
+            .find_map(VirtioDev::fs_external_take_request)
+    }
+
+    pub fn fs_external_reply(&mut self, bytes: Vec<u8>) -> bool {
+        self.bus
+            .virtio
+            .iter_mut()
+            .find(|dev| matches!(dev.backend, Backend::FsExternal { .. }))
+            .is_some_and(|dev| dev.fs_external_reply(bytes))
+    }
+
+    pub fn virtio_console_input(&mut self, bytes: &[u8]) {
+        if let Some((index, dev)) = self
+            .bus
+            .virtio
+            .iter_mut()
+            .enumerate()
+            .find(|(_, dev)| matches!(dev.backend, Backend::Console { .. }))
+        {
+            dev.console_input(bytes);
+            let mut dev = self.bus.virtio.remove(index);
+            dev.process(0, &mut self.bus.ram, RAM_BASE);
+            self.bus.virtio.insert(index, dev);
+        }
+    }
+
+    pub fn virtio_console_take_output(&mut self) -> Vec<u8> {
+        self.bus
+            .virtio
+            .iter_mut()
+            .find(|dev| matches!(dev.backend, Backend::Console { .. }))
+            .map(VirtioDev::console_take_output)
+            .unwrap_or_default()
+    }
+
     /// Supply the RTC's Unix-epoch time from the embedding host.
     pub fn set_rtc_unix_ns(&mut self, ns: u64) {
         self.bus.rtc.set_host_time_ns(ns);
     }
 
+    /// Enable/advance realtime clocking by a host-monotonic duration.
+    pub fn advance_realtime_ns(&mut self, ns: u64) {
+        let ticks = ((ns as u128 * RTC_FREQ as u128) / 1_000_000_000) as u64;
+        self.realtime_ticks = Some(self.realtime_ticks.unwrap_or(0).saturating_add(ticks));
+    }
+
     pub fn sync_devices(&mut self) {
-        self.bus.mtime = self.cpu.insn_count / self.insns_per_tick + self.idle_ticks;
+        let instruction_time = self.cpu.insn_count / self.insns_per_tick + self.idle_ticks;
+        self.bus.mtime = match self.realtime_ticks {
+            // Never move backwards if a run slice predicted slightly beyond
+            // the next host sample while executing a guest rdtime loop.
+            Some(wall) => self.bus.mtime.max(wall),
+            None => instruction_time,
+        };
         if let Some(sys) = self.cpu.sys.as_mut() {
             sys.mtime = self.bus.mtime;
             if self.bus.direct_sbi {
@@ -729,7 +810,10 @@ impl VirtMachine {
             // busy-wait loops reading `time` make progress: same clock as the
             // CLINT, derived live from insn_count.
             sys.time_scale = self.insns_per_tick;
-            sys.time_offset = self.idle_ticks;
+            sys.time_offset = self
+                .bus
+                .mtime
+                .saturating_sub(self.cpu.insn_count / self.insns_per_tick);
         }
     }
 
@@ -748,6 +832,17 @@ impl VirtMachine {
         let function = self.cpu.x[16];
         let arg0 = self.cpu.x[10];
         let arg1 = self.cpu.x[11];
+        self.sbi_calls[0] += 1;
+        let bucket = match ext {
+            BASE => 1,
+            TIME => 2,
+            IPI => 3,
+            RFENCE => 4,
+            HSM => 5,
+            SRST => 6,
+            _ => 7,
+        };
+        self.sbi_calls[bucket] += 1;
         let mut error = 0;
         let mut value = 0;
         match (ext, function) {
@@ -759,7 +854,22 @@ impl VirtMachine {
             }
             (BASE, 4 | 5) => value = 0,
             (BASE, 6) => value = 1,
-            (TIME, 0) => self.bus.mtimecmp = arg0,
+            (TIME, 0) => {
+                self.bus.mtimecmp = arg0;
+                // TIME.set_timer replaces the previous event. If STIP from
+                // that event remains asserted until the outer slice ends,
+                // Linux immediately re-enters its timer handler and rearms
+                // again, producing a timer-interrupt storm. OpenSBI drops its
+                // MTIP-derived line as soon as mtimecmp moves into the future;
+                // direct SBI must provide the same level-triggered behavior.
+                if let Some(sys) = self.cpu.sys.as_mut() {
+                    if self.bus.mtime >= self.bus.mtimecmp {
+                        sys.mip |= IRQ_STIP;
+                    } else {
+                        sys.mip &= !IRQ_STIP;
+                    }
+                }
+            }
             (IPI, 0) => {
                 if arg1 != 0 && arg1 != u64::MAX {
                     error = INVALID_PARAM;
@@ -777,7 +887,16 @@ impl VirtMachine {
             }
             (SRST, 0) => error = INVALID_PARAM,
             // Legacy SBI 0.1, useful for older kernels.
-            (0, _) => self.bus.mtimecmp = arg0,
+            (0, _) => {
+                self.bus.mtimecmp = arg0;
+                if let Some(sys) = self.cpu.sys.as_mut() {
+                    if self.bus.mtime >= self.bus.mtimecmp {
+                        sys.mip |= IRQ_STIP;
+                    } else {
+                        sys.mip &= !IRQ_STIP;
+                    }
+                }
+            }
             (1, _) => self.bus.uart.write(0, arg0 as u8),
             (2, _) => value = u64::MAX,
             (3..=7, _) => {}
@@ -870,7 +989,7 @@ impl VirtMachine {
             // deadline via `idle_ticks` (not `insn_count`, which must
             // stay a true retired-instruction count for budgets/perf).
             let next = self.bus.mtimecmp;
-            if next != u64::MAX && next > self.bus.mtime {
+            if self.realtime_ticks.is_none() && next != u64::MAX && next > self.bus.mtime {
                 self.idle_ticks += next - self.bus.mtime;
             }
         }
@@ -926,6 +1045,14 @@ fn build_virt_fdt(
     f.prop_u32("reg", 0);
     f.prop_str("status", "okay");
     f.prop_str("compatible", "riscv");
+    f.prop_str("riscv,isa-base", "rv64i");
+    f.prop_strs(
+        "riscv,isa-extensions",
+        &["i", "m", "a", "f", "d", "c", "zicntr", "zicsr", "zifencei"],
+    );
+    // OpenSBI 1.4 (the firmware pinned by this repository) still discovers
+    // hart capabilities from the legacy string. Linux uses the structured
+    // properties above, so the optimized kernel needs no ISA fallback.
     f.prop_str("riscv,isa", "rv64imafdc");
     f.prop_str("mmu-type", "riscv,sv48");
     f.begin_node("interrupt-controller");
@@ -1023,6 +1150,23 @@ fn build_virt_fdt(
 mod tests {
     use super::*;
 
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn virt_fdt_uses_structured_isa_properties() {
+        let fdt = build_virt_fdt(512 << 20, "console=ttyS0", 0, 0, 2);
+        assert!(contains_bytes(&fdt, b"riscv,isa-base\0"));
+        assert!(contains_bytes(&fdt, b"riscv,isa-extensions\0"));
+        assert!(contains_bytes(
+            &fdt,
+            b"i\0m\0a\0f\0d\0c\0zicntr\0zicsr\0zifencei\0",
+        ));
+    }
+
     fn direct_machine() -> VirtMachine {
         VirtMachine::new_direct(
             8 << 20,
@@ -1033,6 +1177,8 @@ mod tests {
                 initrd: None,
                 disk: None,
                 fs: Vec::new(),
+                external_fs: None,
+                virtio_console: false,
                 net: None,
             },
         )
@@ -1065,8 +1211,13 @@ mod tests {
         assert_eq!((machine.cpu.x[10], machine.cpu.x[11]), (0, 2 << 24));
         sbi(&mut machine, 0x10, 3, 0x5449_4d45, 0);
         assert_eq!((machine.cpu.x[10], machine.cpu.x[11]), (0, 1));
+        machine.bus.mtime = 100;
+        machine.cpu.sys.as_mut().unwrap().mip |= IRQ_STIP;
         sbi(&mut machine, 0x5449_4d45, 0, 1234, 0);
         assert_eq!(machine.bus.mtimecmp, 1234);
+        assert_eq!(machine.cpu.sys.as_ref().unwrap().mip & IRQ_STIP, 0);
+        sbi(&mut machine, 0x5449_4d45, 0, 99, 0);
+        assert_ne!(machine.cpu.sys.as_ref().unwrap().mip & IRQ_STIP, 0);
         sbi(&mut machine, 0x48_53_4d, 2, 0, 0);
         assert_eq!((machine.cpu.x[10], machine.cpu.x[11]), (0, 0));
         sbi(&mut machine, 0x5246_4e43, 0, 1, 0);

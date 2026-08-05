@@ -1,0 +1,12 @@
+diff --git a/fs/pstat/stat_linux32.go b/fs/pstat/stat_linux32.go
+index c1febaa..55fda86 100644
+--- a/fs/pstat/stat_linux32.go
++++ b/fs/pstat/stat_linux32.go
+@@ -1,5 +1,5 @@
+-//go:build (linux || dragonfly || solaris) && (arm64 || arm || 386)
++//go:build (linux || dragonfly || solaris) && (arm64 || riscv64 || arm || 386)
+ // +build linux dragonfly solaris
+-// +build arm64 arm 386
++// +build arm64 riscv64 arm 386
+ 
+ package pstat

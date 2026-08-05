@@ -5,6 +5,17 @@ export type ImageSource =
   | Response
   | { url: string };
 
+export type ExecutionConfig =
+  | { mode: "local" }
+  | {
+      /** Run Wasm, devices, image downloads, and networking in a dedicated Worker. */
+      mode: "worker";
+      /** Module Worker entry point; defaults to rv64.worker.js beside rv64.js. */
+      workerURL?: string | URL;
+      /** Frequency of cached running/instruction state updates; defaults to 500ms. */
+      statisticsIntervalMs?: number;
+    };
+
 export type BootConfig =
   | {
       mode: "linux-direct";
@@ -12,6 +23,10 @@ export type BootConfig =
       initrd?: ImageSource;
       disk?: ImageSource;
       cmdline?: string;
+      /** Delegate a virtio-9P mount to an asynchronous host handler. Local execution only. */
+      p9?: { tag: string; handle(request: Uint8Array): Uint8Array | Promise<Uint8Array> };
+      /** Add a secondary virtio console, used by integrations such as WANIX host export. */
+      virtioConsole?: boolean;
     }
   | {
       mode: "firmware";
@@ -75,7 +90,15 @@ export interface RV64EventMap {
   stop: { reason: "requested" | "powered-off" | "error" };
   error: unknown;
   console: Uint8Array;
+  /** Bytes from the optional secondary virtio-console host-export channel. */
+  export: Uint8Array;
   networkTransmit: Uint8Array;
+  networkTraffic:
+    | { type: "request"; bytes: number; method: string; url: string }
+    | { type: "response"; status: number; url?: string }
+    | { type: "download"; bytes: number }
+    | { type: "end"; url?: string }
+    | { type: "error"; message: string; url?: string };
   downloadProgress: DownloadProgress;
 }
 
@@ -89,14 +112,18 @@ export interface RV64Options {
   boot: BootConfig;
   /** Linux defaults to the built-in fetch backend; bare metal defaults to none. */
   network?: NetworkConfig;
+  /** Execution stays on the calling thread unless Worker mode is explicitly selected. */
+  execution?: ExecutionConfig;
   events?: RV64EventListeners;
 }
 
 export class RV64 {
   static create(options: RV64Options): Promise<RV64>;
   readonly running: boolean;
+  /** Exact in local mode; periodically sampled in Worker mode. */
   readonly instructions: bigint;
   readonly console: { send(data: string | Uint8Array): void };
+  readonly export: { send(data: string | Uint8Array): void };
   readonly network: {
     readonly mode: NetworkConfig["mode"];
     readonly proxyURL?: string;

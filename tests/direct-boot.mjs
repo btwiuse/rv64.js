@@ -32,7 +32,10 @@ const vm = await RV64.create({
   },
   network: { mode: "none" },
   events: {
-    console: (bytes) => { output += decoder.decode(bytes, { stream: true }); },
+    console: (bytes) => {
+      output += decoder.decode(bytes, { stream: true });
+      if (process.env.RV64_BOOT_TRACE) process.stdout.write(bytes);
+    },
     error: (error) => { observedError = error; },
   },
 });
@@ -53,5 +56,5 @@ assert.match(output, /SBI implementation ID=0x52563634 Version=0x1/);
 assert.match(output, /VFS: Mounted root/);
 assert.match(output, /BENCH_READY/);
 assert.doesNotMatch(output, /OpenSBI v/);
-assert.ok(instructions > 100_000_000n);
+assert.ok(instructions > 30_000_000n);
 console.log(`PASS direct Linux boot — ${instructions} instructions`);

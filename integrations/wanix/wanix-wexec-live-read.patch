@@ -1,0 +1,53 @@
+diff --git a/extras/wexec/main.go b/extras/wexec/main.go
+--- a/extras/wexec/main.go
++++ b/extras/wexec/main.go
+@@ -132,7 +132,7 @@ func main() {
+ 
+ 	debug("waiting for exit")
+ 	for {
+-		b, err := os.ReadFile(fmt.Sprintf("/task/%s/exit", pid))
++		b, err := readLiveFile(fmt.Sprintf("/task/%s/exit", pid))
+ 		if err != nil {
+ 			log.Fatal(err)
+ 		}
+@@ -164,7 +164,7 @@ func pollJSOutput(stdoutPath, stderrPath string, done *atomic.Int32) {
+ }
+ 
+ func pollJSFile(path string, dst io.Writer, offset *int) {
+-	data, err := os.ReadFile(path)
++	data, err := readLiveFile(path)
+ 	if err != nil {
+ 		if errors.Is(err, syscall.ENODATA) || errors.Is(err, syscall.EAGAIN) {
+ 			return
+@@ -179,6 +179,31 @@ func pollJSFile(path string, dst io.Writer, offset *int) {
+ 	}
+ }
+ 
++func readLiveFile(path string) ([]byte, error) {
++	f, err := os.Open(path)
++	if err != nil {
++		return nil, err
++	}
++	defer f.Close()
++	buf := make([]byte, 4096)
++	out := make([]byte, 0, 4096)
++	for {
++		n, readErr := f.Read(buf)
++		if n > 0 {
++			out = append(out, buf[:n]...)
++		}
++		if readErr == io.EOF {
++			return out, nil
++		}
++		if readErr != nil {
++			return nil, readErr
++		}
++		if n == 0 {
++			return out, nil
++		}
++	}
++}
++
+ func copyOutput(path string, dst io.Writer, done *atomic.Int32, reopen bool) {
+ 	buf := make([]byte, 4096)
+ 	if reopen {

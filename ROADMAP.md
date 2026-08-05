@@ -335,13 +335,17 @@ lever now. Its two reverted attempts are documented in git history.
   but kernel configuration remains the primary speed path.
 - [ ] **17. Fast `riscv-virt` guest** — rebuild the quick BusyBox preset for the
   standard platform so the fast and Alpine demos differ by guest profile, not
-  virtual motherboard. The first single-hart rv64.js kernel configuration is
-  already 29.8% faster to Debian readiness and retires 37.1% fewer guest
-  instructions. A first `allnoconfig` platform-only attempt was rejected after
-  native/Wasm and early-console incompatibilities; build the small guest and
-  its kernel together rather than pruning the full Debian kernel further. The
-  modern release guest is now Alpine 3.24 on direct `riscv-virt`, with default
-  HTTP/HTTPS proxy setup and a real `apk update` native/Wasm integration gate;
+  virtual motherboard. The supported modern kernel now starts from a strict
+  `allnoconfig` contract in `kernel/rv64-config.nix`: 527 built-ins, no modules,
+  and a 3.9 MiB Image. It boots Debian and Alpine through the public Wasm API,
+  including the proxy CA/9p/network path and a real `apk update`. Declaring
+  rv64.js's efficient misaligned-access contract avoids Linux's emulated-speed
+  calibration: five Alpine boots reached readiness in 1,246 ms / 39.92M
+  instructions, effectively matching legacy TinyEMU's 1,240 ms / 42.04M. The
+  v86 scorecard Boot row now uses paired Linux 6.12.7/Alpine 3.24.1
+  initramfs artifacts instead of unrelated guest images; its five-run median
+  is 1,534 ms for rv64.js/OpenSBI versus 1,034 ms for v86/SeaBIOS. The modern
+  release guest is Alpine 3.24;
   replacing the remaining legacy fast preset is the unfinished part.
 - [ ] **18. Release-quality terminal and package** — integrate xterm.js through
   the public console API, test both hosted presets end to end, then publish an
@@ -350,7 +354,9 @@ lever now. Its two reverted attempts are documented in git history.
   worker and add a block-backend abstraction. Support OPFS through a synchronous
   access handle in that worker, preferably as a read-only base image plus a
   sparse copy-on-write overlay; retain the in-memory byte-backed backend for
-  ephemeral and unsupported environments.
+  ephemeral and unsupported environments. The optional dedicated-Worker
+  execution facade is implemented (local remains the default); the block
+  backend and OPFS storage work remains.
 
 ## Housekeeping
 

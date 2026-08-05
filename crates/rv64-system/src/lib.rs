@@ -746,6 +746,14 @@ fn build_fdt(
     f.prop_u32("reg", 0);
     f.prop_str("status", "okay");
     f.prop_str("compatible", "riscv");
+    f.prop_str("riscv,isa-base", "rv64i");
+    f.prop_strs(
+        "riscv,isa-extensions",
+        &["i", "m", "a", "f", "d", "c", "zicntr", "zicsr", "zifencei"],
+    );
+    // The legacy-tinyemu board still boots the bundled Linux 4.15 image,
+    // which predates the structured ISA binding. Do not copy this deprecated
+    // compatibility property to the release riscv-virt machine.
     f.prop_str("riscv,isa", "rv64imafdcsu");
     f.prop_str("mmu-type", "riscv,sv48");
     f.prop_u32("clock-frequency", 2_000_000_000);

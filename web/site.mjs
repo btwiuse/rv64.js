@@ -1,7 +1,8 @@
-import { RV64 } from "./rv64.js";
-import { defaultRelayURL } from "./site-config.js";
+import { RV64 } from "./rv64.js?v=2";
+import { resolveAssetOverride } from "./asset-source.mjs";
+import { defaultAssetURL, defaultRelayURL } from "./site-config.js";
 
-export const PUBLISHED_ASSETS = "./assets/demo-images-v2";
+export const PUBLISHED_ASSETS = defaultAssetURL;
 
 export const PRESETS = Object.freeze({
   fast: {
@@ -20,6 +21,7 @@ export const PRESETS = Object.freeze({
 
 const term = document.querySelector("#terminal");
 const status = document.querySelector("#status");
+const networkStatus = document.querySelector("#network-status");
 const boot = document.querySelector("#boot");
 const title = document.querySelector("#terminal-title");
 const decoder = new TextDecoder();
@@ -27,6 +29,13 @@ const encoder = new TextEncoder();
 let selected = "fast";
 let active = null;
 let generation = 0;
+const requestedExecution = new URLSearchParams(location.search).get("execution");
+const executionMode = requestedExecution === "local" ? "local" : "worker";
+
+function cpuStatus(text) {
+  status.textContent = `${text} · ${executionMode}`;
+}
+cpuStatus("Ready");
 
 function write(data) {
   let text = typeof data === "string" ? data : decoder.decode(data, { stream: true });
@@ -36,10 +45,16 @@ function write(data) {
 }
 
 function localAssetCandidates(local, release) {
-  const override = new URLSearchParams(location.search).get("assets");
-  if (override) return [{ url: `${override.replace(/\/$/, "")}/${release}` }];
-  const candidates = (Array.isArray(local) ? local : [local]).map((url) => ({ url }));
-  candidates.push({ url: `${PUBLISHED_ASSETS}/${release}` });
+  const override = resolveAssetOverride(
+    new URLSearchParams(location.search).get("assets"),
+    location.href,
+  );
+  if (override) return [{ url: `${override}/${release}` }];
+  const candidates = [];
+  if (PUBLISHED_ASSETS) {
+    candidates.push({ url: `${PUBLISHED_ASSETS.replace(/\/$/, "")}/${release}` });
+  }
+  candidates.push(...(Array.isArray(local) ? local : [local]).map((url) => ({ url })));
   return candidates;
 }
 
@@ -93,6 +108,8 @@ async function start(presetName) {
   const preset = PRESETS[presetName];
   boot.disabled = true;
   term.textContent = "";
+  networkStatus.textContent = "Network idle";
+  networkStatus.title = "";
   write(`[host] loading ${preset.label}…\n`);
   try {
     if (active) await active.destroy();
@@ -103,7 +120,7 @@ async function start(presetName) {
       const name = preset.release[i];
       images.push(await fetchAsset(preset.local[i], name, (loaded, total) => {
         const amount = total ? `${(loaded / total * 100).toFixed(0)}%` : `${(loaded / 1048576).toFixed(1)} MiB`;
-        status.textContent = `Downloading ${name}: ${amount}`;
+        cpuStatus(`Downloading ${name}: ${amount}`);
       }));
     }
     if (myGeneration !== generation) return;
@@ -118,6 +135,7 @@ async function start(presetName) {
     const vm = await RV64.create({
       wasm,
       memoryMB: preset.ramMB,
+      execution: { mode: executionMode },
       boot: bootConfig,
       network: presetName === "modern"
         ? {
@@ -127,9 +145,42 @@ async function start(presetName) {
         : undefined,
       events: {
         console: (data) => write(data),
+        networkTraffic: (() => {
+          let requests = 0;
+          let uploaded = 0;
+          let downloaded = 0;
+          let last = "";
+          const render = () => {
+            const received = downloaded < 1048576
+              ? `${(downloaded / 1024).toFixed(0)} KiB`
+              : `${(downloaded / 1048576).toFixed(1)} MiB`;
+            const sent = uploaded < 1024
+              ? `${uploaded} B`
+              : `${(uploaded / 1024).toFixed(1)} KiB`;
+            networkStatus.textContent = `${requests} requests · ${sent} sent · ${received} received${last ? ` · ${last}` : ""}`;
+          };
+          return (detail) => {
+            if (detail.type === "request") {
+              requests++;
+              uploaded += detail.bytes;
+              last = `${detail.method} ${new URL(detail.url).hostname}`;
+            } else if (detail.type === "download") {
+              downloaded += detail.bytes;
+            } else if (detail.type === "response") {
+              last = `HTTP ${detail.status}`;
+            } else if (detail.type === "end") {
+              last = "complete";
+            } else if (detail.type === "error") {
+              last = "network error";
+              networkStatus.title = detail.message;
+              write(`\n[network] ${detail.message}\n`);
+            }
+            render();
+          };
+        })(),
         stop: ({ reason }) => {
           if (reason === "powered-off") write("\n[host] guest powered off\n");
-          status.textContent = reason === "powered-off" ? "Powered off" : "Stopped";
+          cpuStatus(reason === "powered-off" ? "Powered off" : "Stopped");
         },
       },
     });
@@ -143,9 +194,9 @@ async function start(presetName) {
       if (now - lastStatus > 500) {
         lastStatus = now;
         const insns = Number(active.instructions);
-        status.textContent = `${(insns / 1e6).toFixed(0)} Minsns · ${(insns / (now - started) / 1000).toFixed(1)} Minsn/s`;
+        cpuStatus(`${(insns / 1e6).toFixed(0)} Minsns · ${(insns / (now - started) / 1000).toFixed(1)} Minsn/s`);
       }
-      setTimeout(frame, 0);
+      setTimeout(frame, 500);
     };
     title.textContent = `${preset.label} console`;
     term.focus();
@@ -154,7 +205,7 @@ async function start(presetName) {
   } catch (error) {
     write(`\n[host] unable to boot: ${error.message}\n\n`);
     write("For local setup, follow the commands below the terminal.\n");
-    status.textContent = "Boot failed";
+    cpuStatus("Boot failed");
     console.error(error);
   } finally {
     boot.disabled = false;

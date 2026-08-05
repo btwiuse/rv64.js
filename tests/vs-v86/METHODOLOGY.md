@@ -35,6 +35,10 @@ detection are about 33 seconds for Numeric, 87 seconds for Assignment, and
 ## Non-negotiable rules
 
 - System emulation only. v86 has no comparable user mode.
+- The Boot row uses the paired Linux 6.12.7/Alpine 3.24.1 uncompressed
+  initramfs artifacts from `prepare-matched-boot.sh`, 512 MiB on each side,
+  and the common `ALPINE_READY` marker. OpenSBI and SeaBIOS are reported as
+  part of each platform rather than hidden or incorrectly called equivalent.
 - Keep an immutable control Wasm. Never compare numbers remembered from a
   different build, artifact set, machine state, or scorecard.
 - Candidate effects below 10% are ties.

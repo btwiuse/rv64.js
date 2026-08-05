@@ -93,6 +93,14 @@ export type NetworkConfig =
   | { mode: "inbrowser"; channel?: string; mac?: Uint8Array }
   | { mode: "external"; mac?: Uint8Array };
 
+export type ExecutionConfig =
+  | { mode: "local" }
+  | {
+      mode: "worker";
+      workerURL?: string | URL;
+      statisticsIntervalMs?: number;
+    };
+
 const vm = await RV64.create({
   wasm: { url: "./rv64_wasm.wasm" },
   memoryMB: 512,
@@ -103,6 +111,7 @@ const vm = await RV64.create({
     cmdline: "console=ttyS0 root=/dev/vda rw",
   },
   network: { mode: "fetch" },
+  execution: { mode: "worker" },
 });
 
 const unsubscribe = vm.on("console", bytes => terminal.write(bytes));
@@ -119,6 +128,15 @@ The library owns instruction slicing and scheduling. Machine-specific
 exports are not present on the public `RV64` class. Repository architecture,
 differential, and performance harnesses explicitly use `RV64Debug`; it is not
 an application compatibility API.
+
+Execution is local on the calling thread by default. `execution.mode =
+"worker"` moves Wasm, devices, networking, and image resolution into a
+dedicated module Worker while retaining the same lifecycle, console, network,
+and event facade on the caller. Worker-mode `running` and `instructions` are
+cached snapshots; `statisticsIntervalMs` controls their refresh interval and
+defaults to 500 ms. `Response` image sources are intentionally local-only;
+Worker mode accepts URL and byte sources. The hosted demo opts into Worker
+mode so instruction slicing and JIT compilation cannot stall its UI.
 
 The event map should cover at least `ready`, `start`, `stop`, `error`,
 `console`, `networkTransmit`, and `downloadProgress`. Listener registration

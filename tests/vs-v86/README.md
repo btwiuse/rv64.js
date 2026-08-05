@@ -103,6 +103,23 @@ runtime configuration, v86 revision, and hashes for Wasm and guest artifacts.
 An exclusive artifact-directory lock prevents concurrent benchmark
 orchestrators.
 
+The Boot row is matched separately from the workload rows. Both sides use
+Linux 6.12.7 from this flake, Alpine 3.24.1 `alpine-base`, the same package-name
+manifest and init script, 512 MiB RAM, and an uncompressed `newc` initramfs.
+This removes the old root-disk and storage-controller mismatch. rv64.js boots
+through OpenSBI 1.4; v86 boots through SeaBIOS because its Linux `bzImage`
+loader is a SeaBIOS option ROM. Timings begin after VM creation and report
+kernel-banner and userspace-ready milestones separately.
+The RISC-V payload is an uncompressed `Image`; v86's normal Linux loader
+requires an x86 `bzImage`, so kernel decompression remains an unavoidable
+platform-path difference. The shared initramfs is uncompressed on both sides.
+
+```sh
+nix develop -c tests/vs-v86/prepare-matched-boot.sh target/bench
+ARTIFACTS=target/bench REPS=5 \
+  node tests/vs-v86/compare-boot.mjs
+```
+
 ## Automated setup (build everything once)
 
 `setup.sh` builds the wasm, the benchmark kernels, and the nbench rootfs into one

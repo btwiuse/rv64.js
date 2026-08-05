@@ -1,0 +1,43 @@
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+
+: "${SHELL:=/bin/sh}"
+if [ -n "$export" ]; then
+    EXPORTDEV=/dev/$export hostexport &
+    unset export
+fi
+if [ -f /boot/rc ]; then
+    . /boot/rc
+fi
+
+case " $(cat /proc/cmdline) " in
+    *" rv64.network=fetch "*)
+        ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
+        route add default gw 10.0.2.2
+        export http_proxy=http://10.0.2.2:8080
+        export HTTP_PROXY="$http_proxy"
+
+        # The fetch backend exposes its public interception CA through a
+        # second read-only 9P mount. Convert its DER certificate to PEM with
+        # BusyBox's base64 applet, avoiding any dependency on openssl.
+        mkdir -p /run/rv64-proxy
+        if mount -t 9p -o trans=virtio,version=9p2000.L rv64-proxy /run/rv64-proxy 2>/dev/null; then
+            if [ -f /run/rv64-proxy/ca.der ] && [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+                {
+                    echo '-----BEGIN CERTIFICATE-----'
+                    base64 /run/rv64-proxy/ca.der
+                    echo '-----END CERTIFICATE-----'
+                } >>/etc/ssl/certs/ca-certificates.crt
+                export https_proxy="$http_proxy"
+                export HTTPS_PROXY="$https_proxy"
+            fi
+        fi
+        ;;
+esac
+
+exec setsid -c "$SHELL" -i <>/dev/ttyS0 >&0 2>&1

@@ -143,6 +143,45 @@ unsubscribe();
 await vm.destroy();
 ```
 
+Embedders that already own a 9P2000.L server can expose it as a live
+virtio-9P mount instead of loading a tar-backed filesystem:
+
+```js
+boot: {
+  mode: "linux-direct",
+  kernel,
+  cmdline: "console=ttyS0 root=host9p rootfstype=9p rootflags=trans=virtio,version=9p2000.L",
+  p9: { tag: "host9p", handle: request => namespace9p(request) },
+}
+```
+
+The handler may return a `Uint8Array` or a promise. External handlers require
+local execution mode; they are intended for hosts such as WANIX that already
+run rv64.js inside their own Worker.
+
+The self-contained [WANIX integration](integrations/wanix/README.md) builds an
+rv64 VM-driver archive and matching RISC-V Linux namespace without patching a
+WANIX checkout.
+
+Execution is local (on the calling thread) by default. Browser applications
+that need to keep their UI responsive can opt into a dedicated module Worker
+without changing the VM lifecycle or event API:
+
+```js
+const vm = await RV64.create({
+  ...options,
+  execution: { mode: "worker" },
+});
+```
+
+Worker mode runs Wasm, devices, image downloads, and networking off the main
+thread. `running` and `instructions` are cached snapshots in this mode (updated
+every 500 ms by default); set `statisticsIntervalMs` to change that interval.
+URL and byte image sources work in both modes. A `Response` source is local-mode
+only because response bodies cannot be transferred reliably between browsers.
+Browser execution slices yield through `MessageChannel`, avoiding the nested
+timer clamping that applies to repeated `setTimeout(..., 0)` calls.
+
 Images may be `{ url }`, `Response`, `Uint8Array`, `ArrayBuffer`, or another
 array-buffer view. `RV64.create()` resolves all images and emits download
 progress before the `ready` event. `start()` runs cooperative execution slices;

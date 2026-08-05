@@ -1,0 +1,67 @@
+diff --git a/extras/wexec/main.go b/extras/wexec/main.go
+--- a/extras/wexec/main.go
++++ b/extras/wexec/main.go
+@@ -97,16 +97,21 @@ func main() {
+ 	var done atomic.Int32
+ 	var wg sync.WaitGroup
+-	wg.Add(1)
+-	go func() {
+-		defer wg.Done()
+-		debug("polling fd/1 => stdout")
+-		copyOutput(stdoutPath, os.Stdout, &done, taskKind == "js")
+-	}()
+-	wg.Add(1)
+-	go func() {
+-		defer wg.Done()
+-		debug("polling fd/2 => stderr")
+-		copyOutput(stderrPath, os.Stderr, &done, taskKind == "js")
+-	}()
++	if taskKind == "js" {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			pollJSOutput(stdoutPath, stderrPath, &done)
++		}()
++	} else {
++		wg.Add(2)
++		go func() {
++			defer wg.Done()
++			copyOutput(stdoutPath, os.Stdout, &done, false)
++		}()
++		go func() {
++			defer wg.Done()
++			copyOutput(stderrPath, os.Stderr, &done, false)
++		}()
++	}
+ 
+ 	debug("starting")
+@@ -136,6 +141,29 @@ func main() {
+ 	}
+ }
+ 
++func pollJSOutput(stdoutPath, stderrPath string, done *atomic.Int32) {
++	stdoutOffset, stderrOffset := 0, 0
++	for done.Load() == 0 {
++		pollJSFile(stdoutPath, os.Stdout, &stdoutOffset)
++		pollJSFile(stderrPath, os.Stderr, &stderrOffset)
++		time.Sleep(250 * time.Millisecond)
++	}
++}
++
++func pollJSFile(path string, dst io.Writer, offset *int) {
++	data, err := os.ReadFile(path)
++	if err != nil {
++		if errors.Is(err, syscall.ENODATA) || errors.Is(err, syscall.EAGAIN) {
++			return
++		}
++		log.Fatal(err)
++	}
++	if len(data) > *offset {
++		dst.Write(data[*offset:])
++		*offset = len(data)
++	}
++}
++
+ func copyOutput(path string, dst io.Writer, done *atomic.Int32, reopen bool) {
+ 	buf := make([]byte, 4096)
+ 	if reopen {

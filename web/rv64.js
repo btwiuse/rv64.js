@@ -31,6 +31,11 @@ export class RV64Debug {
     this.onWispData = () => {};
     this.onWispClose = () => {};
     this.onWispDatagram = () => {};
+    /** Request/response byte and error diagnostics for the stable API. */
+    this.onNetworkTraffic = () => {};
+    /** Optional async external virtio-9P handler: request => reply bytes. */
+    this.onP9Request = null;
+    this.p9Pending = false;
     /** Origins known to require the relay, avoiding a failed fetch every time. */
     this.httpRelayOrigins = new Set();
   }
@@ -572,19 +577,36 @@ RV64Debug.prototype.connectHttpRelay = function (url, options = {}) {
         if (!pending.has(message.id)) return;
         switch (message.type) {
           case HTTP_RELAY_HEAD:
+            this.onNetworkTraffic?.({
+              type: "response",
+              status: new DataView(
+                message.payload.buffer,
+                message.payload.byteOffset,
+                message.payload.byteLength,
+              ).getUint32(0, true),
+            });
             this.stageFor(message.payload);
             this.ex.sys_http_head(message.id);
             break;
           case HTTP_RELAY_BODY:
+            this.onNetworkTraffic?.({
+              type: "download",
+              bytes: message.payload.length,
+            });
             this.stageFor(message.payload);
             this.ex.sys_http_body(message.id);
             break;
           case HTTP_RELAY_END:
             pending.delete(message.id);
+            this.onNetworkTraffic?.({ type: "end" });
             this.ex.sys_http_end(message.id);
             break;
           case HTTP_RELAY_ERROR:
             pending.delete(message.id);
+            this.onNetworkTraffic?.({
+              type: "error",
+              message: new TextDecoder().decode(message.payload),
+            });
             this.stageFor(message.payload);
             this.ex.sys_http_fail(message.id);
             break;
@@ -665,6 +687,8 @@ RV64Debug.prototype.bootVirtLinux = function ({
   netMac,
   proxy = false,
   proxyUpgradeHttps = true,
+  p9,
+  virtioConsole = false,
 }) {
   const stage = (bytes, fn) => {
     if (!bytes) return;
@@ -678,6 +702,9 @@ RV64Debug.prototype.bootVirtLinux = function ({
   stage(disk, () => this.ex.virt_stage_disk());
   if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.virt_stage_cmdline());
   if (netMac) stage(new Uint8Array(netMac), () => this.ex.virt_stage_net_mac());
+  if (p9?.tag) stage(new TextEncoder().encode(p9.tag), () => this.ex.virt_stage_fs_external_tag());
+  this.onP9Request = p9?.handle ?? null;
+  this.ex.virt_console_enable(virtioConsole ? 1 : 0);
   this.ex.virt_net_enable(net || proxy ? 1 : 0);
   this.ex.sys_proxy_enable(proxy ? 1 : 0, proxyUpgradeHttps ? 1 : 0);
   this.ex.virt_boot(ramMB);
@@ -694,6 +721,8 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
   netMac,
   proxy = false,
   proxyUpgradeHttps = true,
+  p9,
+  virtioConsole = false,
 }) {
   const stage = (bytes, fn) => {
     if (!bytes) return;
@@ -706,6 +735,9 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
   stage(disk, () => this.ex.virt_stage_disk());
   if (cmdline) stage(new TextEncoder().encode(cmdline), () => this.ex.virt_stage_cmdline());
   if (netMac) stage(new Uint8Array(netMac), () => this.ex.virt_stage_net_mac());
+  if (p9?.tag) stage(new TextEncoder().encode(p9.tag), () => this.ex.virt_stage_fs_external_tag());
+  this.onP9Request = p9?.handle ?? null;
+  this.ex.virt_console_enable(virtioConsole ? 1 : 0);
   this.ex.virt_net_enable(net || proxy ? 1 : 0);
   this.ex.sys_proxy_enable(proxy ? 1 : 0, proxyUpgradeHttps ? 1 : 0);
   this.ex.virt_boot_direct(ramMB);
@@ -713,7 +745,41 @@ RV64Debug.prototype.bootVirtLinuxDirect = function ({
 
 /** Run a slice of the modern virt machine. Returns true when powered off. */
 RV64Debug.prototype.runVirtSystem = function (maxInsns = 2_000_000n) {
-  return this.ex.virt_run(BigInt(maxInsns)) === 1;
+  const stopped = this.ex.virt_run(BigInt(maxInsns)) === 1;
+  this.pumpP9();
+  return stopped;
+};
+
+RV64Debug.prototype.pumpP9 = function () {
+  if (!this.onP9Request || this.p9Pending) return;
+  const len = this.ex.virt_p9_take_request();
+  if (!len) return;
+  const request = new Uint8Array(this.ex.memory.buffer, this.ex.staging_ptr(), len).slice();
+  this.p9Pending = true;
+  Promise.resolve()
+    .then(() => this.onP9Request(request))
+    .then((reply) => {
+      if (!(reply instanceof Uint8Array)) reply = new Uint8Array(reply);
+      if (reply.length < 7) throw new Error("external 9P handler returned an invalid reply");
+      const ptr = this.ex.staging_alloc(reply.length);
+      new Uint8Array(this.ex.memory.buffer, ptr, reply.length).set(reply);
+      if (this.ex.virt_p9_reply() !== 1) throw new Error("unexpected external 9P reply");
+    })
+    .catch((error) => {
+      console.error("external 9P request failed", error);
+      // Rlerror(size=11, type=7, original tag, errno=EIO) keeps the guest
+      // queue moving even when the host handler rejects.
+      const reply = new Uint8Array(11);
+      new DataView(reply.buffer).setUint32(0, 11, true);
+      reply[4] = 7;
+      reply[5] = request[5];
+      reply[6] = request[6];
+      new DataView(reply.buffer).setUint32(7, 5, true);
+      const ptr = this.ex.staging_alloc(reply.length);
+      new Uint8Array(this.ex.memory.buffer, ptr, reply.length).set(reply);
+      this.ex.virt_p9_reply();
+    })
+    .finally(() => { this.p9Pending = false; });
 };
 
 /** Send keyboard input to the modern machine's 8250 UART. */
@@ -721,6 +787,12 @@ RV64Debug.prototype.virtConsoleInput = function (bytes) {
   const ptr = this.ex.staging_alloc(bytes.length);
   new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
   this.ex.virt_console_input();
+};
+
+RV64Debug.prototype.virtExportInput = function (bytes) {
+  const ptr = this.ex.staging_alloc(bytes.length);
+  new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
+  this.ex.virt_export_input();
 };
 
 RV64Debug.prototype.virtNetInput = function (frame) {
@@ -749,6 +821,14 @@ RV64Debug.prototype.wispDatagram = function (id, bytes) {
 
 RV64Debug.prototype.virtInsnCount = function () {
   return this.ex.virt_insn_count();
+};
+
+/** Direct-SBI call counts for diagnostics and profiling. */
+RV64Debug.prototype.virtSbiCallCounts = function () {
+  const names = ["total", "base", "time", "ipi", "rfence", "hsm", "srst", "other"];
+  return Object.fromEntries(
+    names.map((name, index) => [name, this.ex.virt_sbi_call_count(index)]),
+  );
 };
 
 /** Current modern-machine PC. Diagnostic API; not part of the stable facade. */
@@ -790,6 +870,12 @@ const FORBIDDEN_HEADERS = new Set([
 /** Perform one guest request, streaming the response back as it arrives. */
 RV64Debug.prototype.performHttp = async function (id, req, encodedRequest) {
   const origin = requestOrigin(req.url);
+  this.onNetworkTraffic?.({
+    type: "request",
+    bytes: encodedRequest?.length ?? req.body.length,
+    method: req.method,
+    url: req.url,
+  });
   if (
     encodedRequest &&
     this.httpRelay &&
@@ -814,6 +900,7 @@ RV64Debug.prototype.performHttp = async function (id, req, encodedRequest) {
     if (req.body.length) init.body = req.body;
     const resp = await fetch(req.url, init);
 
+    this.onNetworkTraffic?.({ type: "response", status: resp.status, url: req.url });
     this.stageFor(encodeHead(resp.status, [...resp.headers]));
     this.ex.sys_http_head(BigInt(id));
     headSent = true;
@@ -827,12 +914,14 @@ RV64Debug.prototype.performHttp = async function (id, req, encodedRequest) {
         const { done, value } = await reader.read();
         if (done) break;
         if (value?.length) {
+          this.onNetworkTraffic?.({ type: "download", bytes: value.length });
           this.stageFor(value);
           this.ex.sys_http_body(BigInt(id));
         }
       }
     }
     this.ex.sys_http_end(BigInt(id));
+    this.onNetworkTraffic?.({ type: "end", url: req.url });
   } catch (e) {
     // A CORS rejection occurs before fetch exposes a response head. GET and
     // HEAD are safe to retry; retrying POST could duplicate a request that the
@@ -857,6 +946,11 @@ RV64Debug.prototype.performHttp = async function (id, req, encodedRequest) {
     }
     // The proxy turns this into a 502 the guest can read, rather than a silent
     // hang. A CORS rejection lands here.
+    this.onNetworkTraffic?.({
+      type: "error",
+      message: String(e?.message ?? e),
+      url: req.url,
+    });
     this.stageFor(new TextEncoder().encode(String(e?.message ?? e)));
     this.ex.sys_http_fail(BigInt(id));
   }
@@ -923,7 +1017,9 @@ const PUBLIC_EVENTS = new Set([
   "stop",
   "error",
   "console",
+  "export",
   "networkTransmit",
+  "networkTraffic",
   "downloadProgress",
 ]);
 
@@ -969,8 +1065,20 @@ async function imageBytes(source, name, emit) {
   return bytes;
 }
 
+const hostYieldQueue = [];
+let hostYieldChannel;
+
 function hostYield(callback) {
   if (typeof setImmediate === "function") return setImmediate(callback);
+  if (typeof MessageChannel === "function") {
+    if (!hostYieldChannel) {
+      hostYieldChannel = new MessageChannel();
+      hostYieldChannel.port1.onmessage = () => hostYieldQueue.shift()?.();
+    }
+    hostYieldQueue.push(callback);
+    hostYieldChannel.port2.postMessage(0);
+    return;
+  }
   return setTimeout(callback, 0);
 }
 
@@ -1161,6 +1269,7 @@ export class RV64 {
       this.on(event, listener);
     }
     this.console = Object.freeze({ send: (data) => this.#sendConsole(data) });
+    this.export = Object.freeze({ send: (data) => this.#sendExport(data) });
     this.network = Object.freeze({
       mode: network.mode,
       get proxyURL() { return network.mode === "fetch" ? core.proxyURL() : undefined; },
@@ -1172,6 +1281,15 @@ export class RV64 {
   static async create(options) {
     if (!options || typeof options !== "object") {
       throw new TypeError("RV64.create expects an options object");
+    }
+    if (options.execution?.mode === "worker") {
+      if (options.boot?.p9) {
+        throw new TypeError("external 9P handlers require local execution mode");
+      }
+      return RV64WorkerProxy.create(options);
+    }
+    if (options.execution?.mode !== undefined && options.execution.mode !== "local") {
+      throw new TypeError(`unknown execution mode: ${options.execution.mode}`);
     }
     const { wasm, boot, memoryMB, events } = options;
     if (!wasm) throw new TypeError("RV64.create requires wasm");
@@ -1339,6 +1457,8 @@ export class RV64 {
         disk: boot.disk,
         cmdline: modernCmdline,
         ramMB: memoryMB ?? 512,
+        p9: boot.p9,
+        virtioConsole: boot.virtioConsole,
         ...networkOptions,
       });
       this.#runSlice = () => {
@@ -1357,8 +1477,9 @@ export class RV64 {
       throw new TypeError(`unknown boot mode: ${boot.mode}`);
     }
     this.#core.wispEnable(network.mode === "wisp");
-    this.#core.onWrite = (_fd, bytes) => this.#emit("console", bytes);
+    this.#core.onWrite = (fd, bytes) => this.#emit(fd === 3 ? "export" : "console", bytes);
     this.#core.onNetSend = (frame) => this.#transmitNetwork(frame);
+    this.#core.onNetworkTraffic = (detail) => this.#emit("networkTraffic", detail);
     this.#connectNetwork();
   }
 
@@ -1384,6 +1505,13 @@ export class RV64 {
     const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
     if (!(bytes instanceof Uint8Array)) throw new TypeError("console data must be a string or Uint8Array");
     this.#input(bytes);
+  }
+
+  #sendExport(data) {
+    this.#assertLive();
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    if (!(bytes instanceof Uint8Array)) throw new TypeError("export data must be a string or Uint8Array");
+    this.#core.virtExportInput(bytes);
   }
 
   #connectNetwork() {
@@ -1450,4 +1578,266 @@ export class RV64 {
   #assertLive() {
     if (this.#destroyed) throw new Error("RV64 instance has been destroyed");
   }
+}
+
+class RV64WorkerProxy {
+  #worker;
+  #listeners = new Map();
+  #pending = new Map();
+  #nextRequest = 1;
+  #running = false;
+  #instructions = 0n;
+  #destroyed = false;
+  #networkMode;
+  #proxyURL;
+
+  constructor(worker, networkMode, listeners) {
+    this.#worker = worker;
+    this.#networkMode = networkMode;
+    for (const [event, listener] of Object.entries(listeners ?? {})) {
+      this.on(event, listener);
+    }
+    this.console = Object.freeze({ send: (data) => this.#sendConsole(data) });
+    const proxy = this;
+    this.network = Object.freeze({
+      mode: networkMode,
+      get proxyURL() {
+        return proxy.#proxyURL;
+      },
+      receive: (frame) => this.#receiveNetwork(frame),
+    });
+  }
+
+  static async create(options) {
+    if (typeof Worker === "undefined") {
+      throw new Error("worker execution requires a browser Worker implementation");
+    }
+    const execution = options.execution;
+    const workerURL = execution.workerURL
+      ? new URL(execution.workerURL, import.meta.url)
+      : new URL("./rv64.worker.js", import.meta.url);
+    // Validate and copy transferable inputs before allocating a Worker so a
+    // rejected source (notably Response) cannot leave an idle thread behind.
+    const { options: clonedOptions, transfers } = cloneWorkerOptions(options);
+    const worker = new Worker(workerURL, { name: "rv64.js", type: "module" });
+    const networkMode =
+      options.network?.mode ??
+      (options.boot?.mode === "bare-metal" ? "none" : "fetch");
+    const proxy = new RV64WorkerProxy(worker, networkMode, options.events);
+    const created = new Promise((resolve, reject) => {
+      let settled = false;
+      const fail = (error) => {
+        if (settled) {
+          proxy.#fail(error);
+        } else {
+          settled = true;
+          worker.terminate();
+          reject(error);
+        }
+      };
+      worker.onerror = (event) =>
+        fail(event.error ?? new Error(event.message || "rv64 Worker failed"));
+      worker.onmessageerror = () => fail(new Error("rv64 Worker sent an unreadable message"));
+      worker.onmessage = (event) => {
+        if (event.data?.type === "created") {
+          settled = true;
+          resolve(event.data.state);
+        } else if (event.data?.type === "create-error") {
+          fail(deserializeWorkerError(event.data.error));
+        } else proxy.#handleMessage(event.data);
+      };
+    });
+    worker.postMessage(
+      {
+        type: "create",
+        options: clonedOptions,
+        statisticsIntervalMs: execution.statisticsIntervalMs ?? 500,
+      },
+      transfers,
+    );
+    try {
+      proxy.#applyState(await created);
+      return proxy;
+    } catch (error) {
+      proxy.#destroyed = true;
+      worker.terminate();
+      throw error;
+    }
+  }
+
+  get running() {
+    return this.#running;
+  }
+
+  get instructions() {
+    this.#assertLive();
+    return this.#instructions;
+  }
+
+  on(event, listener) {
+    if (!PUBLIC_EVENTS.has(event)) throw new TypeError(`unknown event: ${event}`);
+    if (typeof listener !== "function") throw new TypeError("listener must be a function");
+    let listeners = this.#listeners.get(event);
+    if (!listeners) this.#listeners.set(event, (listeners = new Set()));
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  async start() {
+    this.#assertLive();
+    await this.#call("start");
+  }
+
+  async stop() {
+    this.#assertLive();
+    await this.#call("stop");
+  }
+
+  async reset() {
+    this.#assertLive();
+    await this.#call("reset");
+  }
+
+  async destroy() {
+    if (this.#destroyed) return;
+    this.#destroyed = true;
+    try {
+      await this.#call("destroy", undefined, true);
+    } finally {
+      this.#worker.terminate();
+      this.#listeners.clear();
+      for (const { reject } of this.#pending.values()) reject(new Error("RV64 instance destroyed"));
+      this.#pending.clear();
+    }
+  }
+
+  #call(method, value, allowDestroyed = false) {
+    if (!allowDestroyed) this.#assertLive();
+    const id = this.#nextRequest++;
+    return new Promise((resolve, reject) => {
+      this.#pending.set(id, { reject, resolve });
+      this.#worker.postMessage({ id, method, type: "call", value });
+    });
+  }
+
+  #handleMessage(message) {
+    if (!message || typeof message !== "object") return;
+    if (message.type === "event") {
+      if (message.event === "start") this.#running = true;
+      if (message.event === "stop") this.#running = false;
+      const detail = message.event === "error" ? deserializeWorkerError(message.detail) : message.detail;
+      this.#emit(message.event, detail);
+      return;
+    }
+    if (message.type === "state") {
+      this.#applyState(message.state);
+      return;
+    }
+    if (message.type === "result") {
+      const pending = this.#pending.get(message.id);
+      if (!pending) return;
+      this.#pending.delete(message.id);
+      this.#applyState(message.state);
+      if (message.error) pending.reject(deserializeWorkerError(message.error));
+      else pending.resolve(message.value);
+      return;
+    }
+  }
+
+  #applyState(state) {
+    if (!state) return;
+    this.#running = state.running;
+    this.#instructions = BigInt(state.instructions);
+    this.#proxyURL = state.proxyURL;
+  }
+
+  #sendConsole(data) {
+    this.#assertLive();
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    if (!(bytes instanceof Uint8Array)) {
+      throw new TypeError("console data must be a string or Uint8Array");
+    }
+    this.#worker.postMessage({ type: "console", value: bytes });
+  }
+
+  #receiveNetwork(frame) {
+    this.#assertLive();
+    if (this.#networkMode !== "external") {
+      throw new Error("network.receive is only available in external mode");
+    }
+    const bytes = frame instanceof Uint8Array ? frame : new Uint8Array(frame);
+    this.#worker.postMessage({ type: "network-receive", value: bytes });
+  }
+
+  #emit(event, detail) {
+    for (const listener of [...(this.#listeners.get(event) ?? [])]) listener(detail);
+  }
+
+  #fail(error) {
+    if (this.#destroyed) return;
+    this.#running = false;
+    this.#emit("error", error);
+    this.#emit("stop", { reason: "error" });
+    for (const { reject } of this.#pending.values()) reject(error);
+    this.#pending.clear();
+    this.#worker.terminate();
+  }
+
+  #assertLive() {
+    if (this.#destroyed) throw new Error("RV64 instance has been destroyed");
+  }
+}
+
+function cloneWorkerOptions(options) {
+  const transfers = [];
+  const cloneImage = (source, name) => {
+    if (source === undefined || source === "default") return source;
+    if (source instanceof Response) {
+      throw new TypeError(`${name} cannot be a Response in worker execution mode`);
+    }
+    if (source && typeof source === "object" && typeof source.url === "string") {
+      const base = globalThis.location?.href ?? import.meta.url;
+      return { url: new URL(source.url, base).href };
+    }
+    let bytes;
+    if (source instanceof ArrayBuffer) bytes = new Uint8Array(source);
+    else if (ArrayBuffer.isView(source)) {
+      bytes = new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+    } else {
+      throw new TypeError(`${name} must be bytes or { url }`);
+    }
+    const copy = bytes.slice();
+    transfers.push(copy.buffer);
+    return copy;
+  };
+
+  const boot = { ...options.boot };
+  for (const key of ["firmware", "kernel", "initrd", "disk", "image"]) {
+    if (key in boot) boot[key] = cloneImage(boot[key], key);
+  }
+  const network = options.network
+    ? {
+        ...options.network,
+        ...(options.network.mac
+          ? { mac: cloneImage(options.network.mac, "network.mac") }
+          : {}),
+      }
+    : undefined;
+  return {
+    options: {
+      wasm: cloneImage(options.wasm, "wasm"),
+      boot,
+      memoryMB: options.memoryMB,
+      ...(network ? { network } : {}),
+      execution: { mode: "local" },
+    },
+    transfers,
+  };
+}
+
+function deserializeWorkerError(value) {
+  const error = new Error(value?.message ?? String(value));
+  if (value?.name) error.name = value.name;
+  if (value?.stack) error.stack = value.stack;
+  return error;
 }

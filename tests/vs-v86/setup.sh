@@ -16,14 +16,17 @@ OUT="${1:-$REPO/target/bench}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
-echo "== 1/3 building rv64-wasm =="
+echo "== 1/4 building rv64-wasm =="
 ( cd "$REPO" && cargo build --release -p rv64-wasm --target wasm32-unknown-unknown )
 
-echo "== 2/3 benchmark kernels =="
+echo "== 2/4 benchmark kernels =="
 "$HERE/build-kernels.sh" "$OUT"
 
-echo "== 3/3 nbench rootfs (rv64 BYTEmark) =="
+echo "== 3/4 nbench rootfs (rv64 BYTEmark) =="
 "$HERE/mk-nbench-rootfs.sh" "$OUT"
+
+echo "== 4/4 matched Linux/Alpine boot artifacts =="
+"$HERE/prepare-matched-boot.sh" "$OUT"
 
 echo "== + cross-ISA benchmark binaries (compile + v86 nbench) =="
 "$HERE/mk-bench-bins.sh" "$OUT"                       # tcc.i386/tcc.rv64/nbench.i386

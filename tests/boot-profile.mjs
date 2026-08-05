@@ -98,8 +98,35 @@ presets["modern-direct"] = {
   instructions(vm) { return vm.virtInsnCount(); },
   pc(vm) { return vm.virtPc(); },
 };
+presets["modern-alpine"] = {
+  files: [
+    process.env.RV64_MODERN_KERNEL || "web/images/modern/Image",
+    "web/images/modern/alpine.ext4",
+  ],
+  markers: {
+    firstOutput: /./s,
+    kernel: /Linux version/,
+    rootMounted: /VFS: Mounted root/,
+    ready: /ALPINE_READY/,
+  },
+  boot(vm, [kernel, disk]) {
+    vm.bootVirtLinuxDirect({
+      kernel,
+      disk,
+      ramMB: 512,
+      cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
+    });
+  },
+  run(vm) { return vm.runVirtSystem(2_000_000n); },
+  instructions(vm) { return vm.virtInsnCount(); },
+  pc(vm) { return vm.virtPc(); },
+};
 const preset = presets[presetName];
-if (!preset) throw new Error("preset must be 'fast', 'modern', or 'modern-direct'");
+if (!preset) {
+  throw new Error(
+    "preset must be 'fast', 'modern', 'modern-direct', or 'modern-alpine'",
+  );
+}
 
 const loadStarted = performance.now();
 const [wasm, ...images] = await Promise.all([

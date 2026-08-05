@@ -53,6 +53,7 @@
             VIRTIO_MMIO = yes;
             VIRTIO_BLK = yes;
             VIRTIO_NET = yes;
+            VIRTIO_CONSOLE = yes;
             EXT4_FS = yes;
             PACKET = yes;
             # The proxy exposes its ephemeral public CA before networking via
@@ -64,48 +65,55 @@
           };
           ignoreConfigErrors = true;
         };
-        # A single-hart kernel for the hardware rv64.js actually implements.
-        # Keep the Debian demo's disk, network and 9p paths built in, but remove
-        # broad distro hardware support and expensive debug/tracing startup.
-        # The stock-derived virtKernel remains the conformance oracle.
-        virtKernelFast = pkgs.pkgsCross.riscv64.linux_latest.override {
-          structuredExtraConfig = with pkgs.lib.kernel; {
-            VIRTIO = yes;
-            VIRTIO_MMIO = yes;
-            VIRTIO_BLK = yes;
-            VIRTIO_NET = yes;
-            EXT4_FS = yes;
-            PACKET = yes;
-            NET_9P = yes;
-            NET_9P_VIRTIO = yes;
-            "9P_FS" = yes;
-
-            SMP = pkgs.lib.mkForce no;
-            NUMA = pkgs.lib.mkForce no;
-            EFI = pkgs.lib.mkForce no;
-            ACPI = pkgs.lib.mkForce no;
-            IPV6 = pkgs.lib.mkForce no;
-            CMA = pkgs.lib.mkForce no;
-            HUGETLBFS = pkgs.lib.mkForce no;
-            HUGETLB_PAGE = pkgs.lib.mkForce no;
-            AUDIT = pkgs.lib.mkForce no;
-            PERF_EVENTS = pkgs.lib.mkForce no;
-            FTRACE = pkgs.lib.mkForce no;
-            FUNCTION_TRACER = pkgs.lib.mkForce no;
-            DEBUG_KERNEL = pkgs.lib.mkForce no;
-            DEBUG_VM_PGTABLE = pkgs.lib.mkForce no;
-            KFENCE = pkgs.lib.mkForce no;
-            TASKS_RUDE_RCU = pkgs.lib.mkForce no;
-            TASKS_TRACE_RCU = pkgs.lib.mkForce no;
+        # A single-hart, opt-in kernel for exactly the hardware rv64.js
+        # implements. Unlike the conformance kernel above, this starts from
+        # allnoconfig and enables only the contract in kernel/rv64-config.nix.
+        virtKernelFast = (pkgs.pkgsCross.riscv64.linux_latest.override {
+          defconfig = "allnoconfig";
+          enableCommonConfig = false;
+          autoModules = false;
+          preferBuiltin = true;
+          structuredExtraConfig = import ./kernel/rv64-config.nix {
+            inherit (pkgs) lib;
           };
-          ignoreConfigErrors = true;
-        };
+          ignoreConfigErrors = false;
+        }).overrideAttrs (old: {
+          # The Nix RISC-V install hook installs Image.gz, while the default
+          # kernel build target produces only Image. Build the required
+          # packaging artifact without changing the runtime kernel payload.
+          postBuild = (old.postBuild or "") + ''
+            make $makeFlags Image.gz
+          '';
+          # linux_latest's pre-override package is modular, so its computed
+          # postInstall hook otherwise survives overrideAttrs and attempts a
+          # modules_install even though this resolved config has MODULES=n.
+          postInstall = ''
+            cp arch/riscv/boot/Image $out/Image
+          '';
+        });
         virtOpensbi = pkgs.pkgsCross.riscv64.opensbi;
+        v86Kernel = (pkgs.pkgsi686Linux.linux_latest.override {
+          defconfig = "allnoconfig";
+          enableCommonConfig = false;
+          autoModules = false;
+          preferBuiltin = true;
+          structuredExtraConfig = import ./kernel/x86-v86-config.nix {
+            inherit (pkgs) lib;
+          };
+          ignoreConfigErrors = false;
+        }).overrideAttrs {
+          # As with the rv64 package, discard the modular post-install hook
+          # inherited from linux_latest and expose the benchmark payload.
+          postInstall = ''
+            cp arch/x86/boot/bzImage $out/bzImage
+          '';
+        };
       in
       {
         packages.virt-kernel = virtKernel;
         packages.virt-kernel-fast = virtKernelFast;
         packages.virt-opensbi = virtOpensbi;
+        packages.v86-kernel = v86Kernel;
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [

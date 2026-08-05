@@ -31,6 +31,7 @@ const vm = await RV64.create({
   events: {
     console(bytes) {
       output += decoder.decode(bytes, { stream: true });
+      if (process.env.RV64_BOOT_TRACE) process.stdout.write(bytes);
       if (!sentApk && output.includes("ALPINE_READY")) {
         sentApk = true;
         vm.console.send("apk update && echo APK_UPDATE_OK\n");

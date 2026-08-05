@@ -145,6 +145,8 @@ fn main() {
         initrd: initrd.as_deref(),
         disk,
         fs,
+        external_fs: None,
+        virtio_console: false,
         net,
     };
     let mut m = if direct {

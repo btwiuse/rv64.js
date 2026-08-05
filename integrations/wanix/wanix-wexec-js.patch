@@ -1,0 +1,171 @@
+diff --git a/extras/wexec/main.go b/extras/wexec/main.go
+index 39bae08..147253d 100644
+--- a/extras/wexec/main.go
++++ b/extras/wexec/main.go
+@@ -1,6 +1,8 @@
+ package main
+ 
+ import (
++	"bytes"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"log"
+@@ -10,6 +12,7 @@ import (
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
++	"syscall"
+ 	"time"
+ )
+ 
+@@ -42,14 +45,35 @@ func main() {
+ 		log.Fatal(err)
+ 	}
+ 	args := os.Args[1:]
+-	args[0] = strings.TrimPrefix(filepath.Join("vm/1/fsys", wd, args[0]), "/")
++	taskKind := "wasi"
++	if program, readErr := os.ReadFile(args[0]); readErr == nil && !bytes.HasPrefix(program, []byte{'\x00', 'a', 's', 'm'}) {
++		taskKind = "js"
++	}
++	if taskKind == "js" {
++		args[0] = strings.TrimPrefix(filepath.Join(wd, args[0]), "/")
++	} else {
++		args[0] = strings.TrimPrefix(filepath.Join("vm/1/fsys", wd, args[0]), "/")
++	}
+ 
+ 	debug("allocating pid")
+-	pidRaw, err := os.ReadFile("/task/new/wasi")
++	pidRaw, err := os.ReadFile("/task/new/" + taskKind)
+ 	if err != nil {
+ 		log.Fatal(err)
+ 	}
+ 	pid := strings.TrimSpace(string(pidRaw))
++	stdoutPath := fmt.Sprintf("/task/%s/fd/1", pid)
++	stderrPath := fmt.Sprintf("/task/%s/fd/2", pid)
++	if taskKind == "js" {
++		stdoutPath = fmt.Sprintf("/tmp/.wexec-%s.out", pid)
++		stderrPath = fmt.Sprintf("/tmp/.wexec-%s.err", pid)
++		for _, name := range []string{stdoutPath, stderrPath} {
++			f, createErr := os.Create(name)
++			if createErr != nil {
++				log.Fatal(createErr)
++			}
++			f.Close()
++		}
++	}
+ 
+ 	debug("writing cmd")
+ 	if err := appendFile(fmt.Sprintf("/task/%s/cmd", pid), []byte(strings.Join(args, " "))); err != nil {
+@@ -58,6 +82,13 @@ func main() {
+ 
+ 	debug("writing env")
+ 	env := strings.Join(append(os.Environ(), ""), "\n")
++	if taskKind == "js" {
++		hostPath := func(name string) string {
++			return strings.TrimPrefix(filepath.Join(wd, name), "/")
++		}
++		env += "WEXEC_STDOUT=" + hostPath(stdoutPath) + "\n"
++		env += "WEXEC_STDERR=" + hostPath(stderrPath) + "\n"
++	}
+ 	if err := appendFile(fmt.Sprintf("/task/%s/env", pid), []byte(env)); err != nil {
+ 		log.Fatal(err)
+ 	}
+@@ -68,47 +99,13 @@ func main() {
+ 	go func() {
+ 		defer wg.Done()
+ 		debug("polling fd/1 => stdout")
+-		f, err := os.Open(fmt.Sprintf("/task/%s/fd/1", pid))
+-		if err != nil {
+-			log.Fatal(err)
+-		}
+-		defer f.Close()
+-		b := make([]byte, 4096)
+-		for {
+-			n, err := f.Read(b)
+-			if err != nil && err != io.EOF {
+-				log.Fatal(err)
+-			}
+-			if done.Load() == 1 && n == 0 {
+-				debug("stdout thread done")
+-				return
+-			}
+-			os.Stdout.Write(b[:n])
+-			time.Sleep(30 * time.Millisecond)
+-		}
++		copyOutput(stdoutPath, os.Stdout, &done, taskKind == "js")
+ 	}()
+ 	wg.Add(1)
+ 	go func() {
+ 		defer wg.Done()
+ 		debug("polling fd/2 => stderr")
+-		f, err := os.Open(fmt.Sprintf("/task/%s/fd/2", pid))
+-		if err != nil {
+-			log.Fatal(err)
+-		}
+-		defer f.Close()
+-		b := make([]byte, 4096)
+-		for {
+-			n, err := f.Read(b)
+-			if err != nil && err != io.EOF {
+-				log.Fatal(err)
+-			}
+-			if done.Load() == 1 && n == 0 {
+-				debug("stderr thread done")
+-				return
+-			}
+-			os.Stderr.Write(b[:n])
+-			time.Sleep(30 * time.Millisecond)
+-		}
++		copyOutput(stderrPath, os.Stderr, &done, taskKind == "js")
+ 	}()
+ 
+ 	debug("starting")
+@@ -139,6 +136,47 @@ func main() {
+ 	}
+ }
+ 
++func copyOutput(path string, dst io.Writer, done *atomic.Int32, reopen bool) {
++	buf := make([]byte, 4096)
++	if reopen {
++		offset := 0
++		for {
++			data, err := os.ReadFile(path)
++			if err != nil {
++				if errors.Is(err, syscall.ENODATA) || errors.Is(err, syscall.EAGAIN) {
++					time.Sleep(30 * time.Millisecond)
++					continue
++				}
++				log.Fatal(err)
++			}
++			if len(data) > offset {
++				dst.Write(data[offset:])
++				offset = len(data)
++			}
++			if done.Load() == 1 && len(data) == offset {
++				return
++			}
++			time.Sleep(30 * time.Millisecond)
++		}
++	}
++	stream, err := os.Open(path)
++	if err != nil {
++		log.Fatal(err)
++	}
++	defer stream.Close()
++	for {
++		n, err := stream.Read(buf)
++		if err != nil && err != io.EOF {
++			log.Fatal(err)
++		}
++		if done.Load() == 1 && n == 0 {
++			return
++		}
++		dst.Write(buf[:n])
++		time.Sleep(30 * time.Millisecond)
++	}
++}
++
+ func appendFile(path string, data []byte) error {
+ 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+ 	if err != nil {

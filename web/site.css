@@ -46,7 +46,16 @@ button { font: inherit; }
 #boot { border: 0; background: var(--green); color: #062014; font-weight: 750; }
 #boot:disabled { opacity: .55; cursor: progress; }
 .secondary { border: 1px solid var(--line); background: transparent; color: var(--text); }
-#status { margin-left: auto; color: var(--muted); font: .82rem ui-monospace, monospace; }
+.telemetry {
+  display: grid;
+  gap: .1rem;
+  margin-left: auto;
+  color: var(--muted);
+  font: .82rem/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.telemetry > div { display: grid; grid-template-columns: 2.5rem auto; gap: .5rem; }
+.telemetry-label { color: var(--green); font-weight: 700; letter-spacing: .06em; }
 
 .terminal-wrap { overflow: hidden; border: 1px solid var(--line); border-radius: .75rem; background: #030504; box-shadow: 0 2rem 6rem #0008; }
 .terminal-bar { display: flex; align-items: center; gap: .4rem; height: 2.5rem; padding: 0 .85rem; background: #181c23; }
@@ -70,6 +79,6 @@ footer { min-height: 5rem; border-top: 1px solid var(--line); color: var(--muted
   main { padding-block: 2.5rem; }
   .presets { grid-template-columns: 1fr; }
   .controls { flex-wrap: wrap; }
-  #status { width: 100%; margin-left: 0; }
+  .telemetry { width: 100%; margin-left: 0; }
   #terminal { height: 25rem; }
 }

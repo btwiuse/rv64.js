@@ -1,0 +1,149 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WANIX: v86 and rv64.js</title>
+  <script type="module" src="../dist/wanix.min.js"></script>
+  <style>
+    html, body { width: 100%; height: 100%; margin: 0; background: #111; color: #ddd; font: 14px system-ui; }
+    main { height: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: #555; }
+    section { min-width: 0; display: grid; grid-template-rows: 36px minmax(0, 1fr); background: #111; }
+    h2 { box-sizing: border-box; height: 36px; margin: 0; padding: 8px 12px; font-size: 15px; background: #222; }
+    wanix-namespace, wanix-term { display: block; min-height: 0; height: 100%; }
+  </style>
+</head>
+<body>
+<wanix-namespace id="shared-system">
+  <wanix-bind dst="." src="#ramfs/new"></wanix-bind>
+  <wanix-bind dst="shared" src="#ramfs/new"></wanix-bind>
+  <wanix-bind dst="task" src="#task"></wanix-bind>
+  <wanix-bind dst="shared/bench.py" type="file" perm="0755">import hashlib
+import os
+import platform
+import time
+
+def timed(label, fn):
+    start = time.perf_counter()
+    result = fn()
+    elapsed = time.perf_counter() - start
+    print(f"{label:20s} {elapsed:8.3f} s  {result}", flush=True)
+
+def python_cpu():
+    value = 0x12345678
+    for i in range(250_000):
+        value = ((value * 1664525 + 1013904223) ^ i) &amp; 0xffffffff
+    return f"checksum={value:08x}"
+
+def sha256_test():
+    block = bytes(range(256)) * 4096
+    total = 32 * 1024 * 1024
+    start = time.perf_counter()
+    digest = hashlib.sha256()
+    for _ in range(total // len(block)):
+        digest.update(block)
+    elapsed = time.perf_counter() - start
+    return f"{total / elapsed / 1048576:.1f} MiB/s {digest.hexdigest()[:16]}"
+
+def shared_io():
+    path = f"/shared/bench-{platform.machine()}.bin"
+    block = bytes(range(256)) * 4096
+    total = 4 * 1024 * 1024
+    start = time.perf_counter()
+    with open(path, "wb", buffering=0) as out:
+        for _ in range(total // len(block)):
+            out.write(block)
+    write_elapsed = time.perf_counter() - start
+    start = time.perf_counter()
+    with open(path, "rb", buffering=0) as src:
+        while src.read(len(block)):
+            pass
+    read_elapsed = time.perf_counter() - start
+    os.unlink(path)
+    return f"write {total/write_elapsed/1048576:.1f}, read {total/read_elapsed/1048576:.1f} MiB/s"
+
+print(f"{platform.machine()} Python {platform.python_version()}")
+timed("pure Python CPU", python_cpu)
+timed("SHA-256 (32 MiB)", sha256_test)
+timed("shared 9P I/O", shared_io)
+</wanix-bind>
+  <wanix-bind dst="wtop" type="file" perm="0755">#!/usr/bin/env wexec
+const workerReady = new Promise((resolve) => {
+  globalThis.onmessage = (event) => {
+    if (event.data.worker) resolve(event.data.worker);
+  };
+});
+const handleURL = new URL("/dist/wanix.handle.js", globalThis.location.origin).href;
+const { WanixHandle } = await import(handleURL);
+const worker = await workerReady;
+const sys = new WanixHandle(worker.port);
+const encoder = new TextEncoder();
+const read = async (path) => {
+  try { return (await sys.readText(path)).trim(); }
+  catch { return ""; }
+};
+const print = (text) => sys.appendFile(worker.env.WEXEC_STDOUT, encoder.encode(text));
+
+for (;;) {
+  const entries = await sys.readDir("task");
+  const ids = entries
+    .map((entry) => String(entry.name ?? entry.Name ?? entry).replace(/\/$/, ""))
+    .filter((name) => /^\d+$/.test(name))
+    .sort((a, b) => Number(a) - Number(b));
+  const rows = await Promise.all(ids.map(async (id) => {
+    const base = `task/${id}`;
+    const [kind, alias, cmd, exit] = await Promise.all([
+      read(`${base}/kind`), read(`${base}/alias`),
+      read(`${base}/cmd`), read(`${base}/exit`),
+    ]);
+    const state = exit === "" ? "RUN" : `EXIT ${exit}`;
+    return `${id.padStart(4)}  ${state.padEnd(8)}  ${(kind || "-").padEnd(6)}  ${(alias || "-").padEnd(8)}  ${cmd}`;
+  }));
+  await print(`\x1b[H\x1b[2JWANIX TASKS  ${new Date().toLocaleTimeString()}\n PID  STATE     KIND    ALIAS     COMMAND\n${rows.join("\n")}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+}
+</wanix-bind>
+  <wanix-bind dst="wrepeat" type="file" perm="0755">#!/usr/bin/env wexec
+const workerReady = new Promise((resolve) => {
+  globalThis.onmessage = (event) => {
+    if (event.data.worker) resolve(event.data.worker);
+  };
+});
+const handleURL = new URL("/dist/wanix.handle.js", globalThis.location.origin).href;
+const { WanixHandle } = await import(handleURL);
+const worker = await workerReady;
+const sys = new WanixHandle(worker.port);
+const encoder = new TextEncoder();
+const words = worker.cmd.trim().split(/\s+/).slice(1);
+const message = words.join(" ") || "wrepeat";
+for (;;) {
+  await sys.appendFile(worker.env.WEXEC_STDOUT, encoder.encode(`${message}\n`));
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+}
+</wanix-bind>
+  <wanix-bind dst="vm" src="#vm"></wanix-bind>
+  <wanix-bind dst="#vm/v86" src="../v86/v86.tgz" type="archive"></wanix-bind>
+  <wanix-bind dst="#vm/rv64" src="../rv64/rv64.tgz" type="archive"></wanix-bind>
+
+  <main>
+    <section>
+      <h2>x86 Linux — copy/v86 via WANIX (shared at /shared)</h2>
+      <wanix-vm id="x86" type="v86" export="ttyS0" mem="512M" term start>
+        <wanix-bind dst="." src="../extras/dist/wanix-linux.tgz" type="archive"></wanix-bind>
+        <wanix-bind dst="usr/bin/wtop" src="wtop"></wanix-bind>
+        <wanix-bind dst="usr/bin/wrepeat" src="wrepeat"></wanix-bind>
+      </wanix-vm>
+      <wanix-term path="#vm/x86/term" raw></wanix-term>
+    </section>
+    <section>
+      <h2>RISC-V Linux — rv64.js via WANIX (shared at /shared)</h2>
+      <wanix-vm id="rv64" type="rv64" export="hvc0" mem="512M" term start>
+        <wanix-bind dst="." src="../extras/dist/wanix-linux-rv64.tgz" type="archive"></wanix-bind>
+        <wanix-bind dst="usr/bin/wtop" src="wtop"></wanix-bind>
+        <wanix-bind dst="usr/bin/wrepeat" src="wrepeat"></wanix-bind>
+      </wanix-vm>
+      <wanix-term path="#vm/rv64/term" raw></wanix-term>
+    </section>
+  </main>
+</wanix-namespace>
+</body>
+</html>

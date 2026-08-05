@@ -11,6 +11,14 @@ pub enum Backend {
     /// virtio-9p (device id 9): host filesystem sharing. One queue, carrying
     /// 9P2000.L messages that `p9::Server` answers.
     Fs { srv: crate::p9::Server },
+    /// virtio-9p whose server lives in the JavaScript host. Requests remain on
+    /// the virtqueue until `fs_external_reply` supplies the matching reply.
+    FsExternal {
+        tag: String,
+        request: Option<Vec<u8>>,
+        reply: Option<Vec<u8>>,
+        awaiting_reply: bool,
+    },
     /// virtio-net (device id 1). RX = queue 0, TX = queue 1.
     ///
     /// The device works purely at layer 2: it moves whole Ethernet frames
@@ -97,7 +105,7 @@ impl VirtioDev {
         match self.backend {
             Backend::Console { .. } => 3,
             Backend::Block { .. } => 2,
-            Backend::Fs { .. } => 9,
+            Backend::Fs { .. } | Backend::FsExternal { .. } => 9,
             Backend::Net { .. } => 1,
         }
     }
@@ -110,7 +118,7 @@ impl VirtioDev {
             0 => match self.backend {
                 // bit 0: VIRTIO_9P_MOUNT_TAG — config space carries the tag
                 // the guest mounts by. Without it the driver refuses to probe.
-                Backend::Fs { .. } => 1,
+                Backend::Fs { .. } | Backend::FsExternal { .. } => 1,
                 // bit 5: VIRTIO_NET_F_MAC — the MAC in config space is ours to
                 // give. Offering nothing else keeps the driver off checksum
                 // offload, GSO and mergeable RX buffers, none of which a
@@ -129,7 +137,7 @@ impl VirtioDev {
             // chain, and the client scatters payload across page-sized
             // descriptors — so the ring needs MAX_MSIZE/4096 entries plus
             // headroom. 128 is also the driver's own VIRTQUEUE_NUM.
-            Backend::Fs { .. } => 128,
+            Backend::Fs { .. } | Backend::FsExternal { .. } => 128,
             // Modern virtio_net stops a TX queue unless it has enough free
             // descriptors for a maximally fragmented skb plus its header.
             // A 16-entry ring can transmit once and then remain stopped even
@@ -278,6 +286,14 @@ impl VirtioDev {
                     _ => tag.get(off as usize - 2).copied().unwrap_or(0),
                 }
             }
+            Backend::FsExternal { tag, .. } => {
+                let tag = tag.as_bytes();
+                match off {
+                    0 => tag.len() as u8,
+                    1 => (tag.len() >> 8) as u8,
+                    _ => tag.get(off as usize - 2).copied().unwrap_or(0),
+                }
+            }
             Backend::Net { mac, .. } => {
                 // struct virtio_net_config { u8 mac[6]; le16 status; ... }
                 // status stays 0: VIRTIO_NET_F_STATUS is not offered, so the
@@ -310,6 +326,39 @@ impl VirtioDev {
     /// True when this device has inbound frames waiting for an RX buffer.
     pub fn net_rx_pending(&self) -> bool {
         matches!(&self.backend, Backend::Net { inbox, .. } if !inbox.is_empty())
+    }
+
+    /// Take the external 9P request waiting for the JavaScript host.
+    pub fn fs_external_take_request(&mut self) -> Option<Vec<u8>> {
+        match &mut self.backend {
+            Backend::FsExternal {
+                request,
+                awaiting_reply,
+                ..
+            } => {
+                let request = request.take();
+                if request.is_some() {
+                    *awaiting_reply = true;
+                }
+                request
+            }
+            _ => None,
+        }
+    }
+
+    /// Supply the reply for the outstanding external 9P request.
+    pub fn fs_external_reply(&mut self, bytes: Vec<u8>) -> bool {
+        match &mut self.backend {
+            Backend::FsExternal {
+                reply,
+                awaiting_reply,
+                ..
+            } if *awaiting_reply && reply.is_none() => {
+                *reply = Some(bytes);
+                true
+            }
+            _ => false,
+        }
     }
 
     // ---- virtqueue processing ------------------------------------------
@@ -493,6 +542,42 @@ impl VirtioDev {
                     pos += n;
                 }
                 Some(pos as u32)
+            }
+            Backend::FsExternal {
+                request,
+                reply,
+                awaiting_reply,
+                ..
+            } => {
+                if let Some(reply) = reply.take() {
+                    let mut pos = 0usize;
+                    for &(addr, len, writable) in chain {
+                        if !writable || pos >= reply.len() {
+                            continue;
+                        }
+                        let n = (reply.len() - pos).min(len as usize);
+                        match guest_slice_mut(ram, ram_base, addr, n as u32) {
+                            Some(d) => d.copy_from_slice(&reply[pos..pos + n]),
+                            None => break,
+                        }
+                        pos += n;
+                    }
+                    *awaiting_reply = false;
+                    return Some(pos as u32);
+                }
+                if request.is_none() && !*awaiting_reply {
+                    let mut bytes = Vec::new();
+                    for &(addr, len, writable) in chain {
+                        if !writable {
+                            bytes.extend_from_slice(guest_slice(ram, ram_base, addr, len)?);
+                        }
+                    }
+                    if bytes.is_empty() {
+                        return Some(0);
+                    }
+                    *request = Some(bytes);
+                }
+                None
             }
             Backend::Net { inbox, outbox, .. } => {
                 if qi == 0 {
@@ -767,6 +852,48 @@ mod tests {
         assert_eq!(dev.read_sized(0x100, 2), 9);
         let tag: Vec<u8> = (0..9).map(|i| dev.read_sized(0x102 + i, 1) as u8).collect();
         assert_eq!(&tag, b"hostshare");
+    }
+
+    #[test]
+    fn external_9p_leaves_the_chain_pending_until_the_host_replies() {
+        let mut dev = VirtioDev::new(Backend::FsExternal {
+            tag: "host9p".into(),
+            request: None,
+            reply: None,
+            awaiting_reply: false,
+        });
+        let mut ram = vec![0u8; 64 * 1024];
+        setup_queue(&mut dev);
+        let request = [7, 0, 0, 0, 100, 3, 0];
+        ram[REQ..REQ + request.len()].copy_from_slice(&request);
+        put_desc(&mut ram, 0, REQ, request.len() as u32, 1, 1);
+        put_desc(&mut ram, 1, REPLY, 4096, 2, 0);
+        publish(&mut ram, &RING0, 0, 1);
+
+        dev.process(0, &mut ram, BASE);
+        assert_eq!(u16_at(&ram, USED + 2), 0);
+        assert_eq!(
+            dev.fs_external_take_request().as_deref(),
+            Some(request.as_slice())
+        );
+        assert_eq!(
+            dev.fs_external_take_request(),
+            None,
+            "request is emitted once"
+        );
+        dev.process(0, &mut ram, BASE);
+        assert_eq!(
+            dev.fs_external_take_request(),
+            None,
+            "in-flight request is not re-emitted"
+        );
+
+        let reply = [7, 0, 0, 0, 101, 3, 0];
+        assert!(dev.fs_external_reply(reply.to_vec()));
+        dev.process(0, &mut ram, BASE);
+        assert_eq!(u16_at(&ram, USED + 2), 1);
+        assert_eq!(&ram[REPLY..REPLY + reply.len()], &reply);
+        assert!(dev.irq_pending());
     }
 
     #[test]

@@ -1,0 +1,153 @@
+diff --git a/task.go b/task.go
+index 92b162f..5880863 100644
+--- a/task.go
++++ b/task.go
+@@ -72,6 +72,12 @@ func SetWorker(t *Task, worker any) {
+ 	t.worker = worker
+ }
+ 
++func SetCloser(t *Task, closer func()) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	t.closer = closer
++}
++
+ func GetWorker(t *Task) any {
+ 	t.mu.Lock()
+ 	defer t.mu.Unlock()
+@@ -195,6 +201,20 @@ func (r *Task) OpenFD(file fs.File, path string) int {
+ 	return r.fdIdx
+ }
+ 
++func (r *Task) SetFD(fd int, path string) error {
++	file, err := r.NS().Open(path)
++	if err != nil {
++		return err
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.fds[fd] = &openFile{file: file, path: path}
++	if fd > r.fdIdx {
++		r.fdIdx = fd
++	}
++	return nil
++}
++
+ func (r *Task) CloseFD(fd int) error {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+@@ -237,6 +257,15 @@ func (r *Task) Open(name string) (fs.File, error) {
+ }
+ 
+ func (r *Task) taskMap() fskit.MapFS {
++	fdMap := fskit.MapFS{}
++	r.mu.Lock()
++	for fd, opened := range r.fds {
++		fdPath := opened.path
++		fdMap[strconv.Itoa(fd)] = fskit.OpenFunc(func(ctx context.Context, name string) (fs.File, error) {
++			return r.NS().OpenContext(ctx, fdPath)
++		})
++	}
++	r.mu.Unlock()
+ 	m := fskit.MapFS{
+ 		"ctl": misc.ControlFile(&cli.Command{
+ 			Usage: "ctl",
+@@ -330,6 +359,9 @@ func (r *Task) taskMap() fskit.MapFS {
+ 		}),
+ 		"ns": r.ns,
+ 	}
++	if len(fdMap) > 0 {
++		m["fd"] = fdMap
++	}
+ 	if r.export != nil {
+ 		m["export"] = r.export
+ 	}
+diff --git a/web/jsdriver.go b/web/jsdriver.go
+index 46f5374..e3511ba 100644
+--- a/web/jsdriver.go
++++ b/web/jsdriver.go
+@@ -22,7 +22,23 @@ func (d *JSDriver) Check(t *wanix.Task) bool {
+ }
+ 
+ func (d *JSDriver) Start(t *wanix.Task) error {
+-	data, err := fs.ReadFile(d.Root.NS(), t.Arg(0))
++	for _, entry := range t.Env() {
++		key, value, ok := strings.Cut(entry, "=")
++		if !ok {
++			continue
++		}
++		switch key {
++		case "WEXEC_STDOUT":
++			if err := t.SetFD(1, value); err != nil {
++				return err
++			}
++		case "WEXEC_STDERR":
++			if err := t.SetFD(2, value); err != nil {
++				return err
++			}
++		}
++	}
++	data, err := fs.ReadFile(t.NS(), t.Arg(0))
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/web/worker/task.go b/web/worker/task.go
+index 4d95aa2..11a3aa4 100644
+--- a/web/worker/task.go
++++ b/web/worker/task.go
+@@ -22,6 +22,8 @@ func StartTaskWorker(svc *Device, t *wanix.Task, blobURL string) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	args := append([]string{blobURL}, strings.Split(t.Cmd(), " ")...)
++	args := append([]string{}, t.Env()...)
++	args = append(args, blobURL)
++	args = append(args, strings.Split(t.Cmd(), " ")...)
+ 	return w.Start(args...)
+ }
+diff --git a/web/worker/worker.go b/web/worker/worker.go
+index 16b2a43..193f79e 100644
+--- a/web/worker/worker.go
++++ b/web/worker/worker.go
+@@ -30,6 +30,13 @@ type Resource struct {
+ 	task   *wanix.Task
+ }
+ 
++func (r *Resource) Terminate() {
++	if !r.worker.IsUndefined() && !r.worker.IsNull() {
++		r.worker.Call("terminate")
++	}
++	r.state = "terminated"
++}
++
+ type guestSetter interface {
+ 	fs.FS
+ 	SetGuest(fs.FS)
+@@ -61,6 +68,7 @@ func (r *Resource) Start(args ...string) error {
+ 	var url js.Value = js.Undefined()
+ 	if len(args) > 0 {
+ 		url = js.ValueOf(args[0])
++		args = args[1:]
+ 	} else {
+ 		blob := js.Global().Get("Blob").New(js.ValueOf([]any{r.src}), js.ValueOf(map[string]any{"type": "text/javascript"}))
+ 		url = js.Global().Get("URL").Call("createObjectURL", blob)
+@@ -79,6 +87,7 @@ func (r *Resource) Start(args ...string) error {
+ 	}))
+ 
+ 	wanix.SetWorker(r.task, r.worker)
++	wanix.SetCloser(r.task, r.Terminate)
+ 
+ 	port := sys.Element().Call("_openPort", r.task.ID())
+ 	p9 := sys.Element().Call("_open9P", r.task.ID())
+@@ -162,10 +171,7 @@ func (r *Resource) rootFS() fskit.MapFS {
+ 				case "start":
+ 					r.Start(args[1:]...)
+ 				case "terminate":
+-					if !r.worker.IsUndefined() {
+-						r.worker.Call("terminate")
+-					}
+-					r.state = "terminated"
++					r.Terminate()
+ 				}
+ 			},
+ 		}),

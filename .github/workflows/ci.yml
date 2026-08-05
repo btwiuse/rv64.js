@@ -13,6 +13,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release-assets-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: deploy/release-assets-worker/package-lock.json
+
+      - name: Install release asset Worker dependencies
+        working-directory: deploy/release-assets-worker
+        run: npm ci
+
+      - name: Validate release asset Worker
+        working-directory: deploy/release-assets-worker
+        run: npm run check
+
+      - name: Validate release asset Worker bundle
+        working-directory: deploy/release-assets-worker
+        run: npx wrangler deploy --dry-run
+
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -49,6 +74,8 @@ jobs:
       - name: Test self-contained JavaScript harnesses
         run: |
           node tests/public-api.mjs
+          node tests/worker-api.mjs
+          node tests/site-asset-source.mjs
           node tests/direct-boot.mjs
           node tests/alpine-boot.mjs
           node tests/vs-v86/harness-selftest.mjs

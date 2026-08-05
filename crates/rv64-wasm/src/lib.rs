@@ -1470,6 +1470,9 @@ static mut VIRT_DISK: Vec<u8> = Vec::new();
 static mut VIRT_CMDLINE: Vec<u8> = Vec::new();
 static mut VIRT_NET_ON: bool = false;
 static mut VIRT_NET_MAC: Vec<u8> = Vec::new();
+static mut VIRT_FS_EXTERNAL_TAG: Vec<u8> = Vec::new();
+static mut VIRT_CONSOLE_ON: bool = false;
+static mut VIRT_LAST_MONOTONIC_MS: f64 = 0.0;
 static mut VIRT: Option<rv64_system::virt::VirtMachine> = None;
 
 stage_into!(virt_stage_opensbi, VIRT_OPENSBI);
@@ -1478,11 +1481,17 @@ stage_into!(virt_stage_initrd, VIRT_INITRD);
 stage_into!(virt_stage_disk, VIRT_DISK);
 stage_into!(virt_stage_cmdline, VIRT_CMDLINE);
 stage_into!(virt_stage_net_mac, VIRT_NET_MAC);
+stage_into!(virt_stage_fs_external_tag, VIRT_FS_EXTERNAL_TAG);
 
 /// Give the next modern virt machine a virtio-net NIC.
 #[no_mangle]
 pub extern "C" fn virt_net_enable(on: u32) {
     unsafe { VIRT_NET_ON = on != 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn virt_console_enable(on: u32) {
+    unsafe { VIRT_CONSOLE_ON = on != 0 }
 }
 
 /// Assemble and boot the modern virt machine from staged images.
@@ -1524,6 +1533,9 @@ fn boot_virt(ram_mb: u32, direct: bool) {
             initrd: (!VIRT_INITRD.is_empty()).then_some(VIRT_INITRD.as_slice()),
             disk: (!VIRT_DISK.is_empty()).then(|| core::mem::take(&mut VIRT_DISK)),
             fs,
+            external_fs: (!VIRT_FS_EXTERNAL_TAG.is_empty())
+                .then(|| core::str::from_utf8(&VIRT_FS_EXTERNAL_TAG).unwrap_or("host")),
+            virtio_console: VIRT_CONSOLE_ON,
             net,
         };
         let mut machine = if direct {
@@ -1536,7 +1548,9 @@ fn boot_virt(ram_mb: u32, direct: bool) {
         VIRT_KERNEL.clear();
         VIRT_INITRD.clear();
         VIRT_CMDLINE.clear();
+        VIRT_FS_EXTERNAL_TAG.clear();
         VIRT = Some(machine);
+        VIRT_LAST_MONOTONIC_MS = host_now_ms();
     }
 }
 
@@ -1545,11 +1559,19 @@ fn boot_virt(ram_mb: u32, direct: bool) {
 #[allow(static_mut_refs)]
 pub extern "C" fn virt_run(max_insns: u64) -> i32 {
     let machine = unsafe { VIRT.as_mut().expect("call virt_boot() first") };
+    let now = unsafe { host_now_ms() };
+    let elapsed_ms = unsafe { (now - VIRT_LAST_MONOTONIC_MS).max(0.0) };
+    unsafe { VIRT_LAST_MONOTONIC_MS = now };
+    machine.advance_realtime_ns((elapsed_ms * 1_000_000.0) as u64);
     machine.set_rtc_unix_ns(unsafe { host_unix_ms() } as u64 * 1_000_000);
     machine.run_slice(max_insns);
     let out = machine.console_output();
     if !out.is_empty() {
         unsafe { host_write(1, out.as_ptr(), out.len()) }
+    }
+    let export = machine.virtio_console_take_output();
+    if !export.is_empty() {
+        unsafe { host_write(3, export.as_ptr(), export.len()) }
     }
     pump_virt_net(machine);
     machine.power_off as i32
@@ -1561,6 +1583,42 @@ pub extern "C" fn virt_console_input() {
     let machine = unsafe { VIRT.as_mut().expect("call virt_boot() first") };
     let bytes = unsafe { core::mem::take(&mut STAGING) };
     machine.console_input(&bytes);
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_export_input() {
+    let machine = unsafe { VIRT.as_mut().expect("call virt_boot() first") };
+    let bytes = unsafe { core::mem::take(&mut STAGING) };
+    machine.virtio_console_input(&bytes);
+}
+
+/// Move the next external 9P request into STAGING, returning its byte length.
+/// Zero means that no request is waiting for the host.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_p9_take_request() -> u32 {
+    unsafe {
+        let Some(machine) = VIRT.as_mut() else {
+            return 0;
+        };
+        let Some(request) = machine.fs_external_take_request() else {
+            return 0;
+        };
+        STAGING = request;
+        STAGING.len() as u32
+    }
+}
+
+/// Deliver the staged reply to the external virtio-9P device.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_p9_reply() -> u32 {
+    unsafe {
+        let reply = core::mem::take(&mut STAGING);
+        VIRT.as_mut()
+            .is_some_and(|machine| machine.fs_external_reply(reply)) as u32
+    }
 }
 
 /// Deliver one inbound Ethernet frame to the modern machine's NIC.
@@ -1631,6 +1689,19 @@ fn pump_wisp(stack: &mut rv64_system::netstack::NetStack) {
 #[allow(static_mut_refs)]
 pub extern "C" fn virt_insn_count() -> u64 {
     unsafe { VIRT.as_ref().map(|m| m.cpu.insn_count).unwrap_or(0) }
+}
+
+/// Diagnostic direct-SBI call counter. Indexes are total, BASE, TIME, IPI,
+/// RFENCE, HSM, SRST, and legacy/other.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_sbi_call_count(index: u32) -> u64 {
+    unsafe {
+        VIRT.as_ref()
+            .and_then(|m| m.sbi_calls.get(index as usize))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// Current modern-machine guest PC (diagnostic: boot and workload profiling).
