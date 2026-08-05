@@ -16,30 +16,15 @@
   <main>
     <section class="hero">
       <p class="eyebrow">Rust · WebAssembly · RV64GC</p>
-      <h1>Choose a Linux machine and boot it.</h1>
+      <h1>Boot Alpine Linux in your browser.</h1>
       <p>
         No server-side emulator. The CPU, devices, and JIT execute locally in
         this tab. Image downloads are cached by your browser.
       </p>
     </section>
 
-    <section class="presets" aria-label="Linux presets">
-      <button class="preset selected" data-preset="fast" type="button">
-        <span class="tag">Quick start</span>
-        <strong>Fast BusyBox Linux</strong>
-        <span>Linux 4.15 · 128 MiB RAM · ~8 MiB download</span>
-        <small>Best for trying the emulator immediately.</small>
-      </button>
-      <button class="preset" data-preset="modern" type="button">
-        <span class="tag">Full system</span>
-        <strong>Alpine Linux</strong>
-        <span>Alpine 3.24 · Linux 6.12 · 512 MiB RAM</span>
-        <small>Direct boot with networking and the apk package manager.</small>
-      </button>
-    </section>
-
     <section class="controls">
-      <button id="boot" type="button">Boot Fast Linux</button>
+      <button id="boot" type="button">Boot Alpine Linux</button>
       <button id="clear" class="secondary" type="button">Clear terminal</button>
       <div class="telemetry" aria-label="Virtual machine telemetry">
         <div><span class="telemetry-label">CPU</span><span id="status" role="status">Ready · worker</span></div>
@@ -52,19 +37,17 @@
         <span></span><span></span><span></span>
         <b id="terminal-title">rv64.js console</b>
       </div>
-      <pre id="terminal" tabindex="0" aria-label="Linux terminal">Select a machine and press Boot.</pre>
+      <pre id="terminal" tabindex="0" aria-label="Linux terminal">Press Boot Alpine Linux to start.</pre>
     </section>
 
     <section class="notes">
       <h2>Run it locally</h2>
-      <pre><code>nix develop
-web/get-images.sh
+      <pre><code>nix develop -c web/prepare-modern-images.sh
 cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
 python3 -m http.server -d . 8000
 # open http://localhost:8000/web/</code></pre>
       <p>
-        The modern preset additionally needs
-        <code>nix develop -c web/prepare-modern-images.sh</code>.
+        The demo uses the current direct-boot kernel and Alpine root image.
         See the <a href="https://github.com/ibuildthecloud/rv64.js#quick-start">README</a>
         for native and Node examples.
       </p>
@@ -76,6 +59,6 @@ python3 -m http.server -d . 8000
     <a href="https://github.com/ibuildthecloud/rv64.js">Source on GitHub</a>
   </footer>
 
-  <script type="module" src="./site.mjs?v=9"></script>
+  <script type="module" src="./site.mjs?v=10"></script>
 </body>
 </html>

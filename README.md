@@ -47,15 +47,15 @@ The hosted demo is available at
 <https://ibuildthecloud.github.io/rv64.js/>. To run it locally:
 
 ```sh
-web/get-images.sh
+nix develop -c web/prepare-modern-images.sh
 cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
 python3 -m http.server -d . 8000
 ```
 
 Open <http://localhost:8000/web/>.
 
-The page offers a fast BusyBox machine and a modern Alpine 3.24/Linux 6.12
-machine. Prepare the modern images once with:
+The page boots Alpine 3.24 on the current Linux 6.12 kernel. Prepare its images
+once with:
 
 ```sh
 nix develop -c web/prepare-modern-images.sh

@@ -39,11 +39,8 @@ jobs:
         working-directory: target/${{ github.ref_name }}
         run: sha256sum -c SHA256SUMS
 
-      - name: Validate fast and Alpine guests
-        run: |
-          nix develop --command bash -c \
-            "RV64_UNTIL='~ #' node examples/boot-linux.mjs fast"
-          nix develop --command node tests/alpine-boot.mjs
+      - name: Validate Alpine guest
+        run: nix develop --command node tests/alpine-boot.mjs
 
       - name: Verify release contents
         shell: bash
@@ -52,9 +49,6 @@ jobs:
           expected=(
             SHA256SUMS
             rv64_wasm.wasm
-            fast-bbl64.bin
-            fast-kernel-riscv64.bin
-            fast-root-riscv64.bin
             modern-Image
             modern-alpine.ext4
           )

@@ -5,13 +5,7 @@ import { defaultAssetURL, defaultRelayURL } from "./site-config.js";
 export const PUBLISHED_ASSETS = defaultAssetURL;
 
 export const PRESETS = Object.freeze({
-  fast: {
-    label: "Fast Linux",
-    ramMB: 128,
-    local: ["images/bbl64.bin", "images/kernel-riscv64.bin", "images/root-riscv64.bin"],
-    release: ["fast-bbl64.bin", "fast-kernel-riscv64.bin", "fast-root-riscv64.bin"],
-  },
-  modern: {
+  alpine: {
     label: "Alpine Linux",
     ramMB: 512,
     local: ["images/modern/Image", "images/modern/alpine.ext4"],
@@ -26,7 +20,6 @@ const boot = document.querySelector("#boot");
 const title = document.querySelector("#terminal-title");
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
-let selected = "fast";
 let active = null;
 let generation = 0;
 const requestedExecution = new URLSearchParams(location.search).get("execution");
@@ -124,25 +117,21 @@ async function start(presetName) {
       }));
     }
     if (myGeneration !== generation) return;
-    const bootConfig = presetName === "fast"
-      ? { mode: "firmware", firmware: images[0], kernel: images[1], disk: images[2] }
-      : {
-          mode: "linux-direct",
-          kernel: images[0],
-          disk: images[1],
-          cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
-        };
+    const bootConfig = {
+      mode: "linux-direct",
+      kernel: images[0],
+      disk: images[1],
+      cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
+    };
     const vm = await RV64.create({
       wasm,
       memoryMB: preset.ramMB,
       execution: { mode: executionMode },
       boot: bootConfig,
-      network: presetName === "modern"
-        ? {
-            mode: "fetch",
-            relayURL: new URLSearchParams(location.search).get("relay") || defaultRelayURL || undefined,
-          }
-        : undefined,
+      network: {
+        mode: "fetch",
+        relayURL: new URLSearchParams(location.search).get("relay") || defaultRelayURL || undefined,
+      },
       events: {
         console: (data) => write(data),
         networkTraffic: (() => {
@@ -212,14 +201,7 @@ async function start(presetName) {
   }
 }
 
-document.querySelectorAll(".preset").forEach((button) => {
-  button.addEventListener("click", () => {
-    selected = button.dataset.preset;
-    document.querySelectorAll(".preset").forEach((item) => item.classList.toggle("selected", item === button));
-    boot.textContent = selected === "fast" ? "Boot Fast Linux" : "Boot Alpine Linux";
-  });
-});
-boot.addEventListener("click", () => start(selected));
+boot.addEventListener("click", () => start("alpine"));
 document.querySelector("#clear").addEventListener("click", () => { term.textContent = ""; });
 term.addEventListener("keydown", (event) => {
   if (!active) return;
