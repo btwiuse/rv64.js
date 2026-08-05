@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="description" content="Boot RISC-V Linux in your browser with rv64.js" />
   <title>rv64.js — RISC-V Linux in your browser</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css" />
   <link rel="stylesheet" href="./site.css?v=2" />
 </head>
 <body>
@@ -37,7 +38,7 @@
         <span></span><span></span><span></span>
         <b id="terminal-title">rv64.js console</b>
       </div>
-      <pre id="terminal" tabindex="0" aria-label="Linux terminal">Press Boot Alpine Linux to start.</pre>
+      <div id="terminal" aria-label="Linux terminal"></div>
     </section>
 
     <section class="notes">
@@ -59,6 +60,6 @@ python3 -m http.server -d . 8000
     <a href="https://github.com/ibuildthecloud/rv64.js">Source on GitHub</a>
   </footer>
 
-  <script type="module" src="./site.mjs?v=10"></script>
+  <script type="module" src="./site.mjs?v=11"></script>
 </body>
 </html>

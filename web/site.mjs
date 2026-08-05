@@ -1,6 +1,8 @@
 import { RV64 } from "./rv64.js?v=2";
 import { resolveAssetOverride } from "./asset-source.mjs";
 import { defaultAssetURL, defaultRelayURL } from "./site-config.js";
+import { Terminal } from "https://esm.sh/@xterm/xterm@6.0.0";
+import { FitAddon } from "https://esm.sh/@xterm/addon-fit@0.11.0";
 
 export const PUBLISHED_ASSETS = defaultAssetURL;
 
@@ -13,7 +15,27 @@ export const PRESETS = Object.freeze({
   },
 });
 
-const term = document.querySelector("#terminal");
+const terminalElement = document.querySelector("#terminal");
+const terminal = new Terminal({
+  convertEol: true,
+  cursorBlink: true,
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+  fontSize: 14,
+  lineHeight: 1.2,
+  scrollback: 5000,
+  theme: {
+    background: "#030504",
+    foreground: "#b9f6ce",
+    cursor: "#6ee7a8",
+    selectionBackground: "#355b48",
+  },
+});
+const fitAddon = new FitAddon();
+terminal.loadAddon(fitAddon);
+terminal.open(terminalElement);
+fitAddon.fit();
+terminal.write("Press Boot Alpine Linux to start.\r\n");
+new ResizeObserver(() => fitAddon.fit()).observe(terminalElement);
 const status = document.querySelector("#status");
 const networkStatus = document.querySelector("#network-status");
 const boot = document.querySelector("#boot");
@@ -31,10 +53,7 @@ function cpuStatus(text) {
 cpuStatus("Ready");
 
 function write(data) {
-  let text = typeof data === "string" ? data : decoder.decode(data, { stream: true });
-  text = text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\r/g, "");
-  term.textContent += text;
-  term.scrollTop = term.scrollHeight;
+  terminal.write(typeof data === "string" ? data : decoder.decode(data, { stream: true }));
 }
 
 function localAssetCandidates(local, release) {
@@ -100,7 +119,7 @@ async function start(presetName) {
   const myGeneration = ++generation;
   const preset = PRESETS[presetName];
   boot.disabled = true;
-  term.textContent = "";
+  terminal.clear();
   networkStatus.textContent = "Network idle";
   networkStatus.title = "";
   write(`[host] loading ${preset.label}…\n`);
@@ -188,7 +207,7 @@ async function start(presetName) {
       setTimeout(frame, 500);
     };
     title.textContent = `${preset.label} console`;
-    term.focus();
+    terminal.focus();
     await vm.start();
     frame();
   } catch (error) {
@@ -202,15 +221,7 @@ async function start(presetName) {
 }
 
 boot.addEventListener("click", () => start("alpine"));
-document.querySelector("#clear").addEventListener("click", () => { term.textContent = ""; });
-term.addEventListener("keydown", (event) => {
-  if (!active) return;
-  if (event.ctrlKey && event.key.length === 1) {
-    active.console.send(new Uint8Array([event.key.toUpperCase().charCodeAt(0) - 64]));
-    event.preventDefault();
-    return;
-  }
-  const keys = { Enter: "\r", Backspace: "\x7f", Tab: "\t", Escape: "\x1b", ArrowUp: "\x1b[A", ArrowDown: "\x1b[B", ArrowRight: "\x1b[C", ArrowLeft: "\x1b[D" };
-  const text = keys[event.key] ?? (event.key.length === 1 ? event.key : null);
-  if (text) { active.console.send(encoder.encode(text)); event.preventDefault(); }
+document.querySelector("#clear").addEventListener("click", () => terminal.clear());
+terminal.onData((data) => {
+  if (active) active.console.send(encoder.encode(data));
 });
