@@ -1,6 +1,6 @@
 import { RV64 } from "./rv64.js?v=2";
 import { resolveAssetOverride } from "./asset-source.mjs";
-import { defaultAssetURL, defaultRelayURL } from "./site-config.js";
+import { defaultAssetURL, defaultRelayURL } from "./site-config.js?v=2";
 import { Terminal } from "https://esm.sh/@xterm/xterm@6.0.0";
 import { FitAddon } from "https://esm.sh/@xterm/addon-fit@0.11.0";
 
