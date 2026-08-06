@@ -43,7 +43,7 @@
 
     <section class="notes">
       <h2>Run it locally</h2>
-      <pre><code>nix develop -c web/prepare-modern-images.sh
+      <pre><code>nix develop -c web/prepare-images.sh
 cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
 python3 -m http.server -d . 8000
 # open http://localhost:8000/web/</code></pre>

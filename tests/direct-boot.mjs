@@ -10,9 +10,9 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const wasmPath = join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm");
 const kernelPath = resolve(
   root,
-  process.env.RV64_MODERN_KERNEL || "web/images/modern/Image",
+  process.env.RV64_MODERN_KERNEL || "web/images/alpine/Image",
 );
-const diskPath = join(root, "web/images/modern/debian.ext4");
+const diskPath = join(root, "web/images/alpine/debian.ext4");
 if (![wasmPath, kernelPath, diskPath].every(existsSync)) {
   console.log("SKIP direct Linux boot (prepare modern images first)");
   process.exit(0);

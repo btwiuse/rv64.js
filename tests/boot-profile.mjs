@@ -48,9 +48,9 @@ const presets = {
   },
   modern: {
     files: [
-      "web/images/modern/opensbi.bin",
-      process.env.RV64_MODERN_KERNEL || "web/images/modern/Image",
-      "web/images/modern/debian.ext4",
+      "web/images/alpine/opensbi.bin",
+      process.env.RV64_MODERN_KERNEL || "web/images/alpine/Image",
+      "web/images/alpine/debian.ext4",
     ],
     markers: {
       firstOutput: /./s,
@@ -77,8 +77,8 @@ const presets = {
 };
 presets["modern-direct"] = {
   files: [
-    process.env.RV64_MODERN_KERNEL || "web/images/modern/Image",
-    "web/images/modern/debian.ext4",
+    process.env.RV64_MODERN_KERNEL || "web/images/alpine/Image",
+    "web/images/alpine/debian.ext4",
   ],
   markers: {
     firstOutput: /./s,
@@ -100,8 +100,8 @@ presets["modern-direct"] = {
 };
 presets["modern-alpine"] = {
   files: [
-    process.env.RV64_MODERN_KERNEL || "web/images/modern/Image",
-    "web/images/modern/alpine.ext4",
+    process.env.RV64_MODERN_KERNEL || "web/images/alpine/Image",
+    "web/images/alpine/alpine.ext4",
   ],
   markers: {
     firstOutput: /./s,

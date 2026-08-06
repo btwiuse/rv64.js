@@ -8,10 +8,10 @@ import { RV64 } from "../web/rv64.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const wasmPath = join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm");
-const kernelPath = process.env.RV64_MODERN_KERNEL || join(root, "web/images/modern/Image");
-const diskPath = join(root, "web/images/modern/alpine.ext4");
+const kernelPath = process.env.RV64_MODERN_KERNEL || join(root, "web/images/alpine/Image");
+const diskPath = join(root, "web/images/alpine/alpine.ext4");
 if (![wasmPath, kernelPath, diskPath].every(existsSync)) {
-  console.log("SKIP Alpine boot (run web/prepare-modern-images.sh first)");
+  console.log("SKIP Alpine boot (run web/prepare-images.sh first)");
   process.exit(0);
 }
 

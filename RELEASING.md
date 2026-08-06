@@ -9,7 +9,7 @@ requires a deliberate manifest and release-process change.
 
 1. Start from a clean worktree and record the release commit.
 2. Enter the reproducible environment with `nix develop`.
-3. Ensure the modern-system kernel has been built at least once with
+3. Ensure the Alpine kernel has been built at least once with
    `tests/virt-smoke/run.sh`.
 4. Run the strict validation gate:
 
@@ -20,7 +20,7 @@ requires a deliberate manifest and release-process change.
    CI covers formatting, Clippy, guest fixtures, debug/release workspace
    tests, the browser-module build, and self-contained JavaScript tests. The
    strict local gate remains required for QEMU, Spike, architecture-signature,
-   image-dependent Wasm, and modern-system boot coverage.
+   image-dependent Wasm, and Alpine-system boot coverage.
 
 5. Run `cargo clippy --workspace --all-targets` and review every warning.
    Existing warning debt is tracked as release debt; do not introduce new
@@ -33,8 +33,7 @@ requires a deliberate manifest and release-process change.
 
 ## Required manual checks
 
-- Boot the stock browser image to a shell.
-- Boot the modern direct-boot Alpine image and run `apk update`.
+- Boot the direct-boot Alpine image to a shell and run `apk update`.
 - Exercise virtio block, console, 9p, and HTTP/HTTPS proxy paths.
 - Confirm that no credentials, generated disk images, benchmark artifacts, or
   machine-specific paths are tracked.
@@ -45,22 +44,22 @@ license and notices.
 ## Browser demo assets
 
 The GitHub Pages site is code-only. Guest firmware, kernels, disks, and the
-compiled Wasm core are published under the versioned `demo-images-v2` release
-tag so large generated binaries never enter Git history.
+compiled Wasm core are published under versioned `demo-images-vN` release tags
+so large generated binaries never enter Git history.
 
 Demo assets are built and published only by GitHub Actions from a pushed tag.
 Do not upload locally built images. After the release-source commit is on
 `main`, create and push the next versioned tag:
 
 ```sh
-git tag demo-images-v2
-git push origin demo-images-v2
+git tag demo-images-vN
+git push origin demo-images-vN
 ```
 
-The `Demo images release` workflow builds the kernel, Alpine disk, legacy fast
-images, and Wasm module in a clean runner; verifies checksums; boots both guest
-profiles; runs a real Alpine `apk update`; and creates the GitHub Release for
-that exact tag. A failed build or validation does not create a release.
+The `Demo images release` workflow builds the kernel, Alpine disk, and Wasm
+module in a clean runner; verifies checksums; boots Alpine and runs a real
+`apk update`; and creates the GitHub Release for that exact tag. A failed build
+or validation does not create a release.
 
 Tags and releases are immutable inputs to the Pages site. Never move or replace
 an existing `demo-images-vN` tag. Use a new version when any asset changes, and

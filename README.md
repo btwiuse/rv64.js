@@ -12,8 +12,8 @@ inspired by [copy/v86](https://github.com/copy/v86).
 
 **Project status: pre-release, with working Linux boots.** The native Rust
 interpreter and the browser's WebAssembly interpreter/JIT boot Linux to an
-interactive shell. The browser demo offers a small Linux 4.15/BusyBox system
-and an Alpine 3.24/Linux 6.12 system with working `apk` networking.
+interactive shell. The browser demo boots Alpine 3.24 on Linux 6.12 with
+working `apk` networking.
 
 The separate Linux user-mode runner is **experimental**. It can load static
 riscv64 ELF executables and supports enough of the Linux syscall ABI for the
@@ -47,36 +47,27 @@ The hosted demo is available at
 <https://ibuildthecloud.github.io/rv64.js/>. To run it locally:
 
 ```sh
-nix develop -c web/prepare-modern-images.sh
+nix develop -c web/prepare-images.sh
 cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
 python3 -m http.server -d . 8000
 ```
 
 Open <http://localhost:8000/web/>.
 
-The page boots Alpine 3.24 on the current Linux 6.12 kernel. Prepare its images
-once with:
+The same machine is available as a runnable Node example. It forwards the host
+terminal to the guest:
 
 ```sh
-nix develop -c web/prepare-modern-images.sh
-```
-
-The same boot paths are available as runnable Node examples. These commands
-forward the host terminal to the guest:
-
-```sh
-node examples/boot-linux.mjs fast
-node examples/boot-linux.mjs modern
+node examples/boot-linux.mjs
 ```
 
 For a non-interactive smoke test, stop after a known boot marker:
 
 ```sh
-RV64_UNTIL='~ #' node examples/boot-linux.mjs fast
-RV64_UNTIL=ALPINE_READY node examples/boot-linux.mjs modern
+RV64_UNTIL=ALPINE_READY node examples/boot-linux.mjs
 ```
 
-The browser and Node example uses the typed public API from `web/rv64.js`:
+The browser and Node examples use the typed public API from `web/rv64.js`:
 
 ```js
 import { RV64 } from "./rv64.js";
@@ -230,14 +221,18 @@ frames are passed to `vm.network.receive(frame)`.
 ### Native full-system emulator
 
 ```sh
-cargo build --release -p rv64-system
-target/release/rv64-boot web/images/bbl64.bin web/images/kernel-riscv64.bin web/images/root-riscv64.bin
+cargo build --release --bin rv64-vboot
+target/release/rv64-vboot --direct web/images/alpine/Image \
+  --disk web/images/alpine/alpine.ext4 --ram 0.5 \
+  -- 'console=ttyS0 root=/dev/vda rw init=/rv64-init'
 ```
 
 Share a host directory over virtio-9p:
 
 ```sh
-target/release/rv64-boot web/images/*.bin --9p ~/src
+target/release/rv64-vboot --direct web/images/alpine/Image \
+  --disk web/images/alpine/alpine.ext4 --9p ~/src --ram 0.5 \
+  -- 'console=ttyS0 root=/dev/vda rw init=/rv64-init'
 ```
 
 Then mount it in the guest:
@@ -249,7 +244,9 @@ mount -t 9p -o trans=virtio,version=9p2000.L host /mnt
 Enable networking through the in-process HTTP proxy:
 
 ```sh
-target/release/rv64-boot web/images/*.bin --proxy
+target/release/rv64-vboot --direct web/images/alpine/Image \
+  --disk web/images/alpine/alpine.ext4 --proxy --ram 0.5 \
+  -- 'console=ttyS0 root=/dev/vda rw init=/rv64-init rv64.network=fetch'
 ```
 
 Configure the guest:
@@ -277,7 +274,7 @@ repository tests and is exposed as `network: { mode: "fetch", relayURL }`. See
 [web/HTTP_RELAY.md](web/HTTP_RELAY.md) for the wire protocol and deployment
 details.
 
-### Modern Alpine/Linux machine
+### Alpine/Linux machine
 
 ```sh
 nix develop -c tests/virt-smoke/mk-alpine-rootfs.sh target/bench

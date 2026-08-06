@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Prepare the modern OpenSBI/Linux browser-demo assets. Outputs are ignored by
+# Prepare the Alpine/Linux browser-demo assets. Outputs are ignored by
 # git because the Alpine disk is generated reproducibly.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-out="$root/web/images/modern"
+out="$root/web/images/alpine"
 bench="$root/target/bench"
 mkdir -p "$out" "$bench"
 
@@ -26,5 +26,5 @@ if [ ! -f "$bench/alpine-riscv64.ext4" ]; then
 fi
 ln -sfn "../../../target/bench/alpine-riscv64.ext4" "$out/alpine.ext4"
 
-echo "modern images ready in $out"
+echo "demo images ready in $out"
 ls -lh "$out/opensbi.bin" "$out/Image" "$out/alpine.ext4"

@@ -333,9 +333,8 @@ lever now. Its two reverted attempts are documented in git history.
   Base/TIME/IPI/RFENCE/HSM/SRST. The five-run lean-kernel comparison improved
   readiness 4.3% and retired 1.9% fewer instructions, so it remains an option
   but kernel configuration remains the primary speed path.
-- [ ] **17. Fast `riscv-virt` guest** — rebuild the quick BusyBox preset for the
-  standard platform so the fast and Alpine demos differ by guest profile, not
-  virtual motherboard. The supported modern kernel now starts from a strict
+- [x] **17. Fast `riscv-virt` guest** — replace the legacy BusyBox preset with
+  the measured Alpine machine as the single supported demo. Its kernel starts from a strict
   `allnoconfig` contract in `kernel/rv64-config.nix`: 527 built-ins, no modules,
   and a 3.9 MiB Image. It boots Debian and Alpine through the public Wasm API,
   including the proxy CA/9p/network path and a real `apk update`. Declaring
@@ -344,12 +343,12 @@ lever now. Its two reverted attempts are documented in git history.
   instructions, effectively matching legacy TinyEMU's 1,240 ms / 42.04M. The
   v86 scorecard Boot row now uses paired Linux 6.12.7/Alpine 3.24.1
   initramfs artifacts instead of unrelated guest images; its five-run median
-  is 1,534 ms for rv64.js/OpenSBI versus 1,034 ms for v86/SeaBIOS. The modern
-  release guest is Alpine 3.24;
-  replacing the remaining legacy fast preset is the unfinished part.
+  is 1,534 ms for rv64.js/OpenSBI versus 1,034 ms for v86/SeaBIOS. The release
+  guest and browser demo now use Alpine 3.24 with direct boot exclusively.
 - [ ] **18. Release-quality terminal and package** — integrate xterm.js through
-  the public console API, test both hosted presets end to end, then publish an
-  ESM package containing JavaScript, Wasm, declarations, and source maps.
+  the public console API, test the hosted Alpine machine end to end, then
+  publish an ESM package containing JavaScript, Wasm, declarations, and source
+  maps. The xterm.js integration is complete; packaging remains.
 - [ ] **19. Persistent browser disks** — move VM execution into a dedicated
   worker and add a block-backend abstraction. Support OPFS through a synchronous
   access handle in that worker, preferably as a read-only base image plus a

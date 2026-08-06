@@ -10,7 +10,7 @@ export const PRESETS = Object.freeze({
   alpine: {
     label: "Alpine Linux",
     ramMB: 512,
-    local: ["images/modern/Image", "images/modern/alpine.ext4"],
+    local: ["images/alpine/Image", "images/alpine/alpine.ext4"],
     release: ["modern-Image", "modern-alpine.ext4"],
   },
 });

@@ -9,12 +9,12 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const useOpenSbi = process.argv.includes("--opensbi");
 const paths = {
   wasm: join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"),
-  kernel: process.env.RV64_MODERN_KERNEL || join(root, "web/images/modern/Image"),
-  disk: join(root, "web/images/modern/alpine.ext4"),
-  ...(useOpenSbi ? { opensbi: join(root, "web/images/modern/opensbi.bin") } : {}),
+  kernel: process.env.RV64_MODERN_KERNEL || join(root, "web/images/alpine/Image"),
+  disk: join(root, "web/images/alpine/alpine.ext4"),
+  ...(useOpenSbi ? { opensbi: join(root, "web/images/alpine/opensbi.bin") } : {}),
 };
 if (!Object.values(paths).every(existsSync)) {
-  console.log("SKIP SBI/apk profile (run web/prepare-modern-images.sh first)");
+  console.log("SKIP SBI/apk profile (run web/prepare-images.sh first)");
   process.exit(0);
 }
 
