@@ -52,9 +52,11 @@ button { font: inherit; }
 .terminal-bar span:nth-child(3) { background: #62c777; }
 .terminal-bar b { margin-left: .4rem; color: var(--muted); font: 500 .75rem ui-monospace, monospace; }
 #terminal {
-  height: 31rem; padding: .75rem; outline: none;
+  height: 31rem; outline: none;
 }
-#terminal:focus { box-shadow: inset 0 0 0 1px #6ee7a855; }
+#terminal .xterm { height: 100%; padding: .75rem; }
+#terminal .xterm-viewport { overflow-y: auto; }
+#terminal:focus-within { box-shadow: inset 0 0 0 1px #6ee7a855; }
 .notes { margin-top: 3rem; max-width: 52rem; }
 .notes pre { overflow-x: auto; padding: 1rem; background: var(--panel); border: 1px solid var(--line); border-radius: .6rem; }
 .notes p { color: var(--muted); }

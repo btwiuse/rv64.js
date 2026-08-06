@@ -1,0 +1,74 @@
+name: Library release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: library-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag must be an exact semver such as v0.1.0" >&2
+            exit 2
+          fi
+
+      - name: Build Wasm library
+        run: cargo build -p rv64-wasm --target wasm32-unknown-unknown --release
+
+      - name: Test JavaScript API
+        run: |
+          node tests/public-api.mjs
+          node tests/worker-api.mjs
+
+      - name: Assemble release assets
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          out="target/library-release"
+          bundle="$out/rv64.js-$version"
+          mkdir -p "$bundle"
+          install -m 0644 web/rv64.js "$bundle/rv64.js"
+          install -m 0644 web/rv64.d.ts "$bundle/rv64.d.ts"
+          install -m 0644 web/rv64.worker.js "$bundle/rv64.worker.js"
+          install -m 0644 target/wasm32-unknown-unknown/release/rv64_wasm.wasm "$bundle/rv64_wasm.wasm"
+          install -m 0644 README.md LICENSE "$bundle/"
+          tar -C "$out" -czf "$out/rv64.js-$version.tar.gz" "rv64.js-$version"
+          cp "$bundle/rv64.js" "$bundle/rv64.d.ts" "$bundle/rv64.worker.js" \
+            "$bundle/rv64_wasm.wasm" "$out/"
+          (cd "$out" && sha256sum rv64.js rv64.d.ts rv64.worker.js \
+            rv64_wasm.wasm "rv64.js-$version.tar.gz" > SHA256SUMS)
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          out="target/library-release"
+          gh release create "$GITHUB_REF_NAME" \
+            "$out/SHA256SUMS" \
+            "$out/rv64.js" \
+            "$out/rv64.d.ts" \
+            "$out/rv64.worker.js" \
+            "$out/rv64_wasm.wasm" \
+            "$out/rv64.js-$version.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "rv64.js $GITHUB_REF_NAME"
