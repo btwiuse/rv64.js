@@ -47,8 +47,8 @@ guest builds, QEMU differentials, `riscv-tests`, Spike lockstep,
 `riscv-arch-test`, Wasm/JIT tests (including standalone and both modern boot
 paths), and the modern OpenSBI/Linux Virt smoke guest.
 
-The current matrix also runs the complete RV64GCV differential twice: 8,310
-interpreter executions against QEMU and 8,310 repeated hot-JIT executions
+The current matrix also runs the complete RV64GCV differential twice: 8,724
+interpreter executions against QEMU and 8,724 repeated hot-JIT executions
 against the interpreter, followed by focused vector fault and full-system
 tests.
 
@@ -73,14 +73,14 @@ ARTIFACTS=target/bench \
 V86DIR=/path/to/pinned/v86 \
 SCORECARD_V2_EXECUTION_MODE=jit \
 SCORECARD_V2_INPUT_POPULATION=scorecard-v2-rv64gcv-v1 \
-SCORECARD_V2_OUTPUT=target/bench/rv64gcv-jit-authoritative-v1 \
+SCORECARD_V2_OUTPUT=target/bench/rv64gcv-jit-direct-simd-authoritative \
 AUTHORITATIVE=1 REPS=3 \
 node tests/vs-v86/scorecard-v2.mjs
 ```
 
-The unchanged scalar three-way regression scorecard uses
-`SCORECARD_V2_INPUT_POPULATION=scorecard-v2-modern` and the default rewrite,
-legacy, and v86 sides. See
+The unchanged scalar two-side regression scorecard uses the same runner with
+`SCORECARD_V2_INPUT_POPULATION=scorecard-v2-modern` and
+`SIDES=rewrite,v86`. See
 [RVV_JIT_RESULT.md](RVV_JIT_RESULT.md) for the measured artifact and report
 hashes.
 

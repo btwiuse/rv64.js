@@ -16,7 +16,7 @@ rv64-core = { path = "../rv64-core" }
 wasm-encoder = { version = "0.255.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-wasmparser = { version = "0.255.0", default-features = false, features = ["std", "validate"] }
+wasmparser = { version = "0.255.0", default-features = false, features = ["std", "validate", "simd"] }
 
 [[example]]
 name = "emit_real_region_corpus"

@@ -910,6 +910,7 @@ function proveRvInterpreterBypass(vm, label) {
     regionBatches: value(vm.ex.jit_stat(43)),
     userTranslationAttempts: value(vm.ex.jit_stat(74)),
     systemTranslationAttempts: value(vm.ex.jit_stat(77)),
+    directVectorInstructions: value(vm.ex.jit_stat(152)),
     registeredModules: value(vm.jitRegCount),
     registeredBytes: value(vm.jitRegBytes),
     pendingBuilds: value(vm.ex.sys_pending_builds?.()),

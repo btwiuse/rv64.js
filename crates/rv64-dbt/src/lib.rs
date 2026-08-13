@@ -55,6 +55,21 @@ pub enum VectorCapability {
     System,
 }
 
+/// Canonical RVV state cells exposed to generated modules. These are concrete
+/// Wasm-linear-memory addresses for one live machine, just like `x_base` and
+/// `f_base`; the typed helper remains available whenever a direct lowering
+/// guard does not hold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VectorStateLayout {
+    pub regs_base: u32,
+    pub vl_addr: u32,
+    pub vtype_addr: u32,
+    pub vstart_addr: u32,
+    /// Architecture-independent diagnostic counter incremented once per RVV
+    /// instruction completed by generated SIMD rather than the helper.
+    pub simd_count_addr: u32,
+}
+
 /// Architectural-state strategy for a multi-entry generated function.
 ///
 /// All variants preserve the same precise-exit contract. They exist so region
@@ -197,6 +212,10 @@ pub struct JitLayout {
     pub reservation: Option<ReservationCapability>,
     /// Typed one-instruction RVV executor for this concrete machine layout.
     pub vector: Option<VectorCapability>,
+    /// Direct access to canonical vector state. `None` keeps the exact helper
+    /// lowering and is valid for embedders that intentionally expose only the
+    /// opaque vector capability.
+    pub vector_state: Option<VectorStateLayout>,
     pub fuel_addr: u32,
     pub mstatus_addr: u32,
     pub copystat_addr: u32,
@@ -235,6 +254,7 @@ impl JitLayout {
             fcsr_addr: 0,
             reservation: None,
             vector: None,
+            vector_state: None,
             fuel_addr: 0,
             mstatus_addr: 0,
             copystat_addr: 0,

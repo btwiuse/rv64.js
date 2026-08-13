@@ -3482,6 +3482,11 @@ impl Cpu {
             };
             let b = match format {
                 0 => self.vector.read_element(s1, index, config.sew),
+                // OPIVI arithmetic/logical operands are signed immediates,
+                // but the three single-width shifts encode an unsigned
+                // uimm5 shift amount. This distinction is observable for
+                // SEW=64, where encodings 16..=31 must not sign-extend.
+                3 if matches!(funct6, 0x25 | 0x28 | 0x29) => s1 as u64,
                 3 => simm5(s1),
                 4 => self.x[s1],
                 _ => unreachable!(),
@@ -4741,5 +4746,26 @@ mod tests {
         cpu.vector.write_element(12, 0, 8, 1);
         cpu.exec_vector_op(multiply).unwrap();
         assert!(cpu.vector.vxsat);
+    }
+
+    #[test]
+    fn vector_shift_immediate_uses_unsigned_uimm5_at_e64() {
+        let mut cpu = Cpu::new();
+        cpu.x[1] = 2;
+        cpu.exec_vector_op(vsetvli(2, 1, 0b11_000)).unwrap(); // e64,m1, vl=2
+        cpu.vector.write_element(8, 0, 64, 1);
+        cpu.vector.write_element(8, 1, 64, 0x8000_0000_0000_0000);
+
+        let shift_left = vector_op(0x25, true, 8, 31, 3, 16); // vsll.vi v16,v8,31
+        cpu.exec_vector_op(shift_left).unwrap();
+        assert_eq!(cpu.vector.read_element(16, 0, 64), 1 << 31);
+
+        let shift_right = vector_op(0x28, true, 8, 31, 3, 16); // vsrl.vi v16,v8,31
+        cpu.exec_vector_op(shift_right).unwrap();
+        assert_eq!(cpu.vector.read_element(16, 1, 64), 1 << 32);
+
+        let shift_arithmetic = vector_op(0x29, true, 8, 31, 3, 16); // vsra.vi v16,v8,31
+        cpu.exec_vector_op(shift_arithmetic).unwrap();
+        assert_eq!(cpu.vector.read_element(16, 1, 64), 0xffff_ffff_0000_0000);
     }
 }

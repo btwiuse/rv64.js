@@ -298,7 +298,7 @@ const STAT_IDS = Object.freeze([
   123, 124, 125, 126, 127, 128, 129,
   134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145,
   146, 147, 148,
-  149, 150, 151,
+  149, 150, 151, 152,
 ]);
 
 function safeBigInt(call) {
@@ -341,6 +341,7 @@ export function deltaRvCounters(before, after) {
   return {
     guestInstructions: guestInstructions.toString(),
     generatedInstructions: generated.toString(),
+    directVectorInstructions: stat(152),
     generatedCoveragePercent:
       guestInstructions > 0n
         ? Number((generated * 1_000_000n) / guestInstructions) / 10_000

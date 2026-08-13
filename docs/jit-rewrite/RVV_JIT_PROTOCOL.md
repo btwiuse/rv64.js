@@ -30,7 +30,7 @@ The population owns `rv64gcv-linux-Image`; it must come from
 `CONFIG_RISCV_ISA_V_DEFAULT_ENABLE`. The legacy `web/images/alpine/Image` is
 not a valid fallback because that artifact has the V extension disabled.
 
-## Semantic lowering contract
+## Semantic and direct lowering contract
 
 The DBT IR represents an RVV instruction as an ordered architectural effect.
 Before that effect, generated code commits every pending scalar register,
@@ -38,17 +38,27 @@ floating-point register, `fcsr`, PC, and retired-count value required to
 reconstruct the exact pre-instruction state. It then invokes a typed Wasm
 helper for the concrete user or system machine.
 
-On success, generated code invalidates cached architectural values because an
-RVV instruction can update integer registers, floating-point registers,
-`fcsr`, vector CSRs, and vector registers. Later IR reads reload canonical
-state. On failure, generated code returns at the pre-instruction PC without
+Each effect also carries an optional direct description decoded solely from
+architectural instruction fields. Generated Wasm may use SIMD or a scalar
+Wasm loop only after runtime guards prove the current vtype, vl, vstart,
+masking, register grouping, privilege state, and memory capability are exact
+for that lowering. A guard miss invokes the typed helper.
+
+Successful direct effects reconcile precise pre-effect publications with the
+function's cached scalar/FP locals. Scalar- or FP-producing vector moves
+reload canonical state. System execution enforces and dirties mstatus vector
+and FP state exactly as the interpreter does.
+
+On helper failure, generated code returns at the pre-instruction PC without
 retiring it; the interpreter re-executes the instruction and produces the
 architectural exception. A partially completed vector memory operation keeps
-its `vstart` state, so restart behavior remains precise.
+its `vstart` state, so restart behavior remains precise. Direct memory is used
+only after the entire selected range and direct-RAM translation capability are
+proved; page crossings, MMIO, code-dirty stores, missing translations, and
+fault candidates retain the helper.
 
-This first lowering is a semantic Wasm-to-Wasm helper lowering, not a claim of
-direct host SIMD generation. Direct Wasm SIMD lowering can be added by broad
-instruction family after equivalence is established.
+Direct FP arithmetic is forbidden unless rounding and accrued exception flags
+can be reproduced exactly. Flag-free bit operations may lower directly.
 
 ## Promotion gates
 
@@ -59,3 +69,5 @@ instruction family after equivalence is established.
 - Existing workspace, Wasm, and scorecard harness tests pass.
 - The authoritative RV64GCV JIT scorecard is measurement-valid.
 - The unchanged scalar JIT scorecard shows no material regression.
+- Any family with an ambiguous first performance result receives a frozen
+  paired A/B, and is removed if it establishes a material regression.

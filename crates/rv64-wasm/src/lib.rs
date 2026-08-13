@@ -443,6 +443,7 @@ pub extern "C" fn user_load(mem_size: u32) -> i32 {
                 USER_TRANSLATE_NS = 0;
                 USER_TRANSLATE_ATTEMPTS = 0;
                 USER_EMITTED_BYTES = 0;
+                JIT_VECTOR_SIMD = 0;
                 STAGING.clear();
                 USER_ARGS.clear();
                 0
@@ -1845,6 +1846,14 @@ static mut BOOT_GEN: u64 = 0;
 // Perf instrumentation: guest instructions retired inside JIT blocks vs
 // total, and dispatch counts (block calls). Exposed via jit_stat().
 static mut JIT_RETIRED: u64 = 0;
+/// RVV instructions completed by generated Wasm SIMD rather than the exact
+/// one-instruction helper. This is architecture-level coverage telemetry, not
+/// part of direct-path selection.
+static mut JIT_VECTOR_SIMD: u64 = 0;
+/// Emit direct-RVV execution telemetry into subsequently compiled modules.
+/// Disabled by default so a diagnostic memory increment is not part of the
+/// production vector fast path.
+static mut JIT_VECTOR_SIMD_PROFILE: bool = false;
 static mut SLICE_CALLS: u64 = 0;
 static mut SLICE_INSNS: u64 = 0;
 static mut JIT_DISPATCHES: u64 = 0;
@@ -2248,6 +2257,7 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             149 => system_cpu_stat(22),
             150 => system_cpu_stat(23),
             151 => system_cpu_stat(24),
+            152 => JIT_VECTOR_SIMD,
             _ => 0,
         }
     }
@@ -2563,6 +2573,14 @@ pub extern "C" fn jit_set_page_policy(on: u32) {
 #[no_mangle]
 pub extern "C" fn jit_set_page_threshold(instructions: u32) {
     unsafe { PAGE_POLICY_THRESHOLD = u64::from(instructions.max(1)) }
+}
+
+#[no_mangle]
+pub extern "C" fn jit_set_vector_simd_profile(on: u32) {
+    unsafe {
+        JIT_VECTOR_SIMD_PROFILE = on != 0;
+        JIT_VECTOR_SIMD = 0;
+    }
 }
 
 #[no_mangle]
@@ -3128,6 +3146,7 @@ pub extern "C" fn sbtest() -> u64 {
             fcsr_addr: 0,
             reservation: None,
             vector: None,
+            vector_state: None,
             fuel_addr: 0,
             mstatus_addr: 0,
             copystat_addr: 0,
@@ -3420,6 +3439,7 @@ fn sbtest_fp_state(state_mode: rv64_dbt::MultiEntryState) -> u64 {
             fcsr_addr: state + 72 * 8,
             reservation: None,
             vector: None,
+            vector_state: None,
             fuel_addr: 0,
             mstatus_addr: 0,
             copystat_addr: 0,
@@ -3588,6 +3608,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
                     reservation: Some(rv64_dbt::ReservationCapability::User),
                     vector: Some(rv64_dbt::VectorCapability::User),
+                    vector_state: Some(jit_vector_state(&m.cpu)),
                     fuel_addr: fuel_addr(),
                     mstatus_addr: 0, // user mode: no privileged FP state
                     copystat_addr: 0,
@@ -4329,6 +4350,7 @@ fn boot_virt(ram_mb: u32, direct: bool) {
             jit.clear();
         }
         JIT_RETIRED = 0;
+        JIT_VECTOR_SIMD = 0;
         JIT_DISPATCHES = 0;
         JIT_TIMER_IRQ_ORIGIN = [0; 4];
         CHAIN_DEPTH = 0;
@@ -4831,6 +4853,7 @@ pub extern "C" fn sys_boot(ram_mb: u32) {
             j.clear();
         }
         JIT_RETIRED = 0;
+        JIT_VECTOR_SIMD = 0;
         JIT_DISPATCHES = 0;
         JIT_TIMER_IRQ_ORIGIN = [0; 4];
         CHAIN_DEPTH = 0;
@@ -4869,6 +4892,20 @@ fn jit_system_memory(cpu: &rv64_core::Cpu) -> rv64_dbt::SystemMemory {
     })
 }
 
+fn jit_vector_state(cpu: &rv64_core::Cpu) -> rv64_dbt::VectorStateLayout {
+    rv64_dbt::VectorStateLayout {
+        regs_base: cpu.vector.regs.as_ptr() as u32,
+        vl_addr: &cpu.vector.vl as *const u64 as u32,
+        vtype_addr: &cpu.vector.vtype as *const u64 as u32,
+        vstart_addr: &cpu.vector.vstart as *const u64 as u32,
+        simd_count_addr: if unsafe { JIT_VECTOR_SIMD_PROFILE } {
+            (&raw const JIT_VECTOR_SIMD) as u32
+        } else {
+            0
+        },
+    }
+}
+
 fn jit_layout(m: &impl SystemJitMachine) -> rv64_dbt::JitLayout {
     let cpu = m.cpu();
     let memory = jit_system_memory(cpu)
@@ -4889,6 +4926,7 @@ fn jit_layout(m: &impl SystemJitMachine) -> rv64_dbt::JitLayout {
         fcsr_addr: &cpu.fcsr as *const u32 as u32,
         reservation: Some(rv64_dbt::ReservationCapability::System),
         vector: Some(rv64_dbt::VectorCapability::System),
+        vector_state: Some(jit_vector_state(cpu)),
         fuel_addr: fuel_addr(),
         mstatus_addr: cpu.jit_mstatus_ptr() as u32,
         copystat_addr: copystat_addr(),
@@ -6837,6 +6875,7 @@ fn run_system_jit(m: &mut impl SystemJitMachine, max_insns: u64) -> i32 {
                             fcsr_addr: &cpu.fcsr as *const u32 as u32,
                             reservation: Some(rv64_dbt::ReservationCapability::System),
                             vector: Some(rv64_dbt::VectorCapability::System),
+                            vector_state: Some(jit_vector_state(cpu)),
                             fuel_addr: fuel_addr(),
                             mstatus_addr: cpu.jit_mstatus_ptr() as u32,
                             copystat_addr: copystat_addr(),
@@ -7959,6 +7998,7 @@ pub extern "C" fn sb_analyze(vpage: u64, which: u32) -> u64 {
             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
             reservation: Some(rv64_dbt::ReservationCapability::System),
             vector: Some(rv64_dbt::VectorCapability::System),
+            vector_state: Some(jit_vector_state(&m.cpu)),
             fuel_addr: fuel_addr(),
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),
@@ -8048,6 +8088,7 @@ pub extern "C" fn sb_analyze_pc(pc: u64, which: u32) -> u64 {
             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
             reservation: Some(rv64_dbt::ReservationCapability::System),
             vector: Some(rv64_dbt::VectorCapability::System),
+            vector_state: Some(jit_vector_state(&m.cpu)),
             fuel_addr: fuel_addr(),
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),

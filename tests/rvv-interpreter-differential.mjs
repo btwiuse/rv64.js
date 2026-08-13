@@ -220,6 +220,9 @@ for (const [name, funct6] of [
   eachWidth(`${name}.vx`, () => V(funct6, true, 8, X_SCALAR, 4, 16));
   eachWidth(`${name}.vi`, () => V(funct6, true, 8, 7, 3, 16));
 }
+for (const [name, funct6] of [["vsll", 0x25], ["vsrl", 0x28], ["vsra", 0x29]]) {
+  addCase(`${name}.vi/e64-uimm31`, V(funct6, true, 8, 31, 3, 16), { sew: 64 });
+}
 for (const [name, funct6] of [
   ["vsub", 0x02], ["vminu", 0x04], ["vmin", 0x05],
   ["vmaxu", 0x06], ["vmax", 0x07],
@@ -602,11 +605,22 @@ for (const { sew, lmul, maximum, label } of legalConfigurations) {
   addCase(`vslidedown.vi/vtype-${label}`, V(0x0f, true, 0, 1, 3, 16), {
     sew, lmul, vl: maximum,
   });
+  addCase(`vmseq.vi/vtype-${label}`, V(0x18, true, 8, 1, 3, 0), {
+    sew, lmul, vl: maximum, vd: 0, maskDestination: true,
+  });
   addMemoryCase(`vle${sew}.v/vtype-${label}`, {
     load: true, memoryEew: sew, sew, lmul, vl: maximum,
   });
   addMemoryCase(`vse${sew}.v/vtype-${label}`, {
     load: false, memoryEew: sew, sew, lmul, vl: maximum,
+  });
+  addMemoryCase(`vlse${sew}.v/vtype-${label}`, {
+    load: true, memoryEew: sew, sew, lmul, vl: maximum,
+    mop: 2, aux: X_SCALAR, scalar: sew / 8,
+  });
+  addMemoryCase(`vsse${sew}.v/vtype-${label}`, {
+    load: false, memoryEew: sew, sew, lmul, vl: maximum,
+    mop: 2, aux: X_SCALAR, scalar: sew / 8,
   });
   if (sew === 32 || sew === 64) {
     addCase(`vfadd.vv/vtype-${label}`, V(0x00, true, 0, 8, 1, 16), {
@@ -948,6 +962,7 @@ async function runWasmJit(elf) {
   }
   const [{ RV64Debug: RV64 }, wasm] = await jitRuntime;
   const vm = await RV64.create(wasm);
+  vm.ex.jit_set_vector_simd_profile(1);
   vm.ex.jit_set_enabled(1);
   vm.ex.jit_set_user_block_threshold(1);
   const chunks = [];
@@ -968,6 +983,7 @@ async function runWasmJit(elf) {
     stop,
     exit: vm.userExitCode(),
     jitInsns: vm.ex.jit_stat(0),
+    simdInsns: vm.ex.jit_stat(152),
     vectorModules,
   };
 }
@@ -1056,21 +1072,21 @@ for (const profile of SEED_PROFILES) {
         ((opcode === 0x07 || opcode === 0x27) && [0, 5, 6, 7].includes(funct3));
     }).length;
     const minimumGenerated = BigInt(eligibleCases * Math.max(1, caseRepetitions - 80));
-    if (jit.stop !== 4 || jit.exit !== 0 || jit.vectorModules === 0 ||
+    if (jit.stop !== 4 || jit.exit !== 0 || jit.vectorModules === 0 || jit.simdInsns === 0n ||
         jit.jitInsns < minimumGenerated || jitDifferences.length !== 0) {
       for (const difference of jitDifferences.slice(0, 30)) {
         console.error(`FAIL JIT ${profile.name}: ${difference}`);
       }
       console.error(
         `RVV JIT DIFFERENTIAL: ${profile.name} failed: stop=${jit.stop} exit=${jit.exit} ` +
-        `vector-modules=${jit.vectorModules} jit-insns=${jit.jitInsns} ` +
+        `vector-modules=${jit.vectorModules} jit-insns=${jit.jitInsns} simd-insns=${jit.simdInsns} ` +
         `minimum-generated=${minimumGenerated} differences=${jitDifferences.length}`,
       );
       process.exit(1);
     }
     console.log(
       `RVV JIT ${profile.name}: PASS vector-modules=${jit.vectorModules} ` +
-      `jit-insns=${jit.jitInsns}`,
+      `jit-insns=${jit.jitInsns} simd-insns=${jit.simdInsns}`,
     );
   }
 }

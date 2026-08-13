@@ -72,6 +72,7 @@ function synthElf(words) {
 
 async function run(elf, jit) {
   const vm = await RV64.create(wasm);
+  vm.ex.jit_set_vector_simd_profile(1);
   vm.ex.jit_set_enabled(jit ? 1 : 0);
   let vectorModules = 0;
   vm.onWrite = () => {};
@@ -94,6 +95,7 @@ async function run(elf, jit) {
       (_, index) => vm.ex.user_vreg_byte(index >>> 4, index & 15),
     ),
     jitInsns: vm.ex.jit_stat(0),
+    simdInsns: vm.ex.jit_stat(152),
     vectorModules,
   };
 }
@@ -114,8 +116,10 @@ for (const field of ["pc", "insns", "vl", "vtype", "vstart", "vcsr"]) {
 assert.deepEqual(jit.regs, interpreter.regs);
 assert.deepEqual(jit.vregs, interpreter.vregs);
 assert.ok(jit.jitInsns > 1000n, `insufficient generated execution: ${jit.jitInsns}`);
+assert.ok(jit.simdInsns > 1000n, `safe iterations did not use direct SIMD: ${jit.simdInsns}`);
 assert.ok(jit.vectorModules > 0, "no generated module imported user_vector");
 console.log(
   `RVV JIT FAULT DIFFERENTIAL: PASS pc=0x${jit.pc.toString(16)} ` +
-  `vstart=${jit.vstart} jit-insns=${jit.jitInsns} vector-modules=${jit.vectorModules}`,
+  `vstart=${jit.vstart} jit-insns=${jit.jitInsns} simd-insns=${jit.simdInsns} ` +
+  `vector-modules=${jit.vectorModules}`,
 );

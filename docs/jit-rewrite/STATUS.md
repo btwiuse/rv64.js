@@ -4,22 +4,23 @@ Last updated: 2026-08-13
 
 ## Current disposition
 
-The RV64GCV semantic JIT-lowering milestone is **achieved**. The complete
-mandatory RVV 1.0 surface for the selected VLEN=128/ELEN=64 machine is now an
-ordered DBT IR effect with typed user/system Wasm lowering, precise scalar/FP
-state barriers, fault replay, `vstart` preservation, and compiled-code dirty
-handling. The strict release matrix passes, including all 8,310 interpreter
-and all 8,310 hot-JIT RVV differential executions.
+The RV64GCV direct JIT-lowering milestone is **achieved**. The complete
+mandatory RVV 1.0 surface for the selected VLEN=128/ELEN=64 machine remains an
+ordered DBT IR effect with typed user/system helper fallback, while broad
+exact instruction families now lower directly to Wasm SIMD or generated Wasm
+loops. Precise scalar/FP barriers, fault replay, `vstart`, privileged dirty
+state, and compiled-code invalidation are preserved. The strict release matrix
+passes, including all 8,724 interpreter and all 8,724 hot-JIT RVV differential
+executions.
 
 The authoritative RV64GCV JIT scorecard is measurement-valid with 78/78
 eligible trials and an empty problem list. It wins eight of thirteen rows
-against pinned copy/v86. Against the frozen pre-lowering checkpoint it improves
-String Sort by `3.9616x`, FP Emulation by `1.7994x`, and Assignment by
-`1.5054x`; the unchanged modern scalar scorecard establishes no material
-regression. The historical all-row copy/v86 parity objective remains **not
-achieved** because Boot, Compile, String Sort, FP Emulation, and Assignment
-still lose. The current lowering calls the shared architectural RVV helper;
-direct Wasm SIMD is a distinct next phase.
+against pinned copy/v86. Against helper-only JIT lowering it improves String
+Sort by `3.4587x`, FP Emulation by `1.7970x`, and Assignment by `1.2915x`.
+The separately rerun modern scalar scorecard remains 11/13, with only Boot and
+Compile losing. The historical all-row RV64GCV/copy-v86 parity objective
+remains **not achieved** because Boot, Compile, String Sort, FP Emulation, and
+Assignment still lose.
 
 The complete implementation boundary, no-workload-identifier audit,
 correctness matrix, scorecards, hashes, and remaining performance gap are in
@@ -1893,3 +1894,21 @@ experimental worktree/release; it is not scorecard-promoted or committed.
 Official evidence at the pause remains 13/13 versus legacy and 11/13 versus
 copy/v86, with Boot and Compile still open. R125 remains accepted only as
 WANIX qualification under the clarified one-percent materiality policy.
+
+## RV64GCV direct SIMD follow-up (2026-08-13)
+
+The separate RV64GCV effort now has architecture-general direct JIT lowering
+for broad integer lane operations, unit and guarded strided memory, whole-
+register transfers, scalar moves, slides/gather, packed comparisons, and
+flag-free FP bit/move permutations. Exact helper fallback remains for every
+guard miss and for FP arithmetic, reductions, masks/restarts, fault candidates,
+and other non-representable families. No PC, symbol, binary, input, or
+benchmark recognizer exists.
+
+The strict release suite passes, including 8,724 QEMU comparisons and 8,724
+hot interpreter/JIT comparisons. The authoritative RV64GCV scorecard is valid
+and remains 8/13, while String Sort improves `3.4587x`, FP Emulation `1.7970x`,
+and Assignment `1.2915x` versus helper-only lowering. The unchanged scalar
+population was rerun separately and remains exactly 11/13 against copy/v86,
+with Boot and Compile as its only losses. See `RVV_JIT_RESULT.md` for hashes,
+tables, and retained evidence. RV64GCV parity remains open.

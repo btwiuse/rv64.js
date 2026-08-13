@@ -1,59 +1,89 @@
-# RV64GCV JIT Lowering Result
+# RV64GCV direct JIT lowering result
 
-Date: 2026-08-13
-Disposition: semantic JIT lowering complete; correctness and no-material-regression gates pass; direct host-SIMD work remains
+Date: 2026-08-13 America/Phoenix
+
+Disposition: direct lowering promoted; correctness and scalar-regression gates
+pass; cross-ISA parity remains open
 
 ## Conclusion
 
-The JIT now accepts the complete mandatory RVV 1.0 surface implemented by the
-RV64GCV interpreter for the selected VLEN=128/ELEN=64 machine. Vector
-instructions are represented as ordered effects in the DBT IR and lower
-through typed user- or system-machine Wasm imports. Generated code commits the
-precise pre-instruction architectural state, executes the vector effect, and
-then either reloads canonical state or returns for precise interpreter fault
-delivery.
+The RV64GCV JIT now lowers broad, architecture-defined RVV families directly
+to generated WebAssembly SIMD or scalar Wasm loops. The complete typed helper
+lowering remains the precise fallback for configurations or operations that
+cannot be represented exactly. Selection uses decoded instruction fields and
+runtime architectural state only; it does not inspect guest PCs, symbols,
+binaries, benchmark names, inputs, or loop signatures.
 
-This is deliberately a semantic helper lowering, not direct Wasm SIMD. The
-surrounding scalar region remains generated Wasm, so RV64GCV binaries no longer
-force whole blocks through the interpreter, but each vector instruction still
-executes through the shared architectural vector implementation. Direct SIMD
-lowering by instruction family is the next performance phase.
+The authoritative frozen RV64GCV scorecard remains **8/13**, but its three
+vector-heavy losses improved substantially relative to the helper-only
+checkpoint:
 
-The implementation substantially improves the frozen RV64GCV checkpoint and
-does not show a material regression on the unchanged scalar scorecard. The
-broader historical objective of matching copy/v86 on every JIT scorecard row
-is **not achieved**: the authoritative RV64GCV scorecard wins eight of thirteen
-rows and loses Boot, Compile, String Sort, FP Emulation, and Assignment.
+- String Sort: `5,075.7 -> 1,467.5 ms` (`3.4587x` faster);
+- FP Emulation: `6,757.9 -> 3,760.6 ms` (`1.7970x` faster); and
+- Assignment: `1,997.9 -> 1,547.0 ms` (`1.2915x` faster).
 
-## Architecture-general implementation
+The unchanged scalar population remains **11/13** against copy/v86. Its only
+losses are still Boot and Compile. The apparent 8/13 result is therefore not a
+regression from 11/13: it is the result for a different, RV64GCV-compiled
+binary population.
 
-- `rv64-dbt` has an explicit `Effect::Vector` with instruction position,
-  fallthrough, and a complete precise side-exit state snapshot.
-- `JitLayout` carries a typed `VectorCapability::User` or
-  `VectorCapability::System`; a module cannot mix the two ABIs.
-- The lifter accepts vector configuration, OP-V, and all supported vector
-  memory encodings only when the layout advertises the vector capability.
-- The Wasm emitter conditionally imports `env.user_vector` or
-  `env.system_vector`. Scalar-only modules have no vector import.
-- Successful vector effects invalidate cached integer, floating-point, and
-  `fcsr` state before later IR reads. Faults return at the original PC without
-  retiring the instruction, preserving partial vector-memory `vstart` state.
-- System vector stores use a separate completion status when a compiled code
-  page was dirtied, so invalidation remains precise.
-- User and system runtimes route the typed calls to the same architectural
-  RVV implementation used by the interpreter.
+The broader parity objective is not achieved. RV64GCV still loses Boot,
+Compile, String Sort, FP Emulation, and Assignment.
 
-The work also fixed a generic precise-effect bug found by the system
-differential: a scalar value computed immediately before an opaque helper
-could be absent from the final region outputs and therefore remain stale in
-canonical state. Side-exit publication now writes every current integer, FP,
-and `fcsr` output required by the effect, independent of final-region
-liveness. This rule applies to every precise effect and is not vector- or
-workload-specific.
+## Architecture-general lowering
 
-There is no dispatch by guest PC, symbol, program identity, benchmark, input
-size, or loop signature. Production selection uses only decoded architectural
-instruction fields, memory capability, and machine type.
+The IR records a conservative `VectorDirect` description beside every ordered
+vector effect. Generated code selects a direct path only after proving the
+current architectural state is compatible; otherwise it invokes the same RVV
+implementation used by the interpreter.
+
+Promoted direct families include:
+
+- integer add/subtract, min/max, bitwise, scalar/immediate shifts, multiply,
+  and vector/scalar/immediate moves;
+- unmasked unit-stride transfers and positive-stride transfers;
+- whole-register loads, stores, and moves;
+- integer scalar element insert/extract;
+- immediate slides, slide-one permutations, and immediate gather;
+- one-register-group integer comparisons with exact packed mask writes; and
+- flag-free FP sign injection, bit broadcasts, scalar element moves, and
+  slide-one permutations.
+
+The lowering supports integer and fractional LMUL at VLEN=128. Partial
+fractional groups use lane-width stores so bytes above the architectural group
+remain unchanged.
+
+Ordinary direct paths require a valid e8/e16/e32/e64 vtype, `vstart=0`,
+`vl=VLMAX`, legal register alignment, and an unmasked instruction. Whole-
+register transfers use their separate architectural rules. Direct memory
+requires an exact in-range extent; system execution additionally proves one
+fused-TLB direct-RAM page and the current translation context. Strided paths
+also bound the stride before multiplication and prove that the last address
+cannot wrap. Page crossings, MMIO, missing translations, code-dirty stores,
+negative or wrapping strides, and faulting/restarted operations retain the
+helper.
+
+FP arithmetic, reductions, conversions, and fused operations also retain the
+helper because ordinary Wasm SIMD cannot reproduce RVV rounding and `fflags`
+for every input. This boundary is semantic, not benchmark-driven.
+
+## State and fault correctness
+
+Direct vector effects still use the precise effect boundary established by the
+semantic lowering:
+
+- pending integer, FP, `fcsr`, PC, and retirement state is published before
+  the instruction;
+- successful direct effects reconcile the exact cached scalar/FP outputs that
+  publication may have changed;
+- scalar- or FP-producing vector moves reload canonical cached state;
+- system paths enforce and dirty `mstatus.VS` and, where required,
+  `mstatus.FS`; and
+- a guard miss or helper fault returns at the unretired instruction with exact
+  `vstart` and partial-memory state.
+
+The direct-path counter is opt-in for differential tests. Production
+scorecards leave it disabled, so measurement does not add a hot counter update.
 
 ## Correctness result
 
@@ -63,105 +93,97 @@ The strict release command
 nix develop --command env REQUIRE_ALL=1 ARTIFACTS=target/bench tests/run-all.sh
 ```
 
-completed with `ALL STAGES PASSED`. Its relevant coverage includes:
+completed with `ALL STAGES PASSED`. Relevant coverage includes:
 
-- 195 release-mode Rust unit and integration tests;
-- all 8,310 QEMU RVV interpreter executions;
-- all 8,310 hot-JIT RVV executions with full interpreter/JIT output equality;
-- a hot vector load fault with identical PC, retired count, vector state, and
-  `vstart=15`;
-- full-system vector configuration, scalar/vector state transfer, vector
-  load/store, code-dirty handling, and post-vector scalar consumption;
+- the complete workspace Rust suite;
+- 8,724 QEMU RVV interpreter comparisons;
+- 8,724 hot interpreter/JIT equality comparisons across 1,454 encodings, six
+  data profiles, and 128 repetitions, with 22,997 direct executions per
+  profile;
+- focused coverage for the RVV unsigned shift-immediate encoding at e64,
+  including the corrected shared interpreter semantics for uimm values 16--31;
+- exact user fault restart at `vstart=15`;
+- hot full-system direct vector load/store, strided memory, state publication,
+  and post-vector scalar consumption, including a dedicated fractional-LMUL
+  system-memory case with 393,094 direct executions;
 - 134/134 `riscv-tests`, 109/109 Spike lockstep tests, and 193 matching
   architecture-test signatures; and
-- the existing integer, memory, M/A, FP, TLB, T2, Linux direct/OpenSBI, Wasm,
-  and Virt smoke gates.
+- all integer, memory, M/A, FP, TLB, T2, Linux direct/OpenSBI, Wasm, and Virt
+  smoke gates.
 
-QEMU 11.0.3 compares the complete VCSR alias state. QEMU 8.2.7 has two known
-reserved-bit WARL defects when directly writing `vxsat` or `vxrm`; only those
-two oracle cases compare the architecturally defined target field on 8.2.
-A separate core regression proves that the emulator discards reserved bits and
-preserves the untouched alias fields.
+## Authoritative RV64GCV scorecard
 
-## Authoritative RV64GCV JIT scorecard
-
-The report is authoritative and measurement-valid: 13 rows, two sides, three
-fresh processes per side, 78/78 eligible trials, an empty problem list,
-generated-execution proof, maximum host-probe spread `1.0187`, and maximum
-scored-sample spread `1.1384`. Lower duration is better; the ratio is v86 time
-divided by rewrite time.
+The report is measurement-valid: 78/78 eligible timed trials, three fresh
+processes per side, an empty problem list, generated-execution proof, maximum
+host-probe spread `1.0123`, and maximum scored-sample spread `1.1526`. Lower
+duration is better; the ratio is v86 time divided by rewrite time.
 
 | Benchmark | Rewrite RV64GCV JIT | copy/v86 JIT | Ratio |
 | --- | ---: | ---: | ---: |
-| ALU | 1,782.6 ms | 3,243.7 ms | WIN `1.8196x` |
-| Mixed | 1,527.4 ms | 2,184.2 ms | WIN `1.4300x` |
-| Matched Boot | 2,171.0 ms | 1,569.5 ms | LOSS `0.7229x` |
-| Python fib(30) | 2,028.0 ms | 3,508.9 ms | WIN `1.7302x` |
-| Compile (`tcc -c`) | 883.9 ms | 718.4 ms | LOSS `0.8128x` |
-| Numeric Sort | 246.0 ms | 330.7 ms | WIN `1.3444x` |
-| String Sort | 5,075.7 ms | 646.4 ms | LOSS `0.1273x` |
-| Bitfield | 129.8 ms | 206.1 ms | WIN `1.5874x` |
-| FP Emulation | 6,757.9 ms | 959.9 ms | LOSS `0.1420x` |
-| Fourier | 558.3 ms | 731.9 ms | WIN `1.3109x` |
-| Assignment | 1,997.9 ms | 634.7 ms | LOSS `0.3177x` |
-| IDEA | 319.5 ms | 724.8 ms | WIN `2.2685x` |
-| Huffman | 590.0 ms | 656.3 ms | WIN `1.1124x` |
+| ALU | 1,779.5 ms | 3,237.1 ms | WIN `1.8192x` |
+| Mixed | 1,528.9 ms | 2,276.6 ms | WIN `1.4890x` |
+| Matched Boot | 2,176.8 ms | 1,564.3 ms | LOSS `0.7186x` |
+| Python fib(30) | 2,027.0 ms | 3,347.9 ms | WIN `1.6517x` |
+| Compile (`tcc -c`) | 931.5 ms | 727.9 ms | LOSS `0.7814x` |
+| Numeric Sort | 222.9 ms | 344.6 ms | WIN `1.5461x` |
+| String Sort | 1,467.5 ms | 641.3 ms | LOSS `0.4370x` |
+| Bitfield | 129.6 ms | 198.4 ms | WIN `1.5310x` |
+| FP Emulation | 3,760.6 ms | 965.3 ms | LOSS `0.2567x` |
+| Fourier | 578.4 ms | 693.1 ms | WIN `1.1984x` |
+| Assignment | 1,547.0 ms | 639.7 ms | LOSS `0.4135x` |
+| IDEA | 324.5 ms | 739.6 ms | WIN `2.2792x` |
+| Huffman | 597.2 ms | 651.5 ms | WIN `1.0909x` |
+
+Evidence:
+
+- helper-only baseline JSON:
+  `target/bench/rv64gcv-jit-authoritative-v1/scorecard-v2-2026-08-13T03-52-58-367Z.json`
+  (`e2f5cb22a686a4e5689285b3d8c4d34e296fcbcd468a9ae5a5f437e232cef2dd`);
+- JSON:
+  `target/bench/rv64gcv-jit-direct-simd-authoritative-v3/scorecard-v2-2026-08-13T07-38-57-253Z.json`
+  (`5067d5e42ab88998da86b267f152dbf1e31781388a7828b25b90acb1f6da0584`);
+- rendered report:
+  `target/bench/rv64gcv-jit-direct-simd-authoritative-v3/scorecard-v2-2026-08-13T07-38-57-253Z.md`
+  (`6d13ac92bf0dae53306355e0abda027bedb4c1502645d66dd8a839531dc0c7a1`);
+- measured release Wasm:
+  `87c2ed0d39642144941cabc1c1837e10e36c51e9299d1950a0e143215cd9e24b`;
+- pinned RVV-capable Linux image:
+  `6029e2d5f0c24da911052be961cb7b3c1150206cff76666c8c8eebd8270a78d9`.
+
+## Scalar regression scorecard
+
+The complete two-side modern scalar rerun is measurement-valid with 78/78
+eligible trials, an empty problem list, maximum host-probe spread `1.0700`, and
+maximum sample spread `1.1246`. It wins 11/13 against v86 and loses only Boot
+and Compile.
 
 Evidence:
 
 - JSON:
-  `target/bench/rv64gcv-jit-authoritative-v1/scorecard-v2-2026-08-13T03-52-58-367Z.json`
-  (`e2f5cb22a686a4e5689285b3d8c4d34e296fcbcd468a9ae5a5f437e232cef2dd`);
+  `target/bench/rvv-direct-simd-modern-regression-v3/scorecard-v2-2026-08-13T07-46-37-219Z.json`
+  (`4864a90d280d965806897b62a27e0d4888c4818607d2d3d329aebb33c5d5a59a`);
 - rendered report:
-  `target/bench/rv64gcv-jit-authoritative-v1/scorecard-v2-2026-08-13T03-52-58-367Z.md`
-  (`b433f24c9e4ef04ccbcc7729dd16be18cffb15dcd0a6c79f9283b6915e976791`);
-- measured release Wasm:
-  `93c8e3e4e128a1364b63461a0130e207e0a7f1d67233986dd3bd45714318ee57`;
-- pinned RVV-capable Linux image:
-  `6029e2d5f0c24da911052be961cb7b3c1150206cff76666c8c8eebd8270a78d9`.
+  `target/bench/rvv-direct-simd-modern-regression-v3/scorecard-v2-2026-08-13T07-46-37-219Z.md`
+  (`5736ca85e26d38879e5b9d50e1e7ed189f2cbfc9740eccd5e8b1cc49792e1e29`).
 
-## Frozen checkpoint comparison
+## Focused promotion evidence
 
-Checkpoint `9850777` was archived before vector lowering as Wasm
-`39092beab711e2875692983c65a0304d50efa3bc75a0ae29bd5955e575e5e34d`.
-One fresh-process, all-row diagnostic run compared it with the candidate on
-the identical RV64GCV population. Artifact override makes the checkpoint run
-ineligible as an authoritative scorecard, but the unchanged row timings give
-the intended before/after attribution.
+Integer comparison lowering received a five-pair alternating A/B because its
+first unpaired Assignment result was ambiguous. Against the identical build
+with comparison lowering disabled, the candidate was neutral on String
+(`0.992x`, 95% CI `[0.975,1.010]`) and improved Assignment `1.096x` (95% CI
+`[1.045,1.111]`). The report is
+`target/bench/rv64gcv-jit-compare-paired-ab/config-ab-2026-08-13T06-23-35-787Z.json`.
 
-| Row | Checkpoint | Candidate | Candidate speedup |
-| --- | ---: | ---: | ---: |
-| ALU | 1,797.8 ms | 1,785.5 ms | `1.0069x` |
-| Mixed | 1,533.6 ms | 1,532.3 ms | `1.0008x` |
-| Boot | 2,180.9 ms | 2,137.0 ms | `1.0206x` |
-| Python | 1,998.4 ms | 2,035.4 ms | `0.9818x` |
-| Compile | 944.0 ms | 931.0 ms | `1.0139x` |
-| Numeric Sort | 256.7 ms | 242.0 ms | `1.0607x` |
-| String Sort | 21,460.8 ms | 5,417.3 ms | `3.9616x` |
-| Bitfield | 129.7 ms | 129.8 ms | `0.9986x` |
-| FP Emulation | 12,475.7 ms | 6,933.2 ms | `1.7994x` |
-| Fourier | 572.9 ms | 573.7 ms | `0.9986x` |
-| Assignment | 3,105.9 ms | 2,063.2 ms | `1.5054x` |
-| IDEA | 327.3 ms | 322.0 ms | `1.0166x` |
-| Huffman | 596.5 ms | 588.1 ms | `1.0143x` |
+An attempted integer-reduction lowering was removed before promotion because
+it regressed Assignment. No benchmark-specific recognizer or special case was
+retained.
 
-The largest apparent slowdown is Python at 1.85% in a single diagnostic
-sample. Bitfield and Fourier differ by 0.14%. The unchanged modern scalar
-scorecard provides an independent regression check: its current valid full
-run is faster than the previous R087 authoritative rewrite median on twelve
-rows and 0.19% slower on ALU. No material scalar regression is established.
+## Remaining boundary
 
-Modern regression evidence:
-`target/bench/rv64gcv-jit-modern-exploratory-v1/scorecard-v2-2026-08-13T04-10-57-850Z.json`
-(`700c89738a28e3358c7ee98f6b3eeb3a9de3f3a3dc6f84619265ed2256e84a12`).
-It is measurement-valid and wins all 13 rows against the frozen legacy JIT and
-11 of 13 against v86, the same loss set as R087 (Boot and Compile).
-
-## Next boundary
-
-The semantic milestone is complete. Closing the remaining vector-heavy gap
-requires direct generated-Wasm lowering, beginning with broad RVV families
-that map naturally to Wasm SIMD128 while retaining the helper for uncommon,
-faulting, or lane-serial semantics. Any such phase must keep the same complete
-instruction differential and frozen scorecards; scorecard observations must
-not become workload recognizers.
+The direct phase is promoted, but parity is still open. The remaining vector
+gap is concentrated in exact helper families such as masked/strided segment
+operations, reductions, widening/narrowing integer operations, and FP
+arithmetic whose flags and rounding cannot be represented naively by Wasm
+SIMD. Future work must preserve the same fallback, full differential, frozen
+population, and scalar regression gates.
