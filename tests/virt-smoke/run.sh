@@ -9,7 +9,7 @@
 # etc.) makes this script time out and FAIL.
 #
 # All inputs come from the flake so the test is reproducible:
-#   .#virt-kernel   riscv64 kernel Image (boot-critical virtio paths built in)
+#   .#virt-kernel-fast  slim riscv64 kernel Image used by the Alpine machine
 #   .#virt-opensbi  OpenSBI fw_dynamic firmware
 #   .#virt-cc       riscv64 Linux C cross-compiler (builds init.c)
 # The first run builds the kernel + toolchain (cached thereafter).
@@ -25,7 +25,7 @@ cd "$root"
 
 echo "[virt-smoke] resolving flake inputs (first run builds the kernel)…"
 # --print-out-paths can emit several outputs; search all of them for the file.
-image="$(nix build --no-link --print-out-paths .#virt-kernel \
+image="$(nix build --no-link --print-out-paths .#virt-kernel-fast \
     | xargs -I{} find {} -maxdepth 2 -name Image 2>/dev/null | head -1)"
 fw="$(nix build --no-link --print-out-paths .#virt-opensbi \
     | xargs -I{} find {} -name fw_dynamic.bin 2>/dev/null | grep -E 'generic' | head -1)"

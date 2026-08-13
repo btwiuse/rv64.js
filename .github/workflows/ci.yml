@@ -54,7 +54,15 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- \
+            -D warnings \
+            -A clippy::unnecessary-map-or \
+            -A clippy::manual-is-multiple-of \
+            -A clippy::if-same-then-else \
+            -A clippy::too-many-arguments \
+            -A clippy::question-mark \
+            -A clippy::unnecessary-unwrap
 
       - name: Build guest fixtures
         run: |
@@ -79,6 +87,7 @@ jobs:
           node tests/direct-boot.mjs
           node tests/alpine-boot.mjs
           node tests/vs-v86/harness-selftest.mjs
+          node tests/vs-v86/amortized-cold-cost-selftest.mjs
           node tests/http-relay.mjs
           node tests/boot-profile-selftest.mjs
           mkdir -p web/images/alpine

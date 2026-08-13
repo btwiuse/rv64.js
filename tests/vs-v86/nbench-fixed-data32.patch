@@ -1,0 +1,247 @@
+--- a/nmglobal.h
++++ b/nmglobal.h
+@@ -177,7 +177,7 @@
+ **
+ ** This is the maximum positive long.
+ */
+-#ifdef LONG64
++#if defined(LONG64) && !defined(SCORECARD_FIXED_DATA32)
+ #define MAXPOSLONG 0x7FFFFFFFFFFFFFFFL
+ #else
+ #define MAXPOSLONG 0x7FFFFFFFL
+@@ -228,8 +228,17 @@
+ 
+ typedef void farvoid;
+ typedef double fardouble;
++#ifdef SCORECARD_FIXED_DATA32
++/* BYTEmark predates LP64. Keep the benchmark payload words identical
++** across i686 and RV64; pointer/index widths remain native to each ISA. */
++typedef signed int farlong;
++typedef unsigned int farulong;
++typedef char scorecard_farlong_must_be_32_bits[(sizeof(farlong) == 4) ? 1 : -1];
++typedef char scorecard_farulong_must_be_32_bits[(sizeof(farulong) == 4) ? 1 : -1];
++#else
+ typedef long farlong;
+ typedef unsigned long farulong;
++#endif
+ typedef char farchar;
+ typedef unsigned char faruchar;
+ 
+@@ -318,7 +327,7 @@
+ /*
+ ** Following field sets the size of the bitfield array (in longs).
+ */
+-#ifdef LONG64
++#if defined(LONG64) && !defined(SCORECARD_FIXED_DATA32)
+ #define BITFARRAYSIZE 16384L
+ #else
+ #define BITFARRAYSIZE 32768L
+--- a/nbench1.h
++++ b/nbench1.h
+@@ -207,8 +207,8 @@
+ */
+ typedef struct {
+ 	union {
+-		long *p;
+-		long (*ap)[ASSIGNROWS][ASSIGNCOLS];
++		farlong *p;
++		farlong (*ap)[ASSIGNROWS][ASSIGNCOLS];
+ 	} ptrs;
+ } longptr;
+ 
+@@ -222,12 +222,12 @@
+ 		ulong numarrays);
+ static void LoadAssign(farlong arraybase[][ASSIGNCOLS]);
+ static void CopyToAssign(farlong arrayfrom[][ASSIGNCOLS],
+-		long arrayto[][ASSIGNCOLS]);
++		farlong arrayto[][ASSIGNCOLS]);
+ static void Assignment(farlong arraybase[][ASSIGNCOLS]);
+-static void calc_minimum_costs(long tableau[][ASSIGNCOLS]);
+-static int first_assignments(long tableau[][ASSIGNCOLS],
++static void calc_minimum_costs(farlong tableau[][ASSIGNCOLS]);
++static int first_assignments(farlong tableau[][ASSIGNCOLS],
+ 		short assignedtableau[][ASSIGNCOLS]);
+-static void second_assignments(long tableau[][ASSIGNCOLS],
++static void second_assignments(farlong tableau[][ASSIGNCOLS],
+ 		short assignedtableau[][ASSIGNCOLS]);
+ 
+ /********************
+--- a/nbench1.c
++++ b/nbench1.c
+@@ -121,7 +121,7 @@
+ 		/*
+ 		** Allocate space for arrays
+ 		*/
+-		arraybase=(farlong *)AllocateMemory(sizeof(long) *
++		arraybase=(farlong *)AllocateMemory(sizeof(farlong) *
+ 			numsortstruct->numarrays * numsortstruct->arraysize,
+ 			&systemerror);
+ 		if(systemerror)
+@@ -153,7 +153,7 @@
+ {       /*
+ 	** Allocate space for arrays
+ 	*/
+-	arraybase=(farlong *)AllocateMemory(sizeof(long) *
++	arraybase=(farlong *)AllocateMemory(sizeof(farlong) *
+ 		numsortstruct->numarrays * numsortstruct->arraysize,
+ 		&systemerror);
+ 	if(systemerror)
+@@ -298,7 +298,7 @@
+ 	ulong bottom,           /* Lower bound */
+ 	ulong top)              /* Upper bound */
+ {
+-ulong temp;                     /* Used to exchange elements */
++farlong temp;                     /* Used to exchange elements */
+ ulong i;                        /* Loop index */
+ 
+ /*
+@@ -332,7 +332,7 @@
+ 	ulong j)                /* Maximum of array */
+ {
+ unsigned long k;
+-long temp;                              /* Used for exchange */
++farlong temp;                              /* Used for exchange */
+ 
+ while((i+i)<=j)
+ {
+@@ -641,7 +641,7 @@
+ ** Now the array is full, allocate enough space for an
+ ** offset pointer array.
+ */
+-optrarray=(farulong *)AllocateMemory(*nstrings * sizeof(unsigned long) *
++optrarray=(farulong *)AllocateMemory(*nstrings * sizeof(farulong) *
+ 		numarrays,
+ 		&systemerror);
+ if(systemerror)
+@@ -956,7 +956,7 @@
+ if(locbitopstruct->adjust==0)
+ {
+ 	bitarraybase=(farulong *)AllocateMemory(locbitopstruct->bitfieldarraysize *
+-		sizeof(ulong),&systemerror);
++		sizeof(farulong),&systemerror);
+ 	if(systemerror)
+ 	{       ReportError(errorcontext,systemerror);
+ 		ErrorExit();
+@@ -973,7 +973,7 @@
+ 		** Allocate space for operations array
+ 		*/
+ 		bitoparraybase=(farulong *)AllocateMemory(locbitopstruct->bitoparraysize*2L*
+-			sizeof(ulong),
++			sizeof(farulong),
+ 			&systemerror);
+ 		if(systemerror)
+ 		{       ReportError(errorcontext,systemerror);
+@@ -995,12 +995,12 @@
+ 	        if (locbitopstruct->bitoparraysize==30L){
+ 		  /* this is the first loop, write a debug file */
+ 		  FILE *file;
+-		  unsigned long *running_base; /* same as farulong */
++		  farulong *running_base;
+ 		  long counter;
+ 		  file=fopen("debugbit.dat","w");
+ 		  running_base=bitarraybase;
+ 		  for (counter=0;counter<(long)(locbitopstruct->bitfieldarraysize);counter++){
+-#ifdef LONG64
++#if defined(LONG64) && !defined(SCORECARD_FIXED_DATA32)
+ 		    fprintf(file,"%08X",(unsigned int)(*running_base&0xFFFFFFFFL));
+ 		    fprintf(file,"%08X",(unsigned int)((*running_base>>32)&0xFFFFFFFFL));
+ 		    if ((counter+1)%4==0) fprintf(file,"\n");
+@@ -1029,13 +1029,13 @@
+ 	** the array space.
+ 	*/
+ 	bitarraybase=(farulong *)AllocateMemory(locbitopstruct->bitfieldarraysize *
+-		sizeof(ulong),&systemerror);
++		sizeof(farulong),&systemerror);
+ 	if(systemerror)
+ 	{       ReportError(errorcontext,systemerror);
+ 		ErrorExit();
+ 	}
+ 	bitoparraybase=(farulong *)AllocateMemory(locbitopstruct->bitoparraysize*2L*
+-		sizeof(ulong),
++		sizeof(farulong),
+ 		&systemerror);
+ 	if(systemerror)
+ 	{       ReportError(errorcontext,systemerror);
+@@ -1107,7 +1107,7 @@
+ randnum((int32)13);
+ for (i=0;i<global_bitopstruct.bitfieldarraysize;i++)
+ {
+-#ifdef LONG64
++#if defined(LONG64) && !defined(SCORECARD_FIXED_DATA32)
+ 	*(bitarraybase+i)=(ulong)0x5555555555555555;
+ #else
+ 	*(bitarraybase+i)=(ulong)0x55555555;
+@@ -1188,7 +1188,7 @@
+ 
+ while(nbits--)
+ {
+-#ifdef LONG64
++#if defined(LONG64) && !defined(SCORECARD_FIXED_DATA32)
+ 	bindex=bit_addr>>6;     /* Index is number /64 */
+ 	bitnumb=bit_addr % 64;   /* Bit number in word */
+ #else
+@@ -1218,7 +1218,7 @@
+ 
+ while(nbits--)
+ {
+-#ifdef LONG64
++#if defined(LONG64) && !defined(SCORECARD_FIXED_DATA32)
+ 	bindex=bit_addr>>6;     /* Index is number /64 */
+ 	bitnumb=bit_addr % 64;  /* Bit number in longword */
+ #else
+@@ -1722,7 +1722,7 @@
+ 		/*
+ 		** Allocate space for arrays
+ 		*/
+-		arraybase=(farlong *) AllocateMemory(sizeof(long)*
++		arraybase=(farlong *) AllocateMemory(sizeof(farlong)*
+ 			ASSIGNROWS*ASSIGNCOLS*locassignstruct->numarrays,
+ 			 &systemerror);
+ 		if(systemerror)
+@@ -1750,7 +1750,7 @@
+ {       /*
+ 	** Allocate space for arrays
+ 	*/
+-	arraybase=(farlong *)AllocateMemory(sizeof(long)*
++	arraybase=(farlong *)AllocateMemory(sizeof(farlong)*
+ 		ASSIGNROWS*ASSIGNCOLS*locassignstruct->numarrays,
+ 		 &systemerror);
+ 	if(systemerror)
+@@ -1955,10 +1955,10 @@
+ ** row and column basis.  These minima are subtracted from
+ ** their rows and columns, creating a new tableau.
+ */
+-static void calc_minimum_costs(long tableau[][ASSIGNCOLS])
++static void calc_minimum_costs(farlong tableau[][ASSIGNCOLS])
+ {
+ ushort i,j;              /* Index variables */
+-long currentmin;        /* Current minimum */
++farlong currentmin;        /* Current minimum */
+ /*
+ ** Determine minimum costs on row basis.  This is done by
+ ** subtracting -- on a row-per-row basis -- the minum value
+@@ -2014,7 +2014,7 @@
+ ** Returns the number of selections made.  If this equals
+ ** the number of rows, then an optimum has been determined.
+ */
+-static int first_assignments(long tableau[][ASSIGNCOLS],
++static int first_assignments(farlong tableau[][ASSIGNCOLS],
+ 		short assignedtableau[][ASSIGNCOLS])
+ {
+ ushort i,j,k;                   /* Index variables */
+@@ -2129,13 +2129,13 @@
+ ** refer to the algorithm's source, mentioned in comments
+ ** toward the beginning of the program.
+ */
+-static void second_assignments(long tableau[][ASSIGNCOLS],
++static void second_assignments(farlong tableau[][ASSIGNCOLS],
+ 		short assignedtableau[][ASSIGNCOLS])
+ {
+ int i,j;                                /* Indexes */
+ short linesrow[ASSIGNROWS];
+ short linescol[ASSIGNCOLS];
+-long smallest;                          /* Holds smallest value */
++farlong smallest;                          /* Holds smallest value */
+ ushort numassigns;                      /* Number of assignments */
+ ushort newrows;                         /* New rows to be considered */
+ /*

@@ -15,7 +15,7 @@ XB="$OUT/xbench"; mkdir -p "$XB"
 command -v riscv64-none-elf-gcc >/dev/null || { echo "run inside: nix develop -c $0"; exit 1; }
 
 RVCC=riscv64-none-elf-gcc
-RVF="-static -O2 -march=rv64gc -mabi=lp64d"
+RVF="-static -O2 -march=rv64gcv_zicsr_zifencei -mabi=lp64d"
 
 # riscv64 freestanding (self-contained _start + raw ecalls, no libc)
 $RVCC -nostdlib $RVF -o "$XB/alu.rv64"        "$HERE/alu.c"

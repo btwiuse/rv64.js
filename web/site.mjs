@@ -107,7 +107,7 @@ async function fetchAsset(local, release, progress) {
   throw last;
 }
 
-async function loadWasm() {
+async function loadRuntime() {
   return fetchAsset(
     ["./rv64_wasm.wasm", "../target/wasm32-unknown-unknown/release/rv64_wasm.wasm"],
     "rv64_wasm.wasm",
@@ -126,7 +126,7 @@ async function start(presetName) {
   try {
     if (active) await active.destroy();
     active = null;
-    const wasm = await loadWasm();
+    const wasm = await loadRuntime();
     const images = [];
     for (let i = 0; i < preset.local.length; i++) {
       const name = preset.release[i];

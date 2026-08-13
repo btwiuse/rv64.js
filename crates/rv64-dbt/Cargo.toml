@@ -1,0 +1,23 @@
+[package]
+name = "rv64-dbt"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Clean-room RV64 to WebAssembly dynamic binary translator"
+publish = false
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+r111-diagnostics = []
+
+[dependencies]
+rv64-core = { path = "../rv64-core" }
+wasm-encoder = { version = "0.255.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+wasmparser = { version = "0.255.0", default-features = false, features = ["std", "validate"] }
+
+[[example]]
+name = "emit_real_region_corpus"
+required-features = ["r111-diagnostics"]

@@ -1,0 +1,114 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>RV64 DBT real-region browser frontend benchmark</title>
+<pre id="result">running</pre>
+<script type="module">
+const reverse = new URLSearchParams(location.search).get("reverse") === "1";
+
+function imports() {
+  return {
+    env: {
+      memory: new WebAssembly.Memory({ initial: 1 }),
+      fp_exec: () => 0n,
+      user_reservation: () => 0,
+      system_reservation: () => 0,
+      tlb_fill: () => -1n,
+      chain_next: () => {},
+      __indirect_function_table: new WebAssembly.Table({ initial: 16, element: "anyfunc" }),
+    },
+  };
+}
+
+async function main() {
+  const manifestResponse = await fetch("/manifest.json", { cache: "no-store" });
+  if (!manifestResponse.ok) throw new Error(`manifest fetch failed: ${manifestResponse.status}`);
+  const records = await manifestResponse.json();
+  const grouped = new Map();
+  for (const record of records) {
+    const key = `${record.workload}/p${record.pages}/l${record.leader_cap}/${record.mode}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(record);
+  }
+  const groups = [...grouped].map(([key, entries]) => ({ key, entries }));
+  if (reverse) {
+    groups.reverse();
+    groups.forEach((group) => group.entries.reverse());
+  }
+  const environment = imports();
+  const results = [];
+  const groupResults = [];
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+    const group = groups[groupIndex];
+    const fetched = [];
+    for (const record of group.entries) {
+      const response = await fetch(`/corpus/${record.wasm}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`${record.wasm}: fetch failed: ${response.status}`);
+      fetched.push({ record, bytes: await response.arrayBuffer() });
+    }
+    const compiled = [];
+    const groupResultStart = results.length;
+    let groupStarted = performance.now();
+    for (const { record, bytes } of fetched) {
+      const started = performance.now();
+      try {
+        compiled.push({ record, module: await WebAssembly.compile(bytes) });
+        results.push({ wasm: record.wasm, compileMs: performance.now() - started });
+      } catch (error) {
+        if (record.mode === "tailcall") {
+          results.length = groupResultStart;
+          for (const entry of group.entries) {
+            results.push({ wasm: entry.wasm, unsupported: "Wasm tail calls are not enabled" });
+          }
+          compiled.length = 0;
+          break;
+        }
+        throw error;
+      }
+    }
+    if (compiled.length === 0) {
+      groupResults.push({ key: group.key, unsupported: "Wasm tail calls are not enabled" });
+      continue;
+    }
+    const compileTotalMs = performance.now() - groupStarted;
+    groupStarted = performance.now();
+    for (const { record, module } of compiled) {
+      const started = performance.now();
+      const instance = await WebAssembly.instantiate(module, environment);
+      const instantiateMs = performance.now() - started;
+      if (typeof instance.exports.run !== "function") {
+        throw new Error(`${record.wasm}: run export is missing`);
+      }
+      const result = results.find((entry) => entry.wasm === record.wasm);
+      result.instantiateMs = instantiateMs;
+    }
+    groupResults.push({
+      key: group.key,
+      compileTotalMs,
+      instantiateTotalMs: performance.now() - groupStarted,
+    });
+    if ((groupIndex & 3) === 3) {
+      await new Promise((resolve) => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = resolve;
+        channel.port2.postMessage(0);
+      });
+    }
+  }
+  return {
+    userAgent: navigator.userAgent,
+    order: reverse ? "reverse" : "forward",
+    results,
+    groupResults,
+  };
+}
+
+try {
+  document.querySelector("#result").textContent = JSON.stringify(await main());
+} catch (error) {
+  document.querySelector("#result").textContent = JSON.stringify({
+    error: error?.stack ?? String(error),
+  });
+} finally {
+  document.documentElement.dataset.done = "1";
+}
+</script>

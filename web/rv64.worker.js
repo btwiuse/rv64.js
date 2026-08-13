@@ -60,6 +60,12 @@ async function call(message) {
     if (message.method === "start") value = await vm.start();
     else if (message.method === "stop") value = await vm.stop();
     else if (message.method === "reset") value = await vm.reset();
+    else if (message.method === "setJitEnabled") {
+      value = await vm.setJitEnabled(message.value);
+    }
+    else if (message.method === "jitStats") value = await vm.jitStats();
+    else if (message.method === "jitProfile") value = await vm.jitProfile(message.value);
+    else if (message.method === "configureJit") value = await vm.configureJit(message.value);
     else if (message.method === "destroy") {
       value = await vm.destroy();
       vm = null;

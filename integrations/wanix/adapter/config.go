@@ -12,8 +12,10 @@ import (
 )
 
 type config struct {
-	memoryMB int
-	cmdline  string
+	memoryMB    int
+	cmdline     string
+	jitDisabled bool
+	benchmark   bool
 }
 
 func parseFlags(args []string) (config, error) {
@@ -29,6 +31,23 @@ func parseFlags(args []string) (config, error) {
 	if value := os.Getenv("VM_APPEND"); value != "" {
 		appendArgs = value
 	}
+	jitDisabled := false
+	benchmark := false
+	kernelArgs := make([]string, 0, len(strings.Fields(appendArgs)))
+	for _, arg := range strings.Fields(appendArgs) {
+		if arg == "rv64.jit=off" {
+			jitDisabled = true
+			continue
+		}
+		if arg == "rv64.benchmark=1" {
+			benchmark = true
+		}
+		if strings.HasPrefix(arg, "rv64.static-t0=") {
+			return config{}, fmt.Errorf("rv64.static-t0 was removed after the experiment was rejected")
+		}
+		kernelArgs = append(kernelArgs, arg)
+	}
+	appendArgs = strings.Join(kernelArgs, " ")
 	bytes, err := parseMemorySize(mem)
 	if err != nil {
 		return config{}, err
@@ -42,7 +61,12 @@ func parseFlags(args []string) (config, error) {
 		// host-export stream on the secondary virtio console.
 		cmdline += " export=hvc0"
 	}
-	return config{memoryMB: bytes / (1024 * 1024), cmdline: cmdline}, nil
+	return config{
+		memoryMB:    bytes / (1024 * 1024),
+		cmdline:     cmdline,
+		jitDisabled: jitDisabled,
+		benchmark:   benchmark,
+	}, nil
 }
 
 func parseMemorySize(value string) (int, error) {

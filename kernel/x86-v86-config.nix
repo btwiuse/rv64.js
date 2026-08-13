@@ -5,6 +5,10 @@
 # system boundary while enabling only the architecture/console path v86 needs.
 with lib.kernel;
 {
+  # copy/v86 implements the 32-bit Pentium-Pro-era ISA, not x86-64 long
+  # mode. Alpine calls this package architecture "x86" and Go calls it 386.
+  X86_32 = yes;
+  M686 = yes;
   SMP = no;
   MODULES = no;
   CC_OPTIMIZE_FOR_SIZE = yes;
@@ -39,6 +43,26 @@ with lib.kernel;
   UNIX98_PTYS = yes;
   SERIAL_8250 = yes;
   SERIAL_8250_CONSOLE = yes;
+
+  # WANIX exposes the live namespace as the guest's 9P root through v86's
+  # virtio-pci device. hvc0 carries the interactive console while ttyS0 is
+  # kept separate for hostexport's framed WANIX protocol.
+  BLOCK = yes;
+  BLK_DEV = yes;
+  PCI = yes;
+  VIRTIO_MENU = yes;
+  VIRTIO_PCI = yes;
+  VIRTIO_CONSOLE = yes;
+  NET = yes;
+  PACKET = yes;
+  UNIX = yes;
+  INET = yes;
+  NETDEVICES = yes;
+  ETHERNET = yes;
+  VIRTIO_NET = yes;
+  NET_9P = yes;
+  NET_9P_VIRTIO = yes;
+  "9P_FS" = yes;
 
   PROC_FS = yes;
   SYSFS = yes;

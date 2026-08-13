@@ -6,7 +6,8 @@
 // Programs are synthesized ELFs: registers seeded with edge values (0, -1,
 // i64::MIN, small ints), then a LOOP whose body is random ALU/FP
 // instructions across every family the JIT compiles (OP, OP-32, OP-IMM,
-// OP-IMM-32, LUI/AUIPC, FMV/FP-arith/FMADD/FCVT/FSQRT). 100 iterations
+// OP-IMM-32, LUI/AUIPC, FENCE/FENCE.I, FMV/FP-arith/FMADD/FCVT/FSQRT).
+// 100 iterations
 // crosses the tier-up threshold mid-run, so each program exercises
 // interpreter execution, tier-up, compiled execution, FP eligibility
 // bails, and division edge cases — any retirement or semantic divergence
@@ -53,14 +54,14 @@ function randInsn() {
   const rd = 1 + (rnd() % 30);
   const rs1 = rnd() % 31;
   const rs2 = rnd() % 31;
-  switch (rnd() % 16) {
+  switch (rnd() % 17) {
     case 0: { // OP: add/sub/sll/slt/sltu/xor/srl/sra/or/and
       const f3 = rnd() % 8;
       const f7 = (f3 === 0 || f3 === 5) && rnd() % 2 ? 0x20 : 0x00;
       return R(0x33, f3, f7, rd, rs1, rs2);
     }
-    case 1: { // M: mul/div/divu/rem/remu (skip mulh*)
-      const f3 = [0, 4, 5, 6, 7][rnd() % 5];
+    case 1: { // M: mul, high-half multiply, divide, and remainder
+      const f3 = rnd() % 8;
       return R(0x33, f3, 0x01, rd, rs1, rs2);
     }
     case 2: { // OP-32
@@ -119,6 +120,8 @@ function randInsn() {
       return rnd() % 2
         ? R(0x53, 0, 0x20, rnd() % 32, rnd() % 32, 1) // fcvt.s.d
         : R(0x53, 0, 0x21, rnd() % 32, rnd() % 32, 0); // fcvt.d.s
+    case 16: // Single-hart FENCE / FENCE.I no-op contract
+      return rnd() % 2 ? 0x0aa0000f : 0x0000100f;
     default: // FP compare (writes GPR) or fsqrt
       return rnd() % 2
         ? R(0x53, rnd() % 3, 0x51, rd, rnd() % 32, rnd() % 32) // fle/flt/feq.d

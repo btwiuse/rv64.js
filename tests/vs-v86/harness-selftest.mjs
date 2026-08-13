@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
 import {
+  CPU_PROBE_SPEC,
   alternatingOrder,
   candidateVerdict,
   median,
   pairedOrder,
 } from "./bench-math.mjs";
+
+assert.deepEqual(CPU_PROBE_SPEC, {
+  algorithm: "pbkdf2-sha256",
+  iterations: 100_000,
+  samples: 7,
+  statistic: "minimum",
+});
 
 assert.equal(median([]), null);
 assert.equal(median([3, 1, 2]), 2);

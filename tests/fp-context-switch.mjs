@@ -16,6 +16,18 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import {
+  bootModern,
+  clearOutput,
+  guestCommand,
+  loadModernImages,
+  machineDiagnostics,
+  missingModernImages,
+  output,
+  pumpUntil,
+  transferBinary,
+  waitForAlpine,
+} from "./modern-linux-harness.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const ARTIFACTS = process.env.ARTIFACTS || process.env.SC;
@@ -26,53 +38,54 @@ if (!ARTIFACTS || !existsSync(binPath)) {
 }
 const { RV64Debug: RV64 } = await import(join(root, "web/rv64.js"));
 const wasm = await readFile(join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"));
-const img = (f) => readFile(join(root, "web/images", f)).then((b) => new Uint8Array(b));
-const [bios, kernel, disk] = await Promise.all([
-  img("bbl64.bin"), img("kernel-riscv64.bin"), img("root-riscv64.bin"),
-]);
+const missing = missingModernImages(root);
+if (missing.length) {
+  console.log(`SKIP fp-context-switch (run web/prepare-images.sh; missing ${missing.join(", ")})`);
+  process.exit(process.env.REQUIRE_ALL === "1" ? 2 : 0);
+}
+const images = await loadModernImages(root);
 const enc = new TextEncoder();
-const tick = () => new Promise((r) => setImmediate(r));
+const machine = await bootModern({
+  RV64,
+  wasm,
+  images,
+  mode: "direct",
+  jit: true,
+  superblock: true,
+});
+const { vm } = machine;
 
-const vm = await RV64.create(wasm);
-vm.ex.jit_set_enabled(1);
-vm.ex.sys_set_superblock(1); // the config the scorecard runs
-let out = "";
-vm.onWrite = (fd, b) => (out += new TextDecoder().decode(b));
-vm.bootLinux({ bios, kernel, disk: disk.slice() });
-for (let i = 0; i < 40000 && !out.includes("~ #"); i++) {
-  vm.runSystem(5_000_000n);
-  if ((i & 15) === 0) await tick();
+if (!await waitForAlpine(machine)) {
+  console.log(`FAIL fp-context-switch: boot timeout\n${machineDiagnostics(machine)}`);
+  process.exit(1);
 }
-if (!out.includes("~ #")) { console.log("FAIL fp-context-switch: boot"); process.exit(1); }
-vm.consoleInput(enc.encode("stty -echo 2>/dev/null\n"));
-for (let i = 0; i < 3000; i++) vm.runSystem(2_000_000n);
-const b64 = Buffer.from(await readFile(binPath)).toString("base64");
-vm.consoleInput(enc.encode(": > /tmp/b\n"));
-for (let i = 0; i < 1500; i++) vm.runSystem(2_000_000n);
-for (let o = 0; o < b64.length; o += 512) {
-  vm.consoleInput(enc.encode(`printf %s '${b64.slice(o, o + 512)}' >> /tmp/b\n`));
-  for (let i = 0; i < 3000; i++) vm.runSystem(2_000_000n);
-  await tick();
+if (!await guestCommand(
+  machine,
+  "stty -echo 2>/dev/null; echo FP_'READY'",
+  "FP_READY",
+)) {
+  console.log(`FAIL fp-context-switch: shell setup timeout\n${machineDiagnostics(machine)}`);
+  process.exit(1);
 }
-vm.consoleInput(enc.encode("base64 -d /tmp/b > /tmp/c && chmod 755 /tmp/c\n"));
-for (let i = 0; i < 12000; i++) vm.runSystem(2_000_000n);
+if (!await transferBinary(machine, await readFile(binPath), "/tmp/c", "FP")) {
+  console.log(`FAIL fp-context-switch: transfer/decode timeout\n${machineDiagnostics(machine)}`);
+  process.exit(1);
+}
 
 // run TWO copies concurrently; the kernel interleaves them on one hart
-out = "";
-vm.consoleInput(enc.encode("/tmp/c > /tmp/o1 & /tmp/c > /tmp/o2 & wait; echo ---; cat /tmp/o1 /tmp/o2\n"));
-const t = performance.now();
-for (let i = 0; i < 4_000_000; i++) {
-  vm.runSystem(5_000_000n);
-  if ((i & 15) === 0) await tick();
-  const done = (out.match(/BENCH_DONE/g) || []).length;
-  if (done >= 2 && out.includes("---")) break;
-  if (performance.now() - t > 400000) break;
-}
+clearOutput(machine);
+vm.virtConsoleInput(enc.encode("/tmp/c > /tmp/o1 & /tmp/c > /tmp/o2 & wait; echo ---; cat /tmp/o1 /tmp/o2\n"));
+await pumpUntil(
+  machine,
+  () => (output(machine).match(/BENCH_DONE/g) || []).length >= 2 && output(machine).includes("---"),
+  { slice: 5_000_000n, timeoutMs: 400_000 },
+);
+const out = output(machine);
 const sums = [...out.matchAll(/checksum=(0x[0-9a-f]+)/g)].map((m) => m[1]);
 const ok = sums.length === 2 && sums[0] === sums[1] && /^0x[0-9a-f]{8,}$/.test(sums[0]);
 console.log(
   ok
     ? `FP CONTEXT SWITCH: PASS (both processes checksum ${sums[0]})`
-    : `FP CONTEXT SWITCH: FAIL (checksums: ${sums.join(", ") || "none"})\ntail: ${out.slice(-300)}`,
+    : `FP CONTEXT SWITCH: FAIL (checksums: ${sums.join(", ") || "none"})\n${machineDiagnostics(machine)}`,
 );
 process.exit(ok ? 0 : 1);

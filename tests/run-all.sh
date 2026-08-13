@@ -12,7 +12,7 @@
 #   5. spike lockstep     per-instruction register-writeback diff vs Spike
 #   6. riscv-arch-test    official architecture tests, signatures vs Spike
 #   7. wasm build + smoke + JIT differential fuzzer through Node
-#   8. virt-smoke        modern-system (Debian-class) boot regression test
+#   8. virt-smoke        slim modern OpenSBI/Linux boot regression test
 #
 # Under the nix dev shell (flake.nix) all tools are present.
 set -u
@@ -87,10 +87,40 @@ fi
 note "7/8 wasm build + smoke"
 if command -v node >/dev/null 2>&1; then
     node tests/vs-v86/harness-selftest.mjs || FAILED=1
+    node tests/vs-v86/amortized-cold-cost-selftest.mjs || FAILED=1
+    node tests/analyze-wanix-pairs-selftest.mjs || FAILED=1
     cargo build --release -q -p rv64-wasm --target wasm32-unknown-unknown || FAILED=1
+    node tests/public-api.mjs || FAILED=1
+    node tests/worker-api.mjs || FAILED=1
     node tests/http-relay.mjs || FAILED=1
+    node tests/p9-concurrency.mjs || FAILED=1
+    node tests/wanix-p9-singleflight.mjs || FAILED=1
     node tests/wasm-smoke.mjs || FAILED=1
     node tests/jit-differential.mjs || FAILED=1
+    node tests/jit-memory-differential.mjs || FAILED=1
+    node tests/jit-m-differential.mjs || FAILED=1
+    node tests/jit-forward-trace-differential.mjs || FAILED=1
+    node tests/jit-fp-differential.mjs || FAILED=1
+    node tests/jit-fp-fastpath-differential.mjs || FAILED=1
+    node tests/jit-a-differential.mjs || FAILED=1
+    node tests/jit-system-memory-differential.mjs || FAILED=1
+    node tests/jit-system-memory-exits.mjs || FAILED=1
+    node tests/jit-system-bulk-copy-differential.mjs || FAILED=1
+    node tests/jit-disabled-bypass.mjs || FAILED=1
+    node tests/jit-system-wfi-yield.mjs || FAILED=1
+    node tests/jit-page-policy-wfi-yield.mjs || FAILED=1
+    node tests/jit-page-policy-smoke.mjs || FAILED=1
+    node tests/jit-page-policy-multipage.mjs || FAILED=1
+    node tests/jit-policy-trace-smoke.mjs || FAILED=1
+    node tests/jit-system-sv39-differential.mjs || FAILED=1
+    node tests/jit-tlb-context-probe.mjs || FAILED=1
+    node tests/jit-system-a-differential.mjs || FAILED=1
+    node tests/jit-system-fp-differential.mjs || FAILED=1
+    node tests/jit-t2-multientry-differential.mjs || FAILED=1
+    node tests/jit-t2-atomic-random.mjs || FAILED=1
+    node tests/jit-standalone-wasmtime.mjs || FAILED=1
+    node tests/jit-modern-linux.mjs || FAILED=1
+    node tests/jit-page-policy-public-modern.mjs || FAILED=1
     ARTIFACTS="${ARTIFACTS:-target/bench}" node tests/fp-context-switch.mjs || FAILED=1
     ARTIFACTS="${ARTIFACTS:-target/bench}" node tests/amo-diff.mjs || FAILED=1
 else
@@ -100,10 +130,10 @@ fi
 note "8/8 virt-smoke (modern-system boot)"
 # Only run when the kernel is already realized in the store; building it is a
 # ~15 min one-off. `nix path-info` checks presence without triggering a build.
-if command -v nix >/dev/null 2>&1 && nix path-info .#virt-kernel >/dev/null 2>&1; then
+if command -v nix >/dev/null 2>&1 && nix path-info .#virt-kernel-fast >/dev/null 2>&1; then
     tests/virt-smoke/run.sh || FAILED=1
 else
-    skip "virt-kernel not built; run tests/virt-smoke/run.sh once to build+cache it"
+    skip "virt-kernel-fast not built; run tests/virt-smoke/run.sh once to build+cache it"
 fi
 
 printf '\n'

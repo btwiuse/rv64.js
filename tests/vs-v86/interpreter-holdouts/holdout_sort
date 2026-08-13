@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+. /opt/holdout/expected.env
+
+rm -f /tmp/holdout.sorted
+echo BENCH_START
+LC_ALL=C sort /opt/holdout/records.txt > /tmp/holdout.sorted
+echo BENCH_DONE
+actual="$(sha256sum /tmp/holdout.sorted | cut -d' ' -f1)"
+[ "$actual" = "$SORTED_SHA256" ]
+printf 'checksum=0x%s\n' "$(printf '%s' "$actual" | cut -c1-16)"

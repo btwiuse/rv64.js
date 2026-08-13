@@ -1,4 +1,8 @@
 /target
+# Cargo fixtures used by standalone Wasm model tests
+tests/*/target/
+# V8 profiling output emitted by local benchmark runs
+/isolate-*-v8.log
 # TinyEMU native build artifacts (source stays vendored)
 reference/tinyemu/*.o
 reference/tinyemu/*.d

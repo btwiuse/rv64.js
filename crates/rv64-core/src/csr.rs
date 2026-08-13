@@ -23,6 +23,10 @@ impl Mode {
 pub const FFLAGS: u32 = 0x001;
 pub const FRM: u32 = 0x002;
 pub const FCSR: u32 = 0x003;
+pub const VSTART: u32 = 0x008;
+pub const VXSAT: u32 = 0x009;
+pub const VXRM: u32 = 0x00a;
+pub const VCSR: u32 = 0x00f;
 
 pub const SSTATUS: u32 = 0x100;
 pub const SIE: u32 = 0x104;
@@ -53,6 +57,9 @@ pub const MINSTRET: u32 = 0xb02;
 pub const CYCLE: u32 = 0xc00;
 pub const TIME: u32 = 0xc01;
 pub const INSTRET: u32 = 0xc02;
+pub const VL: u32 = 0xc20;
+pub const VTYPE: u32 = 0xc21;
+pub const VLENB: u32 = 0xc22;
 
 pub const MVENDORID: u32 = 0xf11;
 pub const MARCHID: u32 = 0xf12;
@@ -65,6 +72,7 @@ pub const MSTATUS_MIE: u64 = 1 << 3;
 pub const MSTATUS_SPIE: u64 = 1 << 5;
 pub const MSTATUS_MPIE: u64 = 1 << 7;
 pub const MSTATUS_SPP: u64 = 1 << 8;
+pub const MSTATUS_VS: u64 = 3 << 9;
 pub const MSTATUS_MPP: u64 = 3 << 11;
 pub const MSTATUS_FS: u64 = 3 << 13;
 pub const MSTATUS_MPRV: u64 = 1 << 17;
@@ -81,6 +89,7 @@ pub const MSTATUS_SD: u64 = 1 << 63;
 pub const SSTATUS_MASK: u64 = MSTATUS_SIE
     | MSTATUS_SPIE
     | MSTATUS_SPP
+    | MSTATUS_VS
     | MSTATUS_FS
     | MSTATUS_SUM
     | MSTATUS_MXR
@@ -95,7 +104,7 @@ pub const IRQ_MTIP: u64 = 1 << 7;
 pub const IRQ_SEIP: u64 = 1 << 9;
 pub const IRQ_MEIP: u64 = 1 << 11;
 
-/// misa: RV64 IMAFDCSU.
+/// misa: RV64 IMAFDCSUV.
 pub const MISA_VALUE: u64 = (2 << 62) // MXL=64
     | (1 << 0)  // A
     | (1 << 2)  // C
@@ -104,7 +113,8 @@ pub const MISA_VALUE: u64 = (2 << 62) // MXL=64
     | (1 << 8)  // I
     | (1 << 12) // M
     | (1 << 18) // S
-    | (1 << 20); // U
+    | (1 << 20) // U
+    | (1 << 21); // V
 
 /// The privileged CSR state added to the hart for full-system mode.
 #[derive(Clone)]

@@ -182,19 +182,26 @@ fn main() {
                 let now_insns = m.cpu.insn_count;
                 let dt = hb_last.elapsed().as_secs_f64();
                 let mips = (now_insns - hb_insns) as f64 / dt / 1e6;
-                let mode = m
-                    .cpu
-                    .sys
-                    .as_ref()
-                    .map(|s| format!("{:?}", s.mode))
-                    .unwrap_or_default();
+                let (mode, machine_trap) = m.cpu.sys.as_ref().map_or_else(
+                    || (String::new(), String::new()),
+                    |s| {
+                        (
+                            format!("{:?}", s.mode),
+                            format!(
+                                " mepc={:#x} mcause={:#x} mtval={:#x} mstatus={:#x}",
+                                s.mepc, s.mcause, s.mtval, s.mstatus
+                            ),
+                        )
+                    },
+                );
                 eprintln!(
-                    "\r[hb] t={:.0}s insns={} {:.0} MIPS pc={:#x} mode={} {}",
+                    "\r[hb] t={:.0}s insns={} {:.0} MIPS pc={:#x} mode={}{} {}",
                     t0.elapsed().as_secs_f64(),
                     now_insns,
                     mips,
                     m.cpu.pc,
                     mode,
+                    machine_trap,
                     m.debug_irq_state()
                 );
                 eprintln!("[hb] last syscalls (a7@satp): {}", fmt_syscalls(&m.cpu));

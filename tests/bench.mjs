@@ -21,6 +21,11 @@ const wasmBytes = await readFile(
 );
 const REPS = 3;
 const json = process.argv.includes("--json");
+const loopQuantumArg = process.argv.find((arg) => arg.startsWith("--loop-quantum="));
+const loopQuantum = loopQuantumArg
+  ? BigInt(loopQuantumArg.slice("--loop-quantum=".length))
+  : null;
+const jitEnabled = !process.argv.includes("--jit=off");
 const results = {};
 
 function stats(vm, t0, t1, insns) {
@@ -51,6 +56,8 @@ for (const [key, argv] of [
   const runs = [];
   for (let r = 0; r < REPS; r++) {
     const vm = await RV64.create(wasmBytes);
+    vm.ex.jit_set_enabled(jitEnabled ? 1 : 0);
+    if (loopQuantum !== null) vm.ex.jit_set_user_loop_quantum(loopQuantum);
     vm.onWrite = () => {};
     vm.loadElf(benchElf, argv);
     const t0 = performance.now();

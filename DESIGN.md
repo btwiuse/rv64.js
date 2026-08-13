@@ -1,12 +1,12 @@
 # rv64.js — Design
 
-A RISC-V (RV64) emulator for the browser: **TinyEMU's scope, v86's architecture.**
+A RISC-V (RV64) emulator for the browser: a scalar `rv64gc` CPU, a modern
+Virt-class Linux machine, and a WebAssembly-only dynamic compiler.
 
-- **What to build** comes from [TinyEMU](https://bellard.org/tinyemu/) (Fabrice
-  Bellard, MIT — vendored in `reference/tinyemu/`): it is the existence proof
-  that a small rv64 machine boots mainline Linux in a browser, and it defines
-  the exact ISA subset, CSRs, MMU mode, interrupt controllers, and virtio
-  devices that suffice.
+- [TinyEMU](https://bellard.org/tinyemu/) (Fabrice Bellard, MIT — vendored in
+  `reference/tinyemu/`) supplied the project's original scope and differential
+  oracle. Its BBL/Linux 4.15 machine remains a compatibility path, not the
+  current kernel, firmware, or product target.
 - **How to structure it** comes from [copy/v86](https://github.com/copy/v86):
   CPU core in Rust compiled to `wasm32-unknown-unknown`, devices and browser
   glue in plain JS, a flat `extern "C"` export surface (no wasm-bindgen), and
@@ -21,6 +21,8 @@ guest images to boot — so we only ever debug the emulator, not the guest.
 ```
 Cargo.toml              workspace
 crates/rv64-core/       portable CPU core (no_std, no I/O)
+crates/rv64-dbt/        clean-room RV64-to-Wasm dynamic compiler
+crates/rv64-system/     legacy and modern Virt full-system machines
 crates/rv64-wasm/       wasm export surface: extern "C" over linear memory
 web/                    JS loader (rv64.js) + demo page
 reference/tinyemu/      vendored TinyEMU source (MIT) — spec map + native oracle
@@ -36,7 +38,7 @@ The one load-bearing decision: **`Cpu` is generic over a `Bus` trait.**
              └─────────────┬──────────────┘
                      trait Bus
               ┌────────────┴─────────────┐
-   FlatMemory (user-mode)      SystemBus (full-system, later)
+   FlatMemory (user-mode)      Legacy/Virt buses (full-system)
    flat buffer, bounds check   sv39/sv48 walk + TLB → RAM | MMIO
 ```
 
@@ -77,46 +79,45 @@ multiple VMs = multiple instantiations.
    A/D, SUM/MXR/MPRV. Interrupt lines are sampled live from the bus each
    step (`Bus::irq_lines`) — level-triggered like real hardware, which is
    what makes timer reprogramming race-free.
-5. ✅ **Devices + boot** (`rv64-system`): CLINT, TinyEMU-minimal PLIC, HTIF,
-   virtio-mmio v2 (console + blk + 9p + net), DTB builder, BBL trampoline.
-   **Boots TinyEMU's stock Linux 4.15 + buildroot image to an interactive
-   shell**, natively (~50 Minsn/s interpreted) and in the browser
-   (web/system.html, ~0.9 s to shell in Node). TinyEMU's device set is now fully
-   covered; 9p and net landed later as roadmap items 7 and 8.
-6. ✅ **JIT** (`rv64-jit`): integrated and live in both run loops. Hot pcs
-   (threshold 16 at dispatch points) are translated by the Rust core into
-   wasm modules; the JS host instantiates each module and registers its
-   function in the core's exported function table; the core dispatches via
-   `call_indirect`, chaining up to 64 blocks before returning to the
-   interpreter (bounds interrupt latency). Superblock formation follows
-   forward plain jumps. Verified: user-mode guests bit-identical under JIT
-   (~3x on hot ALU loops vs interpreted wasm), and Linux boots to a working
-   shell with system blocks active.
-   - **User-mode blocks** include direct guest loads/stores
-     (bounds-checked against flat RAM — a wasm trap is the fatal-fault
-     path). Invalidation: `riscv_flush_icache` syscall (the architectural
-     code-change contract) and fresh `user_load` drop all blocks.
-   - **Full-system blocks** are ALU/branch-only, keyed by virtual pc with
-     the physical address re-verified through the TLB on every dispatch
-     (satp/mapping changes miss safely); guest memory ops end blocks and
-     run through the MMU interpreter. Invalidation: SystemBus tracks a
-     bitset of compiled code pages — any store to one drops all blocks.
-   - Deliberate design point, not a gap: memory ops inside full-system
-     blocks (inline-TLB loads/stores) are the next optimization tier,
-     exactly as v86 evolved; correctness never depends on it.
+   - Full-system scalar interpreter loads/stores can consume the exact fused
+     JIT-TLB row already published by the authoritative translation path. A
+     hit requires the complete virtual-page, permission-context, and row-index
+     proof and uses its live RAM pointer directly; a miss follows the unchanged
+     standard TLB and bus path. Mapping changes, backing invalidation, and
+     generated-code-page marking clear the capability before it can be reused.
+5. ✅ **Devices + boot** (`rv64-system`): the compatibility machine retains
+   HTIF/BBL/TinyEMU images. The supported `VirtMachine` provides CLINT, PLIC,
+   ns16550, RTC, virtio-mmio block/console/9p/net, and a generated DTB. It boots
+   the slim Linux 6.12/Alpine image either directly in S-mode through host SBI
+   or through OpenSBI `fw_dynamic` in M-mode.
+6. ✅ **Dynamic compiler** (`rv64-dbt`): a clean-room typed-SSA RV64-to-Wasm
+   compiler integrated into user, legacy-system, and Virt run loops. T1 emits
+   bounded traces and fuel-metered loops; T2 emits register-resident
+   multi-entry batches and sparse multi-page regions with bounded indirect
+   specialization. Flat and full-system memory, scalar M/A/F/D, exact side
+   exits, reservations, code-page generations, and SMC invalidation are
+   compiled and differentially tested. Large regions compile asynchronously
+   and are revalidated before publication.
+   - Guest faults use explicit state materialization and interpreter re-entry;
+     a host Wasm trap is never the guest exception path.
+   - Full-system loads/stores probe typed translation rows inline, optionally
+     refill through Wasm-to-Wasm helpers, and precisely exit for page crossing,
+     MMIO, permissions, or compiled-code stores.
+   - Related entries remain inside one Wasm function through structured SCC
+     lowering with localized dispatch only where required. On engines with
+     Wasm tail calls, one table-owning trampoline connects external generated
+     successors without making every generated module import the table. Lazy
+     state and a small translation proof cache remain measured opt-in variants.
 
-All six phases are complete. F/D is softfloat (exact fflags, all rounding
-modes) with a native-FP fast path in front of it: FADD/FSUB/FMUL/FDIV run
-as host FP instructions (wasm f32/f64 ops in the browser) when rm=RNE and
-fflags.NX is already sticky-set — conditions under which no new flag
-information is possible — falling back to softfp otherwise. ~2x on
-FP-heavy code in wasm, verified by 600k-iteration differential fuzz.
+All six product phases are complete. The JIT rewrite's architecture, gates,
+policy data, and reproducible commands are recorded in
+[`docs/jit-rewrite/`](docs/jit-rewrite/). The portable default is eager
+register-resident state with structured SCC lowering, a two-page/512-leader
+maximum, sampled control-density admission, and feature-tested frame-free tail
+chaining. Generated TLB caching and recursive chaining remain measured opt-in
+variants; no browser-brand policy exists.
 
-The post-1.0 roadmap lives in [ROADMAP.md](ROADMAP.md) (perf: inline-TLB
-JIT memory ops, block chaining, FP-in-blocks; validation: RISCOF, Spike
-lockstep; features: snapshots). virtio-net/9p were intentionally descoped from
-phase 5 — the boot target was console + blk, which is what "Linux shell in the
-browser" requires. Both landed later: **virtio-9p** (`p9.rs`/`p9fs.rs`) exports a
+**virtio-9p** (`p9.rs`/`p9fs.rs`) exports a
 host directory or an in-memory tree, and **virtio-net** (`virtio.rs`) carries
 frames either to a WebSocket relay (`ws.rs`) or to an **in-browser HTTP proxy**
 (`netstack.rs` + `httpproxy.rs`) whose egress is `fetch()` — the only design that
@@ -134,12 +135,15 @@ HTTPS connection; browser egress gets the equivalent behavior from `fetch()`.
 ## Testing strategy
 
 - **Unit tests** in rv64-core per instruction group (running since phase 1).
-- **riscv-tests / RISCOF** conformance suites from phase 2 — free correctness
-  the x86/arm64 world doesn't get.
-- **Differential testing**: run the same guest on `temu` (built natively from
-  `reference/tinyemu/`) and rv64.js, diff architectural state. TinyEMU is the
-  oracle; QEMU as a second opinion.
-- Known-good guest images from bellard.org/jslinux so guest bugs are ruled out.
+- **riscv-tests and riscv-arch-test** conformance, plus per-writeback Spike
+  lockstep and QEMU user-mode output differentials.
+- **Interpreter/JIT differential testing** over directed and randomized full
+  architectural state, memory, faults, Sv39, FP, atomics, and SMC.
+- **Generated-Wasm gates** in Node/V8, Chrome/V8, Edge/V8,
+  Firefox/SpiderMonkey, and standalone Wasmtime, with exact module hashes and
+  lifecycle measurements.
+- **Modern full-system gates** for direct-SBI Linux, OpenSBI/Linux, in-guest FP
+  context switching and atomics, and a separate marker-driven Virt smoke boot.
 
 ## Licensing
 

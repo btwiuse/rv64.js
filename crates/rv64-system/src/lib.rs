@@ -647,6 +647,29 @@ impl Machine {
         self.cpu.insn_count - start
     }
 
+    /// Direct JIT-off slice using the integrated scalar interpreter driver.
+    /// Generated-code fallback deliberately continues to call [`Self::run_slice`].
+    pub fn run_slice_integrated(&mut self, max_insns: u64) -> u64 {
+        let start = self.cpu.insn_count;
+
+        self.sync_devices();
+        self.bus.poll_net_rx();
+
+        match self.cpu.run_integrated_scalar(&mut self.bus, max_insns) {
+            StopReason::Wfi => {
+                let next = self.bus.mtimecmp;
+                if next != u64::MAX && next > self.bus.mtime {
+                    self.cpu.insn_count += (next - self.bus.mtime) * self.insns_per_tick;
+                }
+            }
+            StopReason::Budget => {}
+            _ => {}
+        }
+        self.sync_devices();
+        self.power_off = self.bus.power_off;
+        self.cpu.insn_count - start
+    }
+
     /// Interpret up to `max_insns`, but stop as soon as `compiled(pc)` reports
     /// the pc has reached a JIT-compiled block — so the interpreter never
     /// overshoots into compiled code (which the JIT should run instead). Used by
@@ -657,13 +680,15 @@ impl Machine {
         &mut self,
         max_insns: u64,
         mut compiled: impl FnMut(u64) -> bool,
-    ) -> u64 {
+    ) -> (u64, bool) {
         let start = self.cpu.insn_count;
         self.sync_devices();
         self.bus.poll_net_rx();
         let mut i = 0u64;
+        let mut yielded = false;
         while i < max_insns {
             if let StopReason::Wfi = self.cpu.run(&mut self.bus, 1) {
+                yielded = true;
                 let next = self.bus.mtimecmp;
                 if next != u64::MAX && next > self.bus.mtime {
                     self.cpu.insn_count += (next - self.bus.mtime) * self.insns_per_tick;
@@ -680,7 +705,7 @@ impl Machine {
         }
         self.sync_devices();
         self.power_off = self.bus.power_off;
-        self.cpu.insn_count - start
+        (self.cpu.insn_count - start, yielded)
     }
 
     /// Advance the CLINT clock (interrupt lines are sampled live by the CPU

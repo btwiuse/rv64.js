@@ -8,7 +8,7 @@
 # build instead of silently growing a general-purpose distro kernel.
 with lib.kernel;
 {
-  # Single RV64GC hart entered through OpenSBI or rv64.js's direct SBI.
+  # Single RV64GCV hart entered through OpenSBI or rv64.js's direct SBI.
   MMU = yes;
   FPU = yes;
   RISCV_SBI = yes;
@@ -21,7 +21,7 @@ with lib.kernel;
   RISCV_TIMER = yes;
   RISCV_INTC = yes;
   SIFIVE_PLIC = yes;
-  RISCV_ISA_V = no;
+  RISCV_ISA_V = yes;
   SMP = no;
 
   # Small deterministic kernel; 100 Hz is sufficient for this VM and avoids

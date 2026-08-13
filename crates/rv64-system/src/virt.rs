@@ -20,7 +20,7 @@ use crate::dtb::Fdt;
 use crate::rtc::GoldfishRtc;
 use crate::virtio::{Backend, VirtioDev};
 use rv64_core::csr::{Mode, IRQ_MEIP, IRQ_MSIP, IRQ_MTIP, IRQ_SEIP, IRQ_SSIP, IRQ_STIP};
-use rv64_core::{Bus, Cpu, Exception, StopReason};
+use rv64_core::{Bus, Cpu, Exception, InstructionTrace, StopReason};
 
 fn plic_dbg() -> bool {
     use std::sync::OnceLock;
@@ -347,6 +347,11 @@ impl VirtBus {
             }
         }
     }
+    pub fn jit_page_marked(&self, page: u64) -> bool {
+        self.jit_pages
+            .get(page as usize / 64)
+            .is_some_and(|word| word & (1 << (page % 64)) != 0)
+    }
     pub fn jit_unmark_page(&mut self, page: u64) {
         if let Some(w) = self.jit_pages.get_mut(page as usize / 64) {
             *w &= !(1 << (page % 64));
@@ -521,6 +526,21 @@ impl Bus for VirtBus {
         }
         lines
     }
+
+    fn jit_fast_off(&self, va: u64, pa: u64, store: bool) -> Option<i64> {
+        if pa < RAM_BASE || (pa | 0xfff) >= RAM_BASE + self.ram.len() as u64 {
+            return None;
+        }
+        if store {
+            let page = ((pa - RAM_BASE) >> 12) as usize;
+            if let Some(word) = self.jit_pages.get(page / 64) {
+                if (word >> (page & 63)) & 1 != 0 {
+                    return None;
+                }
+            }
+        }
+        Some(self.ram.as_ptr() as i64 + (pa as i64 - RAM_BASE as i64) - va as i64)
+    }
 }
 
 pub struct VirtImages<'a> {
@@ -633,9 +653,8 @@ impl VirtMachine {
         if let Some(tag) = images.external_fs {
             virtio.push(VirtioDev::new(Backend::FsExternal {
                 tag: tag.into(),
-                request: None,
-                reply: None,
-                awaiting_reply: false,
+                requests: Default::default(),
+                pending: Default::default(),
             }));
         }
         if let Some(mac) = images.net {
@@ -680,7 +699,12 @@ impl VirtMachine {
         if direct_sbi {
             let sys = cpu.sys.as_mut().unwrap();
             sys.mode = Mode::Supervisor;
-            sys.medeleg = 0xb109;
+            // OpenSBI normally receives illegal-instruction traps in M mode
+            // and redirects unhandled instructions to S mode. Direct-SBI
+            // boot has no M-mode firmware/trap vector, so delegate cause 2
+            // directly as the equivalent path. Linux relies on this for its
+            // lazy first-use vector handler while a task's sstatus.VS is Off.
+            sys.medeleg = 0xb109 | (1 << 2);
             sys.mideleg = IRQ_SSIP | IRQ_STIP | IRQ_SEIP;
             sys.mcounteren = 0x7;
             sys.satp = 0;
@@ -747,11 +771,18 @@ impl VirtMachine {
     }
 
     pub fn fs_external_reply(&mut self, bytes: Vec<u8>) -> bool {
-        self.bus
+        let Some(index) = self
+            .bus
             .virtio
-            .iter_mut()
-            .find(|dev| matches!(dev.backend, Backend::FsExternal { .. }))
-            .is_some_and(|dev| dev.fs_external_reply(bytes))
+            .iter()
+            .position(|dev| matches!(dev.backend, Backend::FsExternal { .. }))
+        else {
+            return false;
+        };
+        let mut dev = self.bus.virtio.remove(index);
+        let accepted = dev.fs_external_reply(bytes, &mut self.bus.ram, RAM_BASE);
+        self.bus.virtio.insert(index, dev);
+        accepted
     }
 
     pub fn virtio_console_input(&mut self, bytes: &[u8]) {
@@ -791,6 +822,7 @@ impl VirtMachine {
 
     pub fn sync_devices(&mut self) {
         let instruction_time = self.cpu.insn_count / self.insns_per_tick + self.idle_ticks;
+        let realtime = self.realtime_ticks.is_some();
         self.bus.mtime = match self.realtime_ticks {
             // Never move backwards if a run slice predicted slightly beyond
             // the next host sample while executing a guest rdtime loop.
@@ -810,10 +842,22 @@ impl VirtMachine {
             // busy-wait loops reading `time` make progress: same clock as the
             // CLINT, derived live from insn_count.
             sys.time_scale = self.insns_per_tick;
-            sys.time_offset = self
+            let offset = self
                 .bus
                 .mtime
                 .saturating_sub(self.cpu.insn_count / self.insns_per_tick);
+            // A JIT slice has internal interrupt and interpreter-fallback
+            // boundaries between public host-clock samples. Re-anchoring to
+            // the same mtime at each such boundary used to lower time_offset,
+            // making rdtime step backwards by the intervening instructions.
+            // A hardware time counter is monotonic. In realtime mode retain
+            // the prior interpolation offset until host time advances past it;
+            // deterministic instruction-counted mode keeps its exact anchor.
+            sys.time_offset = if realtime {
+                sys.time_offset.max(offset)
+            } else {
+                offset
+            };
         }
     }
 
@@ -997,6 +1041,281 @@ impl VirtMachine {
         self.power_off = self.bus.power_off;
         self.cpu.insn_count - start
     }
+
+    /// Direct JIT-off slice using the integrated scalar interpreter driver.
+    /// Generated-code fallback deliberately continues to call [`Self::run_slice`].
+    pub fn run_slice_integrated(&mut self, max_insns: u64) -> u64 {
+        let start = self.cpu.insn_count;
+        self.bus.poll_virtio();
+        self.sync_devices();
+        let mut remaining = max_insns;
+        let mut stop = StopReason::Budget;
+        while remaining != 0 && !self.power_off {
+            let before = self.cpu.insn_count;
+            stop = self.cpu.run_integrated_scalar(&mut self.bus, remaining);
+            remaining = remaining.saturating_sub(self.cpu.insn_count - before);
+            if stop == StopReason::Ecall && self.bus.direct_sbi {
+                self.service_sbi();
+                if self.unsupported_sbi.is_some() {
+                    self.power_off = true;
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        if stop == StopReason::Wfi {
+            let next = self.bus.mtimecmp;
+            if self.realtime_ticks.is_none() && next != u64::MAX && next > self.bus.mtime {
+                self.idle_ticks += next - self.bus.mtime;
+            }
+        }
+        self.sync_devices();
+        self.power_off = self.bus.power_off;
+        self.cpu.insn_count - start
+    }
+
+    /// Exact counterpart of [`Self::run_slice`] using the core's opt-in
+    /// instruction trace path. This exists only for offline compile-policy
+    /// measurement; ordinary interpreter and JIT execution call `run_slice`.
+    pub fn run_slice_traced(
+        &mut self,
+        max_insns: u64,
+        trace: &mut impl FnMut(InstructionTrace),
+    ) -> u64 {
+        let start = self.cpu.insn_count;
+        self.bus.poll_virtio();
+        self.sync_devices();
+        let mut remaining = max_insns;
+        let mut stop = StopReason::Budget;
+        while remaining != 0 && !self.power_off {
+            let before = self.cpu.insn_count;
+            stop = self.cpu.run_traced(&mut self.bus, remaining, trace);
+            remaining = remaining.saturating_sub(self.cpu.insn_count - before);
+            if stop == StopReason::Ecall && self.bus.direct_sbi {
+                self.service_sbi();
+                if self.unsupported_sbi.is_some() {
+                    self.power_off = true;
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        if stop == StopReason::Wfi {
+            let next = self.bus.mtimecmp;
+            if self.realtime_ticks.is_none() && next != u64::MAX && next > self.bus.mtime {
+                self.idle_ticks += next - self.bus.mtime;
+            }
+        }
+        self.sync_devices();
+        self.power_off = self.bus.power_off;
+        self.cpu.insn_count - start
+    }
+
+    /// Low-overhead sampling driver for the page-heat JIT policy.
+    ///
+    /// Each sample attributes at most `quantum` retired instructions to the
+    /// mapping that was active at the start of that chunk. Consequently a
+    /// page or SATP transition can misattribute fewer than `quantum`
+    /// instructions, while the interpreter pays one extra fetch probe per
+    /// chunk instead of per instruction. `compiled` is checked between chunks
+    /// so newly generated code is overshot by at most the same bound.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_slice_sampled(
+        &mut self,
+        max_insns: u64,
+        quantum: u64,
+        sample: &mut dyn FnMut(u64, u64, u64, u8, u64, bool),
+        compiled: &mut dyn FnMut(u64) -> bool,
+    ) -> (u64, bool) {
+        let start = self.cpu.insn_count;
+        self.bus.poll_virtio();
+        self.sync_devices();
+        let mut remaining = max_insns;
+        let mut reason = StopReason::Budget;
+        let mut first = true;
+        while remaining != 0 && !self.power_off {
+            if !first && compiled(self.cpu.pc) {
+                break;
+            }
+            first = false;
+            let pc = self.cpu.pc;
+            let pa = self.cpu.jit_probe_fetch(&mut self.bus, pc);
+            let (satp, mode) = self
+                .cpu
+                .sys
+                .as_ref()
+                .map_or((0, u8::MAX), |sys| (sys.satp, sys.mode as u8));
+            let before = self.cpu.insn_count;
+            reason = self.cpu.run(&mut self.bus, remaining.min(quantum.max(1)));
+            let ran = self.cpu.insn_count - before;
+            remaining = remaining.saturating_sub(ran);
+            if ran != 0 {
+                if let Some(pa) = pa {
+                    sample(pc, pa, satp, mode, ran, false);
+                }
+            }
+            if reason == StopReason::Ecall && self.bus.direct_sbi {
+                self.service_sbi();
+                if self.unsupported_sbi.is_some() {
+                    self.power_off = true;
+                    break;
+                }
+            } else if reason != StopReason::Budget {
+                break;
+            }
+            if ran == 0 {
+                break;
+            }
+            if (self.cpu.insn_count - start) & 2047 == 0 {
+                self.sync_devices();
+            }
+        }
+        if reason == StopReason::Wfi {
+            let next = self.bus.mtimecmp;
+            if self.realtime_ticks.is_none() && next != u64::MAX && next > self.bus.mtime {
+                self.idle_ticks += next - self.bus.mtime;
+            }
+        }
+        self.sync_devices();
+        self.power_off = self.bus.power_off;
+        (self.cpu.insn_count - start, reason == StopReason::Wfi)
+    }
+
+    /// Sampling counterpart that also stops at an exact generated-code PC.
+    ///
+    /// Cold page-policy execution uses `run_slice_sampled`, preserving the
+    /// interpreter's tight loop. Once any generated entry exists, this path
+    /// checks the direct-mapped dispatch predicate after every instruction.
+    /// Sampling and re-entry precision remain independent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_slice_sampled_until(
+        &mut self,
+        max_insns: u64,
+        quantum: u64,
+        sample: &mut dyn FnMut(u64, u64, u64, u8, u64, bool),
+        compiled: &mut dyn FnMut(u64) -> bool,
+        control_entries: bool,
+    ) -> (u64, bool) {
+        let start = self.cpu.insn_count;
+        self.bus.poll_virtio();
+        self.sync_devices();
+        let mut remaining = max_insns;
+        let mut reason = StopReason::Budget;
+        let mut first = true;
+        while remaining != 0 && !self.power_off {
+            if !first && compiled(self.cpu.pc) {
+                break;
+            }
+            first = false;
+            let pc = self.cpu.pc;
+            let pa = self.cpu.jit_probe_fetch(&mut self.bus, pc);
+            let (satp, mode) = self
+                .cpu
+                .sys
+                .as_ref()
+                .map_or((0, u8::MAX), |sys| (sys.satp, sys.mode as u8));
+            let before = self.cpu.insn_count;
+            let mut reached_compiled = false;
+            let mut control_entry = None;
+            let mut stop_at = |next_pc| {
+                reached_compiled = compiled(next_pc);
+                reached_compiled
+            };
+            if control_entries {
+                reason = self.cpu.run_until_observed(
+                    &mut self.bus,
+                    remaining.min(quantum.max(1)),
+                    &mut stop_at,
+                    &mut |entry_pc, entry_pa, entry_satp, entry_mode| {
+                        if control_entry.is_none() {
+                            control_entry = Some((entry_pc, entry_pa, entry_satp, entry_mode));
+                        }
+                    },
+                );
+            } else {
+                reason =
+                    self.cpu
+                        .run_until(&mut self.bus, remaining.min(quantum.max(1)), &mut stop_at);
+            }
+            let ran = self.cpu.insn_count - before;
+            remaining = remaining.saturating_sub(ran);
+            if ran != 0 {
+                if let Some(pa) = pa {
+                    sample(pc, pa, satp, mode, ran, false);
+                }
+                if let Some((entry_pc, entry_pa, entry_satp, entry_mode)) = control_entry {
+                    sample(entry_pc, entry_pa, entry_satp, entry_mode, 0, true);
+                }
+            }
+            if reason == StopReason::Ecall && self.bus.direct_sbi {
+                self.service_sbi();
+                if self.unsupported_sbi.is_some() {
+                    self.power_off = true;
+                    break;
+                }
+            } else if reason != StopReason::Budget {
+                break;
+            }
+            if ran == 0 || reached_compiled {
+                break;
+            }
+            if (self.cpu.insn_count - start) & 2047 == 0 {
+                self.sync_devices();
+            }
+        }
+        if reason == StopReason::Wfi {
+            let next = self.bus.mtimecmp;
+            if self.realtime_ticks.is_none() && next != u64::MAX && next > self.bus.mtime {
+                self.idle_ticks += next - self.bus.mtime;
+            }
+        }
+        self.sync_devices();
+        self.power_off = self.bus.power_off;
+        (self.cpu.insn_count - start, reason == StopReason::Wfi)
+    }
+
+    /// Interpret an uncompiled stretch, stopping as soon as `compiled` says
+    /// the current PC has a generated entry. Direct-SBI ecalls are serviced
+    /// exactly as in `run_slice`; firmware boots route them through OpenSBI.
+    pub fn run_slice_until(
+        &mut self,
+        max_insns: u64,
+        mut compiled: impl FnMut(u64) -> bool,
+    ) -> (u64, bool) {
+        let start = self.cpu.insn_count;
+        self.bus.poll_virtio();
+        self.sync_devices();
+        let mut stop = StopReason::Budget;
+        while self.cpu.insn_count - start < max_insns && !self.power_off {
+            stop = self.cpu.run(&mut self.bus, 1);
+            if stop == StopReason::Ecall && self.bus.direct_sbi {
+                self.service_sbi();
+                if self.unsupported_sbi.is_some() {
+                    self.power_off = true;
+                    break;
+                }
+            } else if stop == StopReason::Wfi {
+                break;
+            }
+            if compiled(self.cpu.pc) {
+                break;
+            }
+            if (self.cpu.insn_count - start) & 63 == 0 {
+                self.sync_devices();
+            }
+        }
+        if stop == StopReason::Wfi {
+            let next = self.bus.mtimecmp;
+            if self.realtime_ticks.is_none() && next != u64::MAX && next > self.bus.mtime {
+                self.idle_ticks += next - self.bus.mtime;
+            }
+        }
+        self.sync_devices();
+        self.power_off = self.bus.power_off;
+        (self.cpu.insn_count - start, stop == StopReason::Wfi)
+    }
 }
 
 fn build_virt_fdt(
@@ -1048,12 +1367,14 @@ fn build_virt_fdt(
     f.prop_str("riscv,isa-base", "rv64i");
     f.prop_strs(
         "riscv,isa-extensions",
-        &["i", "m", "a", "f", "d", "c", "zicntr", "zicsr", "zifencei"],
+        &[
+            "i", "m", "a", "f", "d", "c", "v", "zicntr", "zicsr", "zifencei",
+        ],
     );
     // OpenSBI 1.4 (the firmware pinned by this repository) still discovers
     // hart capabilities from the legacy string. Linux uses the structured
     // properties above, so the optimized kernel needs no ISA fallback.
-    f.prop_str("riscv,isa", "rv64imafdc");
+    f.prop_str("riscv,isa", "rv64imafdcv");
     f.prop_str("mmu-type", "riscv,sv48");
     f.begin_node("interrupt-controller");
     f.prop_u32("#interrupt-cells", 1);
@@ -1163,8 +1484,9 @@ mod tests {
         assert!(contains_bytes(&fdt, b"riscv,isa-extensions\0"));
         assert!(contains_bytes(
             &fdt,
-            b"i\0m\0a\0f\0d\0c\0zicntr\0zicsr\0zifencei\0",
+            b"i\0m\0a\0f\0d\0c\0v\0zicntr\0zicsr\0zifencei\0",
         ));
+        assert!(contains_bytes(&fdt, b"rv64imafdcv\0"));
     }
 
     fn direct_machine() -> VirtMachine {
@@ -1233,5 +1555,28 @@ mod tests {
         sbi(&mut machine, 0x5352_5354, 0, 0, 0);
         assert!(machine.power_off);
         assert!(machine.bus.power_off);
+    }
+
+    #[test]
+    fn realtime_sync_never_rewinds_interpolated_rdtime() {
+        let mut machine = direct_machine();
+        machine.advance_realtime_ns(1_000_000_000);
+        machine.cpu.insn_count = 100_000_000;
+        machine.sync_devices();
+
+        // Model an internal JIT/fallback boundary before the embedding host
+        // has supplied another wall-clock sample.
+        machine.cpu.insn_count += 1_000_000;
+        let before_sync = {
+            let sys = machine.cpu.sys.as_ref().unwrap();
+            machine.cpu.insn_count / sys.time_scale + sys.time_offset
+        };
+        machine.sync_devices();
+        let after_sync = {
+            let sys = machine.cpu.sys.as_ref().unwrap();
+            machine.cpu.insn_count / sys.time_scale + sys.time_offset
+        };
+
+        assert!(after_sync >= before_sync, "rdtime moved backwards");
     }
 }

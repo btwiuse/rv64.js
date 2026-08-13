@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>R077 production-default Chrome execution-only modern Boot</title>
+<pre id="result">running</pre>
+<script type="module">
+const variant = new URLSearchParams(location.search).get("variant");
+if (variant !== "control" && variant !== "production") {
+  throw new Error(`invalid R077 variant ${variant}`);
+}
+const result = document.querySelector("#result");
+const worker = new Worker(
+  `/jit-modern-boot-production-browser-worker.mjs?variant=${encodeURIComponent(variant)}`,
+  { type: "module", name: `r077-${variant}` },
+);
+worker.onmessage = ({ data }) => {
+  if (data?.type === "result") result.textContent = JSON.stringify(data.result);
+  else if (data?.type === "error") result.textContent = JSON.stringify({ error: data.error });
+  else return;
+  document.documentElement.dataset.done = "1";
+  worker.terminate();
+};
+worker.onerror = (event) => {
+  result.textContent = JSON.stringify({ error: event.error?.stack ?? event.message });
+  document.documentElement.dataset.done = "1";
+  worker.terminate();
+};
+</script>

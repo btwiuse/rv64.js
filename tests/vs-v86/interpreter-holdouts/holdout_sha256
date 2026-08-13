@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+. /opt/holdout/expected.env
+
+echo BENCH_START
+i=0
+actual=
+while [ "$i" -lt 32 ]; do
+    actual="$(sha256sum /opt/holdout/corpus.bin | cut -d' ' -f1)"
+    i=$((i + 1))
+done
+echo BENCH_DONE
+[ "$actual" = "$CORPUS_SHA256" ]
+printf 'checksum=0x%s\n' "$(printf '%s' "$actual" | cut -c1-16)"

@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "population": "interpreter-g001-embench-iot-v1",
+  "purpose": "sealed architecture-independent transfer population",
+  "upstream": {
+    "project": "Embench IoT",
+    "repository": "https://github.com/embench/embench-iot.git",
+    "commit": "09c2ed8c3b7008c95d08b038de4a3f6dc103ed70",
+    "gitArchiveSha256": "90d8c3efef1a7c8c19748b465757c79c711990ea1be94753ff5a78c1217d0969"
+  },
+  "benchmarks": [
+    "aha-mont64",
+    "crc32",
+    "depthconv",
+    "edn",
+    "huffbench",
+    "matmult-int",
+    "md5sum",
+    "nettle-aes",
+    "nettle-sha256",
+    "nsichneu",
+    "picojpeg",
+    "qrduino",
+    "sglib-combined",
+    "slre",
+    "statemate",
+    "tarfind",
+    "ud",
+    "wikisort",
+    "xgboost"
+  ],
+  "work": {
+    "entrypoint": "unmodified upstream support/main.c",
+    "globalScaleFactor": 1,
+    "warmupHeat": 0,
+    "timedBenchmarkCallsPerProcess": 1,
+    "verification": "unmodified upstream verify_benchmark",
+    "expectedExitStatus": 0,
+    "expectedBenchmarkStdout": "",
+    "expectedBenchmarkStderr": ""
+  },
+  "toolchain": {
+    "driver": "Zig cc",
+    "version": "0.16.0",
+    "driverSha256": "190a19fb057d44a1ed3b44bff68a218b29d99fc6dec8dd2353878c0e46f18c91",
+    "targets": {
+      "rv64": "riscv64-linux-musl",
+      "i386": "x86-linux-musl"
+    },
+    "libc": "unmodified target-default static musl supplied by the same Zig distribution",
+    "optimization": "-O2",
+    "commonFlags": [
+      "-O2",
+      "-static",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-Wl,--gc-sections",
+      "-DWARMUP_HEAT=0",
+      "-DGLOBAL_SCALE_FACTOR=1",
+      "-DHAVE_BOARDSUPPORT_H=1",
+      "-Isupport",
+      "-Iexamples/native/speed",
+      "-lm"
+    ],
+    "architectureSpecificSourceOrLibraryReplacement": false
+  },
+  "guest": {
+    "linux": "6.12.7",
+    "alpine": "3.24.1",
+    "ramMiB": 512,
+    "commandLine": "console=ttyS0 rdinit=/init"
+  },
+  "timingStatus": "forbidden until the G001 candidate and its correctness identities are frozen"
+}

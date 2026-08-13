@@ -126,9 +126,9 @@ for (;;) {
 
   <main>
     <section>
-      <h2>x86 Linux — copy/v86 via WANIX (shared at /shared)</h2>
+      <h2>i686 Linux — copy/v86 via WANIX (shared at /shared)</h2>
       <wanix-vm id="x86" type="v86" export="ttyS0" mem="512M" term start>
-        <wanix-bind dst="." src="../extras/dist/wanix-linux.tgz" type="archive"></wanix-bind>
+        <wanix-bind dst="." src="../extras/dist/wanix-linux-x86.tgz" type="archive"></wanix-bind>
         <wanix-bind dst="usr/bin/wtop" src="wtop"></wanix-bind>
         <wanix-bind dst="usr/bin/wrepeat" src="wrepeat"></wanix-bind>
       </wanix-vm>

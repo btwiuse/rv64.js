@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>R085 artifact A/B Chrome execution-only modern Boot</title>
+<pre id="result">running</pre>
+<script type="module">
+const variant = new URLSearchParams(location.search).get("variant");
+if (variant !== "control" && variant !== "candidate") {
+  throw new Error(`invalid R085 variant ${variant}`);
+}
+const result = document.querySelector("#result");
+const worker = new Worker(
+  `/jit-modern-boot-r085-browser-worker.mjs?variant=${encodeURIComponent(variant)}`,
+  { type: "module", name: `r085-${variant}` },
+);
+worker.onmessage = ({ data }) => {
+  if (data?.type === "result") result.textContent = JSON.stringify(data.result);
+  else if (data?.type === "error") result.textContent = JSON.stringify({ error: data.error });
+  else return;
+  document.documentElement.dataset.done = "1";
+  worker.terminate();
+};
+worker.onerror = (event) => {
+  result.textContent = JSON.stringify({ error: event.error?.stack ?? event.message });
+  document.documentElement.dataset.done = "1";
+  worker.terminate();
+};
+</script>

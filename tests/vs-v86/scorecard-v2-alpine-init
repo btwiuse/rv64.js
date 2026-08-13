@@ -1,0 +1,16 @@
+#!/bin/sh
+
+# Shared PID 1 for the paired scorecard-v2 Alpine guests. The riscv64 and x86
+# archives are assembled from the same Alpine release and package-name list.
+# Work is released by the host over ttyS0; nothing runs automatically before
+# the benchmark worker has verified the guest identity and drained JIT work.
+
+mount -t devtmpfs dev /dev 2>/dev/null || true
+exec >/dev/ttyS0 2>&1 </dev/ttyS0
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sys /sys 2>/dev/null || true
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+echo "SCORECARD_V2_GUEST linux=$(uname -r) alpine=$(cat /etc/alpine-release) arch=$(uname -m)"
+echo SCORECARD_V2_READY
+exec /bin/sh

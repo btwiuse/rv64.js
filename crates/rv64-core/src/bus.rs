@@ -22,7 +22,11 @@ pub trait Bus {
     /// `va` translates to) is directly JIT-accessible — in guest RAM, and for a
     /// store also writable and not holding compiled code — return the linear
     /// offset such that `linear_index = va + off`; else `None`. Lets a JIT block
-    /// access memory with just a tag match and one add. Default: not accessible.
+    /// access memory with just a tag match and one add. The returned offset is
+    /// also a native-pointer capability: `va.wrapping_add(off as u64)` must
+    /// expose the address of the same live byte while the entry remains valid.
+    /// The backing allocation therefore cannot move without a TLB flush.
+    /// Default: not accessible.
     fn jit_fast_off(&self, _va: u64, _pa: u64, _store: bool) -> Option<i64> {
         None
     }

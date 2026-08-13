@@ -1,5 +1,12 @@
 import { pbkdf2Sync } from "node:crypto";
 
+export const CPU_PROBE_SPEC = Object.freeze({
+  algorithm: "pbkdf2-sha256",
+  iterations: 100_000,
+  samples: 7,
+  statistic: "minimum",
+});
+
 export function median(values) {
   const sorted = values
     .filter((value) => value != null && Number.isFinite(value))
@@ -26,13 +33,21 @@ export function candidateVerdict(speed) {
 }
 
 // Fixed native OpenSSL work avoids V8 tier-up in the host-drift probe. Taking
-// the minimum of three samples tracks single-thread speed while ignoring an
-// isolated scheduler delay.
+// the minimum of seven short samples tracks available single-thread speed
+// while rejecting isolated scheduler/frequency-ramp delays. A sustained host
+// slowdown still affects all seven samples and remains subject to the same
+// scorecard spread limit.
 export function cpuProbe() {
   let best = Infinity;
-  for (let rep = 0; rep < 3; rep++) {
+  for (let rep = 0; rep < CPU_PROBE_SPEC.samples; rep++) {
     const started = performance.now();
-    pbkdf2Sync("rv64-scorecard", "fixed-probe", 100_000, 32, "sha256");
+    pbkdf2Sync(
+      "rv64-scorecard",
+      "fixed-probe",
+      CPU_PROBE_SPEC.iterations,
+      32,
+      "sha256",
+    );
     best = Math.min(best, performance.now() - started);
   }
   return best;

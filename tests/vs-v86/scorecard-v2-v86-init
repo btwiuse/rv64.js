@@ -1,0 +1,77 @@
+#!/bin/sh
+
+# Interactive three-phase benchmark driver used only by scorecard-v2. The host
+# waits for all outstanding v86 WebAssembly.instantiate promises after FIRST
+# and PRIME, then sends one line on ttyS0 to release the next phase.
+
+mount -t devtmpfs dev /dev 2>/dev/null
+exec >/dev/ttyS0 2>&1 </dev/ttyS0
+mount -t proc proc /proc 2>/dev/null
+
+ROW=$(sed 's/ /\n/g' /proc/cmdline | sed -n 's/^scorecard_v2=//p' | head -1)
+
+prepare_nbench() {
+    FLAG=
+    case "$ROW" in
+        numeric) FLAG=DONUMSORT ;;
+        string) FLAG=DOSTRINGSORT ;;
+        bitfield) FLAG=DOBITFIELD ;;
+        fpemul) FLAG=DOEMFLOAT ;;
+        fourier) FLAG=DOFOUR ;;
+        assignment) FLAG=DOASSIGN ;;
+        idea) FLAG=DOIDEA ;;
+        huffman) FLAG=DOHUFF ;;
+    esac
+    [ -n "$FLAG" ] || return 1
+    cat >/C <<EOF
+CUSTOMRUN=T
+ALLSTATS=T
+$FLAG=T
+EOF
+}
+
+run_phase() {
+    PHASE=$1
+    echo "SCORECARD_V2_${PHASE}_BEGIN"
+    case "$ROW" in
+        python)
+            /usr/bin/python3 /fib.py
+            ;;
+        compile)
+            rm -f /w.o
+            echo RUN_START
+            /tcc -c /w.c -o /w.o 2>/tmp/tcc-error
+            echo RUN_DONE
+            md5sum /w.o
+            ;;
+        numeric|string|bitfield|fpemul|fourier|assignment|idea|huffman)
+            cd /
+            ./nbench -c/C
+            ;;
+        *)
+            echo "SCORECARD_V2_BAD_ROW $ROW"
+            return 1
+            ;;
+    esac
+    echo "SCORECARD_V2_${PHASE}_COMPLETE"
+}
+
+case "$ROW" in
+    numeric|string|bitfield|fpemul|fourier|assignment|idea|huffman)
+        prepare_nbench || exit 2
+        ;;
+esac
+
+echo "SCORECARD_V2_READY row=$ROW"
+read -r RELEASE
+[ "$RELEASE" = GO ] || exit 3
+run_phase FIRST || exit 4
+read -r RELEASE
+[ "$RELEASE" = GO ] || exit 5
+run_phase PRIME || exit 6
+read -r RELEASE
+[ "$RELEASE" = GO ] || exit 7
+run_phase STEADY || exit 8
+echo SCORECARD_V2_ALL_COMPLETE
+
+while true; do sleep 3600; done

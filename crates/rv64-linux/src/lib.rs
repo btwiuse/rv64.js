@@ -143,7 +143,8 @@ impl Machine {
             (AT_EUID, 1000),
             (AT_GID, 1000),
             (AT_EGID, 1000),
-            (AT_HWCAP, 0x112d), // imacd (bits: i,m,a,c,d per HWCAP ISA bits)
+            // imafdcv (one HWCAP bit per single-letter ISA extension).
+            (AT_HWCAP, 0x20_112d),
             (AT_CLKTCK, 100),
             (AT_SECURE, 0),
             (AT_RANDOM, at_random),

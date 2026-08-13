@@ -1,0 +1,13 @@
+[package]
+name = "encoder-sink-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-encoder = { version = "0.255.0", default-features = false, features = ["std"] }
+
+[workspace]

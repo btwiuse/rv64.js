@@ -49,11 +49,20 @@ const vm = await RV64.create({
 assert.equal(vm.running, false);
 assert.equal(vm.network.mode, "none");
 assert.deepEqual(events, ["ready"]);
+await vm.configureJit({ policy: "adaptive" });
+assert.equal((await vm.jitStats()).pagePolicy.enabled, "0");
+await vm.configureJit({ policy: "page" });
 await vm.start();
 while (vm.running) await new Promise((resolve) => setTimeout(resolve, 5));
 await new Promise((resolve) => setTimeout(resolve, 60));
 assert.deepEqual(events, ["ready", "start", "stop:powered-off"]);
 assert.ok(vm.instructions > 0n);
+const jitStats = await vm.jitStats();
+assert.equal(jitStats.instructions, vm.instructions.toString());
+assert.equal(
+  jitStats.accountedInstructions,
+  (BigInt(jitStats.generated.retired) + BigInt(jitStats.interpreter.retired)).toString(),
+);
 
 await vm.reset();
 await new Promise((resolve) => setTimeout(resolve, 60));
@@ -61,6 +70,24 @@ assert.equal(vm.instructions, 0n);
 await vm.destroy();
 await vm.destroy();
 assert.throws(() => vm.instructions, /destroyed/);
+
+const systemVm = await RV64.create({
+  wasm,
+  memoryMB: 8,
+  execution: { mode: "worker", statisticsIntervalMs: 50 },
+  boot: {
+    mode: "linux-direct",
+    kernel: new Uint8Array([0x73, 0x00, 0x10, 0x00]),
+  },
+});
+const systemDefault = await systemVm.jitStats();
+assert.equal(systemDefault.loader.modules, 0);
+assert.equal(systemDefault.staticT0.supported, false);
+const modulesBeforeSystemReset = (await systemVm.jitStats()).loader.modules;
+await systemVm.reset();
+const systemReset = await systemVm.jitStats();
+assert.equal(systemReset.loader.modules, modulesBeforeSystemReset);
+await systemVm.destroy();
 
 await assert.rejects(
   RV64.create({

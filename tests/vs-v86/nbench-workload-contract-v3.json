@@ -1,0 +1,40 @@
+{
+  "schema": 3,
+  "suite": "BYTEmark nbench-byte-2.2.3",
+  "sourceTarballSha256": "723dd073f80e9969639eb577d2af4b540fc29716b6eafdac488d8f5aed9101ac",
+  "variant": "scorecard-fixed-work-data32-v3",
+  "crossIsaComparable": true,
+  "measurement": "host wall duration between guest serial markers",
+  "guestClockSelectsWork": false,
+  "invocationsPerPhase": 1,
+  "payloadModel": {
+    "numericElementBits": 32,
+    "stringOffsetBits": 32,
+    "bitfieldWordBits": 32,
+    "assignmentElementBits": 32,
+    "floatingPointBits": 64,
+    "ideaWordBits": 16,
+    "huffmanSymbolBits": 8
+  },
+  "implementation": {
+    "i686": "zig musl target-selected memory routines",
+    "riscv64": "zig musl plus the linked nbench-rv64-fastmem.c word-copy implementation",
+    "disclosure": "nbench-rv64-fastmem.c is embedded in both initramfs archives and included in every workload fingerprint"
+  },
+  "rows": {
+    "numeric": ["NUMNUMARRAYS=128", "NUMARRAYSIZE=8111", "NUMMINSECONDS=0"],
+    "string": ["NUMSTRARRAYS=64", "STRARRAYSIZE=8111", "STRMINSECONDS=0"],
+    "bitfield": ["NUMBITOPS=600", "BITFIELDSIZE=32768", "BITMINSECONDS=0"],
+    "fpemul": ["EMFARRAYSIZE=3000", "EMFLOOPS=64", "EMFMINSECONDS=0"],
+    "fourier": ["FOURSIZE=2000", "FOURMINSECONDS=0"],
+    "assignment": ["ASSIGNARRAYS=8", "ASSIGNMINSECONDS=0"],
+    "idea": ["IDEARRAYSIZE=4000", "IDEALOOPS=1024", "IDEAMINSECONDS=0"],
+    "huffman": ["HUFARRAYSIZE=5000", "HUFFLOOPS=512", "HUFFMINSECONDS=0"]
+  },
+  "stability": {
+    "reasonForV3": "The 32-array String row exceeded the fixed 1.25x fresh-process spread limit in two consecutive five/three-repetition runs.",
+    "selectionRule": "Use the smallest measured power-of-two String work factor whose five fresh-process samples remain below the pre-existing spread limit on both engines.",
+    "retainedDiagnostics": ["NUMSTRARRAYS=8", "NUMSTRARRAYS=16", "NUMSTRARRAYS=32", "NUMSTRARRAYS=64"]
+  },
+  "notes": "Each scored phase executes one explicit kernel invocation. FIRST exposes cold behavior, PRIME tiers the emulator, and STEADY is scored. Self-timed matched-data and historical native-long binaries remain available only as diagnostic variants. V3 changes only String's work factor from 32 to 64; short-size latency remains separately reported."
+}

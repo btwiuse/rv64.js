@@ -1,13 +1,12 @@
 //! System-mode JIT benchmark payload (static riscv64 Linux binary).
 //!
-//! Two selectable workloads to isolate whether *memory density* is what
-//! decides if the system-mode JIT beats the interpreter:
-//!   argv[1] == "alu"  : register-only xorshift accumulate (no memory) —
-//!                       the JIT's best case (pure decode-elimination win).
-//!   argv[1] == "mix"  : repeated transform over a 256 KiB array (loads +
-//!                       stores + ALU + branches) — a realistic
-//!                       data-processing mix, neither md5-extreme nor
-//!                       register-only.
+//! Two selectable workload families isolate whether *memory density* is what
+//! decides if the system-mode JIT beats the interpreter. Short and medium
+//! variants make JIT tier-up latency visible instead of measuring only the
+//! eventual steady state:
+//!   "alu1" / "alu5" / "alu" : 1M / 5M / 60M iterations of register-only
+//!                              xorshift accumulation.
+//!   "mix20" / "mix"          : 20 / 400 passes over a 256 KiB array.
 //! Each runs a fixed amount of work, prints a hex checksum, and exits.
 //! Deterministic, so JIT-on and JIT-off outputs must match bit-for-bit.
 
@@ -37,12 +36,12 @@ fn write_hex(v: u64) {
 const ARR_WORDS: usize = 32 * 1024; // 256 KiB
 static mut ARR: [u64; ARR_WORDS] = [0; ARR_WORDS];
 
-fn alu_workload() -> u64 {
+fn alu_workload(iterations: u64) -> u64 {
     // Pure register work: no loads/stores in the hot loop.
     let mut x: u64 = 0x2545_F491_4F6C_DD1D;
     let mut acc: u64 = 0;
     let mut i: u64 = 0;
-    while i < 60_000_000 {
+    while i < iterations {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
@@ -52,7 +51,7 @@ fn alu_workload() -> u64 {
     acc
 }
 
-fn mix_workload() -> u64 {
+fn mix_workload(passes: usize) -> u64 {
     // Realistic memory+ALU+branch mix: many passes transforming an array,
     // each element mixed with a neighbor (load, load, alu, store).
     unsafe {
@@ -62,7 +61,7 @@ fn mix_workload() -> u64 {
             seed ^= seed >> 7;
             ARR[i] = seed;
         }
-        for _pass in 0..400 {
+        for _pass in 0..passes {
             let mut i = 1;
             while i < ARR_WORDS {
                 let a = ARR[i];
@@ -81,16 +80,36 @@ fn mix_workload() -> u64 {
     }
 }
 
+unsafe fn arg_eq(p: *const u8, expected: &[u8]) -> bool {
+    for (index, byte) in expected.iter().enumerate() {
+        if core::ptr::read_volatile(p.add(index)) != *byte {
+            return false;
+        }
+    }
+    core::ptr::read_volatile(p.add(expected.len())) == 0
+}
+
 #[no_mangle]
 extern "C" fn rust_main(sp: *const u64) -> ! {
     let argc = unsafe { *sp } as usize;
-    let mut mix = false;
-    if argc > 1 {
+    let r = if argc > 1 {
         let p = unsafe { *sp.add(2) } as *const u8;
-        // "mix" starts with 'm'
-        mix = unsafe { core::ptr::read_volatile(p) } == b'm';
-    }
-    let r = if mix { mix_workload() } else { alu_workload() };
+        unsafe {
+            if arg_eq(p, b"alu1") {
+                alu_workload(1_000_000)
+            } else if arg_eq(p, b"alu5") {
+                alu_workload(5_000_000)
+            } else if arg_eq(p, b"mix20") {
+                mix_workload(20)
+            } else if arg_eq(p, b"mix") {
+                mix_workload(400)
+            } else {
+                alu_workload(60_000_000)
+            }
+        }
+    } else {
+        alu_workload(60_000_000)
+    };
     write_hex(r);
     sys(93, 0, 0, 0);
     loop {}

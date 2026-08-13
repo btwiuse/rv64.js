@@ -1,0 +1,171 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>RV64 DBT backend benchmark</title>
+<pre id="result">running</pre>
+<script type="module">
+const params = new URLSearchParams(location.search);
+const variant = params.get("variant");
+const variants = [
+  "cached",
+  "lazy",
+  "direct",
+  "materialized",
+  "tailcall",
+  "cached-memory",
+  "cached-memory-no-tlb",
+  "lazy-memory",
+  "direct-memory",
+  "materialized-memory",
+  "tailcall-memory",
+];
+const configs = {
+  cached: { cycleInsns: 24n, cycleEffect: 21n, memory: false },
+  lazy: { cycleInsns: 24n, cycleEffect: 21n, memory: false },
+  direct: { cycleInsns: 24n, cycleEffect: 21n, memory: false },
+  materialized: { cycleInsns: 24n, cycleEffect: 21n, memory: false },
+  tailcall: { cycleInsns: 24n, cycleEffect: 21n, memory: false },
+  "cached-memory": { cycleInsns: 120n, cycleEffect: 6n, memory: true },
+  "cached-memory-no-tlb": { cycleInsns: 120n, cycleEffect: 6n, memory: true },
+  "lazy-memory": { cycleInsns: 120n, cycleEffect: 6n, memory: true },
+  "direct-memory": { cycleInsns: 120n, cycleEffect: 6n, memory: true },
+  "materialized-memory": { cycleInsns: 120n, cycleEffect: 6n, memory: true },
+  "tailcall-memory": { cycleInsns: 120n, cycleEffect: 6n, memory: true },
+};
+
+const PC_ADDR = 256;
+const RETIRED_ADDR = 264;
+const FUEL_ADDR = 272;
+const ENTRY_PC = 0x1000n;
+const FUEL = 216_000n;
+const STEADY_REPETITIONS = 120;
+const STEADY_INSNS = FUEL * BigInt(STEADY_REPETITIONS);
+const LOAD_TAGS = 512;
+const LOAD_OFFSETS = LOAD_TAGS + 4096 * 8;
+const STORE_TAGS = LOAD_OFFSETS + 4096 * 8;
+const STORE_OFFSETS = STORE_TAGS + 4096 * 8;
+const ACCESS_CONTEXT = STORE_OFFSETS + 4096 * 8;
+const ROW_OFFSET = 2 * 8;
+const HOST_DATA = 0x24000;
+const TRANSLATION_OFFSET = HOST_DATA - 0x2000;
+
+function reset(memory, config) {
+  new Uint8Array(memory.buffer, 0, FUEL_ADDR + 8).fill(0);
+  const view = new DataView(memory.buffer);
+  view.setBigUint64(PC_ADDR, ENTRY_PC, true);
+  view.setBigUint64(RETIRED_ADDR, 0n, true);
+  view.setBigUint64(FUEL_ADDR, FUEL, true);
+  if (config.memory) {
+    view.setBigUint64(20 * 8, 0x2000n, true);
+    view.setBigUint64(LOAD_TAGS + ROW_OFFSET, 0x2000n, true);
+    view.setBigInt64(LOAD_OFFSETS + ROW_OFFSET, BigInt(TRANSLATION_OFFSET), true);
+    view.setBigUint64(STORE_TAGS + ROW_OFFSET, 0x2000n, true);
+    view.setBigInt64(STORE_OFFSETS + ROW_OFFSET, BigInt(TRANSLATION_OFFSET), true);
+    view.setBigUint64(ACCESS_CONTEXT, 0n, true);
+    for (let index = 0; index < 8; index++) {
+      view.setBigUint64(HOST_DATA + index * 8, 0x1000n + BigInt(index), true);
+      view.setBigUint64(HOST_DATA + 64 + index * 8, 0n, true);
+    }
+  }
+}
+
+function verify(memory, config, label) {
+  const view = new DataView(memory.buffer);
+  const retired = view.getBigUint64(RETIRED_ADDR, true);
+  const pc = view.getBigUint64(PC_ADDR, true);
+  const observed = view.getBigUint64(8, true);
+  const expected = (FUEL / config.cycleInsns) * config.cycleEffect;
+  const copied = !config.memory || Array.from({ length: 8 }, (_, index) =>
+    view.getBigUint64(HOST_DATA + 64 + index * 8, true) === 0x1000n + BigInt(index)
+  ).every(Boolean);
+  if (retired !== FUEL || pc !== ENTRY_PC || observed !== expected || !copied) {
+    throw new Error(
+      `${label}: retired=${retired} pc=0x${pc.toString(16)} ` +
+      `effect=${observed} expected=${expected} copied=${copied}`,
+    );
+  }
+  return observed;
+}
+
+async function main() {
+  if (!variants.includes(variant)) throw new Error(`unknown variant ${variant}`);
+  const config = configs[variant];
+  const response = await fetch(`/corpus/${variant}.wasm`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`module fetch failed: ${response.status}`);
+  const bytes = await response.arrayBuffer();
+
+  if (!WebAssembly.validate(bytes)) {
+    if (variant === "tailcall" || variant === "tailcall-memory") {
+      return {
+        variant,
+        userAgent: navigator.userAgent,
+        bytes: bytes.byteLength,
+        unsupported: "WebAssembly tail-call proposal is not enabled",
+      };
+    }
+    throw new Error(`${variant}: WebAssembly.validate returned false`);
+  }
+
+  let start = performance.now();
+  const module = await WebAssembly.compile(bytes);
+  const compileMs = performance.now() - start;
+  const memory = new WebAssembly.Memory({ initial: config.memory ? 3 : 1 });
+  start = performance.now();
+  const instance = await WebAssembly.instantiate(module, { env: { memory } });
+  const instantiateMs = performance.now() - start;
+  const run = instance.exports.run;
+
+  reset(memory, config);
+  start = performance.now();
+  run(0);
+  const firstMs = performance.now() - start;
+  let checksum = verify(memory, config, "first");
+
+  const warmMs = [];
+  for (let index = 0; index < 8; index++) {
+    reset(memory, config);
+    start = performance.now();
+    run(0);
+    warmMs.push(performance.now() - start);
+    checksum ^= verify(memory, config, `warm-${index}`);
+    await new Promise((resolve) => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = resolve;
+      channel.port2.postMessage(0);
+    });
+  }
+
+  const steadyMs = [];
+  for (let sample = 0; sample < 7; sample++) {
+    start = performance.now();
+    for (let repetition = 0; repetition < STEADY_REPETITIONS; repetition++) {
+      reset(memory, config);
+      run(0);
+    }
+    steadyMs.push(performance.now() - start);
+    checksum ^= verify(memory, config, `steady-${sample}`);
+  }
+
+  return {
+    variant,
+    userAgent: navigator.userAgent,
+    bytes: bytes.byteLength,
+    compileMs,
+    instantiateMs,
+    firstMs,
+    warmMs,
+    steadyMs,
+    steadyInsns: STEADY_INSNS.toString(),
+    checksum: checksum.toString(),
+  };
+}
+
+try {
+  document.querySelector("#result").textContent = JSON.stringify(await main());
+} catch (error) {
+  document.querySelector("#result").textContent = JSON.stringify({
+    error: error?.stack ?? String(error),
+  });
+} finally {
+  document.documentElement.dataset.done = "1";
+}
+</script>

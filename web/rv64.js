@@ -35,7 +35,19 @@ export class RV64Debug {
     this.onNetworkTraffic = () => {};
     /** Optional async external virtio-9P handler: request => reply bytes. */
     this.onP9Request = null;
-    this.p9Pending = false;
+    /** Number of external 9P requests currently executing in the host. */
+    this.p9Pending = 0;
+    this.p9Requests = 0;
+    this.p9MaxPending = 0;
+    this.p9HostMs = 0;
+    this.p9RequestBytes = 0;
+    this.p9ReplyBytes = 0;
+    this.p9ReadRequests = 0;
+    this.p9WriteRequests = 0;
+    this.p9ReadBytes = 0;
+    this.p9WriteBytes = 0;
+    this.p9MaxRead = 0;
+    this.p9MaxWrite = 0;
     /** Origins known to require the relay, avoiding a failed fetch every time. */
     this.httpRelayOrigins = new Set();
   }
@@ -103,10 +115,12 @@ export class RV64Debug {
               vm.ex.jit_out_ptr(),
               vm.ex.jit_out_len(),
             ).slice();
+            const copied = performance.now();
             vm.jitRegCount = (vm.jitRegCount ?? 0) + 1;
             vm.jitRegBytes = (vm.jitRegBytes ?? 0) + bytes.length;
             const mod = new WebAssembly.Module(bytes);
-            vm.jitRegMs = (vm.jitRegMs ?? 0) + (performance.now() - t0);
+            const compiled = performance.now();
+            vm.jitRegMs = (vm.jitRegMs ?? 0) + (compiled - t0);
             const inst = new WebAssembly.Instance(mod, {
               // tlb_fill: blocks that probe the guest TLB inline call back
               // into the core to walk the page tables on a miss (wasm->wasm,
@@ -114,10 +128,16 @@ export class RV64Debug {
               env: {
                 memory: vm.ex.memory,
                 tlb_fill: vm.ex.jit_tlb_fill,
+                system_bulk_copy: vm.ex.jit_system_bulk_copy,
+                fp_exec: vm.ex.jit_fp_exec,
+                user_reservation: vm.ex.jit_user_reservation,
+                system_reservation: vm.ex.jit_system_reservation,
                 chain_next: vm.ex.chain_next,
+                tail_chain: vm.tailChain,
                 __indirect_function_table: vm.ex.__indirect_function_table,
               },
             });
+            const instantiated = performance.now();
             const table = vm.ex.__indirect_function_table;
             // Bulk pre-growth: growing a shared table forces V8 to rewire
             // EVERY instance that imports it, so one grow(1) per block was
@@ -129,8 +149,18 @@ export class RV64Debug {
             if (vm.tableNext >= table.length) table.grow(4096);
             const idx = vm.tableNext++;
             table.set(idx, inst.exports.run);
-            vm.jitRegTotalMs = (vm.jitRegTotalMs ?? 0) + (performance.now() - t0);
+            const published = performance.now();
+            vm.jitCopyMs = (vm.jitCopyMs ?? 0) + (copied - t0);
+            vm.jitCompileMs = (vm.jitCompileMs ?? 0) + (compiled - copied);
+            vm.jitInstantiateMs = (vm.jitInstantiateMs ?? 0) +
+              (instantiated - compiled);
+            vm.jitPublishMs = (vm.jitPublishMs ?? 0) + (published - instantiated);
+            vm.jitRegTotalMs = (vm.jitRegTotalMs ?? 0) + (published - t0);
             vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
+            // Capture is opt-in and intentionally happens after lifecycle
+            // timing. A capture run is not a workload timing run; frozen
+            // replay consumes the retained immutable bytes separately.
+            vm.onJitModule?.(bytes, { kind: "single", index: idx });
             return idx;
           } catch (e) {
             console.warn("jit register failed:", e);
@@ -142,22 +172,45 @@ export class RV64Debug {
         // table slots so emitted links can verify `line.idx == base + j`.
         host_jit_register_batch: (n) => {
           try {
+            const t0 = performance.now();
             const bytes = new Uint8Array(
               vm.ex.memory.buffer,
               vm.ex.jit_out_ptr(),
               vm.ex.jit_out_len(),
             ).slice();
-            const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
-              env: { memory: vm.ex.memory, tlb_fill: vm.ex.jit_tlb_fill },
+            const copied = performance.now();
+            vm.jitRegCount = (vm.jitRegCount ?? 0) + 1;
+            vm.jitRegBytes = (vm.jitRegBytes ?? 0) + bytes.length;
+            const mod = new WebAssembly.Module(bytes);
+            const compiled = performance.now();
+            const inst = new WebAssembly.Instance(mod, {
+              env: {
+                memory: vm.ex.memory,
+                tlb_fill: vm.ex.jit_tlb_fill,
+                system_bulk_copy: vm.ex.jit_system_bulk_copy,
+                fp_exec: vm.ex.jit_fp_exec,
+                user_reservation: vm.ex.jit_user_reservation,
+                system_reservation: vm.ex.jit_system_reservation,
+              },
             });
+            const instantiated = performance.now();
             const table = vm.ex.__indirect_function_table;
             vm.tableNext ??= table.length;
             if (vm.tableNext + n > table.length) table.grow(Math.max(4096, n));
             const base = vm.tableNext;
             for (let j = 0; j < n; j++) table.set(base + j, inst.exports["r" + j]);
             vm.tableNext += n;
+            const published = performance.now();
+            vm.jitCopyMs = (vm.jitCopyMs ?? 0) + (copied - t0);
+            vm.jitCompileMs = (vm.jitCompileMs ?? 0) + (compiled - copied);
+            vm.jitInstantiateMs = (vm.jitInstantiateMs ?? 0) +
+              (instantiated - compiled);
+            vm.jitPublishMs = (vm.jitPublishMs ?? 0) + (published - instantiated);
+            vm.jitRegMs = (vm.jitRegMs ?? 0) + (compiled - t0);
+            vm.jitRegTotalMs = (vm.jitRegTotalMs ?? 0) + (published - t0);
             vm.jitBlocks = (vm.jitBlocks ?? 0) + n;
             vm.jitBatches = (vm.jitBatches ?? 0) + 1;
+            vm.onJitModule?.(bytes, { kind: "batch", base, members: n });
             return base;
           } catch (e) {
             console.warn("batch jit register failed:", e);
@@ -171,32 +224,145 @@ export class RV64Debug {
         // invoked — on the JS microtask queue, i.e. strictly BETWEEN
         // runSystem calls, never during wasm execution.
         host_jit_register_async: (ticket) => {
+          const t0 = performance.now();
           const bytes = new Uint8Array(
             vm.ex.memory.buffer,
             vm.ex.jit_out_ptr(),
             vm.ex.jit_out_len(),
           ).slice();
-          WebAssembly.compile(bytes)
-            .then((mod) =>
-              WebAssembly.instantiate(mod, {
+          const copied = performance.now();
+          const templateCacheAction = Number(
+            vm.ex.jit_out_template_cache?.(0) ?? 0n,
+          );
+          const templateCacheId = BigInt.asUintN(
+            64,
+            vm.ex.jit_out_template_cache?.(1) ?? 0n,
+          ).toString();
+          const guestBase = BigInt.asIntN(
+            64,
+            vm.ex.jit_out_template_cache?.(2) ?? 0n,
+          );
+          const guestBaseGlobal = templateCacheAction === 0
+            ? null
+            : new WebAssembly.Global(
+                { value: "i64", mutable: false },
+                guestBase,
+              );
+          const pageTemplateClass = Number(
+            vm.ex.jit_out_page_template_diag?.(0) ?? 0n,
+          );
+          const pageTemplateValue = (field) =>
+            BigInt.asUintN(64, vm.ex.jit_out_page_template_diag(field));
+          const pageTemplateDiagnostic = pageTemplateClass === 0
+            ? null
+            : {
+                ticket: ticket.toString(),
+                phase: vm.scorecardPhase ?? "unattributed",
+                matchClass: pageTemplateClass,
+                currentVirtualPage:
+                  `0x${pageTemplateValue(1).toString(16)}`,
+                currentPhysicalPage:
+                  `0x${pageTemplateValue(2).toString(16)}`,
+                templateVirtualPage:
+                  `0x${pageTemplateValue(3).toString(16)}`,
+                templatePhysicalPage:
+                  `0x${pageTemplateValue(4).toString(16)}`,
+                requestedEntries:
+                  pageTemplateValue(5).toString(),
+                coveredEntries:
+                  pageTemplateValue(6).toString(),
+                emittedWasmBytes:
+                  pageTemplateValue(7).toString(),
+                copiedBytes: bytes.length,
+                templateCacheAction,
+                templateCacheId,
+                issuedAtMs: t0,
+              };
+          vm.jitRegCount = (vm.jitRegCount ?? 0) + 1;
+          vm.jitRegBytes = (vm.jitRegBytes ?? 0) + bytes.length;
+          let compiledModule;
+          if (templateCacheAction === 2) {
+            compiledModule = vm.jitPageTemplateModules?.get(templateCacheId);
+            if (compiledModule) {
+              vm.jitTemplateCacheHits = (vm.jitTemplateCacheHits ?? 0) + 1;
+              compiledModule = Promise.resolve(compiledModule);
+            } else {
+              vm.jitTemplateCacheMisses = (vm.jitTemplateCacheMisses ?? 0) + 1;
+              compiledModule = Promise.reject(
+                new Error(`missing JIT page template ${templateCacheId}`),
+              );
+            }
+          } else {
+            compiledModule = WebAssembly.compile(bytes).then((mod) => {
+              if (templateCacheAction === 1) {
+                (vm.jitPageTemplateModules ??= new Map()).set(templateCacheId, mod);
+                vm.jitTemplateCacheStores = (vm.jitTemplateCacheStores ?? 0) + 1;
+              }
+              return mod;
+            });
+          }
+          compiledModule
+            .then((mod) => {
+              const compiled = performance.now();
+              const guestBaseImport = guestBaseGlobal
+                ? { guest_base: guestBaseGlobal }
+                : {};
+              const inst = new WebAssembly.Instance(mod, {
                 env: {
                   memory: vm.ex.memory,
+                  ...guestBaseImport,
                   tlb_fill: vm.ex.jit_tlb_fill,
+                  system_bulk_copy: vm.ex.jit_system_bulk_copy,
+                  fp_exec: vm.ex.jit_fp_exec,
+                  user_reservation: vm.ex.jit_user_reservation,
+                  system_reservation: vm.ex.jit_system_reservation,
                   chain_next: vm.ex.chain_next,
+                  tail_chain: vm.tailChain,
                   __indirect_function_table: vm.ex.__indirect_function_table,
                 },
-              }),
-            )
-            .then((inst) => {
+              });
+              return { inst, compiled, instantiated: performance.now() };
+            })
+            .then(({ inst, compiled, instantiated }) => {
               const table = vm.ex.__indirect_function_table;
               vm.tableNext ??= table.length;
               if (vm.tableNext >= table.length) table.grow(4096);
               const idx = vm.tableNext++;
               table.set(idx, inst.exports.run);
+              const published = performance.now();
+              vm.jitCopyMs = (vm.jitCopyMs ?? 0) + (copied - t0);
+              vm.jitCompileMs = (vm.jitCompileMs ?? 0) + (compiled - copied);
+              vm.jitInstantiateMs = (vm.jitInstantiateMs ?? 0) +
+                (instantiated - compiled);
+              vm.jitPublishMs = (vm.jitPublishMs ?? 0) +
+                (published - instantiated);
+              vm.jitRegMs = (vm.jitRegMs ?? 0) + (compiled - t0);
+              vm.jitRegTotalMs = (vm.jitRegTotalMs ?? 0) + (published - t0);
               vm.jitBlocks = (vm.jitBlocks ?? 0) + 1;
               vm.ex.sys_sb_ready(ticket, idx);
+              if (pageTemplateDiagnostic) {
+                (vm.jitAsyncModuleDiagnostics ??= []).push({
+                  ...pageTemplateDiagnostic,
+                  failed: false,
+                  copyMs: copied - t0,
+                  compileLatencyMs: compiled - copied,
+                  instantiateMs: instantiated - compiled,
+                  publishMs: published - instantiated,
+                  totalLatencyMs: published - t0,
+                });
+              }
+              vm.onJitModule?.(bytes, { kind: "async-region", ticket, index: idx });
             })
             .catch((e) => {
+              if (pageTemplateDiagnostic) {
+                (vm.jitAsyncModuleDiagnostics ??= []).push({
+                  ...pageTemplateDiagnostic,
+                  failed: true,
+                  error: String(e),
+                  copyMs: copied - t0,
+                  totalLatencyMs: performance.now() - t0,
+                });
+              }
               console.warn("async jit register failed:", e);
               vm.ex.sys_sb_ready(ticket, -1);
             });
@@ -208,6 +374,7 @@ export class RV64Debug {
         ? await WebAssembly.instantiateStreaming(wasmSource, imports)
         : await WebAssembly.instantiate(wasmSource, imports);
     vm = new RV64Debug(instance);
+    vm.hardwareFmaSupported = false;
     // Hardware FMA: use f64x2.relaxed_madd for the guest's FMADD family iff
     // the engine validates it AND it is fused on this hardware (the spec
     // allows unfused; only fused is bit-exact). Probe empirically:
@@ -229,34 +396,39 @@ export class RV64Debug {
         bits(1 + 2 ** -52), bits(1 + 2 ** -52), bits(-(1 + 2 ** -51)));
       if (r !== 0 && Math.abs(r - 2 ** -104) < 2 ** -150) {
         vm.ex.jit_set_hw_fma?.(1);
+        vm.hardwareFmaSupported = true;
       }
     } catch {
       /* no relaxed SIMD: the exact emulated fma stays in charge */
     }
-    // Direct block chaining needs wasm tail calls (return_call_indirect,
-    // shipped by default in V8 11.2+). Feature-detect with a 1-function probe
-    // so older engines just keep the plain dispatch loop.
+    // Frame-free region chaining needs Wasm tail calls. A single helper owns
+    // the shared table and tail-calls its selected entry; generated modules
+    // import this function rather than the table itself. That preserves the
+    // fast transfer while avoiding V8's O(table-importing instances) table.set
+    // publication behavior.
+    vm.tailCallsSupported = false;
+    vm.tailChain = undefined;
     try {
-      new WebAssembly.Module(new Uint8Array([
+      const tailChainModule = new WebAssembly.Module(new Uint8Array([
         0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
-        1, 5, 1, 0x60, 1, 0x7f, 0,
-        2, 11, 1, 1, 0x65, 3, 0x74, 0x61, 0x62, 0x01, 0x70, 0, 0,
-        3, 2, 1, 0,
-        10, 11, 1, 9, 0, 0x20, 0, 0x41, 0, 0x13, 0, 0, 0x0b,
+        // type 0: generated entry (i32 state) -> (); type 1: trampoline
+        // (i32 state, i32 table index) -> ().
+        1, 10, 2, 0x60, 1, 0x7f, 0, 0x60, 2, 0x7f, 0x7f, 0,
+        // One table import, owned by this helper instance only.
+        2, 15, 1, 3, 0x65, 0x6e, 0x76, 5, 0x74, 0x61, 0x62, 0x6c, 0x65,
+        1, 0x70, 0, 0,
+        3, 2, 1, 1,
+        7, 14, 1, 10, 0x74, 0x61, 0x69, 0x6c, 0x5f, 0x63, 0x68, 0x61, 0x69,
+        0x6e, 0, 0,
+        // local.get state; local.get index; return_call_indirect type 0 table 0.
+        10, 11, 1, 9, 0, 0x20, 0, 0x20, 1, 0x13, 0, 0, 0x0b,
       ]));
-      // Chaining is DEFAULT OFF after three measured architectures:
-      // (1) emitted return_call_indirect — ~2ns/hop on node 20.18.1, but
-      // any module importing the shared table makes table.set O(importing
-      // instances): quadratic registration for tcc/CPython populations;
-      // (2) per-module shared helper — same import, same quadratic;
-      // (3) env.chain_next, a host-module Rust dispatch reached as a
-      // function import (no table import, no quadratic) — measured SLOWER
-      // everywhere (nbench ASSIGNMENT 8.3 -> 6.2, python 4.6 -> 6.2s):
-      // the host dispatch loop is already wasm with no JS frame, so the
-      // sandwich (block -> host Rust -> block) re-does the loop's own
-      // bookkeeping plus two extra call frames per hop. The per-dispatch
-      // cost is the bookkeeping itself, not a boundary. RV_TAILCALL=1
-      // re-enables for experiments.
+      vm.tailChain = new WebAssembly.Instance(tailChainModule, {
+        env: { table: vm.ex.__indirect_function_table },
+      }).exports.tail_chain;
+      vm.tailCallsSupported = true;
+      // Legacy trace tail-calls retain their explicit environment switch;
+      // the stable system API enables only structured-region transfers below.
       if (process?.env?.RV_TAILCALL === "1") {
         vm.ex.jit_set_tailcall?.(1);
       }
@@ -301,6 +473,259 @@ export class RV64Debug {
   }
   userPc() {
     return this.ex.user_pc();
+  }
+
+  /** Independent JIT lifecycle phases for benchmark accounting. */
+  jitLifecycleStats() {
+    const userTranslateNs = Number(this.ex.jit_stat(73));
+    const systemTranslateNs = Number(this.ex.jit_stat(76));
+    const userTranslateAttempts = Number(this.ex.jit_stat(74));
+    const systemTranslateAttempts = Number(this.ex.jit_stat(77));
+    const userEmittedBytes = Number(this.ex.jit_stat(75));
+    const systemEmittedBytes = Number(this.ex.jit_stat(78));
+    return {
+      translateMs: (userTranslateNs + systemTranslateNs) / 1_000_000,
+      translateAttempts: userTranslateAttempts + systemTranslateAttempts,
+      emittedBytes: userEmittedBytes + systemEmittedBytes,
+      userTranslateMs: userTranslateNs / 1_000_000,
+      userTranslateAttempts,
+      userEmittedBytes,
+      systemTranslateMs: systemTranslateNs / 1_000_000,
+      systemTranslateAttempts,
+      systemEmittedBytes,
+      copiedBytes: this.jitRegBytes ?? 0,
+      modules: this.jitRegCount ?? 0,
+      copyMs: this.jitCopyMs ?? 0,
+      compileMs: this.jitCompileMs ?? 0,
+      instantiateMs: this.jitInstantiateMs ?? 0,
+      publishMs: this.jitPublishMs ?? 0,
+    };
+  }
+
+  /**
+   * Exact cumulative JIT counters for diagnostics and benchmark attribution.
+   *
+   * u64 counters are returned as decimal strings so the result can cross a
+   * Worker boundary without losing precision. Timing fields are ordinary
+   * JavaScript numbers because their source is performance.now().
+   */
+  jitStats() {
+    const stat = (index) => this.ex.jit_stat?.(index)?.toString() ?? "0";
+    const policy = (index) =>
+      this.ex.jit_page_policy_stat?.(index)?.toString() ?? "0";
+    return {
+      generated: {
+        retired: stat(0),
+        dispatches: stat(1),
+        userEntries: stat(2),
+        systemEntries: stat(3),
+        zeroRetireDispatches: stat(15),
+        tlbFills: stat(31),
+        chainHops: stat(80),
+        tlbFillKinds: {
+          loadHit: stat(81),
+          loadEmpty: stat(82),
+          loadContext: stat(83),
+          loadCollision: stat(84),
+          storeHit: stat(85),
+          storeEmpty: stat(86),
+          storeContext: stat(87),
+          storeCollision: stat(88),
+        },
+      },
+      mmu: {
+        mappingInvalidations: stat(89),
+        changedSatp: stat(90),
+        fullTlbClears: stat(91),
+        storeJitTlbClears: stat(92),
+        sfenceAll: stat(93),
+        sfencePage: stat(94),
+        sfenceForeignAsid: stat(95),
+      },
+      interpreter: {
+        calls: stat(4),
+        retired: stat(5),
+      },
+      // Read-only compatibility for reports produced while the rejected
+      // R070-R077 experiment existed. The production runtime no longer
+      // exports or executes static-T0 code; old counter readers see an
+      // explicit unsupported/all-zero lifecycle instead of failing.
+      staticT0: {
+        supported: false,
+        userFastRetired: "0",
+        userSlowRetired: "0",
+        userSlowBatches: "0",
+        systemFastRetired: "0",
+        systemSlowRetired: "0",
+        systemSlowBatches: "0",
+        systemFetchFills: "0",
+        systemErrors: "0",
+        sampledRetired: "0",
+        samples: "0",
+        interruptPolls: "0",
+        shortSampleMarks: "0",
+        shortSampleBypasses: "0",
+        shortSampleClears: "0",
+        systemEnabled: false,
+        sampledEnabled: false,
+        sampledBackoffEnabled: false,
+        moduleIndex: -1,
+      },
+      regions: {
+        triggered: stat(10),
+        translateFailures: stat(11),
+        issued: stat(12),
+        landed: stat(13),
+        stale: stat(14),
+        pending: stat(17),
+        entriesInstalled: stat(25),
+        entriesReplaced: stat(26),
+        batches: stat(43),
+        batchMembers: stat(44),
+        calls: stat(48),
+        retired: stat(49),
+        extensions: stat(32),
+        exitSamples: stat(33),
+        extensionQueued: stat(39),
+        extensionDrainVisits: stat(40),
+        demoted: stat(42),
+      },
+      translation: {
+        userNanoseconds: stat(73),
+        userAttempts: stat(74),
+        userEmittedBytes: stat(75),
+        systemNanoseconds: stat(76),
+        systemAttempts: stat(77),
+        systemEmittedBytes: stat(78),
+      },
+      pagePolicy: {
+        enabled: policy(0),
+        threshold: policy(1),
+        quantum: policy(2),
+        samples: policy(3),
+        sampledRetired: policy(4),
+        liveMappings: policy(5),
+        candidates: policy(6),
+        queued: policy(7),
+        pending: policy(8),
+        queueDrops: policy(9),
+        queueMaximum: policy(10),
+        issued: policy(11),
+        landed: policy(12),
+        failed: policy(13),
+        compiledMappings: policy(14),
+        queueCapacity: policy(15),
+        rejected: policy(16),
+        suppressed: policy(17),
+        staleDrops: policy(18),
+        issuedPages: policy(19),
+        multiPageIssued: policy(20),
+        rebuilds: policy(21),
+        rebuildEnabled: policy(22),
+        controlEntriesEnabled: policy(23),
+        controlEntrySamples: policy(24),
+        inflightLimit: policy(25),
+        multiPageEntryCap: policy(26),
+        multiPageEntryEligible: policy(27),
+        multiPageEntryBlocked: policy(28),
+        crossPageCallsEnabled: policy(29),
+        measuredRegionsEnabled: policy(30),
+        extensionPageCap: policy(31),
+        extensionMinStay: policy(32),
+        extensionShortBlocked: policy(33),
+        multiPageControlPermille: policy(34),
+        multiPageControlEligible: policy(35),
+        multiPageControlBlocked: policy(36),
+        controlProfileEnabled: policy(37),
+        regionPageCap: policy(38),
+        regionLeaderCap: policy(39),
+        regionTailChainEnabled: policy(40),
+        regionTlbCacheEnabled: policy(43),
+        regionTlbCacheMinAccesses: policy(44),
+        privilegedThresholdMultiplier: policy(45),
+        userRetired: policy(46),
+        privilegedRetired: policy(47),
+        userCandidates: policy(48),
+        privilegedCandidates: policy(49),
+        privilegedControlEntriesEnabled: policy(50),
+        stableChainEnabled: policy(51),
+      },
+      loader: {
+        modules: this.jitRegCount ?? 0,
+        bytes: this.jitRegBytes ?? 0,
+        copyMs: this.jitCopyMs ?? 0,
+        compileMs: this.jitCompileMs ?? 0,
+        instantiateMs: this.jitInstantiateMs ?? 0,
+        publishMs: this.jitPublishMs ?? 0,
+        totalMs: this.jitRegTotalMs ?? 0,
+      },
+      p9: {
+        requests: this.p9Requests,
+        pending: this.p9Pending,
+        maximumPending: this.p9MaxPending,
+        hostMs: this.p9HostMs,
+        requestBytes: this.p9RequestBytes,
+        replyBytes: this.p9ReplyBytes,
+        readRequests: this.p9ReadRequests,
+        writeRequests: this.p9WriteRequests,
+        readBytes: this.p9ReadBytes,
+        writeBytes: this.p9WriteBytes,
+        maximumRead: this.p9MaxRead,
+        maximumWrite: this.p9MaxWrite,
+      },
+    };
+  }
+
+  /** Snapshot opt-in dispatch/fallback profiling for benchmark diagnostics. */
+  jitProfile(limit = 20) {
+    const dispatch = [];
+    const edges = [];
+    const fallback = [];
+    for (let index = 0; index < 8192; index++) {
+      const calls = Number(this.ex.dprof_get?.(1, index) ?? 0n);
+      if (calls) {
+        const retired = Number(this.ex.dprof_get(2, index));
+        dispatch.push({
+          pc: `0x${this.ex.dprof_get(0, index).toString(16)}`,
+          calls,
+          retired,
+          instructionsPerCall: retired / calls,
+        });
+      }
+      const transitions = Number(this.ex.eprof_get?.(2, index) ?? 0n);
+      if (transitions) {
+        const retired = Number(this.ex.eprof_get(3, index));
+        edges.push({
+          source: `0x${this.ex.eprof_get(0, index).toString(16)}`,
+          target: `0x${this.ex.eprof_get(1, index).toString(16)}`,
+          transitions,
+          retired,
+          instructionsPerTransition: retired / transitions,
+        });
+      }
+    }
+    for (let index = 0; index < 1024; index++) {
+      const stretches = Number(this.ex.ihist_get?.(1, index) ?? 0n);
+      if (stretches) {
+        fallback.push({
+          key: `0x${this.ex.ihist_get(0, index).toString(16)}`,
+          stretches,
+          interpretedInstructions: Number(this.ex.ihist_get(2, index)),
+        });
+      }
+    }
+    dispatch.sort((a, b) => b.calls - a.calls);
+    edges.sort((a, b) => b.transitions - a.transitions);
+    fallback.sort((a, b) => b.interpretedInstructions - a.interpretedInstructions);
+    return {
+      generatedBlockCalls: this.ex.jit_stat(46).toString(),
+      generatedBlockInstructions: this.ex.jit_stat(47).toString(),
+      generatedRegionCalls: this.ex.jit_stat(48).toString(),
+      generatedRegionInstructions: this.ex.jit_stat(49).toString(),
+      dispatch: dispatch.slice(0, limit),
+      edges: edges.slice(0, limit),
+      fallback: fallback.slice(0, limit),
+    };
   }
 
   /** Allocate guest RAM at guest address `base` and reset the CPU (pc = base). */
@@ -751,35 +1176,60 @@ RV64Debug.prototype.runVirtSystem = function (maxInsns = 2_000_000n) {
 };
 
 RV64Debug.prototype.pumpP9 = function () {
-  if (!this.onP9Request || this.p9Pending) return;
-  const len = this.ex.virt_p9_take_request();
-  if (!len) return;
-  const request = new Uint8Array(this.ex.memory.buffer, this.ex.staging_ptr(), len).slice();
-  this.p9Pending = true;
-  Promise.resolve()
-    .then(() => this.onP9Request(request))
-    .then((reply) => {
-      if (!(reply instanceof Uint8Array)) reply = new Uint8Array(reply);
-      if (reply.length < 7) throw new Error("external 9P handler returned an invalid reply");
-      const ptr = this.ex.staging_alloc(reply.length);
-      new Uint8Array(this.ex.memory.buffer, ptr, reply.length).set(reply);
-      if (this.ex.virt_p9_reply() !== 1) throw new Error("unexpected external 9P reply");
-    })
-    .catch((error) => {
-      console.error("external 9P request failed", error);
-      // Rlerror(size=11, type=7, original tag, errno=EIO) keeps the guest
-      // queue moving even when the host handler rejects.
-      const reply = new Uint8Array(11);
-      new DataView(reply.buffer).setUint32(0, 11, true);
-      reply[4] = 7;
-      reply[5] = request[5];
-      reply[6] = request[6];
-      new DataView(reply.buffer).setUint32(7, 5, true);
-      const ptr = this.ex.staging_alloc(reply.length);
-      new Uint8Array(this.ex.memory.buffer, ptr, reply.length).set(reply);
-      this.ex.virt_p9_reply();
-    })
-    .finally(() => { this.p9Pending = false; });
+  if (!this.onP9Request) return;
+  for (;;) {
+    const len = this.ex.virt_p9_take_request();
+    if (!len) break;
+    const request = new Uint8Array(this.ex.memory.buffer, this.ex.staging_ptr(), len).slice();
+    this.p9Pending++;
+    this.p9Requests++;
+    this.p9RequestBytes += request.length;
+    if (request.length >= 23 && (request[4] === 116 || request[4] === 118)) {
+      const count = new DataView(request.buffer, request.byteOffset, request.byteLength)
+        .getUint32(19, true);
+      if (request[4] === 116) {
+        this.p9ReadRequests++;
+        this.p9ReadBytes += count;
+        this.p9MaxRead = Math.max(this.p9MaxRead, count);
+      } else {
+        this.p9WriteRequests++;
+        this.p9WriteBytes += count;
+        this.p9MaxWrite = Math.max(this.p9MaxWrite, count);
+      }
+    }
+    this.p9MaxPending = Math.max(this.p9MaxPending, this.p9Pending);
+    const started = performance.now();
+    Promise.resolve()
+      .then(() => this.onP9Request(request))
+      .then((reply) => {
+        if (!(reply instanceof Uint8Array)) reply = new Uint8Array(reply);
+        if (reply.length < 7) throw new Error("external 9P handler returned an invalid reply");
+        this.p9ReplyBytes += reply.length;
+        const ptr = this.ex.staging_alloc(reply.length);
+        new Uint8Array(this.ex.memory.buffer, ptr, reply.length).set(reply);
+        if (this.ex.virt_p9_reply() !== 1) throw new Error("unexpected external 9P reply");
+      })
+      .catch((error) => {
+        console.error("external 9P request failed", error);
+        // Rlerror(size=11, type=7, original tag, errno=EIO) keeps the guest
+        // queue moving even when the host handler rejects.
+        const reply = new Uint8Array(11);
+        new DataView(reply.buffer).setUint32(0, 11, true);
+        reply[4] = 7;
+        reply[5] = request[5];
+        reply[6] = request[6];
+        new DataView(reply.buffer).setUint32(7, 5, true);
+        const ptr = this.ex.staging_alloc(reply.length);
+        new Uint8Array(this.ex.memory.buffer, ptr, reply.length).set(reply);
+        this.ex.virt_p9_reply();
+      })
+      .finally(() => {
+        this.p9HostMs += performance.now() - started;
+        this.p9Pending--;
+        // A completion may have let Linux submit another batch in a run slice.
+        this.pumpP9();
+      });
+  }
 };
 
 /** Send keyboard input to the modern machine's 8250 UART. */
@@ -1317,6 +1767,12 @@ export class RV64 {
     }
     const network = normalizeNetwork(options.network, boot.mode);
     const core = await RV64Debug.create(wasmBytes);
+    // System-mode production policy: approximate heat per safe VA→PA mapping,
+    // then emit one bounded region at a time and compile it asynchronously.
+    // The Wasm defaults are trace- and browser-benchmarked; low-level tests can
+    // still select either policy directly through RV64Debug exports.
+    core.ex.jit_set_page_policy?.(1);
+    if (core.tailCallsSupported) core.ex.jit_set_region_tail_chain?.(1);
     const vm = new RV64(core, { ...resolved, memoryMB }, network, events);
     vm.#assemble();
     vm.#emit("ready", undefined);
@@ -1330,6 +1786,121 @@ export class RV64 {
   get instructions() {
     this.#assertLive();
     return this.#instructions();
+  }
+
+  /** Enable or disable generated-code tiering without stopping the machine. */
+  setJitEnabled(enabled) {
+    this.#assertLive();
+    if (typeof enabled !== "boolean") throw new TypeError("enabled must be a boolean");
+    this.#core.ex.jit_set_enabled(enabled ? 1 : 0);
+  }
+
+  /**
+   * Select measured JIT policy knobs for controlled experiments.
+   * Omitted fields retain their current value.
+   */
+  configureJit(options) {
+    this.#assertLive();
+    if (!options || typeof options !== "object") {
+      throw new TypeError("JIT options must be an object");
+    }
+    for (const removed of ["staticSystemT0", "sampledStaticT0", "sampledStaticT0Backoff"]) {
+      if (Object.hasOwn(options, removed)) {
+        throw new TypeError(`${removed} was removed after the static-T0 experiment was rejected`);
+      }
+    }
+    if (options.policy !== undefined) {
+      if (options.policy !== "page" && options.policy !== "adaptive") {
+        throw new TypeError("JIT policy must be page or adaptive");
+      }
+      this.#core.ex.jit_set_page_policy(options.policy === "page" ? 1 : 0);
+    }
+    if (options.regionTailChain !== undefined) {
+      if (typeof options.regionTailChain !== "boolean") {
+        throw new TypeError("regionTailChain must be a boolean");
+      }
+      if (options.regionTailChain && !this.#core.tailCallsSupported) {
+        throw new Error("regionTailChain requires WebAssembly tail-call support");
+      }
+      this.#core.ex.jit_set_region_tail_chain?.(options.regionTailChain ? 1 : 0);
+    }
+    for (const [name, setter, minimum, maximum] of [
+      ["pageThreshold", "jit_set_page_threshold", 1, 0xffff_ffff],
+      ["privilegedPageThresholdMultiplier", "jit_set_privileged_page_threshold_multiplier", 1, 1024],
+      ["pageQuantum", "jit_set_page_quantum", 1, 4096],
+      ["regionLeaderCap", "jit_set_region_leader_cap", 2, 512],
+      ["regionPageCap", "jit_set_region_page_cap", 1, 3],
+      ["regionExtensionPageCap", "jit_set_region_extension_page_cap", 1, 16],
+      ["measuredRegionMinStay", "jit_set_page_extension_min_stay", 1, 4096],
+      ["pageInflightLimit", "jit_set_page_inflight_limit", 1, 8],
+      ["multiPageEntryCap", "jit_set_page_multipage_entry_cap", 0, 512],
+      ["multiPageControlPermille", "jit_set_page_multipage_control_permille", 0, 1000],
+      ["regionTlbCacheMinAccesses", "jit_set_region_tlb_cache_min_accesses", 1, 64],
+      ["profileSampleShift", "dprof_set_sample_shift", 0, 20],
+    ]) {
+      if (options[name] === undefined) continue;
+      const value = options[name];
+      if (!Number.isInteger(value) || value < minimum || value > maximum) {
+        throw new RangeError(`${name} must be an integer from ${minimum} through ${maximum}`);
+      }
+      this.#core.ex[setter]?.(value);
+    }
+    for (const [name, setter] of [
+      ["directDispatch", "jit_set_region_direct_dispatch"],
+      ["lazyState", "jit_set_region_lazy_state"],
+      ["pageRebuild", "jit_set_page_rebuild"],
+      ["controlEntries", "jit_set_page_control_entries"],
+      ["privilegedControlEntries", "jit_set_page_privileged_control_entries"],
+      ["stablePageChain", "jit_set_page_stable_chain"],
+      ["controlProfile", "jit_set_page_control_profile"],
+      ["crossPageCalls", "jit_set_page_cross_page_calls"],
+      ["measuredRegions", "jit_set_page_measured_regions"],
+      ["demoteRegions", "jit_set_demote"],
+      ["cfgBlocks", "jit_set_region_cfg_blocks"],
+      ["structuredCfg", "jit_set_region_structured_cfg"],
+      ["tlbFill", "jit_set_tlb_fill"],
+      ["tlbHash", "jit_set_tlb_hash"],
+      ["privilegeTlbRetention", "jit_set_privilege_tlb_retention"],
+      ["regionTlbCache", "jit_set_region_tlb_cache"],
+      ["regionChain", "jit_set_region_chain"],
+      ["profile", "dprof_set"],
+    ]) {
+      if (options[name] === undefined) continue;
+      if (typeof options[name] !== "boolean") {
+        throw new TypeError(`${name} must be a boolean`);
+      }
+      this.#core.ex[setter]?.(options[name] ? 1 : 0);
+    }
+  }
+
+  /** Cumulative execution and JIT counters for workload attribution. */
+  jitStats() {
+    this.#assertLive();
+    const stats = this.#core.jitStats();
+    const instructions = this.#instructions();
+    const generated = BigInt(stats.generated.retired);
+    const interpreter = BigInt(stats.interpreter.retired);
+    return {
+      ...stats,
+      instructions: instructions.toString(),
+      accountedInstructions: (generated + interpreter).toString(),
+      generatedCoverage: instructions === 0n
+        ? 0
+        : Number(generated * 1_000_000n / instructions) / 1_000_000,
+      generatedInstructionsPerDispatch:
+        stats.generated.dispatches === "0"
+          ? 0
+          : Number(generated) / Number(stats.generated.dispatches),
+    };
+  }
+
+  /** Return opt-in JIT diagnostics configured with `profile: true`. */
+  jitProfile(limit = 20) {
+    this.#assertLive();
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new RangeError("profile limit must be an integer from 1 through 100");
+    }
+    return this.#core.jitProfile(limit);
   }
 
   on(event, listener) {
@@ -1672,6 +2243,27 @@ class RV64WorkerProxy {
   get instructions() {
     this.#assertLive();
     return this.#instructions;
+  }
+
+  async setJitEnabled(enabled) {
+    this.#assertLive();
+    if (typeof enabled !== "boolean") throw new TypeError("enabled must be a boolean");
+    await this.#call("setJitEnabled", enabled);
+  }
+
+  async configureJit(options) {
+    this.#assertLive();
+    await this.#call("configureJit", options);
+  }
+
+  async jitStats() {
+    this.#assertLive();
+    return this.#call("jitStats");
+  }
+
+  async jitProfile(limit = 20) {
+    this.#assertLive();
+    return this.#call("jitProfile", limit);
   }
 
   on(event, listener) {

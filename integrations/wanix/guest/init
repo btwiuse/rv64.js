@@ -1,7 +1,30 @@
 #!/bin/busybox sh
-/bin/busybox --install -s /bin
+# The packaged Alpine root already contains BusyBox's applet links. Recreating
+# all of them over the external 9P root adds hundreds of serialized metadata
+# operations before the shell appears. Retain a fallback for stripped custom
+# roots without penalizing the normal comparison image.
+if [ ! -x /bin/mount ] || [ ! -x /usr/bin/setsid ]; then
+    /bin/busybox --install -s /bin
+fi
 
 mount -t proc none /proc
+
+# rv64.js uses its ns16550 UART for the interactive console; copy/v86 uses
+# virtio-console so that ttyS0 remains available to hostexport. Derive the
+# terminal from the kernel command line instead of baking either architecture
+# into the otherwise shared init.
+console=ttyS0
+for arg in $(cat /proc/cmdline 2>/dev/null); do
+    case "$arg" in
+        console=*)
+            console=${arg#console=}
+            console=${console%%,*}
+            ;;
+    esac
+done
+console_device=/dev/$console
+echo "WANIX guest init" >"$console_device"
+
 mount -t sysfs none /sys
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts
@@ -16,6 +39,10 @@ if [ -f /boot/rc ]; then
 fi
 
 case " $(cat /proc/cmdline) " in
+    *" rv64.benchmark=1 "*)
+        # The three-way harness does not use guest networking. Avoid making
+        # cold boot wait for the optional fetch proxy's second 9P mount.
+        ;;
     *" rv64.network=fetch "*)
         ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
         route add default gw 10.0.2.2
@@ -40,4 +67,5 @@ case " $(cat /proc/cmdline) " in
         ;;
 esac
 
-exec setsid -c "$SHELL" -i <>/dev/ttyS0 >&0 2>&1
+echo "WANIX shell ready" >"$console_device"
+exec setsid -c "$SHELL" -i <>"$console_device" >&0 2>&1

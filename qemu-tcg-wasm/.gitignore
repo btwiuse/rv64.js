@@ -1,0 +1,8 @@
+/.cache/
+/.deps/
+/.work/
+/build-*/
+/dist/
+/result
+# External checkout pinned by commit in README.md; not vendored here.
+/qemu/

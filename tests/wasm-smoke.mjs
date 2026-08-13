@@ -13,7 +13,7 @@ const { RV64Debug: RV64, Stop } = await import(join(root, "web/rv64.js"));
 const wasmBytes = await readFile(
   join(root, "target/wasm32-unknown-unknown/release/rv64_wasm.wasm"),
 );
-
+const skipLegacySystem = process.env.RV64_SKIP_LEGACY_SYSTEM === "1";
 let failures = 0;
 function check(name, ok, detail = "") {
   console.log(`${ok ? "PASS" : "FAIL"} ${name}${detail ? " — " + detail : ""}`);
@@ -24,11 +24,9 @@ function check(name, ok, detail = "") {
 // small raw ABI. In particular, TLS dependencies must not smuggle in
 // wasm-bindgen/externref support that web/rv64.js does not provide.
 {
-  const expected = [
+  const required = [
     "host_http_request",
     "host_jit_register",
-    "host_jit_register_async",
-    "host_jit_register_batch",
     "host_net_send",
     "host_now_ms",
     "host_random",
@@ -39,6 +37,13 @@ function check(name, ok, detail = "") {
     "host_wisp_open",
     "host_write",
   ];
+  // Publication capabilities are optional until a compiler tier actually
+  // references them. Release LTO removes unused Rust imports, so requiring
+  // every possible publisher here couples the raw host ABI test to one JIT
+  // policy. They remain allow-listed to catch accidental wasm-bindgen or
+  // unrelated host dependencies.
+  const optional = ["host_jit_register_async", "host_jit_register_batch"];
+  const allowed = new Set([...required, ...optional]);
   const imports = WebAssembly.Module.imports(new WebAssembly.Module(wasmBytes));
   const actual = imports
     .filter((item) => item.module === "env" && item.kind === "function")
@@ -48,13 +53,12 @@ function check(name, ok, detail = "") {
     (item) =>
       item.module !== "env" ||
       item.kind !== "function" ||
-      !expected.includes(item.name),
+      !allowed.has(item.name),
   );
   check(
     "raw wasm import ABI",
     unexpected.length === 0 &&
-      actual.length === expected.length &&
-      actual.every((name, index) => name === expected[index]),
+      required.every((name) => actual.includes(name)),
     actual.join(", "),
   );
 }
@@ -183,8 +187,10 @@ for (const [name, argv, wantExit, wantOut] of guests) {
 // ---- full-system Linux boot (needs web/get-images.sh) ----
 {
   const img = (f) => join(root, "web/images", f);
-  if (!existsSync(img("bbl64.bin"))) {
-    console.log("SKIP linux boot (run web/get-images.sh)");
+  if (skipLegacySystem || !existsSync(img("bbl64.bin"))) {
+    console.log(skipLegacySystem
+      ? "SKIP legacy BBL/TinyEMU Linux boot (RV64_SKIP_LEGACY_SYSTEM=1)"
+      : "SKIP linux boot (run web/get-images.sh)");
   } else {
     const vm = await RV64.create(wasmBytes);
     let out = "";
@@ -334,8 +340,10 @@ for (const [name, argv, wantExit, wantOut] of guests) {
 // paths cannot share one machine.
 {
   const img = (f) => join(root, "web/images", f);
-  if (!existsSync(img("bbl64.bin"))) {
-    console.log("SKIP http proxy (run web/get-images.sh)");
+  if (skipLegacySystem || !existsSync(img("bbl64.bin"))) {
+    console.log(skipLegacySystem
+      ? "SKIP legacy BBL/TinyEMU HTTP proxy (RV64_SKIP_LEGACY_SYSTEM=1)"
+      : "SKIP http proxy (run web/get-images.sh)");
   } else {
     // A real origin on loopback, reached by the same fetch() a browser uses.
     // Nothing external is involved, but the entire egress path runs.

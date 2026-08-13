@@ -1,0 +1,229 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>RV64 async page-policy browser benchmark</title>
+<pre id="result">running</pre>
+<script type="module">
+import { RV64Debug as RV64 } from "/web/rv64.js";
+
+const params = new URLSearchParams(location.search);
+const variant = params.get("variant") ?? "interpreter";
+const threshold = Number(params.get("threshold") ?? 1_048_576);
+const quantum = Number(params.get("quantum") ?? 1_024);
+const workloadNames = (params.get("workloads") ?? "alu1,alu5,mix20").split(",");
+const references = {
+  alu1: "4964fd655d986771",
+  alu5: "a5c58dc647744a59",
+  alu: "fb7c3a58011655ba",
+  mix20: "b12cac2b749d5788",
+  mix: "ab036f91acaa986d",
+};
+
+if (variant !== "interpreter" && variant !== "page") {
+  throw new Error(`unknown variant ${variant}`);
+}
+if (workloadNames.some((name) => !(name in references))) {
+  throw new Error(`unknown workload in ${workloadNames.join(",")}`);
+}
+
+const nextTask = (() => {
+  const waiting = [];
+  const channel = new MessageChannel();
+  channel.port1.onmessage = () => waiting.shift()?.();
+  return () => new Promise((resolve) => {
+    waiting.push(resolve);
+    channel.port2.postMessage(0);
+  });
+})();
+
+async function fetchBytes(path) {
+  const response = await fetch(path, { cache: "no-store" });
+  if (!response.ok) throw new Error(`${path}: fetch failed: ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+function encodeBase64(bytes) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 8_192) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 8_192));
+  }
+  return btoa(binary);
+}
+
+async function main() {
+  const assetStarted = performance.now();
+  const [wasm, kernel, disk, binary] = await Promise.all([
+    fetchBytes("/rv64.wasm"),
+    fetchBytes("/kernel"),
+    fetchBytes("/disk"),
+    fetchBytes("/syscompute"),
+  ]);
+  const assetLoadMs = performance.now() - assetStarted;
+
+  let moduleCount = 0;
+  let moduleBytes = 0;
+  const moduleKinds = {};
+  const setupStarted = performance.now();
+  const vm = await RV64.create(wasm);
+  const state = { output: "", poweredOff: false };
+  const decoder = new TextDecoder();
+  vm.onWrite = (_fd, bytes) => {
+    state.output += decoder.decode(bytes, { stream: true });
+  };
+  vm.onJitModule = (bytes, metadata) => {
+    moduleCount++;
+    moduleBytes += bytes.length;
+    moduleKinds[metadata.kind] = (moduleKinds[metadata.kind] ?? 0) + 1;
+  };
+  vm.ex.jit_set_enabled(variant === "page" ? 1 : 0);
+  vm.ex.sys_set_superblock(0);
+  if (variant === "page") {
+    vm.ex.jit_set_page_policy(1);
+    vm.ex.jit_set_page_threshold(threshold);
+    vm.ex.jit_set_page_quantum(quantum);
+  }
+  vm.bootVirtLinuxDirect({
+    kernel,
+    disk,
+    cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
+    ramMB: 512,
+  });
+  const setupMs = performance.now() - setupStarted;
+
+  async function pumpUntil(done, timeoutMs = 180_000) {
+    const started = performance.now();
+    for (let iteration = 0; !done(); iteration++) {
+      if (vm.runVirtSystem(2_000_000n)) {
+        state.poweredOff = true;
+        return done();
+      }
+      if ((iteration & 15) === 0 || vm.ex.sys_pending_builds?.() > 0) {
+        await nextTask();
+      }
+      if (performance.now() - started > timeoutMs) return false;
+    }
+    return true;
+  }
+
+  async function command(text, expected, timeoutMs = 60_000) {
+    if (text.includes(expected)) throw new Error(`marker ${expected} appears in command`);
+    const start = state.output.length;
+    vm.virtConsoleInput(new TextEncoder().encode(`${text}\n`));
+    return pumpUntil(() => state.output.slice(start).includes(expected), timeoutMs);
+  }
+
+  const bootStartIcount = vm.virtInsnCount();
+  const bootStartJit = vm.ex.jit_stat(0);
+  const bootStarted = performance.now();
+  const ready = await pumpUntil(() => state.output.includes("ALPINE_READY"), 300_000);
+  const bootMs = performance.now() - bootStarted;
+  if (!ready) throw new Error(`boot failed: ${state.output.slice(-500)}`);
+  const bootInstructions = vm.virtInsnCount() - bootStartIcount;
+  const bootJitInstructions = vm.ex.jit_stat(0) - bootStartJit;
+
+  const encoded = encodeBase64(binary);
+  if (!await command(": > /tmp/browser_syscompute.b64; echo BROWSER_BIN_'EMPTY'", "BROWSER_BIN_EMPTY")) {
+    throw new Error("binary transfer initialization failed");
+  }
+  for (let offset = 0; offset < encoded.length; offset += 512) {
+    const index = offset / 512;
+    const marker = `BROWSER_BIN_CHUNK_${index}`;
+    const text =
+      `printf %s '${encoded.slice(offset, offset + 512)}' >> /tmp/browser_syscompute.b64; ` +
+      `echo BROWSER_BIN_CHUNK_'${index}'`;
+    if (!await command(text, marker)) throw new Error(`binary transfer failed at ${index}`);
+  }
+  if (!await command(
+    "base64 -d /tmp/browser_syscompute.b64 > /tmp/syscompute && chmod 755 /tmp/syscompute; " +
+      "echo BROWSER_BIN_'DECODED'",
+    "BROWSER_BIN_DECODED",
+  )) throw new Error("binary decode failed");
+
+  const workloads = {};
+  for (const workload of workloadNames) {
+    workloads[workload] = [];
+    for (let repetition = 0; repetition < 2; repetition++) {
+      const outputStart = state.output.length;
+      const startIcount = vm.virtInsnCount();
+      const startJit = vm.ex.jit_stat(0);
+      const started = performance.now();
+      const marker = `BROWSER_${workload.toUpperCase()}_${repetition}_DONE`;
+      const done = await command(
+        `/tmp/syscompute ${workload}; echo BROWSER_${workload.toUpperCase()}_${repetition}_'DONE'`,
+        marker,
+        300_000,
+      );
+      const ms = performance.now() - started;
+      if (!done) throw new Error(`${workload}/${repetition} timed out`);
+      const phaseOutput = state.output.slice(outputStart);
+      if (!phaseOutput.includes(references[workload])) {
+        throw new Error(`${workload}/${repetition} checksum missing: ${phaseOutput.slice(-300)}`);
+      }
+      const instructions = vm.virtInsnCount() - startIcount;
+      const jitInstructions = vm.ex.jit_stat(0) - startJit;
+      workloads[workload].push({
+        ms,
+        instructions: instructions.toString(),
+        jitInstructions: jitInstructions.toString(),
+        mips: Number(instructions) / ms / 1_000,
+        jitPercent: instructions === 0n
+          ? 0
+          : Number(jitInstructions * 10_000n / instructions) / 100,
+      });
+    }
+  }
+
+  if (variant === "interpreter" && (vm.ex.jit_stat(0) !== 0n || moduleCount !== 0)) {
+    throw new Error("interpreter control executed or emitted generated code");
+  }
+  if (variant === "page" && (vm.ex.jit_stat(0) === 0n || moduleCount === 0)) {
+    throw new Error("page policy executed or emitted no generated code");
+  }
+  if (variant === "page" && Object.keys(moduleKinds).some((kind) => kind !== "async-region")) {
+    throw new Error(`synchronous generated module leaked: ${JSON.stringify(moduleKinds)}`);
+  }
+
+  return {
+    schema: 1,
+    methodology: "browser/modern-direct-linux/checksum-verified/two-invocations",
+    userAgent: navigator.userAgent,
+    hardwareConcurrency: navigator.hardwareConcurrency,
+    crossOriginIsolated,
+    variant,
+    threshold: variant === "page" ? threshold : null,
+    quantum: variant === "page" ? quantum : null,
+    assetLoadMs,
+    setupMs,
+    boot: {
+      ms: bootMs,
+      instructions: bootInstructions.toString(),
+      jitInstructions: bootJitInstructions.toString(),
+      mips: Number(bootInstructions) / bootMs / 1_000,
+      jitPercent: Number(bootJitInstructions * 10_000n / bootInstructions) / 100,
+    },
+    workloads,
+    modules: { count: moduleCount, bytes: moduleBytes, kinds: moduleKinds },
+    pagePolicy: variant === "page"
+      ? Array.from({ length: 19 }, (_, index) => vm.ex.jit_page_policy_stat(index).toString())
+      : null,
+    lifecycle: {
+      translateMs: Number(vm.ex.jit_stat(76)) / 1e6,
+      translateAttempts: vm.ex.jit_stat(77).toString(),
+      emittedBytes: vm.ex.jit_stat(78).toString(),
+      copyMs: vm.jitCopyMs ?? 0,
+      wasmCompileElapsedMs: vm.jitCompileMs ?? 0,
+      instantiateMs: vm.jitInstantiateMs ?? 0,
+      publishMs: vm.jitPublishMs ?? 0,
+    },
+  };
+}
+
+try {
+  document.querySelector("#result").textContent = JSON.stringify(await main());
+} catch (error) {
+  document.querySelector("#result").textContent = JSON.stringify({
+    error: error?.stack ?? String(error),
+  });
+} finally {
+  document.documentElement.dataset.done = "1";
+}
+</script>

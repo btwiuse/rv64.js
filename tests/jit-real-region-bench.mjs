@@ -1,0 +1,283 @@
+// Frozen frontend benchmark over multi-entry modules captured from real RV64
+// compiler output. Translation is performed once, outside every timed sample.
+// Each sample uses a fresh Node/V8 process and alternates module order. Raw
+// per-module timings, exact hashes, input hashes, and matched state-mode ratios
+// are retained in the JSON report.
+
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { cpus } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+import { summary } from "./statistics.mjs";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const root = join(here, "..");
+const self = fileURLToPath(import.meta.url);
+const corpusArg = process.argv.find((argument) => argument.startsWith("--corpus="));
+const corpusDir = corpusArg
+  ? corpusArg.split("=")[1]
+  : join(root, "target/jit-real-region-corpus");
+
+function rows() {
+  const lines = readFileSync(join(corpusDir, "manifest.tsv"), "utf8").trim().split("\n");
+  const header = lines.shift().split("\t");
+  return lines.map((line) => {
+    const values = line.split("\t");
+    const row = Object.fromEntries(header.map((name, index) => [name, values[index]]));
+    for (const name of [
+      "pages", "leader_cap", "entries", "read_x", "write_x", "read_f", "write_f",
+      "bytes", "uses_fp",
+    ]) row[name] = Number(row[name]);
+    return row;
+  });
+}
+
+function freshImports() {
+  return {
+    env: {
+      memory: new WebAssembly.Memory({ initial: 1 }),
+      fp_exec: () => 0n,
+      user_reservation: () => 0,
+      system_reservation: () => 0,
+      tlb_fill: () => -1n,
+      system_bulk_copy: () => 0n,
+      chain_next: () => {},
+      __indirect_function_table: new WebAssembly.Table({ initial: 16, element: "anyfunc" }),
+    },
+  };
+}
+
+function worker() {
+  const records = rows();
+  if (process.argv.includes("--reverse")) records.reverse();
+  const imports = freshImports();
+  const results = [];
+  for (const record of records) {
+    const bytes = readFileSync(join(corpusDir, record.wasm));
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    let started = performance.now();
+    let module;
+    try {
+      module = new WebAssembly.Module(bytes);
+    } catch (error) {
+      if (record.mode === "tailcall") {
+        results.push({
+          wasm: record.wasm,
+          hash,
+          unsupported: String(error),
+        });
+        continue;
+      }
+      throw error;
+    }
+    const compileMs = performance.now() - started;
+    started = performance.now();
+    const instance = new WebAssembly.Instance(module, imports);
+    const instantiateMs = performance.now() - started;
+    if (typeof instance.exports.run !== "function") {
+      throw new Error(`${record.wasm}: run export is missing`);
+    }
+    results.push({ record, hash, compileMs, instantiateMs });
+  }
+  process.stdout.write(JSON.stringify({
+    engine: { node: process.version, v8: process.versions.v8 },
+    order: process.argv.includes("--reverse") ? "reverse" : "forward",
+    results,
+  }));
+}
+
+if (process.argv.includes("--worker")) {
+  worker();
+  process.exit(0);
+}
+
+if (!process.argv.includes("--skip-generate")) {
+  const generated = spawnSync(
+    "cargo",
+    [
+      "run", "--release", "-q", "-p", "rv64-dbt", "--example",
+      "emit_real_region_corpus", "--", corpusDir,
+    ],
+    { cwd: root, encoding: "utf8" },
+  );
+  if (generated.status !== 0) {
+    throw new Error(generated.stderr || generated.stdout || "real-region generation failed");
+  }
+}
+
+const manifest = rows();
+const sampleArg = process.argv.find((argument) => argument.startsWith("--samples="));
+const samples = sampleArg ? Number(sampleArg.split("=")[1]) : 3;
+if (!Number.isInteger(samples) || samples < 1 || samples > 15) {
+  throw new Error("--samples must be an integer from 1 through 15");
+}
+
+const runs = [];
+for (let sample = 0; sample < samples; sample++) {
+  const child = spawnSync(
+    process.execPath,
+    [self, "--worker", `--corpus=${corpusDir}`, ...(sample & 1 ? ["--reverse"] : [])],
+    { encoding: "utf8", maxBuffer: 64 << 20 },
+  );
+  if (child.status !== 0) throw new Error(child.stderr || child.stdout);
+  runs.push(JSON.parse(child.stdout));
+}
+
+const byWasm = new Map(manifest.map((record) => [record.wasm, {
+  record,
+  runs: [],
+}]));
+for (const run of runs) {
+  for (const result of run.results) {
+    const target = byWasm.get(result.wasm ?? result.record.wasm);
+    if (!target) throw new Error(`worker returned unknown module ${result.wasm}`);
+    target.runs.push(result);
+  }
+}
+for (const [wasm, entry] of byWasm) {
+  if (entry.runs.length !== samples) throw new Error(`${wasm}: incomplete samples`);
+  const hashes = new Set(entry.runs.map((run) => run.hash));
+  if (hashes.size !== 1) throw new Error(`${wasm}: generated bytes changed between samples`);
+}
+
+const groupKey = (record) =>
+  `${record.workload}/p${record.pages}/l${record.leader_cap}/${record.mode}`;
+const groups = new Map();
+for (const entry of byWasm.values()) {
+  const key = groupKey(entry.record);
+  if (!groups.has(key)) groups.set(key, []);
+  groups.get(key).push(entry);
+}
+
+const cohorts = {};
+for (const [key, entries] of groups) {
+  const unsupported = entries.some((entry) => entry.runs.some((run) => run.unsupported));
+  if (unsupported) {
+    cohorts[key] = {
+      supported: false,
+      modules: entries.length,
+      reasons: [...new Set(entries.flatMap((entry) =>
+        entry.runs.flatMap((run) => run.unsupported ? [run.unsupported] : [])))],
+    };
+    continue;
+  }
+  cohorts[key] = {
+    supported: true,
+    modules: entries.length,
+    bytes: {
+      total: entries.reduce((total, entry) => total + entry.record.bytes, 0),
+      perModule: summary(entries.map((entry) => entry.record.bytes)),
+    },
+    entries: summary(entries.map((entry) => entry.record.entries)),
+    registerUnion: {
+      readX: summary(entries.map((entry) => entry.record.read_x)),
+      writeX: summary(entries.map((entry) => entry.record.write_x)),
+      readF: summary(entries.map((entry) => entry.record.read_f)),
+      writeF: summary(entries.map((entry) => entry.record.write_f)),
+    },
+    compileTotalMs: summary(Array.from({ length: samples }, (_, sample) =>
+      entries.reduce((total, entry) => total + entry.runs[sample].compileMs, 0))),
+    compilePerModuleMs: summary(entries.flatMap((entry) =>
+      entry.runs.map((run) => run.compileMs))),
+    instantiateTotalMs: summary(Array.from({ length: samples }, (_, sample) =>
+      entries.reduce((total, entry) => total + entry.runs[sample].instantiateMs, 0))),
+    instantiatePerModuleMs: summary(entries.flatMap((entry) =>
+      entry.runs.map((run) => run.instantiateMs))),
+  };
+}
+
+function matchedRatio(workload, pages, leaderCap, numerator, denominator, field) {
+  const numeratorEntries = groups.get(`${workload}/p${pages}/l${leaderCap}/${numerator}`);
+  const denominatorEntries = groups.get(`${workload}/p${pages}/l${leaderCap}/${denominator}`);
+  if (!numeratorEntries || !denominatorEntries ||
+      numeratorEntries.some((entry) => entry.runs.some((run) => run.unsupported)) ||
+      denominatorEntries.some((entry) => entry.runs.some((run) => run.unsupported))) return null;
+  if (field === "bytes") {
+    return numeratorEntries.reduce((total, entry) => total + entry.record.bytes, 0) /
+      denominatorEntries.reduce((total, entry) => total + entry.record.bytes, 0);
+  }
+  return summary(Array.from({ length: samples }, (_, sample) =>
+    numeratorEntries.reduce((total, entry) => total + entry.runs[sample][field], 0) /
+      denominatorEntries.reduce((total, entry) => total + entry.runs[sample][field], 0)));
+}
+
+const workloads = [...new Set(manifest.map((record) => record.workload))];
+const geometries = [...new Map(manifest.map((record) => [
+  `${record.pages}/${record.leader_cap}`,
+  { pages: record.pages, leaderCap: record.leader_cap },
+])).values()];
+const comparisons = {};
+for (const workload of workloads) {
+  for (const { pages, leaderCap } of geometries) {
+    const key = `${workload}/p${pages}/l${leaderCap}`;
+    comparisons[key] = {};
+    for (const [name, numerator, denominator] of [
+      ["lazyVsEager", "lazy", "eager"],
+      ["directVsEager", "direct", "eager"],
+      ["eagerVsMemory", "eager", "memory"],
+      ["tailCallVsMemory", "tailcall", "memory"],
+    ]) {
+      comparisons[key][name] = {
+        bytesRatio: matchedRatio(workload, pages, leaderCap, numerator, denominator, "bytes"),
+        compileRatio: matchedRatio(
+          workload, pages, leaderCap, numerator, denominator, "compileMs",
+        ),
+        instantiateRatio: matchedRatio(
+          workload, pages, leaderCap, numerator, denominator, "instantiateMs",
+        ),
+      };
+    }
+  }
+}
+
+const sourceHashes = Object.fromEntries([...new Set(manifest.map((record) => record.source))]
+  .map((source) => [source, createHash("sha256").update(readFileSync(source)).digest("hex")]));
+const modules = Object.fromEntries([...byWasm].map(([wasm, entry]) => [wasm, {
+  ...entry.record,
+  hash: entry.runs[0].hash,
+  rawRuns: entry.runs.map(({ compileMs, instantiateMs, unsupported }) => ({
+    ...(compileMs === undefined ? {} : { compileMs }),
+    ...(instantiateMs === undefined ? {} : { instantiateMs }),
+    ...(unsupported === undefined ? {} : { unsupported }),
+  })),
+}]));
+
+const report = {
+  schema: 1,
+  methodology: "frozen-real-elf-regions/fresh-node-process-per-sample/alternating-order",
+  samples,
+  engine: runs[0].engine,
+  host: { platform: process.platform, arch: process.arch, cpu: cpus()[0]?.model ?? "unknown" },
+  sourceHashes,
+  moduleCount: manifest.length,
+  regionCount: new Set(manifest.map((record) => record.id)).size,
+  cohorts,
+  comparisons,
+  modules,
+};
+
+const outputArg = process.argv.find((argument) => argument.startsWith("--output="));
+if (outputArg) writeFileSync(outputArg.split("=")[1], `${JSON.stringify(report, null, 2)}\n`);
+
+if (process.argv.includes("--json")) {
+  console.log(JSON.stringify(report, null, 2));
+} else {
+  const f = (value) => value.toFixed(3);
+  console.log(
+    `${samples} fresh Node processes; ${report.regionCount} regions; ` +
+      `${report.moduleCount} modules; V8 ${report.engine.v8}`,
+  );
+  for (const [key, values] of Object.entries(comparisons)) {
+    const ratio = (entry) => entry.compileRatio === null
+      ? "unsupported"
+      : `${f(entry.bytesRatio)} bytes / ${f(entry.compileRatio.median)} compile`;
+    console.log(
+      `${key}: lazy/eager ${ratio(values.lazyVsEager)}; ` +
+        `direct/eager ${ratio(values.directVsEager)}; ` +
+        `eager/memory ${ratio(values.eagerVsMemory)}; ` +
+        `tail/memory ${ratio(values.tailCallVsMemory)}`,
+    );
+  }
+}

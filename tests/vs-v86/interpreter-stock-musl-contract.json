@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "population": "stock-musl-rv64gcv-v1",
+  "source": "nbench-byte-2.2.3 plus the existing fixed-data32 and fixed-work patches",
+  "compiler": "zig cc -O2 -static; RV64 -mcpu=baseline_rv64+v+zifencei",
+  "memoryImplementation": "ordinary target musl on both architectures",
+  "commonFlags": [
+    "-fno-builtin-memmove",
+    "-fno-builtin-memcpy"
+  ],
+  "rv64ReplacementSource": null,
+  "purpose": "final fair-input audit; forbidden as a tuning population"
+}

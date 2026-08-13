@@ -1,0 +1,19 @@
+[host_machine]
+system = 'emscripten'
+cpu_family = 'wasm64'
+cpu = 'wasm64'
+endian = 'little'
+
+[binaries]
+c = 'emcc'
+cpp = 'em++'
+ar = 'emar'
+ranlib = 'emranlib'
+pkg-config = ['pkg-config', '--static']
+
+[built-in options]
+c_args = ['-O3', '-pthread', '-DWASM_BIGINT', '-sMEMORY64=1', '-Wno-incompatible-function-pointer-types']
+cpp_args = ['-O3', '-pthread', '-DWASM_BIGINT', '-sMEMORY64=1']
+objc_args = ['-O3', '-pthread', '-DWASM_BIGINT', '-sMEMORY64=1']
+c_link_args = ['-sWASM_BIGINT', '-sASYNCIFY=1', '-sMEMORY64=1', '-L@DEPS_DIR@/lib']
+cpp_link_args = ['-sWASM_BIGINT', '-sASYNCIFY=1', '-sMEMORY64=1', '-L@DEPS_DIR@/lib']

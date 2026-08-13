@@ -8,8 +8,8 @@
 // fflags bits (RISC-V order)
 pub const FFLAG_INEXACT: u32 = 1 << 0;
 pub const FFLAG_UNDERFLOW: u32 = 1 << 1;
-pub const FFLAG_DIVIDE_ZERO: u32 = 1 << 2;
-pub const FFLAG_OVERFLOW: u32 = 1 << 3;
+pub const FFLAG_OVERFLOW: u32 = 1 << 2;
+pub const FFLAG_DIVIDE_ZERO: u32 = 1 << 3;
 pub const FFLAG_INVALID_OP: u32 = 1 << 4;
 
 // Rounding modes (RISC-V frm encoding)
@@ -806,6 +806,20 @@ pub fn cvt_sf64_sf32(a: u64, rm: u32, fl: &mut u32) -> u32 {
     let exp32 = a_exp - 0x3ff + 0x7f;
     let mant = rshift_rnd_u64(a_mant, 52 - 30);
     normalize_sf32_from(a_sign, exp32, mant as u32, rm, fl)
+}
+
+/// f64 -> f32 using IEEE round-to-odd (jamming), as required by
+/// `vfncvt.rod.f.f.w`. A toward-zero conversion supplies the truncated value
+/// and exact exception classification; an inexact finite result then has its
+/// retained least-significant bit forced to one.
+pub fn cvt_sf64_sf32_rod(a: u64, fl: &mut u32) -> u32 {
+    let mut local_flags = 0;
+    let mut result = cvt_sf64_sf32(a, RM_RTZ, &mut local_flags);
+    if local_flags & FFLAG_INEXACT != 0 && !sf32::is_nan(result) {
+        result |= 1;
+    }
+    *fl |= local_flags;
+    result
 }
 
 fn rshift_rnd_u64(a: u64, d: i32) -> u64 {
