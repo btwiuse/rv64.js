@@ -241,6 +241,7 @@ pub(crate) fn direct_call_targets(code: &[u8], base: u64) -> Vec<u64> {
     targets.into_iter().collect()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lift_t1(
     code: &[u8],
     base: u64,
@@ -249,17 +250,39 @@ pub(crate) fn lift_t1(
     fp_mode: FpMode,
     allow_reservation: bool,
 ) -> Option<LiftedRegion> {
-    lift_t1_profiled(
+    lift_t1_with_vector(
         code,
         base,
         entry_pc,
         allow_memory,
         fp_mode,
         allow_reservation,
+        false,
+    )
+}
+
+pub(crate) fn lift_t1_with_vector(
+    code: &[u8],
+    base: u64,
+    entry_pc: u64,
+    allow_memory: bool,
+    fp_mode: FpMode,
+    allow_reservation: bool,
+    allow_vector: bool,
+) -> Option<LiftedRegion> {
+    lift_t1_profiled_with_vector(
+        code,
+        base,
+        entry_pc,
+        allow_memory,
+        fp_mode,
+        allow_reservation,
+        allow_vector,
         None,
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lift_t1_profiled(
     code: &[u8],
     base: u64,
@@ -269,18 +292,42 @@ pub(crate) fn lift_t1_profiled(
     allow_reservation: bool,
     profiled_indirect_target: Option<u64>,
 ) -> Option<LiftedRegion> {
-    let targets: Vec<u64> = profiled_indirect_target.into_iter().collect();
-    lift_t1_profiled_targets(
+    lift_t1_profiled_with_vector(
         code,
         base,
         entry_pc,
         allow_memory,
         fp_mode,
         allow_reservation,
+        false,
+        profiled_indirect_target,
+    )
+}
+
+pub(crate) fn lift_t1_profiled_with_vector(
+    code: &[u8],
+    base: u64,
+    entry_pc: u64,
+    allow_memory: bool,
+    fp_mode: FpMode,
+    allow_reservation: bool,
+    allow_vector: bool,
+    profiled_indirect_target: Option<u64>,
+) -> Option<LiftedRegion> {
+    let targets: Vec<u64> = profiled_indirect_target.into_iter().collect();
+    lift_t1_profiled_targets_with_vector(
+        code,
+        base,
+        entry_pc,
+        allow_memory,
+        fp_mode,
+        allow_reservation,
+        allow_vector,
         &targets,
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lift_t1_profiled_targets(
     code: &[u8],
     base: u64,
@@ -290,28 +337,27 @@ pub(crate) fn lift_t1_profiled_targets(
     allow_reservation: bool,
     profiled_indirect_targets: &[u64],
 ) -> Option<LiftedRegion> {
-    lift_t1_profiled_targets_mode(
+    lift_t1_profiled_targets_with_vector(
         code,
         base,
         entry_pc,
         allow_memory,
         fp_mode,
         allow_reservation,
+        false,
         profiled_indirect_targets,
-        true,
     )
 }
 
-/// Lift one architectural basic block for a multi-entry CFG function. Unlike
-/// T1 traces, forward control transfers terminate the member so both covered
-/// successors can remain inside the shared Wasm dispatcher.
-pub(crate) fn lift_basic_block(
+pub(crate) fn lift_t1_profiled_targets_with_vector(
     code: &[u8],
     base: u64,
     entry_pc: u64,
     allow_memory: bool,
     fp_mode: FpMode,
     allow_reservation: bool,
+    allow_vector: bool,
+    profiled_indirect_targets: &[u64],
 ) -> Option<LiftedRegion> {
     lift_t1_profiled_targets_mode(
         code,
@@ -320,6 +366,52 @@ pub(crate) fn lift_basic_block(
         allow_memory,
         fp_mode,
         allow_reservation,
+        allow_vector,
+        profiled_indirect_targets,
+        true,
+    )
+}
+
+/// Lift one architectural basic block for a multi-entry CFG function. Unlike
+/// T1 traces, forward control transfers terminate the member so both covered
+/// successors can remain inside the shared Wasm dispatcher.
+#[allow(dead_code)]
+pub(crate) fn lift_basic_block(
+    code: &[u8],
+    base: u64,
+    entry_pc: u64,
+    allow_memory: bool,
+    fp_mode: FpMode,
+    allow_reservation: bool,
+) -> Option<LiftedRegion> {
+    lift_basic_block_with_vector(
+        code,
+        base,
+        entry_pc,
+        allow_memory,
+        fp_mode,
+        allow_reservation,
+        false,
+    )
+}
+
+pub(crate) fn lift_basic_block_with_vector(
+    code: &[u8],
+    base: u64,
+    entry_pc: u64,
+    allow_memory: bool,
+    fp_mode: FpMode,
+    allow_reservation: bool,
+    allow_vector: bool,
+) -> Option<LiftedRegion> {
+    lift_t1_profiled_targets_mode(
+        code,
+        base,
+        entry_pc,
+        allow_memory,
+        fp_mode,
+        allow_reservation,
+        allow_vector,
         &[],
         false,
     )
@@ -333,6 +425,7 @@ fn lift_t1_profiled_targets_mode(
     allow_memory: bool,
     fp_mode: FpMode,
     allow_reservation: bool,
+    allow_vector: bool,
     profiled_indirect_targets: &[u64],
     trace_forward: bool,
 ) -> Option<LiftedRegion> {
@@ -374,6 +467,7 @@ fn lift_t1_profiled_targets_mode(
             allow_memory,
             fp_mode,
             allow_reservation,
+            allow_vector,
             trace_forward,
         );
         if !matches!(outcome, StepOutcome::Unsupported) {
@@ -442,7 +536,12 @@ fn lift_t1_profiled_targets_mode(
     ir.trace_mix = metrics.trace_mix;
     ir.trace_stack_memory = metrics.trace_stack_memory;
     ir.writes_x2 = ir.outputs.iter().any(|(reg, _)| *reg == 2);
-    let loop_backedge = detect_single_latch_loop(&ir);
+    // Vector helpers can invalidate every scalar carry. Until the dedicated
+    // loop carrier models that barrier, retain compiled vector bodies but let
+    // the outer dispatcher own their backedges.
+    let loop_backedge = (!ir.has_vector_helper())
+        .then(|| detect_single_latch_loop(&ir))
+        .flatten();
     Some(LiftedRegion {
         byte_len: source_hi.saturating_sub(source_lo),
         span: (source_lo, source_hi),
@@ -499,6 +598,7 @@ fn lift_one(
     allow_memory: bool,
     fp_mode: FpMode,
     allow_reservation: bool,
+    allow_vector: bool,
     trace_forward: bool,
 ) -> StepOutcome {
     let allow_fp = fp_mode != FpMode::Disabled;
@@ -617,6 +717,21 @@ fn lift_one(
             if rs1(insn) == 2 {
                 metrics.trace_mem[9] = metrics.trace_mem[9].saturating_add(1);
             }
+            StepOutcome::Continue
+        }
+        // RVV memory encodings share LOAD-FP/STORE-FP major opcodes but use
+        // the otherwise-unused width fields. The typed helper performs the
+        // complete mandatory base-V operation against canonical machine state.
+        0x07 if allow_memory && allow_vector && matches!(funct3(insn), 0 | 5 | 6 | 7) => {
+            b.vector(insn, pc, fallthrough, retired);
+            StepOutcome::Continue
+        }
+        0x27 if allow_memory && allow_vector && matches!(funct3(insn), 0 | 5 | 6 | 7) => {
+            b.vector(insn, pc, fallthrough, retired);
+            StepOutcome::Continue
+        }
+        0x57 if allow_vector => {
+            b.vector(insn, pc, fallthrough, retired);
             StepOutcome::Continue
         }
         // Floating-point loads preserve raw IEEE bits in the architectural F
@@ -1448,6 +1563,78 @@ mod tests {
             .unwrap();
         assert_eq!(load_exit.guest_pc, 0x100c);
         assert_eq!(load_exit.retired, 3);
+    }
+
+    #[test]
+    fn vector_capability_lifts_complete_ordered_effects_and_breaks_ssa_forwarding() {
+        let words = [
+            enc_i(0x13, 16, 0, 8, -128), // addi a6,s0,-128
+            0xcc08_7057,                 // vsetivli zero,16,e8,m1,ta,ma
+            0x0285_0457,                 // vadd.vx v8,v8,a0
+            0x0207_0407,                 // vle8.v v8,(a4)
+            0x0208_0427,                 // vse8.v v8,(a6)
+            enc_i(0x13, 17, 0, 16, 1),   // addi a7,a6,1
+            0x0000_0073,                 // ecall
+        ];
+        let code = bytes(&words);
+
+        let scalar_only = lift_t1(&code, 0x1000, 0x1000, true, FpMode::User, false).unwrap();
+        assert_eq!(scalar_only.ir.retired, 1);
+        assert!(!scalar_only.ir.has_vector_helper());
+
+        let lifted = lift_t1_with_vector(&code, 0x1000, 0x1000, true, FpMode::User, false, true)
+            .expect("typed vector capability lifts the full sequence");
+        assert_eq!(lifted.ir.retired, 6);
+        assert_eq!(
+            lifted
+                .ir
+                .effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Vector { .. }))
+                .count(),
+            4
+        );
+        let first = lifted
+            .ir
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Vector {
+                    insn,
+                    fallthrough,
+                    exit,
+                    ..
+                } => Some((*insn, *fallthrough, exit)),
+                _ => None,
+            })
+            .expect("first RVV instruction is an effect");
+        assert_eq!(first.0, words[1]);
+        assert_eq!(first.1, 0x1008);
+        assert_eq!(first.2.guest_pc, 0x1004);
+        assert_eq!(first.2.retired, 1);
+        assert!(first.2.outputs.iter().any(|&(reg, _)| reg == 16));
+
+        // The post-vector add must reread a6 from canonical state rather than
+        // forwarding the pre-vector value through the opaque boundary.
+        assert!(lifted
+            .ir
+            .values
+            .iter()
+            .any(|value| matches!(value.op, Op::ReadX(16)) && value.guest_pc == 0x1014));
+        assert!(lifted.ir.validate().is_ok());
+    }
+
+    #[test]
+    fn vector_regions_leave_backedges_to_the_outer_dispatcher() {
+        let code = bytes(&[
+            0x0285_0457,              // vadd.vx v8,v8,a0
+            enc_i(0x13, 1, 0, 1, -1), // addi x1,x1,-1
+            0xfe00_9ce3,              // bnez x1,-8
+        ]);
+        let lifted = lift_t1_with_vector(&code, 0x2000, 0x2000, true, FpMode::User, false, true)
+            .expect("vector loop lifts");
+        assert!(lifted.ir.has_vector_helper());
+        assert!(lifted.loop_backedge.is_none());
     }
 
     #[test]

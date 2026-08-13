@@ -66,13 +66,26 @@ if (!artifactsArg) throw new Error("set ARTIFACTS");
 const artifacts = resolve(artifactsArg);
 const executionMode = parseExecutionMode(process.env.SCORECARD_V2_EXECUTION_MODE);
 const inputPopulation = process.env.SCORECARD_V2_INPUT_POPULATION || "scorecard-v2-modern";
-if (!["scorecard-v2-modern", "stock-musl-v1", "stock-musl-rv64gcv-v1"].includes(inputPopulation)) {
-  throw new Error("SCORECARD_V2_INPUT_POPULATION must be scorecard-v2-modern, stock-musl-v1, or stock-musl-rv64gcv-v1");
+const allowedPopulations = [
+  "scorecard-v2-modern",
+  "scorecard-v2-rv64gcv-v1",
+  "stock-musl-v1",
+  "stock-musl-rv64gcv-v1",
+];
+const RV64GCV_KERNEL_SHA256 = "6029e2d5f0c24da911052be961cb7b3c1150206cff76666c8c8eebd8270a78d9";
+if (!allowedPopulations.includes(inputPopulation)) {
+  throw new Error(`SCORECARD_V2_INPUT_POPULATION must be one of ${allowedPopulations.join(", ")}`);
 }
-if (inputPopulation !== "scorecard-v2-modern" && executionMode !== "interpreter") {
+const rv64gcvJitPopulation = inputPopulation === "scorecard-v2-rv64gcv-v1";
+if (inputPopulation !== "scorecard-v2-modern" && !rv64gcvJitPopulation && executionMode !== "interpreter") {
   throw new Error("alternate input populations are interpreter-only");
 }
-const defaultSides = executionMode === "interpreter" ? INTERPRETER_SIDES : SIDES;
+if (rv64gcvJitPopulation && executionMode !== "jit") {
+  throw new Error("scorecard-v2-rv64gcv-v1 is JIT-only");
+}
+const defaultSides = executionMode === "interpreter" || rv64gcvJitPopulation
+  ? INTERPRETER_SIDES
+  : SIDES;
 const selectedSides = process.env.SIDES
   ? selectedList(process.env.SIDES, SIDES, "sides")
   : [...defaultSides];
@@ -93,10 +106,27 @@ const legacyRoot = resolve(process.env.LEGACY_ROOT || join(root, "target/scoreca
 const v86dir = resolve(process.env.V86DIR || join(artifacts, "v86"));
 
 const stockMuslPopulation = inputPopulation.startsWith("stock-musl-");
-const requiredPaths = stockMuslPopulation
+const rv64gcvPopulation = stockMuslPopulation || rv64gcvJitPopulation;
+const rv64gcvRv64Initramfs = resolve(
+  process.env.SCORECARD_V2_RV64GCV_RV64_INITRAMFS ||
+  process.env.INTERPRETER_AUDIT_RV64_INITRAMFS ||
+  join(artifacts, "interpreter-stock-musl-rv64gcv-v1/interpreter-stock-musl-riscv64.cpio"),
+);
+const rv64gcvX86Initramfs = resolve(
+  process.env.SCORECARD_V2_RV64GCV_X86_INITRAMFS ||
+  process.env.INTERPRETER_AUDIT_X86_INITRAMFS ||
+  join(artifacts, "interpreter-stock-musl-rv64gcv-v1/interpreter-stock-musl-x86.cpio"),
+);
+const rv64KernelImage = resolve(
+  process.env.RV64_KERNEL_IMAGE ||
+  (rv64gcvJitPopulation
+    ? join(artifacts, "interpreter-stock-musl-rv64gcv-v1/rv64gcv-linux-Image")
+    : join(root, "web/images/alpine/Image")),
+);
+const requiredPaths = rv64gcvPopulation
   ? [
-      resolve(process.env.INTERPRETER_AUDIT_RV64_INITRAMFS || ""),
-      resolve(process.env.INTERPRETER_AUDIT_X86_INITRAMFS || ""),
+      rv64gcvRv64Initramfs,
+      rv64gcvX86Initramfs,
     ]
   : [
       join(artifacts, "scorecard-v2-modern-riscv64.cpio"),
@@ -108,9 +138,7 @@ if (stockMuslPopulation &&
   throw new Error("stock-musl-v1 requires both interpreter audit initramfs paths");
 }
 if (selectedSides.includes("rewrite") || selectedSides.includes("legacy")) {
-  requiredPaths.push(resolve(
-    process.env.RV64_KERNEL_IMAGE || join(root, "web/images/alpine/Image"),
-  ));
+  requiredPaths.push(rv64KernelImage);
 }
 if (selectedSides.includes("rewrite")) {
   requiredPaths.push(
@@ -137,6 +165,17 @@ for (const path of requiredPaths) {
   await access(path).catch(() => {
     throw new Error(`required scorecard input missing: ${path}`);
   });
+}
+if (rv64gcvJitPopulation) {
+  const kernelSha256 = createHash("sha256")
+    .update(await readFile(rv64KernelImage))
+    .digest("hex");
+  if (kernelSha256 !== RV64GCV_KERNEL_SHA256) {
+    throw new Error(
+      `RV64GCV kernel identity mismatch: ${kernelSha256} ` +
+      `(expected ${RV64GCV_KERNEL_SHA256})`,
+    );
+  }
 }
 
 if (authoritative) {
@@ -647,6 +686,14 @@ if (executionMode === "interpreter") {
     markdown += `| ${formatValue(row.sides.v86?.median, row.kind)} `;
     markdown += `| ${formatVerdict(row.rewriteVsV86)} |\n`;
   }
+} else if (rv64gcvJitPopulation) {
+  markdown += `| Benchmark | Rewrite RV64GCV JIT | copy/v86 JIT | Rewrite vs v86 |\n`;
+  markdown += `|---|---:|---:|---:|\n`;
+  for (const row of aggregates) {
+    markdown += `| ${row.name} | ${formatValue(row.sides.rewrite?.median, row.kind)} `;
+    markdown += `| ${formatValue(row.sides.v86?.median, row.kind)} `;
+    markdown += `| ${formatVerdict(row.rewriteVsV86)} |\n`;
+  }
 } else {
   markdown += `| Benchmark | Rewrite | Legacy JIT | copy/v86 | Rewrite vs legacy | Rewrite vs v86 |\n`;
   markdown += `|---|---:|---:|---:|---:|---:|\n`;
@@ -657,7 +704,9 @@ if (executionMode === "interpreter") {
     markdown += `| ${formatVerdict(row.rewriteVsLegacy)} | ${formatVerdict(row.rewriteVsV86)} |\n`;
   }
 }
-markdown += `\n- Modern guest contract: Linux 6.12.7, Alpine 3.24.1; riscv64 for both RV64 engines and i686 for v86.\n`;
+markdown += rv64gcvJitPopulation
+  ? `\n- RV64GCV guest contract: the frozen stock-musl RV64GCV binary population is compared with its pinned i686 counterpart.\n`
+  : `\n- Modern guest contract: Linux 6.12.7, Alpine 3.24.1; riscv64 for both RV64 engines and i686 for v86.\n`;
 markdown += `- Input population: ${inputPopulation}.\n`;
 if (executionMode === "interpreter") {
   markdown += `- Both runtimes explicitly disable JIT before guest boot; every measured worker proves zero generated modules, cache growth, translation, and dispatch activity.\n`;

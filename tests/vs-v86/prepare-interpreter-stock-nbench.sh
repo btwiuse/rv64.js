@@ -8,6 +8,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 ARTIFACTS="${1:?usage: prepare-interpreter-stock-nbench.sh ARTIFACTS NBENCH_ARCHIVE [OUTPUT_DIR]}"
 ARCHIVE="${2:?usage: prepare-interpreter-stock-nbench.sh ARTIFACTS NBENCH_ARCHIVE [OUTPUT_DIR]}"
 ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
@@ -17,6 +18,21 @@ mkdir -p "$OUTPUT"
 OUTPUT="$(cd "$OUTPUT" && pwd)"
 ZIG="${ZIG:-$(command -v zig)}"
 RV64_CPU="${RV64_CPU:-baseline_rv64+v+zifencei}"
+
+if [ -n "${RV64_KERNEL_IMAGE:-}" ]; then
+    RV64_KERNEL_SOURCE="$RV64_KERNEL_IMAGE"
+else
+    kernel_output="$(nix build --no-link --print-out-paths "path:$ROOT#virt-kernel-fast")"
+    RV64_KERNEL_SOURCE="$kernel_output/Image"
+fi
+test -f "$RV64_KERNEL_SOURCE" || {
+    echo "missing RVV-capable kernel: $RV64_KERNEL_SOURCE" >&2
+    exit 2
+}
+install -m 0644 "$RV64_KERNEL_SOURCE" "$OUTPUT/rv64gcv-linux-Image"
+printf '%s  %s\n' \
+    6029e2d5f0c24da911052be961cb7b3c1150206cff76666c8c8eebd8270a78d9 \
+    "$OUTPUT/rv64gcv-linux-Image" | sha256sum -c -
 
 RV64_BASE="$ARTIFACTS/scorecard-v2-modern-riscv64.cpio"
 X86_BASE="$ARTIFACTS/scorecard-v2-modern-x86.cpio"
@@ -101,6 +117,7 @@ sha256sum \
     "$OUTPUT/stock-musl-overlay-x86.cpio" \
     "$OUTPUT/interpreter-stock-musl-riscv64.cpio" \
     "$OUTPUT/interpreter-stock-musl-x86.cpio" \
+    "$OUTPUT/rv64gcv-linux-Image" \
     "$HERE/nbench-fixed-data32.patch" \
     "$HERE/nbench-fixed-work.patch" \
     "$HERE/nbench-extras/hwstub.c" \

@@ -966,6 +966,56 @@ pub extern "C" fn jit_system_reservation(op: u32, state_ptr: u32, address: u64) 
     }
 }
 
+/// Execute one complete RVV instruction for a generated Linux-user region.
+/// Status 0 leaves the instruction unretired for precise interpreter replay;
+/// status 1 completed and permits generated execution to continue.
+#[no_mangle]
+pub extern "C" fn jit_user_vector(state_ptr: u32, insn: u32) -> u32 {
+    if state_ptr == 0 {
+        return 0;
+    }
+    // SAFETY: user-mode layouts pass their live `rv64_linux::Machine` as the
+    // opaque generated-function state pointer and import only user_vector.
+    let machine = unsafe { &mut *(state_ptr as usize as *mut rv64_linux::Machine) };
+    let mut bus = FlatMemory::new(0, &mut machine.mem);
+    u32::from(machine.cpu.jit_exec_vector(&mut bus, insn).is_ok())
+}
+
+/// Full-system RVV counterpart. Status 2 means the instruction completed but
+/// a vector store dirtied generated code, so the caller must return after
+/// retiring this instruction and let the dispatcher invalidate that page.
+#[no_mangle]
+pub extern "C" fn jit_system_vector(state_ptr: u32, insn: u32) -> u32 {
+    if state_ptr == 0 || state_ptr != unsafe { ACTIVE_SYSTEM_STATE } {
+        return 0;
+    }
+    // SAFETY: `SystemJitMachine::activate` publishes both the concrete board
+    // kind and its matching state pointer before any generated invocation.
+    unsafe {
+        match ACTIVE_SYSTEM_KIND {
+            kind if kind == SystemMachineKind::Legacy as u8 => {
+                let machine = &mut *(state_ptr as usize as *mut rv64_system::Machine);
+                let dirty_before = machine.bus.jit_dirty_pages.len();
+                match machine.cpu.jit_exec_vector(&mut machine.bus, insn) {
+                    Ok(()) if machine.bus.jit_dirty_pages.len() != dirty_before => 2,
+                    Ok(()) => 1,
+                    Err(_) => 0,
+                }
+            }
+            kind if kind == SystemMachineKind::Virt as u8 => {
+                let machine = &mut *(state_ptr as usize as *mut rv64_system::virt::VirtMachine);
+                let dirty_before = machine.bus.jit_dirty_pages.len();
+                match machine.cpu.jit_exec_vector(&mut machine.bus, insn) {
+                    Ok(()) if machine.bus.jit_dirty_pages.len() != dirty_before => 2,
+                    Ok(()) => 1,
+                    Err(_) => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
 /// Exact scalar floating-point helper imported by generated modules. One ABI
 /// covers unary, binary, ternary, comparison, classification, and conversion
 /// operations so each generated module needs at most one function import. The
@@ -2726,6 +2776,14 @@ pub extern "C" fn jit_set_enabled(on: u32) {
         }
     }
 }
+
+/// Override the adaptive block-entry threshold for deterministic user-mode
+/// differential tests. Production callers never invoke this and retain the
+/// 64-observation default selected by `jit_set_enabled(1)`.
+#[no_mangle]
+pub extern "C" fn jit_set_user_block_threshold(observations: u32) {
+    unsafe { JIT_THRESHOLD = observations.max(1) }
+}
 /// Opt-in: drive the guest CLINT from real host wall-clock instead of the
 /// default deterministic instruction-counted time. For benchmarks that self-
 /// time via the guest clock (nbench) and realistic `date`/timeouts. Off by
@@ -3069,6 +3127,7 @@ pub extern "C" fn sbtest() -> u64 {
             f_base: 0,
             fcsr_addr: 0,
             reservation: None,
+            vector: None,
             fuel_addr: 0,
             mstatus_addr: 0,
             copystat_addr: 0,
@@ -3360,6 +3419,7 @@ fn sbtest_fp_state(state_mode: rv64_dbt::MultiEntryState) -> u64 {
             f_base: state + 40 * 8,
             fcsr_addr: state + 72 * 8,
             reservation: None,
+            vector: None,
             fuel_addr: 0,
             mstatus_addr: 0,
             copystat_addr: 0,
@@ -3527,6 +3587,7 @@ pub extern "C" fn user_run(budget: u64) -> i32 {
                     f_base: m.cpu.f.as_ptr() as u32,
                     fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
                     reservation: Some(rv64_dbt::ReservationCapability::User),
+                    vector: Some(rv64_dbt::VectorCapability::User),
                     fuel_addr: fuel_addr(),
                     mstatus_addr: 0, // user mode: no privileged FP state
                     copystat_addr: 0,
@@ -3650,6 +3711,57 @@ pub extern "C" fn user_freg(i: u32) -> u64 {
 #[allow(static_mut_refs)]
 pub extern "C" fn user_fcsr() -> u32 {
     unsafe { USER.as_ref().map(|e| e.machine.cpu.fcsr).unwrap_or(0) }
+}
+
+/// Read one raw byte from the user machine's architectural vector register
+/// file. This and the vector-CSR accessors below are low-level differential
+/// test probes; ordinary execution does not touch them.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn user_vreg_byte(reg: u32, byte: u32) -> u32 {
+    unsafe {
+        USER.as_ref()
+            .map(|e| e.machine.cpu.vector.regs[(reg & 31) as usize][(byte & 15) as usize] as u32)
+            .unwrap_or(0)
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn user_vl() -> u64 {
+    unsafe { USER.as_ref().map(|e| e.machine.cpu.vector.vl).unwrap_or(0) }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn user_vtype() -> u64 {
+    unsafe {
+        USER.as_ref()
+            .map(|e| e.machine.cpu.vector.vtype)
+            .unwrap_or(0)
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn user_vstart() -> u64 {
+    unsafe {
+        USER.as_ref()
+            .map(|e| e.machine.cpu.vector.vstart)
+            .unwrap_or(0)
+    }
+}
+
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn user_vcsr() -> u32 {
+    unsafe {
+        USER.as_ref()
+            .map(|e| {
+                u32::from(e.machine.cpu.vector.vxrm) << 1 | u32::from(e.machine.cpu.vector.vxsat)
+            })
+            .unwrap_or(0)
+    }
 }
 
 #[no_mangle]
@@ -4776,6 +4888,7 @@ fn jit_layout(m: &impl SystemJitMachine) -> rv64_dbt::JitLayout {
         f_base: cpu.f.as_ptr() as u32,
         fcsr_addr: &cpu.fcsr as *const u32 as u32,
         reservation: Some(rv64_dbt::ReservationCapability::System),
+        vector: Some(rv64_dbt::VectorCapability::System),
         fuel_addr: fuel_addr(),
         mstatus_addr: cpu.jit_mstatus_ptr() as u32,
         copystat_addr: copystat_addr(),
@@ -6723,6 +6836,7 @@ fn run_system_jit(m: &mut impl SystemJitMachine, max_insns: u64) -> i32 {
                             f_base: cpu.f.as_ptr() as u32,
                             fcsr_addr: &cpu.fcsr as *const u32 as u32,
                             reservation: Some(rv64_dbt::ReservationCapability::System),
+                            vector: Some(rv64_dbt::VectorCapability::System),
                             fuel_addr: fuel_addr(),
                             mstatus_addr: cpu.jit_mstatus_ptr() as u32,
                             copystat_addr: copystat_addr(),
@@ -7844,6 +7958,7 @@ pub extern "C" fn sb_analyze(vpage: u64, which: u32) -> u64 {
             f_base: m.cpu.f.as_ptr() as u32,
             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
             reservation: Some(rv64_dbt::ReservationCapability::System),
+            vector: Some(rv64_dbt::VectorCapability::System),
             fuel_addr: fuel_addr(),
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),
@@ -7932,6 +8047,7 @@ pub extern "C" fn sb_analyze_pc(pc: u64, which: u32) -> u64 {
             f_base: m.cpu.f.as_ptr() as u32,
             fcsr_addr: &m.cpu.fcsr as *const u32 as u32,
             reservation: Some(rv64_dbt::ReservationCapability::System),
+            vector: Some(rv64_dbt::VectorCapability::System),
             fuel_addr: fuel_addr(),
             mstatus_addr: m.cpu.jit_mstatus_ptr() as u32,
             copystat_addr: copystat_addr(),

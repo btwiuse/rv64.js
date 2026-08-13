@@ -282,6 +282,15 @@ pub enum Effect {
         dirty: bool,
         exit: SideExit,
     },
+    /// One complete architectural RVV instruction. The backend publishes the
+    /// pre-instruction scalar state, calls the concrete machine's typed vector
+    /// helper, and invalidates cached x/f/fcsr values on success.
+    Vector {
+        position: usize,
+        insn: u32,
+        fallthrough: u64,
+        exit: SideExit,
+    },
 }
 
 impl BinaryOp {
@@ -725,6 +734,12 @@ impl Region {
                     }
                     validate_side_exit(exit, &ty, *position)?;
                 }
+                Effect::Vector { position, exit, .. } => {
+                    if *position > self.values.len() {
+                        return Err(ValidationError("invalid vector effect".into()));
+                    }
+                    validate_side_exit(exit, &ty, *position)?;
+                }
             }
         }
         Ok(())
@@ -770,6 +785,9 @@ impl Region {
                     exit.for_each_value(|value| work.push(value));
                 }
                 Effect::FpState { exit, .. } => {
+                    exit.for_each_value(|value| work.push(value));
+                }
+                Effect::Vector { exit, .. } => {
                     exit.for_each_value(|value| work.push(value));
                 }
             }
@@ -841,6 +859,10 @@ impl Region {
                     *position = live_prefix[*position];
                     *exit = exit.remap(&map);
                 }
+                Effect::Vector { position, exit, .. } => {
+                    *position = live_prefix[*position];
+                    *exit = exit.remap(&map);
+                }
             }
         }
         self.values = values;
@@ -907,6 +929,9 @@ impl Region {
                 Effect::FpState { exit, .. } => {
                     exit.for_each_value(|output| counts[output.0] += 1);
                 }
+                Effect::Vector { exit, .. } => {
+                    exit.for_each_value(|output| counts[output.0] += 1);
+                }
             }
         }
         counts
@@ -932,6 +957,12 @@ impl Region {
         self.values
             .iter()
             .any(|value| matches!(value.op, Op::Reservation { .. }))
+    }
+
+    pub fn has_vector_helper(&self) -> bool {
+        self.effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Vector { .. }))
     }
 }
 
@@ -1486,6 +1517,24 @@ impl Builder {
             dirty,
             exit: self.side_exit(guest_pc, retired),
         });
+    }
+
+    /// Insert a complete RVV architectural effect and begin a new scalar SSA
+    /// epoch. The helper may write any integer/FP register or fcsr, so no
+    /// forwarded value is valid after this boundary.
+    pub fn vector(&mut self, insn: u32, guest_pc: u64, fallthrough: u64, retired: u32) {
+        self.effects.push(Effect::Vector {
+            position: self.values.len(),
+            insn,
+            fallthrough,
+            exit: self.side_exit(guest_pc, retired),
+        });
+        self.regs = [None; 32];
+        self.dirty = 0;
+        self.fregs = [None; 32];
+        self.dirty_f = 0;
+        self.fcsr = None;
+        self.dirty_fcsr = false;
     }
 
     /// Add a post-instruction control side exit. `retired` includes the guest

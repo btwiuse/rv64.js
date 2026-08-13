@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "population": "stock-musl-rv64gcv-v1",
   "source": "nbench-byte-2.2.3 plus the existing fixed-data32 and fixed-work patches",
   "compiler": "zig cc -O2 -static; RV64 -mcpu=baseline_rv64+v+zifencei",
@@ -9,5 +9,7 @@
     "-fno-builtin-memcpy"
   ],
   "rv64ReplacementSource": null,
+  "rv64Kernel": "virt-kernel-fast with CONFIG_RISCV_ISA_V=y and CONFIG_RISCV_ISA_V_DEFAULT_ENABLE=y",
+  "rv64KernelSha256": "6029e2d5f0c24da911052be961cb7b3c1150206cff76666c8c8eebd8270a78d9",
   "purpose": "final fair-input audit; forbidden as a tuning population"
 }

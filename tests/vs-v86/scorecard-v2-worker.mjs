@@ -54,26 +54,54 @@ const executionMode = parseExecutionMode(process.env.SCORECARD_V2_EXECUTION_MODE
 const interpreterOnly = executionMode === "interpreter";
 const holdoutMode = row.family === "holdout";
 const auditPopulation = process.env.SCORECARD_V2_INPUT_POPULATION || "scorecard-v2-modern";
-if (!["scorecard-v2-modern", "stock-musl-v1", "stock-musl-rv64gcv-v1"].includes(auditPopulation)) {
-  throw new Error("SCORECARD_V2_INPUT_POPULATION must be scorecard-v2-modern, stock-musl-v1, or stock-musl-rv64gcv-v1");
+const allowedPopulations = [
+  "scorecard-v2-modern",
+  "scorecard-v2-rv64gcv-v1",
+  "stock-musl-v1",
+  "stock-musl-rv64gcv-v1",
+];
+if (!allowedPopulations.includes(auditPopulation)) {
+  throw new Error(`SCORECARD_V2_INPUT_POPULATION must be one of ${allowedPopulations.join(", ")}`);
 }
 const stockMuslMode = auditPopulation.startsWith("stock-musl-");
+const rv64gcvJitMode = auditPopulation === "scorecard-v2-rv64gcv-v1";
 if (holdoutMode && (!interpreterOnly || !["rewrite", "v86"].includes(side))) {
   throw new Error("interpreter holdouts require interpreter mode and rewrite/v86");
 }
 if (stockMuslMode && (!interpreterOnly || !["rewrite", "v86"].includes(side))) {
   throw new Error("stock-musl-v1 requires interpreter mode and rewrite/v86");
 }
+if (rv64gcvJitMode && (interpreterOnly || !["rewrite", "v86"].includes(side))) {
+  throw new Error("scorecard-v2-rv64gcv-v1 requires JIT mode and rewrite/v86");
+}
 const rv64InitramfsPath = holdoutMode
   ? resolve(process.env.INTERPRETER_HOLDOUT_RV64_INITRAMFS || "")
   : stockMuslMode
     ? resolve(process.env.INTERPRETER_AUDIT_RV64_INITRAMFS || "")
+  : rv64gcvJitMode
+    ? resolve(
+        process.env.SCORECARD_V2_RV64GCV_RV64_INITRAMFS ||
+        process.env.INTERPRETER_AUDIT_RV64_INITRAMFS ||
+        join(artifacts, "interpreter-stock-musl-rv64gcv-v1/interpreter-stock-musl-riscv64.cpio"),
+      )
   : join(artifacts, "scorecard-v2-modern-riscv64.cpio");
 const x86InitramfsPath = holdoutMode
   ? resolve(process.env.INTERPRETER_HOLDOUT_X86_INITRAMFS || "")
   : stockMuslMode
     ? resolve(process.env.INTERPRETER_AUDIT_X86_INITRAMFS || "")
+  : rv64gcvJitMode
+    ? resolve(
+        process.env.SCORECARD_V2_RV64GCV_X86_INITRAMFS ||
+        process.env.INTERPRETER_AUDIT_X86_INITRAMFS ||
+        join(artifacts, "interpreter-stock-musl-rv64gcv-v1/interpreter-stock-musl-x86.cpio"),
+      )
   : join(artifacts, "scorecard-v2-modern-x86.cpio");
+const rv64KernelPath = resolve(
+  process.env.RV64_KERNEL_IMAGE ||
+  (rv64gcvJitMode
+    ? join(artifacts, "interpreter-stock-musl-rv64gcv-v1/rv64gcv-linux-Image")
+    : join(root, "web/images/alpine/Image")),
+);
 if (holdoutMode &&
     (!process.env.INTERPRETER_HOLDOUT_RV64_INITRAMFS ||
      !process.env.INTERPRETER_HOLDOUT_X86_INITRAMFS)) {
@@ -661,7 +689,10 @@ function rvPhaseMarkers(family, phase) {
 function phaseResult(rowSpec, phase, segment, startWatch, endWatch, counters, hostMs) {
   const exit = segment.match(/SCORECARD_V2_EXIT=(\d+)/)?.[1];
   if (!execPid1Diagnostic && exit !== "0") {
-    throw new Error(`${side}/${rowKey}/${phase} guest exit=${exit ?? "missing"}`);
+    throw new Error(
+      `${side}/${rowKey}/${phase} guest exit=${exit ?? "missing"}: ` +
+      JSON.stringify(segment.slice(-4000)),
+    );
   }
   if (rowSpec.family === "nbench") {
     if (nbenchUnscoredDiagnostic) {
@@ -845,11 +876,8 @@ async function loadRv(sideName) {
 }
 
 async function loadModernRvInputs() {
-  const kernelPath = resolve(
-    process.env.RV64_KERNEL_IMAGE || join(root, "web/images/alpine/Image"),
-  );
   const [kernel, initrd] = await Promise.all([
-    readFile(kernelPath),
+    readFile(rv64KernelPath),
     readFile(rv64InitramfsPath),
   ]);
   return { kernel, initrd };
@@ -1297,15 +1325,26 @@ async function runRvWorkload() {
     const engineProfile = await stopEngineProfile(phase);
     const after = readRvCounters(vm, counter);
     const segment = console.segment(offset);
-    phases[phase] = phaseResult(
-      row,
-      phase,
-      segment,
-      startWatch,
-      endWatch,
-      deltaRvCounters(before, after),
-      hostMs,
-    );
+    try {
+      phases[phase] = phaseResult(
+        row,
+        phase,
+        segment,
+        startWatch,
+        endWatch,
+        deltaRvCounters(before, after),
+        hostMs,
+      );
+    } catch (error) {
+      const failureCapture = await writeCapturedJitModules(
+        jitModuleCaptureDir,
+        capturedJitModules,
+      );
+      if (failureCapture) {
+        error.message += `; failing JIT modules captured in ${failureCapture.manifestPath}`;
+      }
+      throw error;
+    }
     if (engineProfile) phases[phase].engineProfile = engineProfile;
     if (profileDiagnostic) phases[phase].profile = readRvProfile(vm);
     if (execPid1Diagnostic) {

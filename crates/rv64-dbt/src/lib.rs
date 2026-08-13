@@ -46,6 +46,15 @@ pub enum ReservationCapability {
     System,
 }
 
+/// Concrete machine whose canonical CPU and bus a generated RVV effect may
+/// access. Keeping this explicit prevents an opaque state pointer from being
+/// cast to the wrong Rust machine type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VectorCapability {
+    User,
+    System,
+}
+
 /// Architectural-state strategy for a multi-entry generated function.
 ///
 /// All variants preserve the same precise-exit contract. They exist so region
@@ -186,6 +195,8 @@ pub struct JitLayout {
     /// Typed canonical reservation-state helper for LR/SC, if this concrete
     /// machine layout supports one.
     pub reservation: Option<ReservationCapability>,
+    /// Typed one-instruction RVV executor for this concrete machine layout.
+    pub vector: Option<VectorCapability>,
     pub fuel_addr: u32,
     pub mstatus_addr: u32,
     pub copystat_addr: u32,
@@ -223,6 +234,7 @@ impl JitLayout {
             f_base: 0,
             fcsr_addr: 0,
             reservation: None,
+            vector: None,
             fuel_addr: 0,
             mstatus_addr: 0,
             copystat_addr: 0,
@@ -303,13 +315,14 @@ pub fn translate_block(
     pc: u64,
     layout: JitLayout,
 ) -> Option<CompiledRegion> {
-    let lifted = lift::lift_t1(
+    let lifted = lift::lift_t1_with_vector(
         code,
         base,
         pc,
         layout.mem.is_some() || layout.sys.is_some(),
         fp_mode(layout),
         layout.reservation.is_some(),
+        layout.vector.is_some(),
     )?;
     let wasm = wasm::emit(&lifted.ir, layout, lifted.loop_backedge).ok()?;
     Some(CompiledRegion {
@@ -578,24 +591,26 @@ where
 }
 
 fn lift_at(code: &[u8], base: u64, pc: u64, layout: JitLayout) -> Option<lift::LiftedRegion> {
-    lift::lift_t1(
+    lift::lift_t1_with_vector(
         code,
         base,
         pc,
         layout.mem.is_some() || layout.sys.is_some(),
         fp_mode(layout),
         layout.reservation.is_some(),
+        layout.vector.is_some(),
     )
 }
 
 fn lift_block_at(code: &[u8], base: u64, pc: u64, layout: JitLayout) -> Option<lift::LiftedRegion> {
-    lift::lift_basic_block(
+    lift::lift_basic_block_with_vector(
         code,
         base,
         pc,
         layout.mem.is_some() || layout.sys.is_some(),
         fp_mode(layout),
         layout.reservation.is_some(),
+        layout.vector.is_some(),
     )
 }
 
@@ -606,13 +621,14 @@ fn lift_at_profiled_targets(
     layout: JitLayout,
     profiled_indirect_targets: &[u64],
 ) -> Option<lift::LiftedRegion> {
-    lift::lift_t1_profiled_targets(
+    lift::lift_t1_profiled_targets_with_vector(
         code,
         base,
         pc,
         layout.mem.is_some() || layout.sys.is_some(),
         fp_mode(layout),
         layout.reservation.is_some(),
+        layout.vector.is_some(),
         profiled_indirect_targets,
     )
 }
@@ -781,25 +797,27 @@ pub fn discover_page_reachable_noncall_pages(
 }
 
 pub fn emittable_at(code: &[u8], base: u64, pc: u64, layout: JitLayout) -> bool {
-    lift::lift_t1(
+    lift::lift_t1_with_vector(
         code,
         base,
         pc,
         layout.mem.is_some() || layout.sys.is_some(),
         fp_mode(layout),
         layout.reservation.is_some(),
+        layout.vector.is_some(),
     )
     .is_some()
 }
 
 pub fn is_loop_at(code: &[u8], base: u64, pc: u64, layout: JitLayout) -> bool {
-    lift::lift_t1(
+    lift::lift_t1_with_vector(
         code,
         base,
         pc,
         layout.mem.is_some() || layout.sys.is_some(),
         fp_mode(layout),
         layout.reservation.is_some(),
+        layout.vector.is_some(),
     )
     .is_some_and(|lifted| lifted.loop_backedge.is_some())
 }

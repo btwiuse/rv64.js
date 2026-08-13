@@ -1,21 +1,31 @@
 # JIT Rewrite Status
 
-Last updated: 2026-08-12
+Last updated: 2026-08-13
 
 ## Current disposition
 
-The RV64GCV pure-interpreter goal is **achieved**. The interpreter now
-implements the complete mandatory ratified RVV 1.0 base extension for the
-selected VLEN=128/ELEN=64 machine, and the authoritative JIT-disabled
-`stock-musl-rv64gcv-v1` scorecard is measurement-valid with all 78 trials
-eligible and independently JIT-inactive. It records twelve wins and one match
-against pinned copy/v86; String Sort is now a `1.2978x` win and FP Emulation a
-`1.1156x` win. The complete implementation, conformance matrix, exact inputs,
-13-row scorecard, hashes, and stop boundary are recorded in
-[RVV_INTERPRETER_FINAL_REPORT.md](RVV_INTERPRETER_FINAL_REPORT.md).
+The RV64GCV semantic JIT-lowering milestone is **achieved**. The complete
+mandatory RVV 1.0 surface for the selected VLEN=128/ELEN=64 machine is now an
+ordered DBT IR effect with typed user/system Wasm lowering, precise scalar/FP
+state barriers, fault replay, `vstart` preservation, and compiled-code dirty
+handling. The strict release matrix passes, including all 8,310 interpreter
+and all 8,310 hot-JIT RVV differential executions.
 
-This milestone stops before RVV JIT lowering. Optional vector extensions not
-part of `RV64GCV` are not claimed.
+The authoritative RV64GCV JIT scorecard is measurement-valid with 78/78
+eligible trials and an empty problem list. It wins eight of thirteen rows
+against pinned copy/v86. Against the frozen pre-lowering checkpoint it improves
+String Sort by `3.9616x`, FP Emulation by `1.7994x`, and Assignment by
+`1.5054x`; the unchanged modern scalar scorecard establishes no material
+regression. The historical all-row copy/v86 parity objective remains **not
+achieved** because Boot, Compile, String Sort, FP Emulation, and Assignment
+still lose. The current lowering calls the shared architectural RVV helper;
+direct Wasm SIMD is a distinct next phase.
+
+The complete implementation boundary, no-workload-identifier audit,
+correctness matrix, scorecards, hashes, and remaining performance gap are in
+[RVV_JIT_RESULT.md](RVV_JIT_RESULT.md). The preceding pure-interpreter
+milestone remains recorded in
+[RVV_INTERPRETER_FINAL_REPORT.md](RVV_INTERPRETER_FINAL_REPORT.md).
 
 ## Historical scalar-baseline disposition (superseded)
 

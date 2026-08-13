@@ -132,6 +132,8 @@ export class RV64Debug {
                 fp_exec: vm.ex.jit_fp_exec,
                 user_reservation: vm.ex.jit_user_reservation,
                 system_reservation: vm.ex.jit_system_reservation,
+                user_vector: vm.ex.jit_user_vector,
+                system_vector: vm.ex.jit_system_vector,
                 chain_next: vm.ex.chain_next,
                 tail_chain: vm.tailChain,
                 __indirect_function_table: vm.ex.__indirect_function_table,
@@ -191,6 +193,8 @@ export class RV64Debug {
                 fp_exec: vm.ex.jit_fp_exec,
                 user_reservation: vm.ex.jit_user_reservation,
                 system_reservation: vm.ex.jit_system_reservation,
+                user_vector: vm.ex.jit_user_vector,
+                system_vector: vm.ex.jit_system_vector,
               },
             });
             const instantiated = performance.now();
@@ -316,6 +320,8 @@ export class RV64Debug {
                   fp_exec: vm.ex.jit_fp_exec,
                   user_reservation: vm.ex.jit_user_reservation,
                   system_reservation: vm.ex.jit_system_reservation,
+                  user_vector: vm.ex.jit_user_vector,
+                  system_vector: vm.ex.jit_system_vector,
                   chain_next: vm.ex.chain_next,
                   tail_chain: vm.tailChain,
                   __indirect_function_table: vm.ex.__indirect_function_table,

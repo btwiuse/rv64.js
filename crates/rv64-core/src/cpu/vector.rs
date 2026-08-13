@@ -1,8 +1,8 @@
 //! Ratified RISC-V Vector 1.0 interpreter support.
 //!
 //! The architectural baseline is RV64GCV with VLEN=128 and ELEN=64.  Vector
-//! instructions deliberately remain on the authoritative interpreter path;
-//! the JIT has no RVV lowering in this phase.
+//! generated code reaches these same authoritative operations through a typed
+//! one-instruction architectural boundary.
 
 use super::*;
 
@@ -4275,6 +4275,70 @@ mod tests {
         cpu.exec_vector_op(insn).unwrap();
         assert_eq!(cpu.csr_read(VLENB), Some(16));
         assert_eq!(cpu.sys.as_ref().unwrap().mstatus & MSTATUS_VS, MSTATUS_VS);
+    }
+
+    #[test]
+    fn vector_csr_warl_writes_preserve_alias_fields_and_drop_reserved_bits() {
+        let mut cpu = Cpu::new();
+        cpu.vector.vxrm = 3;
+        cpu.vector.vxsat = false;
+
+        assert!(cpu.csr_write(VXSAT, u64::MAX));
+        assert_eq!(cpu.csr_read(VXSAT), Some(1));
+        assert_eq!(cpu.csr_read(VXRM), Some(3));
+        assert_eq!(cpu.csr_read(VCSR), Some(7));
+
+        assert!(cpu.csr_write(VXRM, u64::MAX - 1));
+        assert_eq!(cpu.csr_read(VXSAT), Some(1));
+        assert_eq!(cpu.csr_read(VXRM), Some(2));
+        assert_eq!(cpu.csr_read(VCSR), Some(5));
+
+        assert!(cpu.csr_write(VCSR, u64::MAX - 4));
+        assert_eq!(cpu.csr_read(VXSAT), Some(1));
+        assert_eq!(cpu.csr_read(VXRM), Some(1));
+        assert_eq!(cpu.csr_read(VCSR), Some(3));
+    }
+
+    #[test]
+    fn jit_boundary_uses_vector_paths_without_retiring_and_preserves_restart() {
+        let mut cpu = Cpu::new();
+        cpu.pc = 0x1234_5678;
+        cpu.insn_count = 99;
+        cpu.x[1] = 16;
+        let mut bytes: Vec<u8> = (0..32).collect();
+        let mut bus = FlatMemory::new(0, &mut bytes);
+
+        cpu.jit_exec_vector(&mut bus, vsetvli(2, 1, 0))
+            .expect("JIT boundary configures e8,m1");
+        assert_eq!(cpu.vector.vl, 16);
+        assert_eq!(cpu.x[2], 16);
+
+        cpu.x[3] = 8;
+        let load = vector_mem(true, 0, 1, 0, true, 0, 3, 4);
+        cpu.jit_exec_vector(&mut bus, load)
+            .expect("JIT boundary performs vector load");
+        let add_one = vector_op(0x00, true, 4, 1, 3, 5); // vadd.vi v5,v4,1
+        cpu.jit_exec_vector(&mut bus, add_one)
+            .expect("JIT boundary performs vector arithmetic");
+        assert_eq!(&cpu.vector.regs[5], &(9u8..25).collect::<Vec<_>>()[..]);
+        assert_eq!(cpu.pc, 0x1234_5678);
+        assert_eq!(cpu.insn_count, 99);
+
+        // The helper commits elements before a fault and leaves vstart at the
+        // first incomplete element so interpreter replay resumes precisely.
+        let mut short: Vec<u8> = (0..18).collect();
+        let mut short_bus = FlatMemory::new(0, &mut short);
+        cpu.vector.vstart = 0;
+        cpu.vector.regs[4] = [0xaa; VLEN_BYTES];
+        assert_eq!(
+            cpu.jit_exec_vector(&mut short_bus, load),
+            Err(Exception::LoadAccessFault { addr: 18 })
+        );
+        assert_eq!(cpu.vector.vstart, 10);
+        assert_eq!(&cpu.vector.regs[4][..10], &(8u8..18).collect::<Vec<_>>());
+        assert_eq!(&cpu.vector.regs[4][10..], &[0xaa; 6]);
+        assert_eq!(cpu.pc, 0x1234_5678);
+        assert_eq!(cpu.insn_count, 99);
     }
 
     #[test]

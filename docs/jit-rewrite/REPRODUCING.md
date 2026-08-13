@@ -47,6 +47,43 @@ guest builds, QEMU differentials, `riscv-tests`, Spike lockstep,
 `riscv-arch-test`, Wasm/JIT tests (including standalone and both modern boot
 paths), and the modern OpenSBI/Linux Virt smoke guest.
 
+The current matrix also runs the complete RV64GCV differential twice: 8,310
+interpreter executions against QEMU and 8,310 repeated hot-JIT executions
+against the interpreter, followed by focused vector fault and full-system
+tests.
+
+## RV64GCV JIT scorecard
+
+Build the frozen stock-musl RV64GCV/i686 population from the pinned nbench
+archive. The preparation step also realizes and verifies the population-owned
+RVV-capable Linux kernel:
+
+```sh
+nix develop -c tests/vs-v86/prepare-interpreter-stock-nbench.sh \
+  target/bench /path/to/nbench-byte-2.2.3.tar.gz
+cargo build --release -p rv64-wasm --target wasm32-unknown-unknown
+```
+
+Run the authoritative JIT scorecard with the pinned copy/v86 checkout. Do not
+set an artifact override: overrides are proof-only and make a measurement
+ineligible.
+
+```sh
+ARTIFACTS=target/bench \
+V86DIR=/path/to/pinned/v86 \
+SCORECARD_V2_EXECUTION_MODE=jit \
+SCORECARD_V2_INPUT_POPULATION=scorecard-v2-rv64gcv-v1 \
+SCORECARD_V2_OUTPUT=target/bench/rv64gcv-jit-authoritative-v1 \
+AUTHORITATIVE=1 REPS=3 \
+node tests/vs-v86/scorecard-v2.mjs
+```
+
+The unchanged scalar three-way regression scorecard uses
+`SCORECARD_V2_INPUT_POPULATION=scorecard-v2-modern` and the default rewrite,
+legacy, and v86 sides. See
+[RVV_JIT_RESULT.md](RVV_JIT_RESULT.md) for the measured artifact and report
+hashes.
+
 The async T2 publication regression can be stressed independently with the
 older Node supplied by the Nix shell:
 

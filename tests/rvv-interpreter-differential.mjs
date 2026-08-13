@@ -8,15 +8,33 @@
 // mask destinations are excluded from comparison.
 
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const outputDirectory = join(root, "target", "rvv-differential");
+const outputDirectory = join(
+  root,
+  "target",
+  process.env.RVV_JIT_DIFFERENTIAL === "1" ? "rvv-jit-differential" : "rvv-differential",
+);
 const elfPath = join(outputDirectory, "rvv-interpreter-differential.rv64");
 const qemu = process.env.QEMU_RISCV64 || "qemu-riscv64";
 const rewrite = process.env.RV64_RUN || join(root, "target", "release", "rv64-run");
+const jitDifferential = process.env.RVV_JIT_DIFFERENTIAL === "1";
+const skipQemu = process.env.RVV_SKIP_QEMU === "1";
+const qemuVersion = skipQemu
+  ? ""
+  : spawnSync(qemu, ["--version"], { encoding: "utf8" }).stdout.match(/version ([0-9.]+)/)?.[1] ?? "unknown";
+// QEMU 8.2 fails to WARL-mask reserved bits on direct vxsat/vxrm writes. Keep
+// its useful target-field oracle while newer QEMU versions retain the full
+// VCSR alias comparison. Core unit tests independently prove that our writes
+// preserve the other defined field and discard every reserved bit.
+const qemu82VectorCsrCompatibility = qemuVersion.startsWith("8.2.");
+const caseRepetitions = Number(process.env.RVV_CASE_REPETITIONS || (jitDifferential ? 128 : 1));
+if (!Number.isSafeInteger(caseRepetitions) || caseRepetitions < 1 || caseRepetitions > 2047) {
+  throw new Error("RVV_CASE_REPETITIONS must be an integer from 1 through 2047");
+}
 
 const BASE = 0x10000;
 const SEED = 0x80000;
@@ -56,6 +74,12 @@ const S = (opcode, funct3, rs1, rs2, immediate) => {
   const imm = immediate & 0xfff;
   return (opcode | ((imm & 0x1f) << 7) | (funct3 << 12) | (rs1 << 15) |
     (rs2 << 20) | ((imm >>> 5) << 25)) >>> 0;
+};
+const B = (funct3, rs1, rs2, offset) => {
+  const immediate = offset & 0x1fff;
+  return (0x63 | (funct3 << 12) | (rs1 << 15) | (rs2 << 20) |
+    (((immediate >>> 11) & 1) << 7) | (((immediate >>> 1) & 0xf) << 8) |
+    (((immediate >>> 5) & 0x3f) << 25) | (((immediate >>> 12) & 1) << 31)) >>> 0;
 };
 const CSR = (csr, funct3, rd, rs1) =>
   (0x73 | (rd << 7) | (funct3 << 12) | (rs1 << 15) | (csr << 20)) >>> 0;
@@ -825,8 +849,20 @@ function buildProgram() {
   loadImmediate(code, X_OUTPUT, OUTPUT);
   cases.forEach((test, index) => {
     emitSetup(code, test);
-    test.pc = BASE + code.length * 4;
-    code.push(test.instruction);
+    if (caseRepetitions === 1) {
+      test.pc = BASE + code.length * 4;
+      code.push(test.instruction);
+    } else {
+      // Keep the instruction under test at one stable hot PC. The first 64
+      // iterations cross the production adaptive tier threshold; remaining
+      // iterations therefore exercise the generated vector boundary.
+      code.push(ADDI(31, X_ZERO, caseRepetitions));
+      const loop = code.length;
+      test.pc = BASE + loop * 4;
+      code.push(test.instruction, ADDI(31, 31, -1));
+      const branch = code.length;
+      code.push(B(1, 31, X_ZERO, (loop - branch) * 4));
+    }
     emitDump(code, test, index);
   });
   loadImmediate(code, 10, 1); // stdout
@@ -902,7 +938,41 @@ function run(command, args) {
   return spawnSync(command, args, { encoding: null, maxBuffer: 64 * 1024 * 1024 });
 }
 
-function byteMask(test) {
+let jitRuntime;
+async function runWasmJit(elf) {
+  if (!jitRuntime) {
+    jitRuntime = Promise.all([
+      import(join(root, "web", "rv64.js")),
+      readFile(join(root, "target", "wasm32-unknown-unknown", "release", "rv64_wasm.wasm")),
+    ]);
+  }
+  const [{ RV64Debug: RV64 }, wasm] = await jitRuntime;
+  const vm = await RV64.create(wasm);
+  vm.ex.jit_set_enabled(1);
+  vm.ex.jit_set_user_block_threshold(1);
+  const chunks = [];
+  let vectorModules = 0;
+  const vectorImport = Buffer.from("user_vector");
+  vm.onWrite = (fd, bytes) => {
+    if (fd === 1) chunks.push(Buffer.from(bytes));
+  };
+  vm.onJitModule = (bytes) => {
+    if (Buffer.from(bytes).includes(vectorImport)) vectorModules++;
+  };
+  if (!vm.loadElf(elf, ["rvv-jit-differential"], 16)) {
+    throw new Error("Wasm JIT failed to load the synthetic RVV ELF");
+  }
+  const stop = vm.runUser(200_000_000n);
+  return {
+    output: Buffer.concat(chunks),
+    stop,
+    exit: vm.userExitCode(),
+    jitInsns: vm.ex.jit_stat(0),
+    vectorModules,
+  };
+}
+
+function byteMask(test, qemuCompatibility = false) {
   const mask = new Uint8Array(RECORD_BYTES).fill(0xff);
   if (test.maskDestination) {
     const registerOffset = HEADER_BYTES + test.vd * 16;
@@ -910,17 +980,25 @@ function byteMask(test) {
       mask[registerOffset + (bit >>> 3)] &= ~(1 << (bit & 7));
     }
   }
+  if (qemuCompatibility && test.name === "csrrw/vxsat") {
+    mask.fill(0, 32, 40);
+    mask[32] = 0x01;
+  }
+  if (qemuCompatibility && test.name === "csrrw/vxrm") {
+    mask.fill(0, 32, 40);
+    mask[32] = 0x06;
+  }
   return mask;
 }
 
-function compare(qemuOutput, rewriteOutput) {
+function compare(qemuOutput, rewriteOutput, qemuCompatibility = false) {
   const expectedLength = cases.length * RECORD_BYTES;
   if (qemuOutput.length !== expectedLength || rewriteOutput.length !== expectedLength) {
     return [`output length qemu=${qemuOutput.length} rewrite=${rewriteOutput.length} expected=${expectedLength}`];
   }
   const differences = [];
   for (let caseIndex = 0; caseIndex < cases.length; caseIndex++) {
-    const mask = byteMask(cases[caseIndex]);
+    const mask = byteMask(cases[caseIndex], qemuCompatibility);
     const base = caseIndex * RECORD_BYTES;
     for (let offset = 0; offset < RECORD_BYTES; offset++) {
       if (((qemuOutput[base + offset] ^ rewriteOutput[base + offset]) & mask[offset]) !== 0) {
@@ -946,16 +1024,21 @@ for (const profile of SEED_PROFILES) {
   await writeFile(elfPath, synthElf(code, profile));
   await chmod(elfPath, 0o755);
 
-  const qemuRun = run(qemu, ["-cpu", "rv64,v=true,vlen=128,elen=64", elfPath]);
+  const qemuRun = skipQemu
+    ? null
+    : run(qemu, ["-cpu", "rv64,v=true,vlen=128,elen=64", elfPath]);
   const rewriteRun = run(rewrite, [elfPath]);
-  if (qemuRun.error) throw qemuRun.error;
+  if (qemuRun?.error) throw qemuRun.error;
   if (rewriteRun.error) throw rewriteRun.error;
-  if (qemuRun.status !== 0 || rewriteRun.status !== 0) {
-    console.error(`${profile.name}: QEMU status=${qemuRun.status}: ${qemuRun.stderr.toString()}${qemuRun.stdout.toString()}`);
+  if ((qemuRun && qemuRun.status !== 0) || rewriteRun.status !== 0) {
+    if (qemuRun) {
+      console.error(`${profile.name}: QEMU status=${qemuRun.status}: ${qemuRun.stderr.toString()}${qemuRun.stdout.toString()}`);
+    }
     console.error(`${profile.name}: rewrite status=${rewriteRun.status}: ${rewriteRun.stderr.toString()}${rewriteRun.stdout.toString()}`);
     process.exit(1);
   }
-  const differences = compare(qemuRun.stdout, rewriteRun.stdout);
+  const reference = qemuRun?.stdout ?? rewriteRun.stdout;
+  const differences = compare(reference, rewriteRun.stdout, qemu82VectorCsrCompatibility);
   if (differences.length !== 0) {
     for (const difference of differences.slice(0, 30)) {
       console.error(`FAIL ${profile.name}: ${difference}`);
@@ -963,8 +1046,43 @@ for (const profile of SEED_PROFILES) {
     console.error(`RVV DIFFERENTIAL: ${profile.name}: ${differences.length} / ${cases.length} CASES DIFFER`);
     process.exit(1);
   }
+  if (jitDifferential) {
+    const jit = await runWasmJit(await readFile(elfPath));
+    const jitDifferences = compare(reference, jit.output);
+    const eligibleCases = cases.filter((test) => {
+      const opcode = test.instruction & 0x7f;
+      const funct3 = (test.instruction >>> 12) & 7;
+      return opcode === 0x57 ||
+        ((opcode === 0x07 || opcode === 0x27) && [0, 5, 6, 7].includes(funct3));
+    }).length;
+    const minimumGenerated = BigInt(eligibleCases * Math.max(1, caseRepetitions - 80));
+    if (jit.stop !== 4 || jit.exit !== 0 || jit.vectorModules === 0 ||
+        jit.jitInsns < minimumGenerated || jitDifferences.length !== 0) {
+      for (const difference of jitDifferences.slice(0, 30)) {
+        console.error(`FAIL JIT ${profile.name}: ${difference}`);
+      }
+      console.error(
+        `RVV JIT DIFFERENTIAL: ${profile.name} failed: stop=${jit.stop} exit=${jit.exit} ` +
+        `vector-modules=${jit.vectorModules} jit-insns=${jit.jitInsns} ` +
+        `minimum-generated=${minimumGenerated} differences=${jitDifferences.length}`,
+      );
+      process.exit(1);
+    }
+    console.log(
+      `RVV JIT ${profile.name}: PASS vector-modules=${jit.vectorModules} ` +
+      `jit-insns=${jit.jitInsns}`,
+    );
+  }
 }
-console.log(
-  `RVV DIFFERENTIAL: ALL ${cases.length * SEED_PROFILES.length} EXECUTIONS PASS ` +
-  `(${cases.length} encodings x ${SEED_PROFILES.length} data profiles; ${code.length} guest instructions/profile)`,
-);
+if (jitDifferential) {
+  console.log(
+    `RVV JIT DIFFERENTIAL: ALL ${cases.length * SEED_PROFILES.length} EXECUTIONS PASS ` +
+    `(${cases.length} encodings x ${SEED_PROFILES.length} data profiles x ` +
+    `${caseRepetitions} hot repetitions; interpreter==JIT full output)`,
+  );
+} else {
+  console.log(
+    `RVV DIFFERENTIAL: ALL ${cases.length * SEED_PROFILES.length} EXECUTIONS PASS ` +
+    `(${cases.length} encodings x ${SEED_PROFILES.length} data profiles; ${code.length} guest instructions/profile)`,
+  );
+}

@@ -195,6 +195,8 @@ for (const forbidden of [
 assert.match(worker, /!rewriteWasmOverride/, "Wasm overrides must remain diagnostic-only");
 
 const runner = await readFile(join(root, "tests/vs-v86/scorecard-v2.mjs"), "utf8");
+assert.match(runner, /scorecard-v2-rv64gcv-v1/, "runner must admit the frozen RV64GCV JIT population");
+assert.match(worker, /scorecard-v2-rv64gcv-v1 requires JIT mode and rewrite\/v86/);
 for (const required of [
   "web/images/alpine/Image",
   "matched-linux-x86-bzImage",

@@ -213,6 +213,36 @@ impl Default for Cpu {
 }
 
 impl Cpu {
+    /// Execute exactly one mandatory RVV instruction without advancing `pc`
+    /// or `insn_count`.
+    ///
+    /// Generated code uses this as its architectural vector boundary after
+    /// publishing all pending scalar state. Returning an exception leaves the
+    /// instruction unretired so the ordinary interpreter can re-execute it
+    /// and deliver the precise trap. Vector memory helpers retain `vstart`
+    /// when an element faults, making that re-execution restartable.
+    pub fn jit_exec_vector<B: Bus>(&mut self, bus: &mut B, insn: u32) -> Result<(), Exception> {
+        match opcode(insn) {
+            0x07 if matches!(funct3(insn), 0 | 5 | 6 | 7) => {
+                if vector::unit_stride_memory_encoding(insn) {
+                    self.exec_unit_stride_memory_insn(bus, insn, true)
+                } else {
+                    self.exec_vector_memory(bus, insn, true)
+                }
+            }
+            0x27 if matches!(funct3(insn), 0 | 5 | 6 | 7) => {
+                if vector::unit_stride_memory_encoding(insn) {
+                    self.exec_unit_stride_memory_insn(bus, insn, false)
+                } else {
+                    self.exec_vector_memory(bus, insn, false)
+                }
+            }
+            0x57 if funct3(insn) == 7 => self.exec_vector_config(insn),
+            0x57 => self.exec_vector_op(insn),
+            _ => Err(Exception::IllegalInstruction { insn }),
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             x: [0; 32],

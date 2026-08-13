@@ -56,6 +56,7 @@ if command -v qemu-riscv64 >/dev/null 2>&1; then
             echo "DIFF-FAIL $g (qemu=$QE rv64=$RE)"; FAILED=1
         fi
     done
+    node tests/rvv-interpreter-differential.mjs || FAILED=1
 else
     skip "qemu-riscv64 not found"
 fi
@@ -102,6 +103,9 @@ if command -v node >/dev/null 2>&1; then
     node tests/jit-forward-trace-differential.mjs || FAILED=1
     node tests/jit-fp-differential.mjs || FAILED=1
     node tests/jit-fp-fastpath-differential.mjs || FAILED=1
+    node tests/jit-vector-differential.mjs || FAILED=1
+    node tests/jit-vector-fault-differential.mjs || FAILED=1
+    node tests/jit-system-vector-differential.mjs || FAILED=1
     node tests/jit-a-differential.mjs || FAILED=1
     node tests/jit-system-memory-differential.mjs || FAILED=1
     node tests/jit-system-memory-exits.mjs || FAILED=1

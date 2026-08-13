@@ -250,6 +250,7 @@ fn system_layout() -> JitLayout {
         f_base: 512,
         fcsr_addr: 768,
         reservation: Some(ReservationCapability::System),
+        vector: Some(rv64_dbt::VectorCapability::System),
         fuel_addr: 776,
         mstatus_addr: 784,
         copystat_addr: 792,

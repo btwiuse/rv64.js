@@ -13,6 +13,7 @@ use crate::lift::LoopBackedge;
 use crate::structure::{self, Structure};
 use crate::{
     JitLayout, MultiEntryState, ReservationCapability, SystemMemory, TlbMissPolicy, TranslationRow,
+    VectorCapability,
 };
 use std::collections::VecDeque;
 use std::fmt;
@@ -36,6 +37,7 @@ impl std::error::Error for EmitError {}
 struct HelperImports {
     fp: bool,
     reservation: Option<ReservationCapability>,
+    vector: Option<VectorCapability>,
     tlb_fill: bool,
     bulk_copy: bool,
     chain: bool,
@@ -49,6 +51,10 @@ impl HelperImports {
             reservation: region
                 .has_reservation_helper()
                 .then_some(layout.reservation)
+                .flatten(),
+            vector: region
+                .has_vector_helper()
+                .then_some(layout.vector)
                 .flatten(),
             tlb_fill: region_uses_memory(region)
                 && layout
@@ -78,6 +84,14 @@ impl HelperImports {
 
     const fn tlb_fill_index(self) -> Option<u32> {
         if self.tlb_fill {
+            Some(self.fp as u32 + self.reservation.is_some() as u32 + self.vector.is_some() as u32)
+        } else {
+            None
+        }
+    }
+
+    const fn vector_index(self) -> Option<u32> {
+        if self.vector.is_some() {
             Some(self.fp as u32 + self.reservation.is_some() as u32)
         } else {
             None
@@ -86,7 +100,12 @@ impl HelperImports {
 
     const fn bulk_copy_index(self) -> Option<u32> {
         if self.bulk_copy {
-            Some(self.fp as u32 + self.reservation.is_some() as u32 + self.tlb_fill as u32)
+            Some(
+                self.fp as u32
+                    + self.reservation.is_some() as u32
+                    + self.vector.is_some() as u32
+                    + self.tlb_fill as u32,
+            )
         } else {
             None
         }
@@ -95,6 +114,7 @@ impl HelperImports {
     const fn count(self) -> u32 {
         self.fp as u32
             + self.reservation.is_some() as u32
+            + self.vector.is_some() as u32
             + self.tlb_fill as u32
             + self.bulk_copy as u32
             + self.chain as u32
@@ -106,6 +126,7 @@ impl HelperImports {
             Some(
                 self.fp as u32
                     + self.reservation.is_some() as u32
+                    + self.vector.is_some() as u32
                     + self.tlb_fill as u32
                     + self.bulk_copy as u32,
             )
@@ -119,6 +140,7 @@ impl HelperImports {
             Some(
                 self.fp as u32
                     + self.reservation.is_some() as u32
+                    + self.vector.is_some() as u32
                     + self.tlb_fill as u32
                     + self.bulk_copy as u32
                     + self.chain as u32,
@@ -141,6 +163,15 @@ impl HelperImports {
                 ));
             }
             (None, reservation) => self.reservation = reservation,
+            _ => {}
+        }
+        match (self.vector, other.vector) {
+            (Some(lhs), Some(rhs)) if lhs != rhs => {
+                return Err(EmitError(
+                    "one module cannot mix user and system vector capabilities".into(),
+                ));
+            }
+            (None, vector) => self.vector = vector,
             _ => {}
         }
         Ok(())
@@ -1329,6 +1360,10 @@ fn emit_cached_multi_entry(
     let tail_dispatch_local = helpers
         .tail_chain
         .then(|| alloc_local(&mut local_types, ValType::I32));
+    let vector_status = regions
+        .iter()
+        .any(|(region, _)| region.has_vector_helper())
+        .then(|| alloc_local(&mut local_types, ValType::I32));
     let mut function = Function::new_with_locals_types(local_types);
 
     emit_memory_context_init(&mut function, layout, memory_temps);
@@ -1358,6 +1393,7 @@ fn emit_cached_multi_entry(
             &state,
             selector_local,
             hops_local,
+            vector_status,
         )?;
     } else if direct_dispatch {
         emit_cached_direct_dispatch(
@@ -1370,6 +1406,7 @@ fn emit_cached_multi_entry(
             &state,
             selector_local,
             hops_local,
+            vector_status,
         )?;
     } else {
         function.instruction(&Instruction::Block(BlockType::Empty));
@@ -1389,6 +1426,7 @@ fn emit_cached_multi_entry(
             memory_temps,
             &state,
             selector_local,
+            vector_status,
         )?;
 
         function.instruction(&Instruction::LocalGet(selector_local));
@@ -1483,6 +1521,53 @@ fn emit_cached_state_load(function: &mut Function, layout: JitLayout, state: &Ca
     if let Some(local) = state.fuel {
         function.instruction(&Instruction::I32Const(layout.fuel_addr as i32));
         function.instruction(&Instruction::I64Load(memarg(3, 0)));
+        function.instruction(&Instruction::LocalSet(local));
+    }
+}
+
+/// An RVV instruction may update any scalar register or fcsr. Eager cached
+/// modules reload their allocated architectural union immediately; lazy
+/// modules clear validity so each later read fetches canonical helper state.
+/// PC, retirement, fuel, and translation context remain owned by the enclosing
+/// generated invocation and are deliberately not reloaded here.
+fn emit_cached_state_reload_after_vector(
+    function: &mut Function,
+    layout: JitLayout,
+    state: &CachedStateLocals,
+) {
+    if state.lazy() {
+        if let Some(valid) = state.valid_x {
+            function.instruction(&Instruction::I64Const(0));
+            function.instruction(&Instruction::LocalSet(valid));
+        }
+        if let Some(valid) = state.valid_f {
+            function.instruction(&Instruction::I64Const(0));
+            function.instruction(&Instruction::LocalSet(valid));
+        }
+        if let Some(valid) = state.valid_fcsr {
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::LocalSet(valid));
+        }
+        return;
+    }
+
+    for (reg, local) in state.x.iter().copied().enumerate() {
+        if let Some(local) = local {
+            function.instruction(&Instruction::I32Const(layout.x_base as i32));
+            function.instruction(&Instruction::I64Load(memarg(3, reg as u64 * 8)));
+            function.instruction(&Instruction::LocalSet(local));
+        }
+    }
+    for (reg, local) in state.f.iter().copied().enumerate() {
+        if let Some(local) = local {
+            function.instruction(&Instruction::I32Const(layout.f_base as i32));
+            function.instruction(&Instruction::I64Load(memarg(3, reg as u64 * 8)));
+            function.instruction(&Instruction::LocalSet(local));
+        }
+    }
+    if let Some(local) = state.fcsr {
+        function.instruction(&Instruction::I32Const(layout.fcsr_addr as i32));
+        function.instruction(&Instruction::I32Load(memarg(2, 0)));
         function.instruction(&Instruction::LocalSet(local));
     }
 }
@@ -1643,6 +1728,7 @@ fn emit_cached_direct_dispatch(
     state: &CachedStateLocals,
     selector_local: u32,
     hops_local: u32,
+    vector_status: Option<u32>,
 ) -> Result<(), EmitError> {
     function.instruction(&Instruction::I32Const(-1));
     function.instruction(&Instruction::LocalSet(selector_local));
@@ -1684,6 +1770,7 @@ fn emit_cached_direct_dispatch(
             state,
             &local_maps[index],
             loop_backedge,
+            vector_status,
         )?;
 
         let member_for = |value: ValueId| {
@@ -2090,6 +2177,7 @@ fn emit_cached_structured_member(
     memory_temps: Option<MemoryTemps>,
     state: &CachedStateLocals,
     local_map: &[Option<u32>],
+    vector_status: Option<u32>,
 ) -> Result<(), EmitError> {
     emit_cached_body(
         function,
@@ -2100,6 +2188,7 @@ fn emit_cached_structured_member(
         state,
         local_map,
         None,
+        vector_status,
     )
 }
 
@@ -2114,6 +2203,7 @@ fn emit_cached_structured_cfg(
     state: &CachedStateLocals,
     selector_local: u32,
     hops_local: u32,
+    vector_status: Option<u32>,
 ) -> Result<(), EmitError> {
     let successors = cfg_successors(regions);
     let entries: Vec<usize> = (0..regions.len()).collect();
@@ -2173,6 +2263,7 @@ fn emit_cached_structured_cfg(
                     memory_temps,
                     state,
                     &local_maps[member],
+                    vector_status,
                 )?;
                 emit_structured_safety(function, state, hops_local, exit_scope, &active_scopes)?;
                 emit_structured_successor(
@@ -2463,6 +2554,7 @@ fn emit_cached_dispatch_tree(
     memory_temps: Option<MemoryTemps>,
     state: &CachedStateLocals,
     matched_local: u32,
+    vector_status: Option<u32>,
 ) -> Result<(), EmitError> {
     if order.len() <= 3 {
         for &index in order {
@@ -2480,6 +2572,7 @@ fn emit_cached_dispatch_tree(
                 state,
                 &local_maps[index],
                 loop_backedge,
+                vector_status,
             )?;
             function.instruction(&Instruction::I32Const(1));
             function.instruction(&Instruction::LocalSet(matched_local));
@@ -2504,6 +2597,7 @@ fn emit_cached_dispatch_tree(
         memory_temps,
         state,
         matched_local,
+        vector_status,
     )?;
     function.instruction(&Instruction::Else);
     emit_cached_dispatch_tree(
@@ -2516,6 +2610,7 @@ fn emit_cached_dispatch_tree(
         memory_temps,
         state,
         matched_local,
+        vector_status,
     )?;
     function.instruction(&Instruction::End);
     Ok(())
@@ -2819,7 +2914,11 @@ fn emit_cached_body(
     state: &CachedStateLocals,
     local_map: &[Option<u32>],
     loop_backedge: Option<LoopBackedge>,
+    vector_status: Option<u32>,
 ) -> Result<(), EmitError> {
+    let loop_backedge = (!region.has_vector_helper())
+        .then_some(loop_backedge)
+        .flatten();
     let memory_temps = memory_temps_for_region(memory_temps, region, layout);
     let copy_plan = match (layout.sys, memory_temps.and_then(|temps| temps.copy)) {
         (Some(memory), Some(_)) => {
@@ -3066,6 +3165,41 @@ fn emit_cached_body(
                             function, region, layout, state, local_map, exit, None,
                         )
                     })?;
+                }
+                Effect::Vector {
+                    position: effect_position,
+                    insn,
+                    fallthrough,
+                    exit,
+                } if *effect_position == position => {
+                    let status = vector_status.ok_or_else(|| {
+                        EmitError("cached vector effect lacks a status local".into())
+                    })?;
+                    emit_cached_side_exit_state(
+                        function, region, layout, state, local_map, exit, None,
+                    )?;
+                    emit_vector_call(function, helpers, *insn)?;
+                    function.instruction(&Instruction::LocalSet(status));
+
+                    function.instruction(&Instruction::LocalGet(status));
+                    function.instruction(&Instruction::I32Eqz);
+                    function.instruction(&Instruction::If(BlockType::Empty));
+                    emit_cached_retirement(function, layout, state, exit.retired);
+                    function.instruction(&Instruction::Return);
+                    function.instruction(&Instruction::End);
+
+                    function.instruction(&Instruction::LocalGet(status));
+                    function.instruction(&Instruction::I32Const(2));
+                    function.instruction(&Instruction::I32Eq);
+                    function.instruction(&Instruction::If(BlockType::Empty));
+                    function.instruction(&Instruction::I32Const(layout.pc_addr as i32));
+                    emit_guest_pc(function, *fallthrough, layout);
+                    function.instruction(&Instruction::I64Store(memarg(3, 0)));
+                    emit_cached_retirement(function, layout, state, exit.retired.saturating_add(1));
+                    function.instruction(&Instruction::Return);
+                    function.instruction(&Instruction::End);
+
+                    emit_cached_state_reload_after_vector(function, layout, state);
                 }
                 _ => {}
             }
@@ -3373,6 +3507,25 @@ fn emit_cached_side_exit(
     exit: &SideExit,
     dynamic_pc: Option<u32>,
 ) -> Result<(), EmitError> {
+    emit_cached_side_exit_state(function, region, layout, state, local_map, exit, dynamic_pc)?;
+    emit_cached_retirement(function, layout, state, exit.retired);
+    Ok(())
+}
+
+fn emit_cached_side_exit_state(
+    function: &mut Function,
+    region: &Region,
+    layout: JitLayout,
+    state: &CachedStateLocals,
+    local_map: &[Option<u32>],
+    exit: &SideExit,
+    dynamic_pc: Option<u32>,
+) -> Result<(), EmitError> {
+    // First synchronize values retained from earlier cached members. Values
+    // dirtied by the current member are published directly from the precise
+    // SideExit snapshot below. In particular, a value written only before an
+    // opaque effect may have no function-wide cached-state representation at
+    // all, because it is neither read nor live after that effect.
     for (reg, state_local) in state.x.iter().copied().enumerate() {
         let Some(state_local) = state_local else {
             continue;
@@ -3380,35 +3533,26 @@ fn emit_cached_side_exit(
         if state.write_x & (1u32 << reg) == 0 {
             continue;
         }
-        let exit_value = exit.outputs.iter().find(|&&(r, _)| r as usize == reg);
-        if exit_value.is_none() {
-            if let Some(valid) = state.valid_x {
-                emit_valid_i64(function, valid, reg);
-                function.instruction(&Instruction::If(BlockType::Empty));
-            }
+        if exit.outputs.iter().any(|&(r, _)| r as usize == reg) {
+            continue;
+        }
+        if let Some(valid) = state.valid_x {
+            emit_valid_i64(function, valid, reg);
+            function.instruction(&Instruction::If(BlockType::Empty));
         }
         function.instruction(&Instruction::I32Const(layout.x_base as i32));
-        if let Some(&(_, value)) = exit_value {
-            function.instruction(&Instruction::LocalGet(
-                local_map[value.0].ok_or_else(|| EmitError("missing cached exit value".into()))?,
-            ));
-        } else {
-            function.instruction(&Instruction::LocalGet(state_local));
-        }
+        function.instruction(&Instruction::LocalGet(state_local));
         function.instruction(&Instruction::I64Store(memarg(3, reg as u64 * 8)));
-        if exit_value.is_none() && state.valid_x.is_some() {
+        if state.valid_x.is_some() {
             function.instruction(&Instruction::End);
         }
     }
-    // Previously completed members have already synchronized materialized
-    // registers.  A precise exit therefore stores only values dirtied by the
-    // current member before the fault/guard, exactly as captured by SideExit.
+    // Publish every integer value dirtied by this member before the precise
+    // boundary, independently of the cached-state residency policy. This is
+    // the authoritative architectural snapshot consumed by helpers and T0.
     for &(reg, value) in &exit.outputs {
-        if !is_materialized_x(state, reg) {
-            continue;
-        }
         let value_local = local_map[value.0]
-            .ok_or_else(|| EmitError("missing materialized integer exit value".into()))?;
+            .ok_or_else(|| EmitError("missing cached integer exit value".into()))?;
         emit_materialized_x_store(function, layout, reg, value_local);
     }
     for (reg, state_local) in state.f.iter().copied().enumerate() {
@@ -3418,46 +3562,42 @@ fn emit_cached_side_exit(
         if state.write_f & (1u32 << reg) == 0 {
             continue;
         }
-        let exit_value = exit.f_outputs.iter().find(|&&(r, _)| r as usize == reg);
-        if exit_value.is_none() {
-            if let Some(valid) = state.valid_f {
-                emit_valid_i64(function, valid, reg);
-                function.instruction(&Instruction::If(BlockType::Empty));
-            }
+        if exit.f_outputs.iter().any(|&(r, _)| r as usize == reg) {
+            continue;
+        }
+        if let Some(valid) = state.valid_f {
+            emit_valid_i64(function, valid, reg);
+            function.instruction(&Instruction::If(BlockType::Empty));
         }
         function.instruction(&Instruction::I32Const(layout.f_base as i32));
-        if let Some(&(_, value)) = exit_value {
-            function.instruction(&Instruction::LocalGet(
-                local_map[value.0]
-                    .ok_or_else(|| EmitError("missing cached FP exit value".into()))?,
-            ));
-        } else {
-            function.instruction(&Instruction::LocalGet(state_local));
-        }
+        function.instruction(&Instruction::LocalGet(state_local));
         function.instruction(&Instruction::I64Store(memarg(3, reg as u64 * 8)));
-        if exit_value.is_none() && state.valid_f.is_some() {
+        if state.valid_f.is_some() {
             function.instruction(&Instruction::End);
         }
     }
-    if let Some(state_local) = state.fcsr.filter(|_| state.write_fcsr) {
-        let exit_value = exit.fcsr_output;
-        if exit_value.is_none() {
-            if let Some(valid) = state.valid_fcsr {
-                function.instruction(&Instruction::LocalGet(valid));
-                function.instruction(&Instruction::If(BlockType::Empty));
-            }
+    for &(reg, value) in &exit.f_outputs {
+        let value_local =
+            local_map[value.0].ok_or_else(|| EmitError("missing cached FP exit value".into()))?;
+        function.instruction(&Instruction::I32Const(layout.f_base as i32));
+        function.instruction(&Instruction::LocalGet(value_local));
+        function.instruction(&Instruction::I64Store(memarg(3, u64::from(reg) * 8)));
+    }
+    if let Some(value) = exit.fcsr_output {
+        function.instruction(&Instruction::I32Const(layout.fcsr_addr as i32));
+        function.instruction(&Instruction::LocalGet(
+            local_map[value.0].ok_or_else(|| EmitError("missing cached fcsr exit value".into()))?,
+        ));
+        function.instruction(&Instruction::I32Store(memarg(2, 0)));
+    } else if let Some(state_local) = state.fcsr.filter(|_| state.write_fcsr) {
+        if let Some(valid) = state.valid_fcsr {
+            function.instruction(&Instruction::LocalGet(valid));
+            function.instruction(&Instruction::If(BlockType::Empty));
         }
         function.instruction(&Instruction::I32Const(layout.fcsr_addr as i32));
-        if let Some(value) = exit_value {
-            function.instruction(&Instruction::LocalGet(
-                local_map[value.0]
-                    .ok_or_else(|| EmitError("missing cached fcsr exit value".into()))?,
-            ));
-        } else {
-            function.instruction(&Instruction::LocalGet(state_local));
-        }
+        function.instruction(&Instruction::LocalGet(state_local));
         function.instruction(&Instruction::I32Store(memarg(2, 0)));
-        if exit_value.is_none() && state.valid_fcsr.is_some() {
+        if state.valid_fcsr.is_some() {
             function.instruction(&Instruction::End);
         }
     }
@@ -3468,17 +3608,25 @@ fn emit_cached_side_exit(
         emit_guest_pc(function, exit.guest_pc, layout);
     }
     function.instruction(&Instruction::I64Store(memarg(3, 0)));
+    // The region argument documents that the snapshot belongs to this body
+    // and keeps the API symmetric with the ordinary emitter.
+    let _ = region;
+    Ok(())
+}
+
+fn emit_cached_retirement(
+    function: &mut Function,
+    layout: JitLayout,
+    state: &CachedStateLocals,
+    extra: u32,
+) {
     function.instruction(&Instruction::I32Const(layout.retired_addr as i32));
     function.instruction(&Instruction::LocalGet(state.retired));
-    if exit.retired != 0 {
-        function.instruction(&Instruction::I64Const(i64::from(exit.retired)));
+    if extra != 0 {
+        function.instruction(&Instruction::I64Const(i64::from(extra)));
         function.instruction(&Instruction::I64Add);
     }
     function.instruction(&Instruction::I64Store(memarg(3, 0)));
-    // The region argument documents that the side-exit snapshot belongs to
-    // this body and keeps the API symmetric with the ordinary emitter.
-    let _ = region;
-    Ok(())
 }
 
 fn validate_emission(region: &Region, layout: JitLayout) -> Result<(), EmitError> {
@@ -3493,6 +3641,23 @@ fn validate_emission(region: &Region, layout: JitLayout) -> Result<(), EmitError
     if let Some(memory) = layout.sys {
         validate_system_memory(memory)?;
     }
+    if region.has_vector_helper() {
+        match layout.vector {
+            Some(VectorCapability::User) if layout.mem.is_some() && layout.sys.is_none() => {}
+            Some(VectorCapability::System) if layout.sys.is_some() && layout.mem.is_none() => {}
+            Some(VectorCapability::User) => {
+                return Err(EmitError(
+                    "user vector capability requires flat user memory".into(),
+                ));
+            }
+            Some(VectorCapability::System) => {
+                return Err(EmitError(
+                    "system vector capability requires full-system memory".into(),
+                ));
+            }
+            None => return Err(EmitError("vector effect lacks a typed capability".into())),
+        }
+    }
     Ok(())
 }
 
@@ -3502,6 +3667,9 @@ fn emit_function(
     loop_backedge: Option<LoopBackedge>,
     helpers: HelperImports,
 ) -> Result<Function, EmitError> {
+    let loop_backedge = (!region.has_vector_helper())
+        .then_some(loop_backedge)
+        .flatten();
     if region.has_effects() {
         return match loop_backedge {
             Some(loop_backedge) => emit_effectful_loop(region, layout, loop_backedge, helpers),
@@ -3618,6 +3786,9 @@ fn emit_effectful(
         .map(|value| val_type(value.ty))
         .collect();
     let memory_temps = allocate_memory_temps(&mut local_types, region, layout);
+    let vector_status = region
+        .has_vector_helper()
+        .then(|| alloc_local(&mut local_types, ValType::I32));
     let mut function = Function::new_with_locals_types(local_types);
     emit_memory_context_init(&mut function, layout, memory_temps);
     // Validation guarantees operands precede their users. Marking all locals
@@ -3821,6 +3992,52 @@ fn emit_effectful(
                     emit_fp_state(&mut function, layout, *dirty, |function| {
                         emit_side_exit(function, region, layout, &local_map, &all_defined, exit)
                     })?;
+                }
+                Effect::Vector {
+                    position: vector_position,
+                    insn,
+                    fallthrough,
+                    exit,
+                } if *vector_position == position => {
+                    let status = vector_status.expect("vector effect status local");
+                    emit_side_exit_state(
+                        &mut function,
+                        region,
+                        layout,
+                        &local_map,
+                        &all_defined,
+                        exit,
+                    )?;
+                    emit_vector_call(&mut function, helpers, *insn)?;
+                    function.instruction(&Instruction::LocalSet(status));
+
+                    // Zero means the architectural instruction did not
+                    // complete. Leave it unretired at its original PC so T0
+                    // can raise the exact trap (or restart from vstart).
+                    function.instruction(&Instruction::LocalGet(status));
+                    function.instruction(&Instruction::I32Eqz);
+                    function.instruction(&Instruction::If(BlockType::Empty));
+                    emit_retirement_const(&mut function, layout.retired_addr, exit.retired);
+                    function.instruction(&Instruction::Return);
+                    function.instruction(&Instruction::End);
+
+                    // Status two is a completed system vector store that
+                    // dirtied generated code. Stop after this instruction so
+                    // the runtime invalidates that page before more code runs.
+                    function.instruction(&Instruction::LocalGet(status));
+                    function.instruction(&Instruction::I32Const(2));
+                    function.instruction(&Instruction::I32Eq);
+                    function.instruction(&Instruction::If(BlockType::Empty));
+                    function.instruction(&Instruction::I32Const(layout.pc_addr as i32));
+                    emit_guest_pc(&mut function, *fallthrough, layout);
+                    function.instruction(&Instruction::I64Store(memarg(3, 0)));
+                    emit_retirement_const(
+                        &mut function,
+                        layout.retired_addr,
+                        exit.retired.saturating_add(1),
+                    );
+                    function.instruction(&Instruction::Return);
+                    function.instruction(&Instruction::End);
                 }
                 _ => {}
             }
@@ -5224,6 +5441,23 @@ fn emit_side_exit(
     defined: &[bool],
     exit: &SideExit,
 ) -> Result<(), EmitError> {
+    emit_side_exit_state(function, region, layout, local_map, defined, exit)?;
+    emit_retirement_const(function, layout.retired_addr, exit.retired);
+    Ok(())
+}
+
+/// Publish every architectural value needed by a precise side exit, excluding
+/// retirement. Vector helpers need this state before they run, but retirement
+/// is committed only on a failed helper call; a successful vector instruction
+/// remains part of the enclosing region's ordinary retirement total.
+fn emit_side_exit_state(
+    function: &mut Function,
+    region: &Region,
+    layout: JitLayout,
+    local_map: &[Option<u32>],
+    defined: &[bool],
+    exit: &SideExit,
+) -> Result<(), EmitError> {
     emit_commit_outputs(function, layout, &exit.outputs, |function, value| {
         emit_value(function, region, layout, local_map, defined, value)
     })?;
@@ -5238,7 +5472,21 @@ fn emit_side_exit(
     function.instruction(&Instruction::I32Const(layout.pc_addr as i32));
     emit_guest_pc(function, exit.guest_pc, layout);
     function.instruction(&Instruction::I64Store(memarg(3, 0)));
-    emit_retirement_const(function, layout.retired_addr, exit.retired);
+    Ok(())
+}
+
+fn emit_vector_call(
+    function: &mut Function,
+    helpers: HelperImports,
+    insn: u32,
+) -> Result<(), EmitError> {
+    function.instruction(&Instruction::LocalGet(0));
+    function.instruction(&Instruction::I32Const(insn as i32));
+    function.instruction(&Instruction::Call(
+        helpers
+            .vector_index()
+            .ok_or_else(|| EmitError("missing vector helper import".into()))?,
+    ));
     Ok(())
 }
 
@@ -5377,6 +5625,11 @@ fn finish_module(function: Function, helpers: HelperImports, layout: JitLayout) 
             .ty()
             .function([ValType::I32, ValType::I32, ValType::I64], [ValType::I32]);
     }
+    if helpers.vector.is_some() {
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I32]);
+    }
     if helpers.tlb_fill {
         types
             .ty()
@@ -5424,11 +5677,25 @@ fn finish_module(function: Function, helpers: HelperImports, layout: JitLayout) 
             EntityType::Function(1 + helpers.fp as u32),
         );
     }
+    if let Some(vector) = helpers.vector {
+        imports.import(
+            "env",
+            match vector {
+                VectorCapability::User => "user_vector",
+                VectorCapability::System => "system_vector",
+            },
+            EntityType::Function(1 + helpers.fp as u32 + helpers.reservation.is_some() as u32),
+        );
+    }
     if helpers.tlb_fill {
         imports.import(
             "env",
             "tlb_fill",
-            EntityType::Function(1 + helpers.fp as u32 + helpers.reservation.is_some() as u32),
+            EntityType::Function(
+                1 + helpers.fp as u32
+                    + helpers.reservation.is_some() as u32
+                    + helpers.vector.is_some() as u32,
+            ),
         );
     }
     if helpers.bulk_copy {
@@ -5438,6 +5705,7 @@ fn finish_module(function: Function, helpers: HelperImports, layout: JitLayout) 
             EntityType::Function(
                 1 + helpers.fp as u32
                     + helpers.reservation.is_some() as u32
+                    + helpers.vector.is_some() as u32
                     + helpers.tlb_fill as u32,
             ),
         );
@@ -5494,6 +5762,11 @@ fn finish_shared_module(
             .ty()
             .function([ValType::I32, ValType::I32, ValType::I64], [ValType::I32]);
     }
+    if helpers.vector.is_some() {
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I32]);
+    }
     if helpers.tlb_fill {
         types
             .ty()
@@ -5544,11 +5817,25 @@ fn finish_shared_module(
             EntityType::Function(1 + helpers.fp as u32),
         );
     }
+    if let Some(vector) = helpers.vector {
+        imports.import(
+            "env",
+            match vector {
+                VectorCapability::User => "user_vector",
+                VectorCapability::System => "system_vector",
+            },
+            EntityType::Function(1 + helpers.fp as u32 + helpers.reservation.is_some() as u32),
+        );
+    }
     if helpers.tlb_fill {
         imports.import(
             "env",
             "tlb_fill",
-            EntityType::Function(1 + helpers.fp as u32 + helpers.reservation.is_some() as u32),
+            EntityType::Function(
+                1 + helpers.fp as u32
+                    + helpers.reservation.is_some() as u32
+                    + helpers.vector.is_some() as u32,
+            ),
         );
     }
     if helpers.bulk_copy {
@@ -5558,6 +5845,7 @@ fn finish_shared_module(
             EntityType::Function(
                 1 + helpers.fp as u32
                     + helpers.reservation.is_some() as u32
+                    + helpers.vector.is_some() as u32
                     + helpers.tlb_fill as u32,
             ),
         );
@@ -5572,6 +5860,7 @@ fn finish_shared_module(
             EntityType::Function(
                 1 + helpers.fp as u32
                     + helpers.reservation.is_some() as u32
+                    + helpers.vector.is_some() as u32
                     + helpers.tlb_fill as u32
                     + helpers.bulk_copy as u32,
             ),
@@ -5782,6 +6071,11 @@ fn finish_multi_module(
             .ty()
             .function([ValType::I32, ValType::I32, ValType::I64], [ValType::I32]);
     }
+    if helpers.vector.is_some() {
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I32]);
+    }
     if helpers.tlb_fill {
         types
             .ty()
@@ -5829,11 +6123,25 @@ fn finish_multi_module(
             EntityType::Function(1 + helpers.fp as u32),
         );
     }
+    if let Some(vector) = helpers.vector {
+        imports.import(
+            "env",
+            match vector {
+                VectorCapability::User => "user_vector",
+                VectorCapability::System => "system_vector",
+            },
+            EntityType::Function(1 + helpers.fp as u32 + helpers.reservation.is_some() as u32),
+        );
+    }
     if helpers.tlb_fill {
         imports.import(
             "env",
             "tlb_fill",
-            EntityType::Function(1 + helpers.fp as u32 + helpers.reservation.is_some() as u32),
+            EntityType::Function(
+                1 + helpers.fp as u32
+                    + helpers.reservation.is_some() as u32
+                    + helpers.vector.is_some() as u32,
+            ),
         );
     }
     if helpers.bulk_copy {
@@ -5843,6 +6151,7 @@ fn finish_multi_module(
             EntityType::Function(
                 1 + helpers.fp as u32
                     + helpers.reservation.is_some() as u32
+                    + helpers.vector.is_some() as u32
                     + helpers.tlb_fill as u32,
             ),
         );
@@ -6251,6 +6560,54 @@ mod tests {
         (loads, stores)
     }
 
+    fn count_direct_state_stores(bytes: &[u8], base: u32, offset: u64, i64_store: bool) -> usize {
+        let mut stores = 0;
+        for payload in Parser::new(0).parse_all(bytes) {
+            let Payload::CodeSectionEntry(body) = payload.expect("generated payload parses") else {
+                continue;
+            };
+            let mut operators = body
+                .get_operators_reader()
+                .expect("generated function operators parse");
+            let mut stage = 0;
+            while !operators.eof() {
+                let operator = operators.read().expect("generated operator parses");
+                match operator {
+                    Operator::I32Const { value } if value == base as i32 => stage = 1,
+                    Operator::LocalGet { .. } if stage == 1 => stage = 2,
+                    Operator::I64Store { memarg }
+                        if i64_store && stage == 2 && memarg.offset == offset =>
+                    {
+                        stores += 1;
+                        stage = 0;
+                    }
+                    Operator::I32Store { memarg }
+                        if !i64_store && stage == 2 && memarg.offset == offset =>
+                    {
+                        stores += 1;
+                        stage = 0;
+                    }
+                    _ => stage = 0,
+                }
+            }
+        }
+        stores
+    }
+
+    fn import_names(bytes: &[u8]) -> Vec<(String, String)> {
+        let mut names = Vec::new();
+        for payload in Parser::new(0).parse_all(bytes) {
+            let Payload::ImportSection(section) = payload.expect("generated payload parses") else {
+                continue;
+            };
+            for import in section.into_imports() {
+                let import = import.expect("generated import parses");
+                names.push((import.module.to_owned(), import.name.to_owned()));
+            }
+        }
+        names
+    }
+
     fn two_pair_memory_region(transform_values: bool) -> Region {
         let mut builder = Builder::new(0x1000);
         let source = builder.read_x(1, 0x1000);
@@ -6634,6 +6991,79 @@ mod tests {
         assert_eq!(count_i64_state_ops(&bytes, 3 * 8), (2, 2));
     }
 
+    #[test]
+    fn structured_precise_effect_publishes_side_exit_only_state() {
+        // Model the compiler sequence that exposed this bug:
+        //   addi a6, s0, -128
+        //   vse8.v v8, (a6)
+        // The vector boundary ends the scalar SSA epoch, so a6 is absent from
+        // the region's final outputs and from the structured resident bank.
+        // Its precise SideExit snapshot must nevertheless reach canonical
+        // state before the opaque helper call. FP and fcsr use the same rule.
+        let mut first_builder = Builder::new(0x1000);
+        let frame = first_builder.read_x(8, 0x1000);
+        let minus_128 = first_builder.const_i64(-128, 0x1000);
+        let address = first_builder.binary(BinaryOp::I64Add, frame, minus_128, 0x1000);
+        first_builder.write_x(16, address);
+        let fp_value = first_builder.const_i64(0x1234, 0x1000);
+        first_builder.write_f(31, fp_value);
+        let fcsr_value = first_builder.const_i32(0x5, 0x1000);
+        first_builder.write_fcsr(fcsr_value);
+        first_builder.vector(0x0208_0427, 0x1004, 0x1008, 1);
+        let next = first_builder.const_i64(0x1008, 0x1004);
+        let first = first_builder.finish(0x1008, next, 2, ExitKind::Dispatch);
+
+        assert!(first.outputs.iter().all(|&(reg, _)| reg != 16));
+        assert!(first.f_outputs.iter().all(|&(reg, _)| reg != 31));
+        assert!(first.fcsr_output.is_none());
+        let vector_exit = first
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Vector { exit, .. } => Some(exit),
+                _ => None,
+            })
+            .expect("region contains its vector boundary");
+        assert!(vector_exit.outputs.iter().any(|&(reg, _)| reg == 16));
+        assert!(vector_exit.f_outputs.iter().any(|&(reg, _)| reg == 31));
+        assert!(vector_exit.fcsr_output.is_some());
+
+        let mut second_builder = Builder::new(0x1008);
+        let next = second_builder.const_i64(0x100c, 0x1008);
+        let second = second_builder.finish(0x100c, next, 1, ExitKind::Dispatch);
+
+        let mut layout = system_layout(true);
+        layout.x_base = 0x20_000;
+        layout.f_base = 0x21_000;
+        layout.fcsr_addr = 0x22_000;
+        layout.pc_addr = 0x22_008;
+        layout.retired_addr = 0x22_010;
+        layout.vector = Some(VectorCapability::System);
+        let bytes = emit_multi_entry_mode(
+            &[(&first, None), (&second, None)],
+            layout,
+            true,
+            MultiEntryState::RegisterStructured,
+        )
+        .expect("structured vector module emits");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("structured vector module validates");
+
+        assert_eq!(
+            count_direct_state_stores(&bytes, layout.x_base, 16 * 8, true),
+            1
+        );
+        assert_eq!(
+            count_direct_state_stores(&bytes, layout.f_base, 31 * 8, true),
+            1
+        );
+        assert_eq!(
+            count_direct_state_stores(&bytes, layout.fcsr_addr, 0, false),
+            1
+        );
+    }
+
     fn system_layout(refill_on_miss: bool) -> JitLayout {
         let mut layout = JitLayout::bare();
         layout.sys = Some(SystemMemory::fused_4k(
@@ -6662,6 +7092,59 @@ mod tests {
         wasmparser::Validator::new()
             .validate_all(&bytes)
             .expect("generated module must validate");
+    }
+
+    #[test]
+    fn vector_import_is_conditional_and_typed_to_the_memory_capability() {
+        let vector_region = || {
+            let mut builder = Builder::new(0x1000);
+            builder.vector(0x0285_0457, 0x1000, 0x1004, 0);
+            let next = builder.const_i64(0x1004, 0x1000);
+            builder.finish(0x1004, next, 1, ExitKind::Dispatch)
+        };
+        let region = vector_region();
+
+        let mut user = JitLayout::bare();
+        user.mem = Some((4096, 65536));
+        user.vector = Some(VectorCapability::User);
+        let user_bytes = emit(&region, user, None).expect("user vector module emits");
+        assert!(import_names(&user_bytes)
+            .iter()
+            .any(|(module, name)| module == "env" && name == "user_vector"));
+        assert!(!import_names(&user_bytes)
+            .iter()
+            .any(|(_, name)| name == "system_vector"));
+
+        let mut system = system_layout(true);
+        system.vector = Some(VectorCapability::System);
+        let system_bytes = emit(&region, system, None).expect("system vector module emits");
+        assert!(import_names(&system_bytes)
+            .iter()
+            .any(|(module, name)| module == "env" && name == "system_vector"));
+        assert!(!import_names(&system_bytes)
+            .iter()
+            .any(|(_, name)| name == "user_vector"));
+
+        let mut missing = user;
+        missing.vector = None;
+        assert!(emit(&region, missing, None)
+            .expect_err("untyped vector module is rejected")
+            .0
+            .contains("typed capability"));
+        let mut mismatched = user;
+        mismatched.vector = Some(VectorCapability::System);
+        assert!(emit(&region, mismatched, None)
+            .expect_err("system helper cannot receive a user machine")
+            .0
+            .contains("full-system memory"));
+
+        let mut scalar_builder = Builder::new(0x2000);
+        let next = scalar_builder.const_i64(0x2004, 0x2000);
+        let scalar = scalar_builder.finish(0x2004, next, 1, ExitKind::Dispatch);
+        let scalar_bytes = emit(&scalar, user, None).expect("scalar module remains valid");
+        assert!(!import_names(&scalar_bytes)
+            .iter()
+            .any(|(_, name)| name.ends_with("_vector")));
     }
 
     #[test]
