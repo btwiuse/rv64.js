@@ -17,5 +17,5 @@ pub mod exception;
 pub mod softfp;
 
 pub use bus::{Bus, FlatMemory};
-pub use cpu::{Cpu, InstructionTrace, StopReason};
+pub use cpu::{CompiledEntryMap, Cpu, InstructionTrace, StopReason};
 pub use exception::Exception;

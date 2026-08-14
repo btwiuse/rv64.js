@@ -648,7 +648,6 @@ impl Machine {
     }
 
     /// Direct JIT-off slice using the integrated scalar interpreter driver.
-    /// Generated-code fallback deliberately continues to call [`Self::run_slice`].
     pub fn run_slice_integrated(&mut self, max_insns: u64) -> u64 {
         let start = self.cpu.insn_count;
 
@@ -684,10 +683,20 @@ impl Machine {
         let start = self.cpu.insn_count;
         self.sync_devices();
         self.bus.poll_net_rx();
-        let mut i = 0u64;
         let mut yielded = false;
-        while i < max_insns {
-            if let StopReason::Wfi = self.cpu.run(&mut self.bus, 1) {
+        while self.cpu.insn_count - start < max_insns {
+            let before = self.cpu.insn_count;
+            let slice_progress = before - start;
+            let run_budget = (max_insns - slice_progress).min(64 - (slice_progress & 63));
+            let mut reached_compiled = false;
+            let mut stop_at = |pc| {
+                reached_compiled = compiled(pc);
+                reached_compiled
+            };
+            let reason =
+                self.cpu
+                    .run_integrated_scalar_until(&mut self.bus, run_budget, &mut stop_at);
+            if reason == StopReason::Wfi {
                 yielded = true;
                 let next = self.bus.mtimecmp;
                 if next != u64::MAX && next > self.bus.mtime {
@@ -695,11 +704,13 @@ impl Machine {
                 }
                 break;
             }
-            i = self.cpu.insn_count - start;
-            if compiled(self.cpu.pc) {
+            if reached_compiled {
                 break; // reached compiled code — hand back to the JIT
             }
-            if i & 63 == 0 {
+            if self.cpu.insn_count == before {
+                break;
+            }
+            if (self.cpu.insn_count - start) & 63 == 0 {
                 self.sync_devices();
             }
         }

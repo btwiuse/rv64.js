@@ -1,5 +1,15 @@
 # Final RV64-to-WebAssembly JIT Rewrite Exercise Report
 
+> **Historical closure record.** This report describes the repository and
+> owner-directed stop on 2026-08-10. Work was subsequently reauthorized,
+> checkpointed, extended with RV64GCV lowering, and continued with a focused
+> Boot JIT-lifecycle objective. Its statements that no more work was authorized,
+> that the rewrite was uncommitted, and that Boot remained a loss are not the
+> current repository status. See
+> [BOOT_JIT_PARITY_RESULT.md](BOOT_JIT_PARITY_RESULT.md) and
+> [STATUS.md](STATUS.md) for the current result. The chronology below is
+> intentionally preserved rather than rewritten.
+
 Date: 2026-08-10  
 Disposition: concluded by owner; implementation preserved; parity objective not achieved
 

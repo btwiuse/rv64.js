@@ -52,6 +52,43 @@ interpreter executions against QEMU and 8,724 repeated hot-JIT executions
 against the interpreter, followed by focused vector fault and full-system
 tests.
 
+## Boot JIT-on/JIT-off parity
+
+Build the release Wasm once, then use the configuration A/B runner so both
+sides resolve to that same artifact. The control disables JIT execution through
+the public diagnostic switch; the candidate uses the production policy.
+
+```sh
+cargo build --release -p rv64-wasm --target wasm32-unknown-unknown
+
+ARTIFACTS=target/bench \
+SCORECARD_V2_EXECUTION_MODE=jit \
+SCORECARD_V2_INPUT_POPULATION=scorecard-v2-modern \
+ROWS=boot REPS=11 \
+CONTROL_CONFIG='{"SCORECARD_V2_DISABLE_RV_JIT":"1"}' \
+CANDIDATE_CONFIG='{}' \
+SCORECARD_V2_OUTPUT=target/bench/boot-jit-on-vs-off-scalar \
+taskset -c 8-15 node tests/vs-v86/scorecard-v2-config-ab.mjs
+
+ARTIFACTS=target/bench \
+SCORECARD_V2_EXECUTION_MODE=jit \
+SCORECARD_V2_INPUT_POPULATION=scorecard-v2-rv64gcv-v1 \
+ROWS=boot REPS=11 \
+CONTROL_CONFIG='{"SCORECARD_V2_DISABLE_RV_JIT":"1"}' \
+CANDIDATE_CONFIG='{}' \
+SCORECARD_V2_OUTPUT=target/bench/boot-jit-on-vs-off-rv64gcv \
+taskset -c 8-15 node tests/vs-v86/scorecard-v2-config-ab.mjs
+```
+
+Verify `configuration.wasmBySide.control.sha256` and
+`configuration.wasmBySide.candidate.sha256` are identical, the input identity
+sets match, `measurementValid` is true, and `problems` is empty. The complete
+pre-change/final-artifact regression uses the same runner with all rows,
+`REPS=5`, and a frozen control artifact through
+`CONTROL_CONFIG='{"SCORECARD_V2_REWRITE_WASM":"/path/to/control.wasm"}'`.
+See [BOOT_JIT_PARITY_RESULT.md](BOOT_JIT_PARITY_RESULT.md) for exact report and
+artifact hashes, follow-up rows, and the final results.
+
 ## RV64GCV JIT scorecard
 
 Build the frozen stock-musl RV64GCV/i686 population from the pinned nbench
@@ -78,11 +115,12 @@ AUTHORITATIVE=1 REPS=3 \
 node tests/vs-v86/scorecard-v2.mjs
 ```
 
-The unchanged scalar two-side regression scorecard uses the same runner with
-`SCORECARD_V2_INPUT_POPULATION=scorecard-v2-modern` and
-`SIDES=rewrite,v86`. See
-[RVV_JIT_RESULT.md](RVV_JIT_RESULT.md) for the measured artifact and report
-hashes.
+The final scalar authoritative scorecard uses
+`SCORECARD_V2_INPUT_POPULATION=scorecard-v2-modern` and its default
+`rewrite,legacy,v86` side set; do not override `SIDES`. See
+[BOOT_JIT_PARITY_RESULT.md](BOOT_JIT_PARITY_RESULT.md) for the current measured
+artifact and report hashes, and [RVV_JIT_RESULT.md](RVV_JIT_RESULT.md) for the
+preceding direct-lowering milestone.
 
 The async T2 publication regression can be stressed independently with the
 older Node supplied by the Nix shell:

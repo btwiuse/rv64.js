@@ -54,7 +54,7 @@ assert.equal(core.ex.jit_page_policy_stat(25), 2n);
 assert.equal(core.ex.jit_page_policy_stat(34), 100n);
 assert.equal(core.ex.jit_page_policy_stat(38), 2n);
 assert.equal(core.ex.jit_page_policy_stat(39), 512n);
-assert.equal(core.ex.jit_page_policy_stat(45), 32n);
+assert.equal(core.ex.jit_page_policy_stat(45), 64n);
 assert.equal(core.ex.jit_page_policy_stat(50), 0n);
 assert.equal(core.ex.jit_page_policy_stat(51), 1n);
 await vm.start();
@@ -63,7 +63,7 @@ while (vm.running && !output.includes("ALPINE_READY") && performance.now() < dea
   await new Promise((resolve) => setImmediate(resolve));
 }
 // Readiness can precede the first asynchronous module on slower Wasm engines,
-// especially now that transient S-mode code needs 32x the user threshold.
+// especially now that transient S-mode code needs 64x the user threshold.
 // Repeat the same documented userspace phase until its asynchronously built
 // entry gets a chance to execute; this tests tier-up/landing, not scheduler
 // luck at the instant the shell prints ALPINE_READY.

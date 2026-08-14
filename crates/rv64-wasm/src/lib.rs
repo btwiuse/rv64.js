@@ -1426,11 +1426,16 @@ trait SystemJitMachine {
         max_insns: u64,
         compiled: &mut dyn FnMut(u64) -> bool,
     ) -> (u64, bool);
+    fn run_compiled_interpreter_until(
+        &mut self,
+        max_insns: u64,
+        compiled: rv64_core::CompiledEntryMap,
+    ) -> (u64, bool);
     fn run_policy_interpreter(
         &mut self,
         max_insns: u64,
         sample: &mut dyn FnMut(PagePolicySample),
-        compiled: &mut dyn FnMut(u64) -> bool,
+        compiled: rv64_core::CompiledEntryMap,
         precise_stop: bool,
         control_entries: bool,
     ) -> (u64, bool);
@@ -1498,11 +1503,18 @@ impl SystemJitMachine for rv64_system::Machine {
     ) -> (u64, bool) {
         self.run_slice_until(max_insns, compiled)
     }
+    fn run_compiled_interpreter_until(
+        &mut self,
+        max_insns: u64,
+        compiled: rv64_core::CompiledEntryMap,
+    ) -> (u64, bool) {
+        self.run_slice_until(max_insns, &mut |pc| compiled.contains(pc))
+    }
     fn run_policy_interpreter(
         &mut self,
         max_insns: u64,
         sample: &mut dyn FnMut(PagePolicySample),
-        compiled: &mut dyn FnMut(u64) -> bool,
+        compiled: rv64_core::CompiledEntryMap,
         precise_stop: bool,
         _control_entries: bool,
     ) -> (u64, bool) {
@@ -1513,7 +1525,7 @@ impl SystemJitMachine for rv64_system::Machine {
         let mut first = true;
         let mut yielded = false;
         while self.cpu.insn_count - start < max_insns && !self.power_off {
-            if !first && compiled(self.cpu.pc) {
+            if !first && compiled.contains(self.cpu.pc) {
                 break;
             }
             first = false;
@@ -1643,11 +1655,18 @@ impl SystemJitMachine for rv64_system::virt::VirtMachine {
     ) -> (u64, bool) {
         self.run_slice_until(max_insns, compiled)
     }
+    fn run_compiled_interpreter_until(
+        &mut self,
+        max_insns: u64,
+        compiled: rv64_core::CompiledEntryMap,
+    ) -> (u64, bool) {
+        self.run_slice_until_compiled(max_insns, compiled)
+    }
     fn run_policy_interpreter(
         &mut self,
         max_insns: u64,
         sample: &mut dyn FnMut(PagePolicySample),
-        compiled: &mut dyn FnMut(u64) -> bool,
+        compiled: rv64_core::CompiledEntryMap,
         precise_stop: bool,
         control_entries: bool,
     ) -> (u64, bool) {
@@ -2316,11 +2335,12 @@ const PAGE_POLICY_STALE_INSNS: u64 = 2_097_152;
 static mut PAGE_POLICY_ENABLED: bool = false;
 static mut PAGE_POLICY_THRESHOLD: u64 = 131_072;
 // Privileged code encountered during kernel/firmware work is generally much
-// more transient than a user process's hot loop. Require 32x as much S/M-mode
-// heat while retaining the ordinary threshold for user code. A 8/16/32/64
-// fresh-process sweep found a broad boot-time plateau, and 32 passed the full
-// unrelated-row guard; keeping the setter explicit preserves controlled A/Bs.
-static mut PAGE_POLICY_PRIVILEGED_THRESHOLD_MULTIPLIER: u64 = 32;
+// more transient than a user process's hot loop. Require 64x as much S/M-mode
+// heat while retaining the ordinary threshold for user code. This keeps cold
+// firmware/kernel regions in the now-faster integrated interpreter and still
+// permits genuinely persistent privileged loops to tier up. Keeping the setter
+// explicit preserves controlled policy A/Bs.
+static mut PAGE_POLICY_PRIVILEGED_THRESHOLD_MULTIPLIER: u64 = 64;
 static mut PAGE_POLICY_QUANTUM: u64 = 1_024;
 static mut PAGE_POLICY_REBUILD: bool = false;
 static mut PAGE_POLICY_CONTROL_ENTRIES: bool = true;
@@ -7492,23 +7512,28 @@ fn run_system_jit(m: &mut impl SystemJitMachine, max_insns: u64) -> i32 {
                         .get(&key)
                         .is_some_and(|entries| entries.contains(&pc))
             });
-            // The pointer stays stable during the sampled call: observation
-            // only updates page-policy maps/queues, and async callbacks cannot
-            // run until this Wasm invocation returns.
-            let dispatch = jit.dispatch.as_ptr();
-            let mut stop_at_compiled =
-                |pc| unsafe { (*dispatch.add(JitState::dslot(pc))).pc == pc };
+            // The dispatch allocation stays stable and immutable during the
+            // interpreter call: observation only updates policy maps/queues,
+            // and async callbacks cannot run until this Wasm invocation
+            // returns. Its repr(C) PC tag is the first u64 in each line.
+            let compiled = unsafe {
+                rv64_core::CompiledEntryMap::from_strided_pc_tags(
+                    jit.dispatch.as_ptr().cast::<u64>(),
+                    jit.dispatch.len(),
+                    core::mem::size_of::<DispatchLine>() / core::mem::size_of::<u64>(),
+                )
+            };
             let (ran, yielded) = if policy_sample_needed {
                 let mut observe = |sample| page_policy_observe(jit, sample);
                 m.run_policy_interpreter(
                     remaining.min(4096),
                     &mut observe,
-                    &mut stop_at_compiled,
+                    compiled,
                     precise_stop,
                     unsafe { PAGE_POLICY_CONTROL_ENTRIES || PAGE_POLICY_CONTROL_PROFILE },
                 )
             } else {
-                m.run_interpreter_until(remaining.min(4096), &mut stop_at_compiled)
+                m.run_compiled_interpreter_until(remaining.min(4096), compiled)
             };
             unsafe {
                 SLICE_CALLS += 1;

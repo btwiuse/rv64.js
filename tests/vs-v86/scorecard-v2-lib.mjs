@@ -108,7 +108,7 @@ export const V86_RUNTIME = Object.freeze({
 export const EXPECTED_PRODUCTION_POLICY = Object.freeze({
   enabled: "1",
   threshold: "131072",
-  privilegedThresholdMultiplier: "32",
+  privilegedThresholdMultiplier: "64",
   privilegedControlEntriesEnabled: "0",
   stableChainEnabled: "1",
   quantum: "1024",

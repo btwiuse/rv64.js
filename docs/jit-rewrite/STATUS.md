@@ -1,8 +1,28 @@
 # JIT Rewrite Status
 
-Last updated: 2026-08-13
+Last updated: 2026-08-14
 
 ## Current disposition
+
+The Boot JIT-lifecycle objective is **achieved**. On the exact final Wasm,
+scalar Boot is `1.057x` faster with JIT enabled than disabled (paired 95% CI
+`[1.042,1.065]`), and RV64GCV Boot is `1.079x` faster
+(`[1.069,1.085]`). Complete scalar and RV64GCV artifact A/B matrices show no
+scorecard-class regression; focused fifteen-pair reruns resolve the initially
+suspicious scalar Assignment and RV64GCV Huffman rows to parity. The exact
+benchmarked source rebuilds to the same artifact and passes the strict
+eight-stage correctness matrix.
+
+The final authoritative scalar scorecard is now 12/13 non-losses against
+copy/v86: Boot moved from LOSS to MATCH, and Compile is the only remaining
+loss. The final authoritative RV64GCV scorecard has eight wins plus a Boot
+MATCH, or 9/13 non-losses; Compile, String Sort, FP Emulation, and Assignment
+remain losses. This does not complete the older all-row copy/v86 parity goal.
+
+The implementation and exact evidence are recorded in
+[BOOT_JIT_PARITY_RESULT.md](BOOT_JIT_PARITY_RESULT.md).
+
+## RV64GCV lowering disposition
 
 The RV64GCV direct JIT-lowering milestone is **achieved**. The complete
 mandatory RVV 1.0 surface for the selected VLEN=128/ELEN=64 machine remains an
@@ -13,14 +33,13 @@ state, and compiled-code invalidation are preserved. The strict release matrix
 passes, including all 8,724 interpreter and all 8,724 hot-JIT RVV differential
 executions.
 
-The authoritative RV64GCV JIT scorecard is measurement-valid with 78/78
-eligible trials and an empty problem list. It wins eight of thirteen rows
+The original authoritative RV64GCV JIT scorecard was measurement-valid with
+78/78 eligible trials and an empty problem list. It won eight of thirteen rows
 against pinned copy/v86. Against helper-only JIT lowering it improves String
 Sort by `3.4587x`, FP Emulation by `1.7970x`, and Assignment by `1.2915x`.
-The separately rerun modern scalar scorecard remains 11/13, with only Boot and
-Compile losing. The historical all-row RV64GCV/copy-v86 parity objective
-remains **not achieved** because Boot, Compile, String Sort, FP Emulation, and
-Assignment still lose.
+The later Boot lifecycle result supersedes those current scorecard numbers;
+the historical all-row RV64GCV/copy-v86 parity objective remains **not
+achieved**.
 
 The complete implementation boundary, no-workload-identifier audit,
 correctness matrix, scorecards, hashes, and remaining performance gap are in

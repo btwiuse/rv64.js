@@ -20,7 +20,7 @@ use crate::dtb::Fdt;
 use crate::rtc::GoldfishRtc;
 use crate::virtio::{Backend, VirtioDev};
 use rv64_core::csr::{Mode, IRQ_MEIP, IRQ_MSIP, IRQ_MTIP, IRQ_SEIP, IRQ_SSIP, IRQ_STIP};
-use rv64_core::{Bus, Cpu, Exception, InstructionTrace, StopReason};
+use rv64_core::{Bus, CompiledEntryMap, Cpu, Exception, InstructionTrace, StopReason};
 
 fn plic_dbg() -> bool {
     use std::sync::OnceLock;
@@ -1043,7 +1043,6 @@ impl VirtMachine {
     }
 
     /// Direct JIT-off slice using the integrated scalar interpreter driver.
-    /// Generated-code fallback deliberately continues to call [`Self::run_slice`].
     pub fn run_slice_integrated(&mut self, max_insns: u64) -> u64 {
         let start = self.cpu.insn_count;
         self.bus.poll_virtio();
@@ -1127,7 +1126,7 @@ impl VirtMachine {
         max_insns: u64,
         quantum: u64,
         sample: &mut dyn FnMut(u64, u64, u64, u8, u64, bool),
-        compiled: &mut dyn FnMut(u64) -> bool,
+        compiled: CompiledEntryMap,
     ) -> (u64, bool) {
         let start = self.cpu.insn_count;
         self.bus.poll_virtio();
@@ -1136,7 +1135,7 @@ impl VirtMachine {
         let mut reason = StopReason::Budget;
         let mut first = true;
         while remaining != 0 && !self.power_off {
-            if !first && compiled(self.cpu.pc) {
+            if !first && compiled.contains(self.cpu.pc) {
                 break;
             }
             first = false;
@@ -1148,7 +1147,9 @@ impl VirtMachine {
                 .as_ref()
                 .map_or((0, u8::MAX), |sys| (sys.satp, sys.mode as u8));
             let before = self.cpu.insn_count;
-            reason = self.cpu.run(&mut self.bus, remaining.min(quantum.max(1)));
+            reason = self
+                .cpu
+                .run_integrated_scalar(&mut self.bus, remaining.min(quantum.max(1)));
             let ran = self.cpu.insn_count - before;
             remaining = remaining.saturating_sub(ran);
             if ran != 0 {
@@ -1195,7 +1196,7 @@ impl VirtMachine {
         max_insns: u64,
         quantum: u64,
         sample: &mut dyn FnMut(u64, u64, u64, u8, u64, bool),
-        compiled: &mut dyn FnMut(u64) -> bool,
+        compiled: CompiledEntryMap,
         control_entries: bool,
     ) -> (u64, bool) {
         let start = self.cpu.insn_count;
@@ -1205,7 +1206,7 @@ impl VirtMachine {
         let mut reason = StopReason::Budget;
         let mut first = true;
         while remaining != 0 && !self.power_off {
-            if !first && compiled(self.cpu.pc) {
+            if !first && compiled.contains(self.cpu.pc) {
                 break;
             }
             first = false;
@@ -1220,11 +1221,11 @@ impl VirtMachine {
             let mut reached_compiled = false;
             let mut control_entry = None;
             let mut stop_at = |next_pc| {
-                reached_compiled = compiled(next_pc);
+                reached_compiled = compiled.contains(next_pc);
                 reached_compiled
             };
             if control_entries {
-                reason = self.cpu.run_until_observed(
+                reason = self.cpu.run_integrated_scalar_until_observed(
                     &mut self.bus,
                     remaining.min(quantum.max(1)),
                     &mut stop_at,
@@ -1235,9 +1236,11 @@ impl VirtMachine {
                     },
                 );
             } else {
-                reason =
-                    self.cpu
-                        .run_until(&mut self.bus, remaining.min(quantum.max(1)), &mut stop_at);
+                reason = self.cpu.run_integrated_scalar_until(
+                    &mut self.bus,
+                    remaining.min(quantum.max(1)),
+                    &mut stop_at,
+                );
             }
             let ran = self.cpu.insn_count - before;
             remaining = remaining.saturating_sub(ran);
@@ -1288,8 +1291,98 @@ impl VirtMachine {
         self.bus.poll_virtio();
         self.sync_devices();
         let mut stop = StopReason::Budget;
+
         while self.cpu.insn_count - start < max_insns && !self.power_off {
+            let before = self.cpu.insn_count;
+            let slice_progress = before - start;
+            let run_budget = (max_insns - slice_progress).min(64 - (slice_progress & 63));
+            let mut reached_compiled = false;
+            let mut stop_at = |pc| {
+                reached_compiled = compiled(pc);
+                reached_compiled
+            };
+            stop = self
+                .cpu
+                .run_integrated_scalar_until(&mut self.bus, run_budget, &mut stop_at);
+            let mut serviced_sbi = false;
+            if stop == StopReason::Ecall && self.bus.direct_sbi {
+                self.service_sbi();
+                serviced_sbi = true;
+                if self.unsupported_sbi.is_some() {
+                    self.power_off = true;
+                    break;
+                }
+            } else if stop == StopReason::Wfi {
+                break;
+            }
+            if reached_compiled || (serviced_sbi && compiled(self.cpu.pc)) {
+                break;
+            }
+            if self.cpu.insn_count == before {
+                break;
+            }
+            if (self.cpu.insn_count - start) & 63 == 0 {
+                self.sync_devices();
+            }
+        }
+        if stop == StopReason::Wfi {
+            let next = self.bus.mtimecmp;
+            if self.realtime_ticks.is_none() && next != u64::MAX && next > self.bus.mtime {
+                self.idle_ticks += next - self.bus.mtime;
+            }
+        }
+        self.sync_devices();
+        self.power_off = self.bus.power_off;
+        (self.cpu.insn_count - start, stop == StopReason::Wfi)
+    }
+
+    /// Exact generated-entry counterpart of [`Self::run_slice_until`] whose
+    /// direct-map probe is inlined into the integrated Tier-0 loop.
+    pub fn run_slice_until_compiled(
+        &mut self,
+        max_insns: u64,
+        compiled: CompiledEntryMap,
+    ) -> (u64, bool) {
+        let start = self.cpu.insn_count;
+        self.bus.poll_virtio();
+        self.sync_devices();
+        let mut stop = StopReason::Budget;
+
+        // Generated code commonly exits across a one- or two-instruction
+        // unsupported/system bridge. For that bounded prefix, the compact
+        // scalar driver has less setup than integrated Tier-0. If the gap is
+        // longer, immediately hand the remainder to the integrated loop. This
+        // decision depends only on observed bridge length, never guest PC,
+        // image identity, symbols, or workload input.
+        const SHORT_BRIDGE_PREFIX: u64 = 2;
+        let mut continue_integrated = true;
+        while self.cpu.insn_count - start < max_insns.min(SHORT_BRIDGE_PREFIX) && !self.power_off {
+            let before = self.cpu.insn_count;
             stop = self.cpu.run(&mut self.bus, 1);
+            if stop == StopReason::Ecall && self.bus.direct_sbi {
+                self.service_sbi();
+                if self.unsupported_sbi.is_some() {
+                    self.power_off = true;
+                    continue_integrated = false;
+                    break;
+                }
+            } else if stop == StopReason::Wfi {
+                continue_integrated = false;
+                break;
+            }
+            if compiled.contains(self.cpu.pc) || self.cpu.insn_count == before {
+                continue_integrated = false;
+                break;
+            }
+        }
+
+        while continue_integrated && self.cpu.insn_count - start < max_insns && !self.power_off {
+            let before = self.cpu.insn_count;
+            let slice_progress = before - start;
+            let run_budget = (max_insns - slice_progress).min(64 - (slice_progress & 63));
+            stop =
+                self.cpu
+                    .run_integrated_scalar_until_compiled(&mut self.bus, run_budget, compiled);
             if stop == StopReason::Ecall && self.bus.direct_sbi {
                 self.service_sbi();
                 if self.unsupported_sbi.is_some() {
@@ -1299,7 +1392,10 @@ impl VirtMachine {
             } else if stop == StopReason::Wfi {
                 break;
             }
-            if compiled(self.cpu.pc) {
+            if compiled.contains(self.cpu.pc) {
+                break;
+            }
+            if self.cpu.insn_count == before {
                 break;
             }
             if (self.cpu.insn_count - start) & 63 == 0 {
@@ -1578,5 +1674,79 @@ mod tests {
         };
 
         assert!(after_sync >= before_sync, "rdtime moved backwards");
+    }
+
+    #[test]
+    fn compiled_slice_short_bridge_stops_before_generated_entry() {
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct TestLine {
+            pc: u64,
+            payload: u64,
+        }
+
+        let mut machine = direct_machine();
+        let pc = machine.cpu.pc;
+        let offset = (pc - RAM_BASE) as usize;
+        machine.bus.ram[offset..offset + 4].copy_from_slice(&0x0010_0093u32.to_le_bytes());
+        machine.bus.ram[offset + 4..offset + 8].copy_from_slice(&0x0010_8093u32.to_le_bytes());
+
+        let target = pc + 4;
+        let mut lines = [TestLine {
+            pc: u64::MAX,
+            payload: 0,
+        }; 8];
+        lines[((target >> 1) as usize) & (lines.len() - 1)].pc = target;
+        let compiled = unsafe {
+            CompiledEntryMap::from_strided_pc_tags(
+                lines.as_ptr().cast::<u64>(),
+                lines.len(),
+                core::mem::size_of::<TestLine>() / core::mem::size_of::<u64>(),
+            )
+        };
+
+        let (ran, yielded) = machine.run_slice_until_compiled(10, compiled);
+        assert_eq!(ran, 1);
+        assert!(!yielded);
+        assert_eq!(machine.cpu.pc, target);
+        assert_eq!(machine.cpu.x[1], 1);
+    }
+
+    #[test]
+    fn compiled_slice_long_bridge_transfers_to_integrated_tier_zero() {
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct TestLine {
+            pc: u64,
+            payload: u64,
+        }
+
+        let mut machine = direct_machine();
+        let pc = machine.cpu.pc;
+        let offset = (pc - RAM_BASE) as usize;
+        for index in 0..3 {
+            machine.bus.ram[offset + index * 4..offset + index * 4 + 4]
+                .copy_from_slice(&0x0010_8093u32.to_le_bytes());
+        }
+
+        let target = pc + 12;
+        let mut lines = [TestLine {
+            pc: u64::MAX,
+            payload: 0,
+        }; 8];
+        lines[((target >> 1) as usize) & (lines.len() - 1)].pc = target;
+        let compiled = unsafe {
+            CompiledEntryMap::from_strided_pc_tags(
+                lines.as_ptr().cast::<u64>(),
+                lines.len(),
+                core::mem::size_of::<TestLine>() / core::mem::size_of::<u64>(),
+            )
+        };
+
+        let (ran, yielded) = machine.run_slice_until_compiled(10, compiled);
+        assert_eq!(ran, 3);
+        assert!(!yielded);
+        assert_eq!(machine.cpu.pc, target);
+        assert_eq!(machine.cpu.x[1], 3);
     }
 }

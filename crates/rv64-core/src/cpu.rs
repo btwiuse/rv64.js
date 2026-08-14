@@ -42,6 +42,51 @@ struct ScalarFetchCapability {
     linear_off: i64,
 }
 
+/// Read-only direct-mapped set of generated-code entry PCs.
+///
+/// The JIT owns the backing lines; Tier-0 receives only the address of each
+/// line's leading `u64` PC tag plus its fixed stride. This lets the integrated
+/// interpreter perform the same single-load entry test inline, without an
+/// indirect callback on every guest instruction.
+#[derive(Clone, Copy)]
+pub struct CompiledEntryMap {
+    tags: *const u64,
+    slot_mask: usize,
+    stride_words: usize,
+}
+
+impl CompiledEntryMap {
+    /// Construct a strided PC-tag view.
+    ///
+    /// # Safety
+    ///
+    /// `tags` must remain valid and immutable for `slots * stride_words`
+    /// `u64` words while the map is used. `slots` must be a non-zero power of
+    /// two and each line's PC tag must be its first word.
+    pub unsafe fn from_strided_pc_tags(
+        tags: *const u64,
+        slots: usize,
+        stride_words: usize,
+    ) -> Self {
+        debug_assert!(!tags.is_null());
+        debug_assert!(slots.is_power_of_two());
+        debug_assert!(stride_words != 0);
+        Self {
+            tags,
+            slot_mask: slots - 1,
+            stride_words,
+        }
+    }
+
+    #[inline(always)]
+    pub fn contains(self, pc: u64) -> bool {
+        let slot = ((pc >> 1) as usize) & self.slot_mask;
+        // SAFETY: guaranteed by `from_strided_pc_tags`; the JIT does not
+        // mutate or reallocate its dispatch array during an interpreter call.
+        unsafe { self.tags.add(slot * self.stride_words).read() == pc }
+    }
+}
+
 /// One successfully retired instruction observed by the opt-in policy tracer.
 /// This is deliberately produced by [`Cpu::run_traced`], not by the ordinary
 /// [`Cpu::run`] path: compile-policy experiments may inspect every retired
@@ -1167,19 +1212,28 @@ impl Cpu {
         self.interpreter_fetch_linear_off = capability.linear_off;
     }
 
-    /// R066 execution driver.  `CHECK_STOP` is a compile-time choice so the
-    /// cold-boot `run` path retains no generated-code re-entry callback, while
-    /// `run_until` gets the exact existing post-instruction contract.
-    fn run_integrated_scalar_t0<B: Bus, F: FnMut(u64) -> bool, const CHECK_STOP: bool>(
+    /// Integrated scalar execution driver. `CHECK_STOP` and `OBSERVE_TARGET`
+    /// are compile-time choices so the direct-interpreter path retains no JIT
+    /// policy callbacks, while generated-code fallback can preserve the exact
+    /// post-instruction re-entry and control-target contracts.
+    fn run_integrated_scalar_t0<
+        B: Bus,
+        F: FnMut(u64) -> bool,
+        G: FnMut(u64, u64, u64, u8),
+        const CHECK_STOP: bool,
+        const OBSERVE_TARGET: bool,
+    >(
         &mut self,
         bus: &mut B,
         budget: u64,
         stop_at: &mut F,
+        observe_target: &mut G,
     ) -> StopReason {
         let system = self.sys.is_some();
         let mut pc = self.pc;
         let mut retired = 0u64;
         let mut consumed = 0u64;
+        let mut observed_target = false;
         let mut fetch_context = self.sys.as_ref().map_or(0, |sys| sys.mode as u64);
         let mut fetch = if self.interpreter_fetch_map_gen == self.map_gen {
             ScalarFetchCapability {
@@ -1212,6 +1266,7 @@ impl Cpu {
                 }
             }
 
+            let previous_pc = pc;
             match self.scalar_t0_step(bus, pc, fetch_context, &mut fetch) {
                 Ok(ScalarT0Step::Retired(next_pc)) => {
                     pc = next_pc;
@@ -1266,6 +1321,25 @@ impl Cpu {
                 self.publish_scalar_fetch_capability(fetch);
                 return StopReason::Budget;
             }
+            if OBSERVE_TARGET && !observed_target {
+                let sequential2 = previous_pc.checked_add(2) == Some(pc);
+                let sequential4 = previous_pc.checked_add(4) == Some(pc);
+                if !sequential2 && !sequential4 {
+                    // Match `run_until_observed`: make the post-instruction
+                    // architectural state visible before probing and invoking
+                    // the policy observer. This happens at most once per call.
+                    self.commit_scalar_t0_state(pc, retired);
+                    retired = 0;
+                    if let Some(pa) = self.jit_probe_fetch(bus, pc) {
+                        let (satp, mode) = self
+                            .sys
+                            .as_ref()
+                            .map_or((0, u8::MAX), |sys| (sys.satp, sys.mode as u8));
+                        observe_target(pc, pa, satp, mode);
+                        observed_target = true;
+                    }
+                }
+            }
         }
 
         self.commit_scalar_t0_state(pc, retired);
@@ -1274,10 +1348,59 @@ impl Cpu {
     }
 
     /// Direct-interpreter driver that keeps ordinary scalar PC and retirement
-    /// state in locals. JIT fallback continues to use the authoritative
-    /// per-instruction `run` path.
+    /// state in locals.
     pub fn run_integrated_scalar<B: Bus>(&mut self, bus: &mut B, budget: u64) -> StopReason {
-        self.run_integrated_scalar_t0::<B, _, false>(bus, budget, &mut |_| false)
+        self.run_integrated_scalar_t0::<B, _, _, false, false>(
+            bus,
+            budget,
+            &mut |_| false,
+            &mut |_, _, _, _| {},
+        )
+    }
+
+    /// Integrated counterpart of [`Self::run_until`]. The predicate is checked
+    /// after every handled instruction, including a system exception redirected
+    /// to its guest trap vector, so generated-code re-entry remains exact.
+    pub fn run_integrated_scalar_until<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        budget: u64,
+        stop_at: &mut impl FnMut(u64) -> bool,
+    ) -> StopReason {
+        self.run_integrated_scalar_t0::<B, _, _, true, false>(
+            bus,
+            budget,
+            stop_at,
+            &mut |_, _, _, _| {},
+        )
+    }
+
+    /// Exact generated-code re-entry using an inline direct-map tag probe.
+    pub fn run_integrated_scalar_until_compiled<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        budget: u64,
+        compiled: CompiledEntryMap,
+    ) -> StopReason {
+        self.run_integrated_scalar_t0::<B, _, _, true, false>(
+            bus,
+            budget,
+            &mut |pc| compiled.contains(pc),
+            &mut |_, _, _, _| {},
+        )
+    }
+
+    /// Integrated counterpart of [`Self::run_until_observed`]. It reports the
+    /// first mapped non-sequential target while retaining exact generated-code
+    /// re-entry after every handled instruction.
+    pub fn run_integrated_scalar_until_observed<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        budget: u64,
+        stop_at: &mut impl FnMut(u64) -> bool,
+        observe_target: &mut impl FnMut(u64, u64, u64, u8),
+    ) -> StopReason {
+        self.run_integrated_scalar_t0::<B, _, _, true, true>(bus, budget, stop_at, observe_target)
     }
 
     /// Run up to `budget` instructions; returns why we stopped.
@@ -3708,6 +3831,80 @@ mod tests {
     }
 
     #[test]
+    fn integrated_run_until_stops_exactly_at_requested_next_pc() {
+        let words = [
+            0x00100093u32, // addi x1, x0, 1
+            0x00108093,    // addi x1, x1, 1
+            0x00108093,    // addi x1, x1, 1
+            0x00000073,    // ecall
+        ];
+        let mut mem = vec![0u8; 0x1000];
+        for (i, word) in words.iter().enumerate() {
+            mem[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut cpu = Cpu::new();
+        cpu.pc = BASE;
+        let mut bus = FlatMemory::new(BASE, &mut mem);
+        let mut probes = 0;
+        let stop = cpu.run_integrated_scalar_until(&mut bus, 100, &mut |pc| {
+            probes += 1;
+            pc == BASE + 8
+        });
+        assert_eq!(stop, StopReason::Budget);
+        assert_eq!(cpu.pc, BASE + 8);
+        assert_eq!(cpu.insn_count, 2);
+        assert_eq!(cpu.x[1], 2);
+        assert_eq!(probes, 2);
+        assert_eq!(cpu.run_integrated_scalar(&mut bus, 100), StopReason::Ecall);
+        assert_eq!(cpu.x[1], 3);
+    }
+
+    #[test]
+    fn integrated_compiled_map_stops_at_strided_direct_map_entry() {
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct TestLine {
+            pc: u64,
+            payload: u64,
+        }
+
+        let words = [
+            0x00100093u32, // addi x1, x0, 1
+            0x00108093,    // addi x1, x1, 1
+            0x00108093,    // compiled entry; must not execute here
+            0x00000073,    // ecall
+        ];
+        let mut mem = vec![0u8; 0x1000];
+        for (i, word) in words.iter().enumerate() {
+            mem[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let target = BASE + 8;
+        let mut lines = [TestLine {
+            pc: u64::MAX,
+            payload: 0,
+        }; 8];
+        lines[((target >> 1) as usize) & (lines.len() - 1)].pc = target;
+        let compiled = unsafe {
+            CompiledEntryMap::from_strided_pc_tags(
+                lines.as_ptr().cast::<u64>(),
+                lines.len(),
+                core::mem::size_of::<TestLine>() / core::mem::size_of::<u64>(),
+            )
+        };
+        assert!(compiled.contains(target));
+        assert!(!compiled.contains(BASE + 4));
+
+        let mut cpu = Cpu::new();
+        cpu.pc = BASE;
+        let mut bus = FlatMemory::new(BASE, &mut mem);
+        let stop = cpu.run_integrated_scalar_until_compiled(&mut bus, 100, compiled);
+        assert_eq!(stop, StopReason::Budget);
+        assert_eq!(cpu.pc, target);
+        assert_eq!(cpu.insn_count, 2);
+        assert_eq!(cpu.x[1], 2);
+    }
+
+    #[test]
     fn run_until_observed_reports_a_mapped_nonsequential_target() {
         let words = [
             0x00100093u32, // addi x1,x0,1
@@ -3727,6 +3924,34 @@ mod tests {
             cpu.run_until_observed(&mut bus, 2, &mut |_| false, &mut |pc, pa, satp, mode| {
                 entries.push((pc, pa, satp, mode))
             });
+        assert_eq!(stop, StopReason::Budget);
+        assert_eq!(cpu.pc, BASE + 12);
+        assert_eq!(cpu.insn_count, 2);
+        assert_eq!(entries, vec![(BASE + 12, BASE + 12, 0, u8::MAX)]);
+    }
+
+    #[test]
+    fn integrated_run_until_observed_matches_control_target_contract() {
+        let words = [
+            0x00100093u32, // addi x1,x0,1
+            0x0080006f,    // jal x0,+8
+            0x00108093,    // skipped
+            0x00000073,    // ecall
+        ];
+        let mut mem = vec![0u8; 0x1000];
+        for (i, word) in words.iter().enumerate() {
+            mem[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut cpu = Cpu::new();
+        cpu.pc = BASE;
+        let mut bus = FlatMemory::new(BASE, &mut mem);
+        let mut entries = Vec::new();
+        let stop = cpu.run_integrated_scalar_until_observed(
+            &mut bus,
+            2,
+            &mut |_| false,
+            &mut |pc, pa, satp, mode| entries.push((pc, pa, satp, mode)),
+        );
         assert_eq!(stop, StopReason::Budget);
         assert_eq!(cpu.pc, BASE + 12);
         assert_eq!(cpu.insn_count, 2);

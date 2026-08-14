@@ -39,7 +39,7 @@ assert.equal(initialJitStats.accountedInstructions, "0");
 assert.equal(initialJitStats.generatedCoverage, 0);
 assert.equal(initialJitStats.pagePolicy.enabled, "1");
 assert.equal(initialJitStats.pagePolicy.threshold, "131072");
-assert.equal(initialJitStats.pagePolicy.privilegedThresholdMultiplier, "32");
+assert.equal(initialJitStats.pagePolicy.privilegedThresholdMultiplier, "64");
 assert.equal(initialJitStats.pagePolicy.privilegedControlEntriesEnabled, "0");
 assert.equal(initialJitStats.pagePolicy.stableChainEnabled, "1");
 assert.equal(initialJitStats.pagePolicy.controlEntriesEnabled, "1");

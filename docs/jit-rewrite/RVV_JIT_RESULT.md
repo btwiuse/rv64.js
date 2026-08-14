@@ -5,6 +5,13 @@ Date: 2026-08-13 America/Phoenix
 Disposition: direct lowering promoted; correctness and scalar-regression gates
 pass; cross-ISA parity remains open
 
+> **2026-08-14 postscript.** A later architecture-general Tier-0/JIT lifecycle
+> change moved scalar and RV64GCV Boot from LOSS to MATCH against copy/v86 and
+> made JIT-enabled Boot faster than JIT-disabled Boot on the same artifact.
+> The scorecard values below remain the direct-lowering milestone record; the
+> superseding current measurements and exact regression proof are in
+> [BOOT_JIT_PARITY_RESULT.md](BOOT_JIT_PARITY_RESULT.md).
+
 ## Conclusion
 
 The RV64GCV JIT now lowers broad, architecture-defined RVV families directly
