@@ -138,6 +138,14 @@ defaults to 500 ms. `Response` image sources are intentionally local-only;
 Worker mode accepts URL and byte sources. The hosted demo opts into Worker
 mode so instruction slicing and JIT compilation cannot stall its UI.
 
+The stable facade includes bounded JIT controls (`setJitEnabled` and
+`configureJit`) and on-demand snapshots (`jitStats` and `jitProfile`). Numeric
+u64 counters cross the Worker boundary as decimal strings. `jitStats` has no
+side effects; detailed dispatch profiling is collected only after an embedder
+opts in with `configureJit({ profile: true })`. The library creates no
+background telemetry timer. The hosted demo owns its once-per-second,
+visible-page sampling policy outside the emulator.
+
 The event map should cover at least `ready`, `start`, `stop`, `error`,
 `console`, `networkTransmit`, and `downloadProgress`. Listener registration
 returns an unsubscribe function. The xterm.js integration belongs in a small
@@ -154,8 +162,10 @@ the layer-2 WebSocket mode. `vm.network.proxyURL` reports the configured proxy
 address without callers hardcoding it.
 
 The public surface must not include raw Wasm exports, staging helpers, HTTP
-implementation helpers, relay internals, or JIT experiment counters. Tests may
-use a separately named unstable debug API.
+implementation helpers, relay internals, or unbounded internal compiler
+controls. Stable cumulative JIT snapshots and bounded configuration are part
+of the facade; raw experiment exports remain confined to a separately named
+unstable debug API.
 
 ## Direct Linux boot contract
 

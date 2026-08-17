@@ -1,6 +1,6 @@
 # rv64.js roadmap
 
-All six original phases are complete (see DESIGN.md): rv64gc + privileged
+All six original phases are complete (see DESIGN.md): rv64gcv + privileged
 architecture, boots Linux natively and in the browser, JIT live in both run
 loops, softfloat F/D with native fast path, riscv-tests 134/134, validated
 against Spike/QEMU/TinyEMU. This file tracks what comes next, in rough
@@ -8,12 +8,14 @@ priority order. Check items off as they land.
 
 ## Performance (the JIT's next tiers)
 
-**Phase paused 2026-08-01:** the authoritative scorecard is 11/13 and the
-Assignment loss is fixed. `PERFORMANCE_PROGRESS.md` records E001–E029,
-including the closure of registration, fallback, region, boundary, memory,
-control, ALU, and large multi-value ABI axes for Compile. No bounded
-performance experiment remains open. Items 2b and 4 below are deferred/optional
-research directions, not the next scheduled work.
+**Milestone completed 2026-08-16:** the frozen RV64GCV and scalar JIT
+scorecards are both 13/13 win-or-match against pinned copy/v86, and the
+protected WANIX browser gate passes. RVV 1.0 is supported by the interpreter
+and architecture-general JIT lowering. The exact result and release matrix are
+recorded in
+[`RV64GCV_JIT_13_OF_13_RESULT.md`](docs/jit-rewrite/RV64GCV_JIT_13_OF_13_RESULT.md).
+Items 2b and 4 below remain deferred research directions rather than required
+work for this milestone.
 
 - [x] **1. Inline-TLB memory ops in full-system JIT blocks** *(done; the
   system-mode win)* — system JIT blocks translate guest loads/stores inline
@@ -364,14 +366,14 @@ lever now. Its two reverted attempts are documented in git history.
 - [x] **12. CI** — GitHub Actions enforces formatting, Clippy, guest builds,
   debug/release tests, the Wasm build, and a real fast-Linux browser-API boot.
   The image/oracle-heavy strict gate remains reproducible through Nix.
-- [x] **13. Browser demo** — GitHub Pages offers fast BusyBox and modern
-  direct-boot Alpine/Linux presets backed by versioned release assets.
+- [x] **13. Browser demo** — GitHub Pages offers the modern direct-boot
+  Alpine/Linux machine backed by versioned release assets.
 - [ ] Optionally rename the directory (`~/src/arm64.js` → `rv64.js`).
 
 ## Recommended sequencing
 
-1 → 2 → 3 (the perf trilogy) → 7 → 8/8b. All done, and the extended measured
-performance phase is now paused. Snapshot/restore is not planned. The active
+1 → 2 → 3 (the perf trilogy) → 7 → 8/8b. All done, including the later
+RV64GCV 13/13 closure. Snapshot/restore is not planned. The active
 release direction is **14 → 15 → 16 → 17 → 18**: define the stable API, converge
 on `riscv-virt`, deliver measured no-firmware direct Linux boot, rebuild the
 fast guest on that platform, and finish the terminal/package integration.

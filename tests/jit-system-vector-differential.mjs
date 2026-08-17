@@ -111,6 +111,45 @@ function fractionalMemoryProgram() {
   return bytes;
 }
 
+function unitStrideFullShapeProgram() {
+  const code = [
+    U(0x17, 14, 0x2),       // x14 = RAM_BASE + 0x2000 (source)
+    U(0x17, 12, 0x3),       // x12 = RAM_BASE + 0x3004
+    I(0x13, 0, 12, 12, -20), // one vector before destination page
+    U(0x37, 13, 0x1),
+    R(0x33, 0, 0, 13, 12, 13), // x13 = end of destination page
+    I(0x13, 0, 15, 12, 0),
+    I(0x13, 0, 4, 0, 0x5a),
+    I(0x13, 0, 17, 0, 0x400),
+    CSR(0x300, 1, 0, 17),
+    0xcc08_7057,             // vsetivli zero,16,e8,m1,ta,ma
+    V(0x17, true, 0, 4, 4, 8), // vmv.v.x v8,x4; VS becomes Dirty
+    VMEM(false, 14, 8),      // initialize the fixed source vector
+    U(0x37, 31, 0x40),       // 262144 stores: 1024 page wraps
+  ];
+  const loop = code.length;
+  code.push(
+    VMEM(true, 14, 9),       // repeated same-page unit load
+    I(0x13, 0, 12, 12, 16), // resident base changes before the vector effect
+    VMEM(false, 12, 9),      // repeated same-page unit store
+    B(1, 12, 13, 8),         // keep walking until the page end
+    I(0x13, 0, 12, 15, 0),  // then exercise a new destination page
+    I(0x13, 0, 31, 31, -1),
+  );
+  code.push(B(1, 31, 0, (loop - code.length) * 4));
+  code.push(
+    CSR(0x300, 2, 24, 0),
+    U(0x37, 25, 0x40008),
+    I(0x13, 0, 26, 0, 1),
+    S(3, 25, 26, 0),
+    0x0000_006f,
+  );
+  const bytes = new Uint8Array(code.length * 4);
+  const view = new DataView(bytes.buffer);
+  code.forEach((word, index) => view.setUint32(index * 4, word, true));
+  return bytes;
+}
+
 async function run(jit, bios = program()) {
   const vm = await RV64.create(wasm);
   vm.ex.jit_set_vector_simd_profile(1);
@@ -132,6 +171,8 @@ async function run(jit, bios = program()) {
     memory: [
       vm.ex.sys_ram_u64(0x8000_2000n),
       vm.ex.sys_ram_u64(0x8000_2008n),
+      vm.ex.sys_ram_u64(0x8000_3000n),
+      vm.ex.sys_ram_u64(0x8000_3ff8n),
     ],
     jitInsns: vm.ex.jit_stat(0),
     simdInsns: vm.ex.jit_stat(152),
@@ -180,4 +221,24 @@ assert.ok(
 console.log(
   `RVV JIT SYSTEM FRACTIONAL MEMORY: PASS jit-insns=${fractionalJit.jitInsns} ` +
   `simd-insns=${fractionalJit.simdInsns} vector-modules=${fractionalJit.vectorModules}`,
+);
+
+// Exercise the deterministic full-VL/LMUL=1 unit-stride path on both stable
+// and changing destination pages. This is intentionally an ISA-shape test:
+// it does not depend on a guest PC, symbol, or fixed compiler loop body.
+const unitBios = unitStrideFullShapeProgram();
+const unitInterpreter = await run(false, unitBios);
+const unitJit = await run(true, unitBios);
+assert.ok(unitInterpreter.poweredOff);
+assert.ok(unitJit.poweredOff);
+assert.equal(unitJit.pc, unitInterpreter.pc);
+assert.deepEqual(unitJit.regs, unitInterpreter.regs);
+assert.deepEqual(unitJit.memory, unitInterpreter.memory);
+assert.equal(unitJit.memory[2], 0x5a5a_5a5a_5a5a_5a5an);
+assert.equal(unitJit.memory[3], 0x5a5a_5a5a_5a5a_5a5an);
+assert.ok(unitJit.jitInsns > 1000n, `unit test lacked generated execution: ${unitJit.jitInsns}`);
+assert.ok(unitJit.simdInsns > 1000n, `unit test lacked direct SIMD: ${unitJit.simdInsns}`);
+console.log(
+  `RVV JIT SYSTEM UNIT SHAPE: PASS jit-insns=${unitJit.jitInsns} ` +
+  `simd-insns=${unitJit.simdInsns} vector-modules=${unitJit.vectorModules}`,
 );

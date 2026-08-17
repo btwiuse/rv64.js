@@ -62,7 +62,10 @@ jobs:
             -A clippy::if-same-then-else \
             -A clippy::too-many-arguments \
             -A clippy::question-mark \
-            -A clippy::unnecessary-unwrap
+            -A clippy::unnecessary-unwrap \
+            -A clippy::manual-range-patterns \
+            -A clippy::manual-div-ceil \
+            -A clippy::unnecessary-cast
 
       - name: Build guest fixtures
         run: |
@@ -90,6 +93,7 @@ jobs:
           node tests/vs-v86/amortized-cold-cost-selftest.mjs
           node tests/http-relay.mjs
           node tests/boot-profile-selftest.mjs
+          node tests/jit-telemetry-selftest.mjs
           mkdir -p web/images/alpine
           curl --fail --location --retry 3 \
             https://rv64-release-assets.darren-e4d.workers.dev/demo-images-v3/modern-Image \

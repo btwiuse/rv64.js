@@ -158,8 +158,10 @@ fn main() {
                 stack.input(&frame);
             }
             proxy.pump(stack, egress);
-            for frame in stack.take_output() {
-                m.net_input(&frame);
+            let capacity = m.net_input_capacity();
+            for frame in stack.take_output_limit(capacity) {
+                let accepted = m.net_input(&frame);
+                debug_assert!(accepted);
             }
         }
 
@@ -169,7 +171,7 @@ fn main() {
                 r.send(&frame);
             }
             for frame in r.recv() {
-                m.net_input(&frame);
+                let _ = m.net_input(&frame);
             }
             if r.is_closed() {
                 eprintln!("\r\n[rv64-boot] net: relay closed");

@@ -23,13 +23,13 @@
 //!
 //! ## What the TCP is and is not
 //!
-//! Both endpoints live in one process, so the wire is effectively lossless and
-//! there is no congestion to control. What remains genuinely necessary: correct
-//! SYN/FIN sequencing, acknowledging exactly what arrived, and respecting the
-//! guest's advertised window. Frames *can* still be dropped — the device bounds
-//! its mailboxes, and a guest whose RX ring backs up will lose one — so unacked
-//! data is retained and retransmitted after a stall rather than assumed
-//! delivered.
+//! Both endpoints live in one process, so the wire is lossless and there is no
+//! congestion to control. What remains genuinely necessary: correct SYN/FIN
+//! sequencing, acknowledging exactly what arrived, and respecting the guest's
+//! advertised window. Host-to-NIC admission is explicit: output stays queued in
+//! this stack until the device has room for it. TCP payload is ACK-clocked, with
+//! one segment in flight per connection, so repeatedly pumping the emulator
+//! cannot manufacture retransmissions.
 
 use std::collections::VecDeque;
 
@@ -56,12 +56,6 @@ const MSS: usize = 1460;
 /// Window we advertise to the guest. Bounded because everything the guest sends
 /// is buffered in `rx` until the proxy consumes it.
 const RCV_WINDOW: u16 = 32768;
-
-/// `take_output` calls with unacked data and no progress before we retransmit.
-/// The host loop calls once per slice, so this is a handful of slices — long
-/// enough not to duplicate normal traffic, short enough that a dropped frame
-/// does not stall a transfer visibly.
-const RETRANSMIT_STALL: u32 = 8;
 
 // ---- configuration --------------------------------------------------------
 
@@ -144,14 +138,12 @@ struct Conn {
     snd_nxt: u32,
     /// Guest's advertised receive window.
     snd_wnd: u16,
-    /// Sent but unacknowledged payload, retained for retransmission.
+    /// The one sent but unacknowledged payload segment.
     unacked: Vec<u8>,
     /// Queued by the proxy, not yet sent.
     tx: VecDeque<u8>,
     /// Proxy asked to close: send FIN once `tx` drains.
     fin_pending: bool,
-    /// `take_output` calls since `snd_una` last advanced.
-    stalled: u32,
 }
 
 struct UdpFlow {
@@ -168,7 +160,7 @@ pub struct NetStack {
     conns: Vec<Conn>,
     udp: Vec<UdpFlow>,
     next_id: ConnId,
-    out: Vec<Vec<u8>>,
+    out: VecDeque<Vec<u8>>,
     events: Vec<Event>,
 }
 
@@ -180,7 +172,7 @@ impl NetStack {
             conns: Vec::new(),
             udp: Vec::new(),
             next_id: 1,
-            out: Vec::new(),
+            out: VecDeque::new(),
             events: Vec::new(),
         }
     }
@@ -200,8 +192,15 @@ impl NetStack {
 
     /// Frames to hand to the guest's NIC.
     pub fn take_output(&mut self) -> Vec<Vec<u8>> {
+        self.take_output_limit(usize::MAX)
+    }
+
+    /// Take at most `limit` frames for which the guest NIC has reserved room.
+    /// Frames beyond the limit remain owned by the stack for the next pump.
+    pub fn take_output_limit(&mut self, limit: usize) -> Vec<Vec<u8>> {
         self.pump_tx();
-        core::mem::take(&mut self.out)
+        let count = limit.min(self.out.len());
+        self.out.drain(..count).collect()
     }
 
     /// Connection events since the last call.
@@ -283,7 +282,7 @@ impl NetStack {
         out.extend_from_slice(&self.cfg.host_ip);
         out.extend_from_slice(sender_mac);
         out.extend_from_slice(sender_ip);
-        self.out.push(out);
+        self.out.push_back(out);
     }
 
     fn on_ip(&mut self, frame: &[u8]) {
@@ -449,7 +448,7 @@ impl NetStack {
         udp.extend_from_slice(&[0, 0]); // checksum optional in IPv4
         udp.extend_from_slice(&m);
         let frame = self.build_ip(BROADCAST, IP_PROTO_UDP, [255, 255, 255, 255], &udp);
-        self.out.push(frame);
+        self.out.push_back(frame);
     }
 
     // ---- TCP --------------------------------------------------------------
@@ -522,7 +521,6 @@ impl NetStack {
             unacked: Vec::new(),
             tx: VecDeque::new(),
             fin_pending: false,
-            stalled: 0,
         });
         let i = self.conns.len() - 1;
         self.emit_flags(i, TCP_SYN | TCP_ACK, iss);
@@ -548,13 +546,14 @@ impl NetStack {
         if flags & TCP_ACK != 0 {
             let c = &mut self.conns[i];
             let acked = ack.wrapping_sub(c.snd_una) as usize;
-            if acked > 0 && acked <= c.unacked.len() + 1 {
+            let control_in_flight =
+                usize::from(matches!(c.state, State::SynReceived | State::LastAck));
+            if acked > 0 && acked <= c.unacked.len() + control_in_flight {
                 // The SYN and FIN each consume a sequence number without
                 // occupying a byte of `unacked`.
                 let data_acked = acked.min(c.unacked.len());
                 c.unacked.drain(..data_acked);
                 c.snd_una = ack;
-                c.stalled = 0;
             }
             if c.state == State::SynReceived {
                 c.state = State::Established;
@@ -565,7 +564,7 @@ impl NetStack {
                     port: c.remote_port,
                 });
             }
-            if c.state == State::LastAck && c.unacked.is_empty() {
+            if c.state == State::LastAck && c.snd_una == c.snd_nxt {
                 self.conns.remove(i);
                 return;
             }
@@ -596,26 +595,23 @@ impl NetStack {
         }
     }
 
-    /// Send whatever is queued, respecting the guest's window, then FIN if the
-    /// proxy asked to close and everything has gone out.
+    /// Send one segment per connection when its predecessor has been ACKed,
+    /// respecting the guest's window. Send FIN only after all payload is ACKed.
     fn pump_tx(&mut self) {
-        let mut done = Vec::new();
         for i in 0..self.conns.len() {
             if self.conns[i].state == State::LastAck {
                 continue;
             }
-            loop {
+            let can_send = {
                 let c = &self.conns[i];
-                if c.tx.is_empty() {
-                    break;
-                }
-                // In-flight bytes must not exceed what the guest will accept.
-                let in_flight = c.snd_nxt.wrapping_sub(c.snd_una) as usize;
-                let room = (c.snd_wnd as usize).saturating_sub(in_flight);
-                if room == 0 {
-                    break;
-                }
-                let n = c.tx.len().min(MSS).min(room);
+                c.unacked.is_empty() && !c.tx.is_empty() && c.snd_wnd != 0
+            };
+            if can_send {
+                let n = self.conns[i]
+                    .tx
+                    .len()
+                    .min(MSS)
+                    .min(self.conns[i].snd_wnd as usize);
                 let chunk: Vec<u8> = self.conns[i].tx.drain(..n).collect();
                 let seq = self.conns[i].snd_nxt;
                 self.conns[i].unacked.extend_from_slice(&chunk);
@@ -623,35 +619,12 @@ impl NetStack {
                 self.emit_segment(i, TCP_PSH | TCP_ACK, seq, &chunk);
             }
             let c = &self.conns[i];
-            if c.fin_pending && c.tx.is_empty() && c.state != State::LastAck {
+            if c.fin_pending && c.tx.is_empty() && c.unacked.is_empty() {
                 let seq = c.snd_nxt;
                 self.conns[i].snd_nxt = seq.wrapping_add(1);
                 self.conns[i].state = State::LastAck;
                 self.emit_flags(i, TCP_FIN | TCP_ACK, seq);
             }
-            // Retransmit from the oldest unacked byte if the peer has stopped
-            // acknowledging: the device drops frames when a mailbox is full, so
-            // "lossless" is not quite true.
-            let c = &mut self.conns[i];
-            if !c.unacked.is_empty() {
-                c.stalled += 1;
-                if c.stalled >= RETRANSMIT_STALL {
-                    c.stalled = 0;
-                    let seq = c.snd_una;
-                    let chunk: Vec<u8> = c.unacked.iter().take(MSS).copied().collect();
-                    self.emit_segment(i, TCP_PSH | TCP_ACK, seq, &chunk);
-                }
-            }
-            if self.conns[i].state == State::LastAck && self.conns[i].unacked.is_empty() {
-                // Nothing further to deliver; the guest's ACK removes it, but a
-                // guest that never ACKs must not leak the entry forever.
-                if self.conns[i].stalled >= RETRANSMIT_STALL {
-                    done.push(i);
-                }
-            }
-        }
-        for i in done.into_iter().rev() {
-            self.conns.remove(i);
         }
     }
 
@@ -689,7 +662,7 @@ impl NetStack {
         seg[16..18].copy_from_slice(&sum.to_be_bytes());
         let dst = self.guest_mac.unwrap_or(BROADCAST);
         let frame = self.build_ip_from(dst, IP_PROTO_TCP, c.remote_ip, self.cfg.guest_ip, &seg);
-        self.out.push(frame);
+        self.out.push_back(frame);
     }
 
     /// Reset an unexpected segment, so the guest fails immediately.
@@ -706,7 +679,7 @@ impl NetStack {
         seg[16..18].copy_from_slice(&sum.to_be_bytes());
         let dst = self.guest_mac.unwrap_or(BROADCAST);
         let frame = self.build_ip(dst, IP_PROTO_TCP, src, &seg);
-        self.out.push(frame);
+        self.out.push_back(frame);
     }
 
     // ---- framing ----------------------------------------------------------
@@ -718,7 +691,7 @@ impl NetStack {
     fn emit_ip_from(&mut self, proto: u8, src_ip: [u8; 4], dst_ip: [u8; 4], payload: &[u8]) {
         let dst = self.guest_mac.unwrap_or(BROADCAST);
         let frame = self.build_ip_from(dst, proto, src_ip, dst_ip, payload);
-        self.out.push(frame);
+        self.out.push_back(frame);
     }
 
     fn build_ip(&self, dst_mac: [u8; 6], proto: u8, dst_ip: [u8; 4], payload: &[u8]) -> Vec<u8> {
@@ -1056,20 +1029,40 @@ mod tests {
     #[test]
     fn a_large_response_is_split_into_mss_segments() {
         let mut s = stack();
-        let (id, _) = handshake(&mut s, 40001, 5000);
+        let cfg = NetConfig::default();
+        let (id, our_seq) = handshake(&mut s, 40001, 5000);
         let body = vec![0x41u8; MSS * 2 + 100];
         s.send(id, &body);
-        let out = s.take_output();
-        assert_eq!(out.len(), 3, "two full segments plus a remainder");
         let mut seen = Vec::new();
-        for (i, frame) in out.iter().enumerate() {
-            let (_, _, _, payload) = parse_tcp(frame);
+        let mut next_ack = our_seq;
+        for i in 0..3 {
+            let out = s.take_output();
+            assert_eq!(out.len(), 1, "one segment is released per ACK");
+            let (_, seq, _, payload) = parse_tcp(&out[0]);
+            assert_eq!(seq, next_ack);
             if i < 2 {
                 assert_eq!(payload.len(), MSS, "segment {i} must be a full MSS");
+            } else {
+                assert_eq!(payload.len(), 100);
             }
+            next_ack = next_ack.wrapping_add(payload.len() as u32);
             seen.extend(payload);
+
+            for _ in 0..32 {
+                assert!(
+                    s.take_output().is_empty(),
+                    "host pump frequency must not duplicate unacknowledged data"
+                );
+            }
+            s.input(&ip_frame(
+                IP_PROTO_TCP,
+                cfg.guest_ip,
+                cfg.host_ip,
+                &tcp_seg(40001, 8080, 5001, next_ack, TCP_ACK, &[]),
+            ));
         }
         assert_eq!(seen, body, "stream reassembles to what was sent");
+        assert!(s.take_output().is_empty());
     }
 
     #[test]
@@ -1118,13 +1111,44 @@ mod tests {
         assert_eq!(flags, TCP_ACK);
         assert_eq!(ack, 7002, "the FIN consumes a sequence number");
 
-        // A half-close still lets us finish sending, then FIN.
+        // A half-close still lets us finish sending. FIN is ACK-clocked behind
+        // the payload so it cannot overtake data retained by the local NIC.
         s.send(id, b"trailing body");
         s.close(id);
         let out = s.take_output();
-        assert_eq!(out.len(), 2, "data then FIN");
+        assert_eq!(out.len(), 1, "only data before its ACK");
         assert_eq!(parse_tcp(&out[0]).3, b"trailing body");
-        assert_eq!(parse_tcp(&out[1]).0, TCP_FIN | TCP_ACK);
+        assert!(s.take_output().is_empty(), "FIN waits for the data ACK");
+
+        let data_end = our_seq.wrapping_add(b"trailing body".len() as u32);
+        s.input(&ip_frame(
+            IP_PROTO_TCP,
+            cfg.guest_ip,
+            cfg.host_ip,
+            &tcp_seg(40003, 8080, 7002, data_end, TCP_ACK, &[]),
+        ));
+        let out = s.take_output();
+        assert_eq!(out.len(), 1);
+        let (flags, fin_seq, _, payload) = parse_tcp(&out[0]);
+        assert_eq!(flags, TCP_FIN | TCP_ACK);
+        assert_eq!(fin_seq, data_end);
+        assert!(payload.is_empty());
+
+        // A duplicate data ACK does not acknowledge the FIN or discard state.
+        s.input(&ip_frame(
+            IP_PROTO_TCP,
+            cfg.guest_ip,
+            cfg.host_ip,
+            &tcp_seg(40003, 8080, 7002, data_end, TCP_ACK, &[]),
+        ));
+        assert_eq!(s.conns.len(), 1);
+        s.input(&ip_frame(
+            IP_PROTO_TCP,
+            cfg.guest_ip,
+            cfg.host_ip,
+            &tcp_seg(40003, 8080, 7002, data_end.wrapping_add(1), TCP_ACK, &[]),
+        ));
+        assert!(s.conns.is_empty(), "the FIN ACK closes the connection");
     }
 
     #[test]
@@ -1212,23 +1236,36 @@ mod tests {
     }
 
     #[test]
-    fn unacked_data_is_retransmitted_after_a_stall() {
+    fn repeated_pumps_do_not_retransmit_unacked_data() {
         let mut s = stack();
         let (id, _) = handshake(&mut s, 40005, 3000);
         s.send(id, b"first send");
         let first = s.take_output();
         assert_eq!(first.len(), 1);
-        // The guest never acknowledges — a frame the device dropped looks
-        // exactly like this — so the data must go out again rather than stall.
-        let mut retransmits = 0;
-        for _ in 0..RETRANSMIT_STALL + 1 {
-            for f in s.take_output() {
-                if parse_tcp(&f).3 == b"first send" {
-                    retransmits += 1;
-                }
-            }
+        assert_eq!(parse_tcp(&first[0]).3, b"first send");
+        // Emulator slices are not a clock. A tight host loop may call this
+        // thousands of times before Linux gets to its RX queue and ACKs.
+        for _ in 0..10_000 {
+            assert!(s.take_output().is_empty());
         }
-        assert!(retransmits >= 1, "expected a retransmission");
+    }
+
+    #[test]
+    fn output_beyond_nic_capacity_remains_queued() {
+        let mut s = stack();
+        let (first_id, _) = handshake(&mut s, 40007, 4000);
+        let (second_id, _) = handshake(&mut s, 40008, 5000);
+        s.send(first_id, b"first connection");
+        s.send(second_id, b"second connection");
+
+        let first = s.take_output_limit(1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(parse_tcp(&first[0]).3, b"first connection");
+
+        let second = s.take_output_limit(1);
+        assert_eq!(second.len(), 1, "the undelivered frame stays in the stack");
+        assert_eq!(parse_tcp(&second[0]).3, b"second connection");
+        assert!(s.take_output_limit(1).is_empty());
     }
 
     #[test]

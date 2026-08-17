@@ -242,6 +242,25 @@ pub enum VectorCompareOp {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VectorReductionOp {
+    And,
+    Or,
+    Xor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VectorMaskOp {
+    AndNot,
+    And,
+    Or,
+    Xor,
+    OrNot,
+    Nand,
+    Nor,
+    Xnor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VectorOperand {
     Vector(u8),
     ScalarX(u8),
@@ -254,20 +273,36 @@ pub enum VectorOperand {
 /// the authoritative fallback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VectorDirect {
+    /// Immediate vector configuration with all architectural results resolved
+    /// from the instruction encoding and this machine's fixed VLEN/ELEN.
+    ConfigImmediate {
+        destination: u8,
+        vtype: u64,
+        vl: u64,
+    },
+    /// `vsetvli x0,x0,vtype`, specialized only when a runtime guard proves
+    /// that both the old and new configurations have this full VLMAX.
+    ConfigRetainFull {
+        vtype: u64,
+        vlmax: u64,
+    },
     Lane {
         op: VectorLaneOp,
+        masked: bool,
         destination: u8,
         source2: Option<u8>,
         operand: VectorOperand,
     },
     UnitStride {
         load: bool,
+        masked: bool,
         width: u8,
         register: u8,
         base: u8,
     },
     Strided {
         load: bool,
+        masked: bool,
         width: u8,
         register: u8,
         base: u8,
@@ -309,6 +344,44 @@ pub enum VectorDirect {
         source: u8,
         index: u8,
     },
+    GatherVector {
+        destination: u8,
+        source: u8,
+        indices: u8,
+    },
+    /// Write each active element's architectural index (`vid.v`).
+    Index {
+        destination: u8,
+    },
+    /// Unmasked bitwise integer reduction into element zero of `destination`.
+    Reduction {
+        op: VectorReductionOp,
+        destination: u8,
+        source: u8,
+        seed: u8,
+    },
+    /// Boolean operation over packed architectural mask bits.
+    MaskLogic {
+        op: VectorMaskOp,
+        destination: u8,
+        source2: u8,
+        source1: u8,
+    },
+    WidenAddSub {
+        signed: bool,
+        subtract: bool,
+        wide_left: bool,
+        destination: u8,
+        source2: u8,
+        operand: VectorOperand,
+    },
+    WidenMultiplyAccumulate {
+        source2_signed: bool,
+        operand_signed: bool,
+        destination: u8,
+        source2: u8,
+        operand: VectorOperand,
+    },
     FloatSign {
         op: VectorFloatSignOp,
         destination: u8,
@@ -341,6 +414,64 @@ pub enum VectorDirect {
     },
 }
 
+fn decode_vector_lane(
+    funct6: u32,
+    destination: u8,
+    format: u32,
+    source: u8,
+    source2: u8,
+    masked: bool,
+) -> Option<VectorDirect> {
+    let (op, allowed_formats) = match funct6 {
+        0x00 => (VectorLaneOp::Add, 0b0001_1001),
+        0x02 => (VectorLaneOp::Sub, 0b0001_0001),
+        0x03 => (VectorLaneOp::ReverseSub, 0b0001_1000),
+        0x04 => (VectorLaneOp::MinUnsigned, 0b0001_0001),
+        0x05 => (VectorLaneOp::MinSigned, 0b0001_0001),
+        0x06 => (VectorLaneOp::MaxUnsigned, 0b0001_0001),
+        0x07 => (VectorLaneOp::MaxSigned, 0b0001_0001),
+        0x09 => (VectorLaneOp::And, 0b0001_1001),
+        0x0a => (VectorLaneOp::Or, 0b0001_1001),
+        0x0b => (VectorLaneOp::Xor, 0b0001_1001),
+        // vmul uses the OPMVV/OPMVX formats rather than OPIVV/OPIVX.
+        0x25 if matches!(format, 2 | 6) => (VectorLaneOp::Multiply, 0b0100_0100),
+        // Wasm SIMD shifts have one scalar shift amount. Per-lane VV shifts
+        // deliberately retain the helper fallback.
+        0x25 => (VectorLaneOp::ShiftLeft, 0b0001_1000),
+        0x28 => (VectorLaneOp::ShiftRightUnsigned, 0b0001_1000),
+        0x29 => (VectorLaneOp::ShiftRightSigned, 0b0001_1000),
+        // The vm=0 encoding in this slot is vmerge, not a masked move.
+        0x17 if !masked && source2 == 0 => (VectorLaneOp::Move, 0b0001_1001),
+        _ => return None,
+    };
+    if allowed_formats & (1 << format) == 0 {
+        return None;
+    }
+
+    let operand = match format {
+        0 | 2 => VectorOperand::Vector(source),
+        3 if matches!(
+            op,
+            VectorLaneOp::ShiftLeft
+                | VectorLaneOp::ShiftRightUnsigned
+                | VectorLaneOp::ShiftRightSigned
+        ) =>
+        {
+            VectorOperand::Immediate(source as i8)
+        }
+        3 => VectorOperand::Immediate(((source << 3) as i8) >> 3),
+        4 | 6 => VectorOperand::ScalarX(source),
+        _ => return None,
+    };
+    Some(VectorDirect::Lane {
+        op,
+        masked,
+        destination,
+        source2: (op != VectorLaneOp::Move).then_some(source2),
+        operand,
+    })
+}
+
 impl VectorDirect {
     pub fn decode(insn: u32) -> Option<Self> {
         let opcode = insn & 0x7f;
@@ -350,7 +481,36 @@ impl VectorDirect {
         let source2 = ((insn >> 20) & 0x1f) as u8;
         let unmasked = insn & (1 << 25) != 0;
 
-        if matches!(opcode, 0x07 | 0x27) && unmasked {
+        if opcode == 0x57
+            && format == 7
+            && (insn >> 30 == 0b11 || (insn >> 31 == 0 && source == 0 && destination != 0))
+        {
+            let immediate_avl = insn >> 30 == 0b11;
+            let raw_type = u64::from((insn >> 20) & if immediate_avl { 0x3ff } else { 0x7ff });
+            // vsetivli carries AVL in the rs1 field. For vsetvli rd,x0,
+            // the ratified AVL table requests VLMAX exactly.
+            let avl = if immediate_avl {
+                u64::from(source)
+            } else {
+                u64::MAX
+            };
+            let (vtype, vl) = decode_immediate_vector_config(raw_type, avl);
+            return Some(Self::ConfigImmediate {
+                destination,
+                vtype,
+                vl,
+            });
+        }
+
+        if opcode == 0x57 && format == 7 && insn >> 31 == 0 && source == 0 && destination == 0 {
+            let raw_type = u64::from((insn >> 20) & 0x7ff);
+            let (vtype, vlmax) = decode_immediate_vector_config(raw_type, u64::MAX);
+            if vtype >> 63 == 0 {
+                return Some(Self::ConfigRetainFull { vtype, vlmax });
+            }
+        }
+
+        if matches!(opcode, 0x07 | 0x27) {
             let width = match format {
                 0 => 8,
                 5 => 16,
@@ -365,6 +525,7 @@ impl VectorDirect {
             if mew == 0 && mop == 0 && aux == 0 && fields == 1 {
                 return Some(Self::UnitStride {
                     load: opcode == 0x07,
+                    masked: !unmasked,
                     width,
                     register: destination,
                     base: source,
@@ -373,13 +534,15 @@ impl VectorDirect {
             if mew == 0 && mop == 2 && fields == 1 {
                 return Some(Self::Strided {
                     load: opcode == 0x07,
+                    masked: !unmasked,
                     width,
                     register: destination,
                     base: source,
                     stride: aux as u8,
                 });
             }
-            if mew == 0
+            if unmasked
+                && mew == 0
                 && mop == 0
                 && aux == 8
                 && fields.is_power_of_two()
@@ -395,10 +558,13 @@ impl VectorDirect {
             return None;
         }
 
-        if opcode != 0x57 || !unmasked || format == 7 {
+        if opcode != 0x57 || format == 7 {
             return None;
         }
         let funct6 = insn >> 26;
+        if !unmasked {
+            return decode_vector_lane(funct6, destination, format, source, source2, true);
+        }
         if format == 1 {
             if funct6 == 0x10 && source == 0 {
                 return Some(Self::FloatScalarExtract {
@@ -487,6 +653,88 @@ impl VectorDirect {
                 index: source,
             });
         }
+        if funct6 == 0x0c && format == 0 {
+            return Some(Self::GatherVector {
+                destination,
+                source: source2,
+                indices: source,
+            });
+        }
+        if funct6 == 0x14 && format == 2 && source2 == 0 && source == 0x11 {
+            return Some(Self::Index { destination });
+        }
+        if format == 2 {
+            let op = match funct6 {
+                0x18 => Some(VectorMaskOp::AndNot),
+                0x19 => Some(VectorMaskOp::And),
+                0x1a => Some(VectorMaskOp::Or),
+                0x1b => Some(VectorMaskOp::Xor),
+                0x1c => Some(VectorMaskOp::OrNot),
+                0x1d => Some(VectorMaskOp::Nand),
+                0x1e => Some(VectorMaskOp::Nor),
+                0x1f => Some(VectorMaskOp::Xnor),
+                _ => None,
+            };
+            if let Some(op) = op {
+                return Some(Self::MaskLogic {
+                    op,
+                    destination,
+                    source2,
+                    source1: source,
+                });
+            }
+            let op = match funct6 {
+                0x01 => Some(VectorReductionOp::And),
+                0x02 => Some(VectorReductionOp::Or),
+                0x03 => Some(VectorReductionOp::Xor),
+                _ => None,
+            };
+            if let Some(op) = op {
+                return Some(Self::Reduction {
+                    op,
+                    destination,
+                    source: source2,
+                    seed: source,
+                });
+            }
+        }
+        if matches!(format, 2 | 6) && matches!(funct6, 0x30..=0x37) {
+            return Some(Self::WidenAddSub {
+                signed: funct6 & 1 != 0,
+                subtract: funct6 & 2 != 0,
+                wide_left: funct6 >= 0x34,
+                destination,
+                source2,
+                operand: if format == 2 {
+                    VectorOperand::Vector(source)
+                } else {
+                    VectorOperand::ScalarX(source)
+                },
+            });
+        }
+        if matches!(format, 2 | 6)
+            && matches!(funct6, 0x3c..=0x3f)
+            && !(funct6 == 0x3e && format == 2)
+        {
+            let (source2_signed, operand_signed) = match funct6 {
+                0x3c => (false, false),
+                0x3d => (true, true),
+                0x3e => (true, false),
+                0x3f => (false, true),
+                _ => unreachable!(),
+            };
+            return Some(Self::WidenMultiplyAccumulate {
+                source2_signed,
+                operand_signed,
+                destination,
+                source2,
+                operand: if format == 2 {
+                    VectorOperand::Vector(source)
+                } else {
+                    VectorOperand::ScalarX(source)
+                },
+            });
+        }
         let compare = match funct6 {
             0x18 => Some((VectorCompareOp::Equal, 0b0001_1001)),
             0x19 => Some((VectorCompareOp::NotEqual, 0b0001_1001)),
@@ -515,52 +763,7 @@ impl VectorDirect {
                 operand,
             });
         }
-        let (op, allowed_formats) = match funct6 {
-            0x00 => (VectorLaneOp::Add, 0b0001_1001),
-            0x02 => (VectorLaneOp::Sub, 0b0001_0001),
-            0x03 => (VectorLaneOp::ReverseSub, 0b0001_1000),
-            0x04 => (VectorLaneOp::MinUnsigned, 0b0001_0001),
-            0x05 => (VectorLaneOp::MinSigned, 0b0001_0001),
-            0x06 => (VectorLaneOp::MaxUnsigned, 0b0001_0001),
-            0x07 => (VectorLaneOp::MaxSigned, 0b0001_0001),
-            0x09 => (VectorLaneOp::And, 0b0001_1001),
-            0x0a => (VectorLaneOp::Or, 0b0001_1001),
-            0x0b => (VectorLaneOp::Xor, 0b0001_1001),
-            // vmul uses the OPMVV/OPMVX formats rather than OPIVV/OPIVX.
-            0x25 if matches!(format, 2 | 6) => (VectorLaneOp::Multiply, 0b0100_0100),
-            // Wasm SIMD shifts have one scalar shift amount. Per-lane VV
-            // shifts deliberately retain the helper fallback.
-            0x25 => (VectorLaneOp::ShiftLeft, 0b0001_1000),
-            0x28 => (VectorLaneOp::ShiftRightUnsigned, 0b0001_1000),
-            0x29 => (VectorLaneOp::ShiftRightSigned, 0b0001_1000),
-            0x17 if source2 == 0 => (VectorLaneOp::Move, 0b0001_1001),
-            _ => return None,
-        };
-        if allowed_formats & (1 << format) == 0 {
-            return None;
-        }
-
-        let operand = match format {
-            0 | 2 => VectorOperand::Vector(source),
-            3 if matches!(
-                op,
-                VectorLaneOp::ShiftLeft
-                    | VectorLaneOp::ShiftRightUnsigned
-                    | VectorLaneOp::ShiftRightSigned
-            ) =>
-            {
-                VectorOperand::Immediate(source as i8)
-            }
-            3 => VectorOperand::Immediate(((source << 3) as i8) >> 3),
-            4 | 6 => VectorOperand::ScalarX(source),
-            _ => return None,
-        };
-        Some(Self::Lane {
-            op,
-            destination,
-            source2: (op != VectorLaneOp::Move).then_some(source2),
-            operand,
-        })
+        decode_vector_lane(funct6, destination, format, source, source2, false)
     }
 
     pub const fn uses_memory(self) -> bool {
@@ -569,6 +772,37 @@ impl VectorDirect {
             Self::UnitStride { .. } | Self::Strided { .. } | Self::WholeRegisterMemory { .. }
         )
     }
+}
+
+fn decode_immediate_vector_config(raw_type: u64, avl: u64) -> (u64, u64) {
+    const VILL: u64 = 1 << 63;
+    if raw_type >> 8 != 0 {
+        return (VILL, 0);
+    }
+    let lmul_exp = match raw_type & 7 {
+        0 => 0i32,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        5 => -3,
+        6 => -2,
+        7 => -1,
+        _ => return (VILL, 0),
+    };
+    let vsew = i32::try_from((raw_type >> 3) & 7).expect("three-bit vsew");
+    if vsew > 3 {
+        return (VILL, 0);
+    }
+    let sew_log = 3 + vsew;
+    if sew_log > 6 + lmul_exp {
+        return (VILL, 0);
+    }
+    let vlmax_log = 7 + lmul_exp - sew_log;
+    if vlmax_log < 0 {
+        return (VILL, 0);
+    }
+    let vlmax = 1u64 << vlmax_log;
+    (raw_type & 0xff, avl.min(vlmax))
 }
 
 impl SideExit {
@@ -653,6 +887,10 @@ pub enum Effect {
         dirty: bool,
         exit: SideExit,
     },
+    /// Full-system vector availability check at an exact architectural
+    /// boundary. Read-only vector CSR lowering uses this without dirtying VS;
+    /// ordinary vector instructions retain the complete `Vector` effect below.
+    VectorState { position: usize, exit: SideExit },
     /// One complete architectural RVV instruction. The backend publishes the
     /// pre-instruction scalar state, calls the concrete machine's typed vector
     /// helper, and invalidates cached x/f/fcsr values on success.
@@ -1100,7 +1338,7 @@ impl Region {
                     }
                     validate_side_exit(exit, &ty, *position)?;
                 }
-                Effect::FpState { position, exit, .. } => {
+                Effect::FpState { position, exit, .. } | Effect::VectorState { position, exit } => {
                     if *position > self.values.len() {
                         return Err(ValidationError("invalid FP-state effect".into()));
                     }
@@ -1156,7 +1394,7 @@ impl Region {
                     work.push(*target);
                     exit.for_each_value(|value| work.push(value));
                 }
-                Effect::FpState { exit, .. } => {
+                Effect::FpState { exit, .. } | Effect::VectorState { exit, .. } => {
                     exit.for_each_value(|value| work.push(value));
                 }
                 Effect::Vector { exit, .. } => {
@@ -1227,7 +1465,7 @@ impl Region {
                     *target = map[target.0].expect("indirect guard target is live");
                     *exit = exit.remap(&map);
                 }
-                Effect::FpState { position, exit, .. } => {
+                Effect::FpState { position, exit, .. } | Effect::VectorState { position, exit } => {
                     *position = live_prefix[*position];
                     *exit = exit.remap(&map);
                 }
@@ -1298,7 +1536,7 @@ impl Region {
                     counts[target.0] += 1;
                     exit.for_each_value(|output| counts[output.0] += 1);
                 }
-                Effect::FpState { exit, .. } => {
+                Effect::FpState { exit, .. } | Effect::VectorState { exit, .. } => {
                     exit.for_each_value(|output| counts[output.0] += 1);
                 }
                 Effect::Vector { exit, .. } => {
@@ -1891,6 +2129,13 @@ impl Builder {
         });
     }
 
+    pub fn vector_state(&mut self, guest_pc: u64, retired: u32) {
+        self.effects.push(Effect::VectorState {
+            position: self.values.len(),
+            exit: self.side_exit(guest_pc, retired),
+        });
+    }
+
     /// Insert a complete RVV architectural effect and begin a new scalar SSA
     /// epoch. The helper may write any integer/FP register or fcsr, so no
     /// forwarded value is valid after this boundary.
@@ -1997,12 +2242,22 @@ mod tests {
             VectorDirect::decode(vadd),
             Some(VectorDirect::Lane {
                 op: VectorLaneOp::Add,
+                masked: false,
                 destination: 16,
                 source2: Some(8),
                 operand: VectorOperand::Vector(12),
             })
         );
-        assert!(VectorDirect::decode(vadd & !(1 << 25)).is_none());
+        assert_eq!(
+            VectorDirect::decode(vadd & !(1 << 25)),
+            Some(VectorDirect::Lane {
+                op: VectorLaneOp::Add,
+                masked: true,
+                destination: 16,
+                source2: Some(8),
+                operand: VectorOperand::Vector(12),
+            })
+        );
 
         // Wasm shifts accept one scalar count, so the vector-count form stays
         // on the exact helper while immediate and scalar forms are candidates.
@@ -2037,18 +2292,29 @@ mod tests {
             VectorDirect::decode(vle32),
             Some(VectorDirect::UnitStride {
                 load: true,
+                masked: false,
                 width: 32,
                 register: 16,
                 base: 10,
             })
         );
         assert!(VectorDirect::decode(vle32 | (1 << 20)).is_none());
-        assert!(VectorDirect::decode(vle32 & !(1 << 25)).is_none());
+        assert_eq!(
+            VectorDirect::decode(vle32 & !(1 << 25)),
+            Some(VectorDirect::UnitStride {
+                load: true,
+                masked: true,
+                width: 32,
+                register: 16,
+                base: 10,
+            })
+        );
         let vlse32 = vle32 | (2 << 26) | (13 << 20);
         assert_eq!(
             VectorDirect::decode(vlse32),
             Some(VectorDirect::Strided {
                 load: true,
+                masked: false,
                 width: 32,
                 register: 16,
                 base: 10,
@@ -2142,6 +2408,50 @@ mod tests {
             })
         );
         assert_eq!(
+            VectorDirect::decode(vector_encoding(0x0c, true, 8, 12, 0, 16)),
+            Some(VectorDirect::GatherVector {
+                destination: 16,
+                source: 8,
+                indices: 12,
+            })
+        );
+        assert_eq!(
+            VectorDirect::decode(vector_encoding(0x14, true, 0, 0x11, 2, 16)),
+            Some(VectorDirect::Index { destination: 16 })
+        );
+        assert!(VectorDirect::decode(vector_encoding(0x14, false, 0, 0x11, 2, 16)).is_none());
+        assert_eq!(
+            VectorDirect::decode(vector_encoding(0x02, true, 8, 12, 2, 16)),
+            Some(VectorDirect::Reduction {
+                op: VectorReductionOp::Or,
+                destination: 16,
+                source: 8,
+                seed: 12,
+            })
+        );
+        assert!(VectorDirect::decode(vector_encoding(0x02, false, 8, 12, 2, 16)).is_none());
+        assert_eq!(
+            VectorDirect::decode(vector_encoding(0x30, true, 9, 8, 2, 11)),
+            Some(VectorDirect::WidenAddSub {
+                signed: false,
+                subtract: false,
+                wide_left: false,
+                destination: 11,
+                source2: 9,
+                operand: VectorOperand::Vector(8),
+            })
+        );
+        assert_eq!(
+            VectorDirect::decode(vector_encoding(0x3c, true, 8, 29, 6, 11)),
+            Some(VectorDirect::WidenMultiplyAccumulate {
+                source2_signed: false,
+                operand_signed: false,
+                destination: 11,
+                source2: 8,
+                operand: VectorOperand::ScalarX(29),
+            })
+        );
+        assert_eq!(
             VectorDirect::decode(vector_encoding(0x09, true, 8, 12, 1, 16)),
             Some(VectorDirect::FloatSign {
                 op: VectorFloatSignOp::Negate,
@@ -2192,8 +2502,33 @@ mod tests {
         );
         assert!(VectorDirect::decode(vector_encoding(0x1a, true, 8, 7, 3, 0)).is_none());
 
-        // Configuration and FP operations never masquerade as integer SIMD.
-        assert!(VectorDirect::decode(0xcc08_7057).is_none());
+        // Immediate configuration has an architecture-defined direct result;
+        // FP arithmetic still never masquerades as integer SIMD.
+        assert_eq!(
+            VectorDirect::decode(0xcc08_7057),
+            Some(VectorDirect::ConfigImmediate {
+                destination: 0,
+                vtype: 0xc0,
+                vl: 16,
+            })
+        );
+        assert_eq!(
+            VectorDirect::decode(0x0da0_7557),
+            Some(VectorDirect::ConfigImmediate {
+                destination: 10,
+                vtype: 0xda,
+                vl: 8,
+            })
+        );
+        // The retain-vl form is a candidate only for a full-VLMAX runtime
+        // guard; its cold mismatched/partial cases remain with the helper.
+        assert_eq!(
+            VectorDirect::decode(0x0c80_7057),
+            Some(VectorDirect::ConfigRetainFull {
+                vtype: 0xc8,
+                vlmax: 8,
+            })
+        );
         assert!(VectorDirect::decode(vector_encoding(0x00, true, 8, 12, 1, 16)).is_none());
     }
 

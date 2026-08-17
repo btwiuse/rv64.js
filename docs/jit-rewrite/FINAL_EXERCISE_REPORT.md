@@ -6,7 +6,7 @@
 > Boot JIT-lifecycle objective. Its statements that no more work was authorized,
 > that the rewrite was uncommitted, and that Boot remained a loss are not the
 > current repository status. See
-> [BOOT_JIT_PARITY_RESULT.md](BOOT_JIT_PARITY_RESULT.md) and
+> [RV64GCV_JIT_13_OF_13_RESULT.md](RV64GCV_JIT_13_OF_13_RESULT.md) and
 > [STATUS.md](STATUS.md) for the current result. The chronology below is
 > intentionally preserved rather than rewritten.
 

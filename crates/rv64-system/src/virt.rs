@@ -660,7 +660,7 @@ impl VirtMachine {
         if let Some(mac) = images.net {
             virtio.push(VirtioDev::new(Backend::Net {
                 mac,
-                inbox: Vec::new(),
+                inbox: Default::default(),
                 outbox: Vec::new(),
             }));
         }
@@ -747,10 +747,21 @@ impl VirtMachine {
     /// Deliver an inbound Ethernet frame to the guest's NIC. `poll_virtio`
     /// already runs every slice here, so it lands as soon as the guest has a
     /// buffer posted.
-    pub fn net_input(&mut self, frame: &[u8]) {
-        if let Some(dev) = self.bus.virtio.iter_mut().find(|d| d.device_id() == 1) {
-            dev.net_input(frame);
-        }
+    pub fn net_input(&mut self, frame: &[u8]) -> bool {
+        self.bus
+            .virtio
+            .iter_mut()
+            .find(|d| d.device_id() == 1)
+            .is_some_and(|dev| dev.net_input(frame))
+    }
+
+    /// Number of inbound frames that can be admitted without loss.
+    pub fn net_input_capacity(&self) -> usize {
+        self.bus
+            .virtio
+            .iter()
+            .find(|d| d.device_id() == 1)
+            .map_or(0, VirtioDev::net_input_capacity)
     }
 
     /// Collect the Ethernet frames the guest has transmitted.
@@ -1696,7 +1707,7 @@ mod tests {
             pc: u64::MAX,
             payload: 0,
         }; 8];
-        lines[((target >> 1) as usize) & (lines.len() - 1)].pc = target;
+        lines[rv64_core::cpu::compiled_entry_slot(target, lines.len() - 1)].pc = target;
         let compiled = unsafe {
             CompiledEntryMap::from_strided_pc_tags(
                 lines.as_ptr().cast::<u64>(),
@@ -1734,7 +1745,7 @@ mod tests {
             pc: u64::MAX,
             payload: 0,
         }; 8];
-        lines[((target >> 1) as usize) & (lines.len() - 1)].pc = target;
+        lines[rv64_core::cpu::compiled_entry_slot(target, lines.len() - 1)].pc = target;
         let compiled = unsafe {
             CompiledEntryMap::from_strided_pc_tags(
                 lines.as_ptr().cast::<u64>(),

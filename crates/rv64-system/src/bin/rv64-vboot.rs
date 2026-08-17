@@ -233,11 +233,13 @@ fn main() {
                 stack.input(&frame);
             }
             proxy.pump(stack, egress);
-            for frame in stack.take_output() {
+            let capacity = m.net_input_capacity();
+            for frame in stack.take_output_limit(capacity) {
                 if net_trace {
                     eprintln!("[vboot] net proxy->guest {}", describe_frame(&frame));
                 }
-                m.net_input(&frame);
+                let accepted = m.net_input(&frame);
+                debug_assert!(accepted);
             }
         }
         // Pump the relay both ways once per slice.
@@ -246,7 +248,7 @@ fn main() {
                 r.send(&frame);
             }
             for frame in r.recv() {
-                m.net_input(&frame);
+                let _ = m.net_input(&frame);
             }
             if r.is_closed() {
                 eprintln!("\r\n[vboot] net: relay closed");

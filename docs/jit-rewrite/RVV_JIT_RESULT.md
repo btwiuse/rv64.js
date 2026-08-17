@@ -2,8 +2,26 @@
 
 Date: 2026-08-13 America/Phoenix
 
-Disposition: direct lowering promoted; correctness and scalar-regression gates
-pass; cross-ISA parity remains open
+Disposition: historical direct-lowering milestone; superseded by the final
+13/13 cross-ISA result
+
+> **2026-08-16 final postscript.** Later architecture-general RVV coverage and
+> generic dispatch-progress corrections complete the frozen RV64GCV objective
+> at **13/13** and pass the protected WANIX browser Shell gate. The exact same
+> release Wasm also retains 13/13 on the scalar scorecard and passes the strict
+> release matrix without skips. See
+> [RV64GCV_JIT_13_OF_13_RESULT.md](RV64GCV_JIT_13_OF_13_RESULT.md) for the
+> superseding measurements, artifact identities, invalid-run ledger, and
+> mechanism audit.
+
+> **2026-08-14 final postscript.** The later architecture-general RVV,
+> lifecycle, state, and structured-memory work reaches the owner-selected
+> **12/13** RV64GCV milestone: ten wins, two matches, and only String Sort
+> behind pinned copy/v86. The scalar population is 13/13, WANIX and cold Boot
+> meet their standing product gates, and the complete strict release matrix
+> passes. See
+> [RV64GCV_JIT_12_OF_13_RESULT.md](RV64GCV_JIT_12_OF_13_RESULT.md) for the
+> superseding scorecards, exact artifact identities, and correctness record.
 
 > **2026-08-14 postscript.** A later architecture-general Tier-0/JIT lifecycle
 > change moved scalar and RV64GCV Boot from LOSS to MATCH against copy/v86 and

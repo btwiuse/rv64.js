@@ -43,7 +43,7 @@ pub enum Backend {
     Net {
         mac: [u8; 6],
         /// Frames from the host, awaiting an RX buffer from the guest.
-        inbox: Vec<Vec<u8>>,
+        inbox: VecDeque<Vec<u8>>,
         /// Frames the guest has sent, awaiting collection by the host.
         outbox: Vec<Vec<u8>>,
     },
@@ -342,14 +342,23 @@ impl VirtioDev {
         }
     }
 
-    /// Queue a frame from the host for delivery to the guest. Dropped if the
-    /// guest is not draining — the same thing a real NIC does when its ring
-    /// backs up.
-    pub fn net_input(&mut self, frame: &[u8]) {
+    /// Queue a frame from the host for delivery to the guest. Returns false
+    /// without consuming ownership when the bounded inbox has no room.
+    pub fn net_input(&mut self, frame: &[u8]) -> bool {
         if let Backend::Net { inbox, .. } = &mut self.backend {
             if frame.len() <= NET_MAX_FRAME && inbox.len() < NET_QUEUE_LIMIT {
-                inbox.push(frame.to_vec());
+                inbox.push_back(frame.to_vec());
+                return true;
             }
+        }
+        false
+    }
+
+    /// Number of frames the host can admit without dropping any.
+    pub fn net_input_capacity(&self) -> usize {
+        match &self.backend {
+            Backend::Net { inbox, .. } => NET_QUEUE_LIMIT.saturating_sub(inbox.len()),
+            _ => 0,
         }
     }
 
@@ -630,7 +639,7 @@ impl VirtioDev {
                     if inbox.is_empty() {
                         return ServiceResult::Blocked;
                     }
-                    let frame = &inbox[0];
+                    let frame = inbox.front().expect("checked non-empty inbox");
                     let need = NET_HDR_LEN + frame.len();
                     let capacity: usize = chain
                         .iter()
@@ -640,7 +649,7 @@ impl VirtioDev {
                     if capacity < need {
                         // The frame cannot fit the buffer the guest offered.
                         // Drop it: keeping it would wedge the queue forever.
-                        inbox.remove(0);
+                        inbox.pop_front();
                         return ServiceResult::Blocked;
                     }
                     let mut hdr = [0u8; NET_HDR_LEN];
@@ -660,7 +669,7 @@ impl VirtioDev {
                         }
                         written += n;
                     }
-                    inbox.remove(0);
+                    inbox.pop_front();
                     ServiceResult::Complete(written as u32)
                 } else {
                     // TX: reassemble the frame from the readable descriptors and
@@ -1204,7 +1213,7 @@ mod tests {
     fn net_device() -> (VirtioDev, Vec<u8>) {
         let dev = VirtioDev::new(Backend::Net {
             mac: TEST_MAC,
-            inbox: Vec::new(),
+            inbox: Default::default(),
             outbox: Vec::new(),
         });
         (dev, vec![0u8; 64 * 1024])
@@ -1279,7 +1288,7 @@ mod tests {
         setup_ring(&mut dev, 0, &RING0);
 
         let frame: Vec<u8> = (0..74u8).map(|i| i.wrapping_mul(3)).collect();
-        dev.net_input(&frame);
+        assert!(dev.net_input(&frame));
         assert!(dev.net_rx_pending());
 
         put_desc_in(&mut ram, &RING0, 0, RXBUF, 2048, 2 /* WRITE */, 0);
@@ -1313,7 +1322,7 @@ mod tests {
         assert_eq!(u16_at(&ram, RING0.used + 2), 0);
         assert!(!dev.irq_pending());
         // It is still there when a frame turns up.
-        dev.net_input(b"late frame");
+        assert!(dev.net_input(b"late frame"));
         dev.process(0, &mut ram, BASE);
         assert_eq!(u16_at(&ram, RING0.used + 2), 1);
     }
@@ -1322,7 +1331,7 @@ mod tests {
     fn an_undersized_rx_buffer_drops_the_frame_instead_of_wedging() {
         let (mut dev, mut ram) = net_device();
         setup_ring(&mut dev, 0, &RING0);
-        dev.net_input(&vec![7u8; 1500]);
+        assert!(dev.net_input(&vec![7u8; 1500]));
         put_desc_in(&mut ram, &RING0, 0, RXBUF, 64, 2, 0);
         publish(&mut ram, &RING0, 0, 1);
         dev.process(0, &mut ram, BASE);
@@ -1336,8 +1345,12 @@ mod tests {
         let (mut dev, mut ram) = net_device();
         setup_ring(&mut dev, 1, &RING1);
         // A guest that never posts RX buffers must not grow host memory.
-        for _ in 0..NET_QUEUE_LIMIT + 50 {
-            dev.net_input(b"flood");
+        for _ in 0..NET_QUEUE_LIMIT {
+            assert!(dev.net_input(b"flood"));
+        }
+        assert_eq!(dev.net_input_capacity(), 0);
+        for _ in 0..50 {
+            assert!(!dev.net_input(b"flood"));
         }
         let Backend::Net { inbox, .. } = &dev.backend else {
             unreachable!()
@@ -1356,9 +1369,9 @@ mod tests {
     #[test]
     fn an_over_long_frame_is_refused() {
         let (mut dev, _) = net_device();
-        dev.net_input(&vec![0u8; NET_MAX_FRAME + 1]);
+        assert!(!dev.net_input(&vec![0u8; NET_MAX_FRAME + 1]));
         assert!(!dev.net_rx_pending(), "frame larger than NET_MAX_FRAME");
-        dev.net_input(&vec![0u8; NET_MAX_FRAME]);
+        assert!(dev.net_input(&vec![0u8; NET_MAX_FRAME]));
         assert!(dev.net_rx_pending(), "a frame at the limit is accepted");
     }
 }

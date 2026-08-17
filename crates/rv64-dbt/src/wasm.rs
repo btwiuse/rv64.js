@@ -8,7 +8,7 @@
 use crate::ir::{
     BinaryOp, DivideOp, Effect, ExactFpOp, LoadKind, Op, Region, ReservationOp, SideExit,
     StoreKind, ValueData, ValueId, ValueType, VectorCompareOp, VectorDirect, VectorFloatSignOp,
-    VectorLaneOp, VectorOperand,
+    VectorLaneOp, VectorMaskOp, VectorOperand, VectorReductionOp,
 };
 use crate::lift::LoopBackedge;
 use crate::structure::{self, Structure};
@@ -189,6 +189,7 @@ struct MemoryTemps {
     store_cache: Option<TranslationCacheTemps>,
     copy: Option<DenseCopyTemps>,
     bulk_copy: Option<BulkCopyTemps>,
+    member_range: Option<MemberRangeTemps>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -212,6 +213,13 @@ struct BulkCopyTemps {
     result: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MemberRangeTemps {
+    start: u32,
+    load_linear: u32,
+    store_linear: u32,
+}
+
 /// Shared temporaries for direct RVV-to-Wasm-SIMD lowering. One set is reused
 /// by every mutually-exclusive member in a generated function.
 #[derive(Clone, Copy, Debug)]
@@ -222,11 +230,16 @@ struct VectorTemps {
     chunk: u32,
     splat: u32,
     result: u32,
+    mask: u32,
     address: u32,
     stride: u32,
     last: u32,
+    element: u32,
     index: u32,
     linear: u32,
+    linear2: u32,
+    context: Option<u32>,
+    unit_lmul1_sew: Option<u32>,
 }
 
 /// Internal-only completion code. Runtime helpers return 0/1/2; direct SIMD
@@ -236,6 +249,102 @@ const VECTOR_STATUS_DIRECT: i32 = 3;
 /// Direct SIMD completed and wrote canonical scalar state. Cached modules must
 /// reload their scalar/FP union just as they do after the opaque helper.
 const VECTOR_STATUS_DIRECT_SCALAR: i32 = 4;
+
+/// An exact architectural vector configuration established by a preceding
+/// immediate configuration instruction in the same straight-line region.
+/// Keeping this fact in the emitter lets later integer RVV instructions omit
+/// repeated vtype/vl/vstart decoding without making any assumption about the
+/// guest binary or its control-flow address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KnownVectorConfig {
+    vtype: u64,
+    vl: u64,
+    vsew: u8,
+    lmul_exp: i8,
+    fractional_lmul: bool,
+    span: u8,
+    group_bytes: u8,
+    vlmax: u64,
+}
+
+/// Exact register-group shape for a vector memory operation. Its effective
+/// LMUL is `LMUL * EEW / SEW`, so mixed-width loads and stores can have a
+/// different group shape from the current arithmetic configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KnownVectorMemoryConfig {
+    fractional_lmul: bool,
+    span: u8,
+    group_bytes: u8,
+}
+
+impl KnownVectorConfig {
+    fn decode(vtype: u64, vl: u64) -> Option<Self> {
+        if vtype >> 8 != 0 {
+            return None;
+        }
+        let lmul_exp = match vtype & 7 {
+            0 => 0i8,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            5 => -3,
+            6 => -2,
+            7 => -1,
+            _ => return None,
+        };
+        let vsew = ((vtype >> 3) & 7) as u8;
+        if vsew > 3 || 3 + i16::from(vsew) > 6 + i16::from(lmul_exp) {
+            return None;
+        }
+        let vlmax_log = 4 + i16::from(lmul_exp) - i16::from(vsew);
+        if vlmax_log < 0 {
+            return None;
+        }
+        let vlmax = 1u64 << vlmax_log;
+        if vl > vlmax {
+            return None;
+        }
+        let (fractional_lmul, span, group_bytes) = if lmul_exp < 0 {
+            (true, 1, 16u8 >> (-lmul_exp as u32))
+        } else {
+            (false, 1u8 << (lmul_exp as u32), 16u8 << (lmul_exp as u32))
+        };
+        Some(Self {
+            vtype,
+            vl,
+            vsew,
+            lmul_exp,
+            fractional_lmul,
+            span,
+            group_bytes,
+            vlmax,
+        })
+    }
+
+    fn memory_config(self, width: u8) -> Option<KnownVectorMemoryConfig> {
+        let eew_exp = match width {
+            8 => 0i8,
+            16 => 1,
+            32 => 2,
+            64 => 3,
+            _ => return None,
+        };
+        let emul_exp = self.lmul_exp + eew_exp - self.vsew as i8;
+        if !(-3..=3).contains(&emul_exp) {
+            return None;
+        }
+        let (fractional_lmul, span, group_bytes) = if emul_exp < 0 {
+            (true, 1, 16u8 >> (-emul_exp as u32))
+        } else {
+            (false, 1u8 << (emul_exp as u32), 16u8 << (emul_exp as u32))
+        };
+        Some(KnownVectorMemoryConfig {
+            fractional_lmul,
+            span,
+            group_bytes,
+        })
+    }
+}
 
 // RV64C's architecture-defined compact register bank, plus the dedicated
 // return-address and stack-pointer registers used by compressed control/stack
@@ -285,6 +394,19 @@ fn region_has_direct_vector(region: &Region, layout: JitLayout) -> bool {
                 effect,
                 Effect::Vector {
                     direct: Some(_),
+                    ..
+                }
+            )
+        })
+}
+
+fn region_has_unmasked_unit_stride(region: &Region, layout: JitLayout) -> bool {
+    layout.vector_state.is_some()
+        && region.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Vector {
+                    direct: Some(VectorDirect::UnitStride { masked: false, .. }),
                     ..
                 }
             )
@@ -527,6 +649,149 @@ fn address_root_offset(region: &Region, value: ValueId) -> (ValueId, i64) {
         }
         _ => (value, 0),
     }
+}
+
+const MEMBER_RANGE_MIN_ACCESSES: usize = 3;
+
+/// One architecture-level bounds-check-elimination opportunity. Every covered
+/// ordinary access is `ReadX(root_reg) + constant`, and the complete static
+/// span fits one system page. Runtime permission rows still prove the actual
+/// page before the direct body can run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MemberRangePlan {
+    root: ValueId,
+    min_offset: i64,
+    span: u64,
+    loads: usize,
+    stores: usize,
+}
+
+impl MemberRangePlan {
+    fn direct_offset(self, region: &Region, address: ValueId) -> Option<u64> {
+        let (root, offset) = address_root_offset(region, address);
+        if root != self.root {
+            return None;
+        }
+        u64::try_from(offset.checked_sub(self.min_offset)?).ok()
+    }
+
+    fn root_reg(self, region: &Region) -> Option<u8> {
+        match region.values.get(self.root.0)?.op {
+            Op::ReadX(reg) => Some(reg),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MemberRangeGroup {
+    root: ValueId,
+    min_offset: i64,
+    max_end: i64,
+    loads: usize,
+    stores: usize,
+}
+
+impl MemberRangeGroup {
+    fn accesses(self) -> usize {
+        self.loads + self.stores
+    }
+}
+
+fn extend_member_range_group(
+    groups: &mut Vec<MemberRangeGroup>,
+    region: &Region,
+    address: ValueId,
+    bytes: u64,
+    store: bool,
+) {
+    let (root, offset) = address_root_offset(region, address);
+    if !matches!(
+        region.values.get(root.0).map(|value| &value.op),
+        Some(Op::ReadX(_))
+    ) {
+        return;
+    }
+    let Ok(bytes) = i64::try_from(bytes) else {
+        return;
+    };
+    let Some(end) = offset.checked_add(bytes) else {
+        return;
+    };
+    if let Some(group) = groups.iter_mut().find(|group| group.root == root) {
+        group.min_offset = group.min_offset.min(offset);
+        group.max_end = group.max_end.max(end);
+        if store {
+            group.stores += 1;
+        } else {
+            group.loads += 1;
+        }
+    } else {
+        groups.push(MemberRangeGroup {
+            root,
+            min_offset: offset,
+            max_end: end,
+            loads: usize::from(!store),
+            stores: usize::from(store),
+        });
+    }
+}
+
+fn member_range_plan(region: &Region) -> Option<MemberRangePlan> {
+    let mut groups = Vec::new();
+    for value in &region.values {
+        if let Op::Load { address, kind, .. } = value.op {
+            extend_member_range_group(&mut groups, region, address, kind.bytes(), false);
+        }
+    }
+    for effect in &region.effects {
+        if let Effect::Store {
+            address,
+            kind,
+            condition: None,
+            ..
+        } = effect
+        {
+            extend_member_range_group(&mut groups, region, *address, kind.bytes(), true);
+        }
+    }
+    groups.sort_unstable_by(|left, right| {
+        right
+            .accesses()
+            .cmp(&left.accesses())
+            .then_with(|| left.root.cmp(&right.root))
+    });
+    let group = groups.into_iter().next()?;
+    if group.accesses() < MEMBER_RANGE_MIN_ACCESSES {
+        return None;
+    }
+    let span = u64::try_from(group.max_end.checked_sub(group.min_offset)?).ok()?;
+    if span == 0 || span > 4096 {
+        return None;
+    }
+    Some(MemberRangePlan {
+        root: group.root,
+        min_offset: group.min_offset,
+        span,
+        loads: group.loads,
+        stores: group.stores,
+    })
+}
+
+fn outlined_member_range_plan(region: &Region, layout: JitLayout) -> Option<MemberRangePlan> {
+    let memory = layout.sys?;
+    // Existing dense-range and whole-copy paths already hoist or batch their
+    // translations. Replacing them would discard a stronger lowering.
+    let minimum = usize::from(memory.cache_min_accesses.max(1));
+    if bulk_copy_loop_plan(region).is_some()
+        || dense_copy_plan(region, minimum).is_some()
+        || dense_store_plan(region, minimum).is_some()
+    {
+        return None;
+    }
+    let plan = member_range_plan(region)?;
+    let page_bytes = 1u64.checked_shl(u32::from(memory.page_shift))?;
+    (plan.span <= page_bytes).then_some(plan)
 }
 
 /// Recognize a straight-line, same-width unrolled copy. Translation and
@@ -922,6 +1187,9 @@ fn memory_temps_for_region(
     if bulk_copy_loop_plan(region).is_none() {
         temps.bulk_copy = None;
     }
+    if outlined_member_range_plan(region, layout).is_none() {
+        temps.member_range = None;
+    }
     if !copy && !store {
         temps.load_cache = None;
         temps.store_cache = None;
@@ -973,23 +1241,159 @@ fn allocate_memory_temps(
         store_cache,
         copy,
         bulk_copy,
+        member_range: None,
     })
 }
 
-fn allocate_vector_temps(local_types: &mut Vec<ValType>, enabled: bool) -> Option<VectorTemps> {
-    enabled.then(|| VectorTemps {
+fn allocate_vector_temps(
+    local_types: &mut Vec<ValType>,
+    enabled: bool,
+    unit_stride: bool,
+    shared_context: Option<u32>,
+    system: bool,
+) -> Option<VectorTemps> {
+    if !enabled {
+        return None;
+    }
+    let context =
+        system.then(|| shared_context.unwrap_or_else(|| alloc_local(local_types, ValType::I64)));
+    let unit_lmul1_sew = unit_stride.then(|| alloc_local(local_types, ValType::I32));
+    Some(VectorTemps {
         vtype: alloc_local(local_types, ValType::I64),
         group_bytes: alloc_local(local_types, ValType::I32),
         span: alloc_local(local_types, ValType::I32),
         chunk: alloc_local(local_types, ValType::I32),
         splat: alloc_local(local_types, ValType::V128),
         result: alloc_local(local_types, ValType::V128),
+        mask: alloc_local(local_types, ValType::V128),
         address: alloc_local(local_types, ValType::I64),
         stride: alloc_local(local_types, ValType::I64),
         last: alloc_local(local_types, ValType::I64),
+        element: alloc_local(local_types, ValType::I64),
         index: alloc_local(local_types, ValType::I32),
         linear: alloc_local(local_types, ValType::I32),
+        linear2: alloc_local(local_types, ValType::I32),
+        context,
+        unit_lmul1_sew,
     })
+}
+
+/// Snapshot the effective system translation context for vector-only modules.
+/// Modules that also lower scalar memory reuse `MemoryTemps::context`, which
+/// `emit_memory_context_init` has already initialized.
+fn emit_vector_memory_context_init(
+    function: &mut Function,
+    layout: JitLayout,
+    temps: Option<VectorTemps>,
+    memory_temps: Option<MemoryTemps>,
+) {
+    if memory_temps.is_some() {
+        return;
+    }
+    let (Some(memory), Some(context)) = (layout.sys, temps.and_then(|temps| temps.context)) else {
+        return;
+    };
+    function.instruction(&Instruction::I32Const(memory.context_addr as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::LocalSet(context));
+}
+
+/// Record `SEW + 1` when the live state describes a legal, full-VL, LMUL=1
+/// vector group whose system VS field is already dirty. Zero selects the
+/// general lowering. VLEN is 128 bits, so this state maps one architectural
+/// vector register exactly to one Wasm v128. Requiring dirty state lets a
+/// matching direct operation omit both the repeated enabled check and the
+/// otherwise redundant mstatus read/modify/write.
+fn emit_vector_unit_lmul1_refresh(
+    function: &mut Function,
+    layout: JitLayout,
+    temps: Option<VectorTemps>,
+) {
+    let Some((temps, active, state)) = temps
+        .zip(temps.and_then(|temps| temps.unit_lmul1_sew))
+        .zip(layout.vector_state)
+        .map(|((temps, active), state)| (temps, active, state))
+    else {
+        return;
+    };
+
+    function.instruction(&Instruction::I32Const(state.vtype_addr as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::LocalSet(temps.vtype));
+
+    // No VILL or reserved high bits; policy bits 6/7 are immaterial here.
+    function.instruction(&Instruction::LocalGet(temps.vtype));
+    function.instruction(&Instruction::I64Const(!0xffi64));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I64Eqz);
+    // LMUL=1.
+    function.instruction(&Instruction::LocalGet(temps.vtype));
+    function.instruction(&Instruction::I64Const(7));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I64Eqz);
+    function.instruction(&Instruction::I32And);
+    // ELEN=64: e8/e16/e32/e64 only.
+    function.instruction(&Instruction::LocalGet(temps.vtype));
+    function.instruction(&Instruction::I64Const(3));
+    function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::I64Const(7));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalTee(temps.index));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32LeU);
+    function.instruction(&Instruction::I32And);
+    // A direct instruction always starts at element zero.
+    function.instruction(&Instruction::I32Const(state.vstart_addr as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::I64Eqz);
+    function.instruction(&Instruction::I32And);
+    // Full LMUL=1 group: vl == 16 bytes >> log2(SEW bytes).
+    function.instruction(&Instruction::I32Const(state.vl_addr as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::I64Const(16));
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::I32And);
+    if layout.vector == Some(VectorCapability::System) {
+        function.instruction(&Instruction::I32Const(layout.mstatus_addr as i32));
+        function.instruction(&Instruction::I64Load(memarg(3, 0)));
+        function.instruction(&Instruction::I64Const(3 << 9));
+        function.instruction(&Instruction::I64And);
+        function.instruction(&Instruction::I64Const(3 << 9));
+        function.instruction(&Instruction::I64Eq);
+        function.instruction(&Instruction::I32And);
+    }
+
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalSet(active));
+}
+
+fn emit_vector_unit_lmul1_invalidate(function: &mut Function, temps: Option<VectorTemps>) {
+    let Some(active) = temps.and_then(|temps| temps.unit_lmul1_sew) else {
+        return;
+    };
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(active));
+}
+
+/// `last` and `stride` double as an invocation-local load-translation cache
+/// on the deterministic unit-stride path. All other vector lowerings may use
+/// either scratch local, so invalidate the cached tag before emitting them.
+fn emit_vector_unit_load_cache_invalidate(function: &mut Function, temps: Option<VectorTemps>) {
+    let Some(temps) = temps.filter(|temps| temps.unit_lmul1_sew.is_some()) else {
+        return;
+    };
+    function.instruction(&Instruction::I64Const(-1));
+    function.instruction(&Instruction::LocalSet(temps.last));
 }
 
 /// Snapshot the runtime's effective data-access context once per generated
@@ -1226,6 +1630,20 @@ fn emit_cached_multi_entry(
         && layout.dispatch_base != 0
         && layout.map_gen_addr != 0
         && layout.chain_hops_addr != 0;
+    // The public cached dispatcher is the first defined function. Selected
+    // members get one private ordinary body immediately after it, allowing a
+    // cold translation/refill/fault path without cloning that path into the
+    // embedding engine's hot optimized function.
+    let mut fallback_indices = vec![None; regions.len()];
+    let mut fallbacks = Vec::new();
+    if structured_cfg {
+        for (member, &(region, _)) in regions.iter().enumerate() {
+            if outlined_member_range_plan(region, layout).is_some() {
+                fallback_indices[member] = Some(helpers.count() + 1 + fallbacks.len() as u32);
+                fallbacks.push(emit_function(region, layout, None, helpers)?);
+            }
+        }
+    }
     let mut need_x = 0u32;
     let mut need_f = 0u32;
     let mut need_fcsr = false;
@@ -1395,6 +1813,15 @@ fn emit_cached_multi_entry(
                 fuel_bytes: alloc_local(&mut local_types, ValType::I64),
                 result: alloc_local(&mut local_types, ValType::I64),
             });
+            let has_member_range = structured_cfg
+                && regions
+                    .iter()
+                    .any(|(region, _)| outlined_member_range_plan(region, layout).is_some());
+            let member_range = has_member_range.then(|| MemberRangeTemps {
+                start: alloc_local(&mut local_types, ValType::I64),
+                load_linear: alloc_local(&mut local_types, ValType::I32),
+                store_linear: alloc_local(&mut local_types, ValType::I32),
+            });
             Some(MemoryTemps {
                 index: alloc_local(&mut local_types, ValType::I32),
                 offset: alloc_local(&mut local_types, ValType::I64),
@@ -1404,6 +1831,7 @@ fn emit_cached_multi_entry(
                 store_cache,
                 copy,
                 bulk_copy,
+                member_range,
             })
         } else {
             None
@@ -1424,10 +1852,20 @@ fn emit_cached_multi_entry(
         regions
             .iter()
             .any(|(region, _)| region_has_direct_vector(region, layout)),
+        regions
+            .iter()
+            .any(|(region, _)| region_has_unmasked_unit_stride(region, layout)),
+        memory_temps.map(|temps| temps.context),
+        layout.sys.is_some(),
     );
     let mut function = Function::new_with_locals_types(local_types);
 
     emit_memory_context_init(&mut function, layout, memory_temps);
+    emit_vector_memory_context_init(&mut function, layout, vector_temps, memory_temps);
+    if layout.sys.is_some() {
+        emit_vector_unit_load_cache_invalidate(&mut function, vector_temps);
+    }
+    emit_vector_unit_lmul1_refresh(&mut function, layout, vector_temps);
     emit_cached_state_load(&mut function, layout, &state);
     if let Some(chain_start) = chain_start_local {
         function.instruction(&Instruction::LocalGet(state.retired));
@@ -1452,6 +1890,7 @@ fn emit_cached_multi_entry(
             helpers,
             memory_temps,
             &state,
+            &fallback_indices,
             selector_local,
             hops_local,
             vector_status,
@@ -1547,6 +1986,7 @@ fn emit_cached_multi_entry(
     function.instruction(&Instruction::End);
     Ok(finish_shared_module(
         function,
+        fallbacks,
         helpers,
         regions.len() as u32,
         export_members,
@@ -1767,10 +2207,18 @@ fn emit_region_tail_chain(
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Empty));
 
-    // dispatch[((pc >> 1) & mask)] where each repr(C) line is 16 bytes.
+    // Fold the next bank of PC bits into the low direct-map index.  This keeps
+    // one lookup while preventing equally aligned functions in independently
+    // randomized mappings from deterministically evicting each other.
     function.instruction(&Instruction::LocalGet(state.pc));
     function.instruction(&Instruction::I64Const(1));
     function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::LocalGet(state.pc));
+    function.instruction(&Instruction::I64Const(i64::from(
+        layout.dispatch_mask.count_ones() + 1,
+    )));
+    function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::I64Xor);
     function.instruction(&Instruction::I64Const(i64::from(layout.dispatch_mask)));
     function.instruction(&Instruction::I64And);
     function.instruction(&Instruction::I32WrapI64);
@@ -1883,6 +2331,7 @@ fn emit_cached_direct_dispatch(
             state,
             &local_maps[index],
             loop_backedge,
+            None,
             vector_status,
             vector_temps,
         )?;
@@ -2282,6 +2731,125 @@ fn emit_structured_successor(
     Ok(())
 }
 
+fn emit_member_range_row_probe(
+    function: &mut Function,
+    memory: SystemMemory,
+    row: TranslationRow,
+    temps: MemoryTemps,
+    range: MemberRangeTemps,
+    linear_local: u32,
+) {
+    emit_translation_probe(function, row, temps, range.start, memory.page_shift);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(range.start));
+    emit_translation_offset(function, row, temps);
+    function.instruction(&Instruction::I64Add);
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalSet(linear_local));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
+fn emit_member_range_condition(
+    function: &mut Function,
+    region: &Region,
+    plan: MemberRangePlan,
+    layout: JitLayout,
+    memory_temps: MemoryTemps,
+    state: &CachedStateLocals,
+) -> Result<(), EmitError> {
+    let memory = layout
+        .sys
+        .ok_or_else(|| EmitError("member range requires system memory".into()))?;
+    let range = memory_temps
+        .member_range
+        .ok_or_else(|| EmitError("member range lacks allocated temporaries".into()))?;
+    let root_reg = plan
+        .root_reg(region)
+        .ok_or_else(|| EmitError("member range root is not an architectural register".into()))?;
+    if let Some(root_local) = state.x[usize::from(root_reg)] {
+        emit_lazy_state_read_i64(
+            function,
+            layout.x_base,
+            root_local,
+            state.valid_x,
+            usize::from(root_reg),
+        );
+    } else if is_materialized_x(state, root_reg) {
+        // Hybrid structured state keeps nonresident registers canonical at
+        // every member boundary, which is exactly where this guard executes.
+        function.instruction(&Instruction::I32Const(layout.x_base as i32));
+        function.instruction(&Instruction::I64Load(memarg(3, u64::from(root_reg) * 8)));
+    } else {
+        return Err(EmitError(format!(
+            "member range root x{root_reg} has no cached representation"
+        )));
+    }
+    if plan.min_offset != 0 {
+        function.instruction(&Instruction::I64Const(plan.min_offset));
+        function.instruction(&Instruction::I64Add);
+    }
+    function.instruction(&Instruction::LocalSet(range.start));
+
+    let page_bytes = 1u64
+        .checked_shl(u32::from(memory.page_shift))
+        .ok_or_else(|| EmitError("invalid member-range page size".into()))?;
+    let last_start = page_bytes
+        .checked_sub(plan.span)
+        .ok_or_else(|| EmitError("member range exceeds the system page".into()))?;
+    function.instruction(&Instruction::LocalGet(range.start));
+    function.instruction(&Instruction::I64Const((page_bytes - 1) as i64));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I64Const(last_start as i64));
+    function.instruction(&Instruction::I64LeU);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+
+    // This proof derives its page from the selected architectural root. A page
+    // local allocated for an unrelated dense member can hold stale scratch.
+    let mut probe_temps = memory_temps;
+    probe_temps.page = None;
+    emit_translation_index(function, memory, probe_temps, range.start);
+    if plan.loads != 0 {
+        emit_member_range_row_probe(
+            function,
+            memory,
+            memory.load,
+            probe_temps,
+            range,
+            range.load_linear,
+        );
+        if plan.stores != 0 {
+            function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            emit_member_range_row_probe(
+                function,
+                memory,
+                memory.store,
+                probe_temps,
+                range,
+                range.store_linear,
+            );
+            function.instruction(&Instruction::Else);
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::End);
+        }
+    } else {
+        emit_member_range_row_probe(
+            function,
+            memory,
+            memory.store,
+            probe_temps,
+            range,
+            range.store_linear,
+        );
+    }
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_cached_structured_member(
     function: &mut Function,
@@ -2291,21 +2859,60 @@ fn emit_cached_structured_member(
     memory_temps: Option<MemoryTemps>,
     state: &CachedStateLocals,
     local_map: &[Option<u32>],
+    fallback_index: Option<u32>,
     vector_status: Option<u32>,
     vector_temps: Option<VectorTemps>,
 ) -> Result<(), EmitError> {
-    emit_cached_body(
-        function,
-        region,
-        layout,
-        helpers,
-        memory_temps,
-        state,
-        local_map,
-        None,
-        vector_status,
-        vector_temps,
-    )
+    let plan = outlined_member_range_plan(region, layout);
+    let range = memory_temps.and_then(|temps| temps.member_range);
+    if let (Some(plan), Some(range), Some(memory_temps), Some(fallback_index)) =
+        (plan, range, memory_temps, fallback_index)
+    {
+        emit_member_range_condition(function, region, plan, layout, memory_temps, state)?;
+        function.instruction(&Instruction::If(BlockType::Empty));
+        emit_cached_body(
+            function,
+            region,
+            layout,
+            helpers,
+            Some(memory_temps),
+            state,
+            local_map,
+            None,
+            Some((plan, range)),
+            vector_status,
+            vector_temps,
+        )?;
+        function.instruction(&Instruction::Else);
+        // Keep the ordinary translation/refill/fault path out of the hot
+        // structured function. Canonical state is exact at the call boundary;
+        // the private function executes this one member and returns directly
+        // to the system scheduler.
+        emit_cached_state_commit(function, layout, state);
+        function.instruction(&Instruction::LocalGet(0));
+        function.instruction(&Instruction::Call(fallback_index));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+        Ok(())
+    } else if plan.is_none() && fallback_index.is_none() {
+        emit_cached_body(
+            function,
+            region,
+            layout,
+            helpers,
+            memory_temps,
+            state,
+            local_map,
+            None,
+            None,
+            vector_status,
+            vector_temps,
+        )
+    } else {
+        Err(EmitError(
+            "outlined member-range plan and fallback allocation disagree".into(),
+        ))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2317,6 +2924,7 @@ fn emit_cached_structured_cfg(
     helpers: HelperImports,
     memory_temps: Option<MemoryTemps>,
     state: &CachedStateLocals,
+    fallback_indices: &[Option<u32>],
     selector_local: u32,
     hops_local: u32,
     vector_status: Option<u32>,
@@ -2380,6 +2988,7 @@ fn emit_cached_structured_cfg(
                     memory_temps,
                     state,
                     &local_maps[member],
+                    fallback_indices[member],
                     vector_status,
                     vector_temps,
                 )?;
@@ -2630,6 +3239,115 @@ fn emit_cached_x_member_input(
     Ok(local)
 }
 
+fn emit_cached_vector_x_inputs(
+    function: &mut Function,
+    layout: JitLayout,
+    state: &CachedStateLocals,
+    exit: &SideExit,
+    direct: VectorDirect,
+) -> Result<(), EmitError> {
+    let inputs = vector_direct_x_inputs(direct);
+    for (slot, reg) in inputs.iter().copied().enumerate() {
+        let Some(reg) = reg else { continue };
+        if reg == 0 || inputs[..slot].contains(&Some(reg)) {
+            continue;
+        }
+        if exit.outputs.iter().any(|(output, _)| *output == reg) {
+            // The scalar epoch publication immediately before this helper has
+            // already synchronized the precise current-member value.
+            continue;
+        }
+        let Some(state_local) = state.x[reg as usize] else {
+            // Materialized state is synchronized at its defining operation.
+            continue;
+        };
+        function.instruction(&Instruction::I32Const(layout.x_base as i32));
+        emit_lazy_state_read_i64(
+            function,
+            layout.x_base,
+            state_local,
+            state.valid_x,
+            reg as usize,
+        );
+        function.instruction(&Instruction::I64Store(memarg(3, u64::from(reg) * 8)));
+    }
+    Ok(())
+}
+
+/// Feed a unit-stride vector memory operation directly from the cached scalar
+/// state when its base is already available as a Wasm local. The cold helper
+/// arm still publishes the complete precise side-exit state before use.
+fn emit_cached_vector_unit_address(
+    function: &mut Function,
+    layout: JitLayout,
+    state: &CachedStateLocals,
+    local_map: &[Option<u32>],
+    exit: &SideExit,
+    direct: VectorDirect,
+    temps: Option<VectorTemps>,
+) -> Result<bool, EmitError> {
+    let VectorDirect::UnitStride { base, .. } = direct else {
+        return Ok(false);
+    };
+    let Some(temps) = temps else { return Ok(false) };
+
+    // A value produced earlier in this member is newer than the function-wide
+    // cached register. Its precise side-exit SSA value is already available.
+    if let Some(&(_, value)) = exit.outputs.iter().find(|&&(reg, _)| reg == base) {
+        let value_local = local_map[value.0]
+            .ok_or_else(|| EmitError("missing vector-memory base exit value".into()))?;
+        function.instruction(&Instruction::LocalGet(value_local));
+        function.instruction(&Instruction::LocalSet(temps.address));
+        return Ok(true);
+    }
+
+    let Some(state_local) = state.x[base as usize] else {
+        return Ok(false);
+    };
+    emit_lazy_state_read_i64(
+        function,
+        layout.x_base,
+        state_local,
+        state.valid_x,
+        base as usize,
+    );
+    function.instruction(&Instruction::LocalSet(temps.address));
+    Ok(true)
+}
+
+fn emit_cached_vector_epoch_outputs(
+    function: &mut Function,
+    layout: JitLayout,
+    local_map: &[Option<u32>],
+    exit: &SideExit,
+) -> Result<(), EmitError> {
+    // Vector effects terminate scalar SSA forwarding. Values produced in this
+    // member must therefore reach canonical memory even on a direct vector
+    // arm: a later epoch may materialize them instead of retaining a cached
+    // local. Function-wide state from earlier members and the precise PC can
+    // still be deferred to the cold helper arm.
+    for &(reg, value) in &exit.outputs {
+        let value_local = local_map[value.0]
+            .ok_or_else(|| EmitError("missing direct-vector integer epoch value".into()))?;
+        emit_materialized_x_store(function, layout, reg, value_local);
+    }
+    for &(reg, value) in &exit.f_outputs {
+        let value_local = local_map[value.0]
+            .ok_or_else(|| EmitError("missing direct-vector FP epoch value".into()))?;
+        function.instruction(&Instruction::I32Const(layout.f_base as i32));
+        function.instruction(&Instruction::LocalGet(value_local));
+        function.instruction(&Instruction::I64Store(memarg(3, u64::from(reg) * 8)));
+    }
+    if let Some(value) = exit.fcsr_output {
+        let value_local = local_map[value.0]
+            .ok_or_else(|| EmitError("missing direct-vector fcsr epoch value".into()))?;
+        function.instruction(&Instruction::I32Const(layout.fcsr_addr as i32));
+        function.instruction(&Instruction::LocalGet(value_local));
+        function.instruction(&Instruction::I32Store(memarg(2, 0)));
+    }
+    Ok(())
+}
+
 fn emit_materialized_x_store(
     function: &mut Function,
     layout: JitLayout,
@@ -2691,6 +3409,7 @@ fn emit_cached_dispatch_tree(
                 state,
                 &local_maps[index],
                 loop_backedge,
+                None,
                 vector_status,
                 vector_temps,
             )?;
@@ -3036,6 +3755,7 @@ fn emit_cached_body(
     state: &CachedStateLocals,
     local_map: &[Option<u32>],
     loop_backedge: Option<LoopBackedge>,
+    direct_range: Option<(MemberRangePlan, MemberRangeTemps)>,
     vector_status: Option<u32>,
     vector_temps: Option<VectorTemps>,
 ) -> Result<(), EmitError> {
@@ -3113,6 +3833,11 @@ fn emit_cached_body(
     if loop_backedge.is_some() {
         function.instruction(&Instruction::Loop(BlockType::Empty));
     }
+    // This is intentionally local to one Region. A successful vsetivli has
+    // exact vtype/vl/vstart results; every subsequently completed ordinary
+    // vector instruction preserves that configuration and resets vstart to
+    // zero. Any configuration form we cannot resolve clears the fact.
+    let mut known_vector_config = None;
     for position in 0..=region.values.len() {
         for effect in &region.effects {
             match effect {
@@ -3134,7 +3859,25 @@ fn emit_cached_body(
                         .as_ref()
                         .and_then(|plan| plan.store_access(*effect_position, *address, *value));
                     let address_local = local_map[address.0].expect("cached address local");
-                    if let (Some(access), Some(copy)) =
+                    let direct_access = direct_range.and_then(|(plan, temps)| {
+                        condition
+                            .is_none()
+                            .then(|| plan.direct_offset(region, *address))
+                            .flatten()
+                            .map(|offset| (temps.store_linear, offset))
+                    });
+                    if let Some((base, offset)) = direct_access {
+                        function.instruction(&Instruction::LocalGet(base));
+                        function.instruction(&Instruction::LocalGet(
+                            local_map[value.0].expect("cached direct-store value local"),
+                        ));
+                        function.instruction(&match kind {
+                            StoreKind::I8 => Instruction::I64Store8(memarg(0, offset)),
+                            StoreKind::I16 => Instruction::I64Store16(memarg(0, offset)),
+                            StoreKind::I32 => Instruction::I64Store32(memarg(0, offset)),
+                            StoreKind::I64 => Instruction::I64Store(memarg(0, offset)),
+                        });
+                    } else if let (Some(access), Some(copy)) =
                         (copy_access, memory_temps.and_then(|temps| temps.copy))
                     {
                         if copy_plan
@@ -3289,6 +4032,16 @@ fn emit_cached_body(
                         )
                     })?;
                 }
+                Effect::VectorState {
+                    position: effect_position,
+                    exit,
+                } if *effect_position == position => {
+                    emit_vector_state(function, layout, |function| {
+                        emit_cached_side_exit(
+                            function, region, layout, state, local_map, exit, None,
+                        )
+                    })?;
+                }
                 Effect::Vector {
                     position: effect_position,
                     insn,
@@ -3299,18 +4052,97 @@ fn emit_cached_body(
                     let status = vector_status.ok_or_else(|| {
                         EmitError("cached vector effect lacks a status local".into())
                     })?;
-                    emit_cached_side_exit_state(
-                        function, region, layout, state, local_map, exit, None,
-                    )?;
-                    emit_vector_execution(
-                        function,
-                        layout,
-                        helpers,
-                        *insn,
+                    if vector_config_instruction(*insn) {
+                        emit_vector_unit_lmul1_invalidate(function, vector_temps);
+                    }
+                    if !matches!(
                         *direct,
-                        vector_temps,
-                        status,
+                        Some(VectorDirect::UnitStride { masked: false, .. })
+                    ) {
+                        emit_vector_unit_load_cache_invalidate(function, vector_temps);
+                    }
+                    let retained_config = known_vector_config
+                        .and_then(|config| known_vector_retaining_config_transition(config, *insn));
+                    let deferred_fallback =
+                        retained_config.is_some() || vector_cached_direct_deferable(*direct);
+                    let mut address_preloaded = false;
+                    if deferred_fallback {
+                        emit_cached_vector_epoch_outputs(function, layout, local_map, exit)?;
+                        if let Some(direct) = *direct {
+                            address_preloaded = emit_cached_vector_unit_address(
+                                function,
+                                layout,
+                                state,
+                                local_map,
+                                exit,
+                                direct,
+                                vector_temps,
+                            )?;
+                            if !address_preloaded {
+                                emit_cached_vector_x_inputs(function, layout, state, exit, direct)?;
+                            }
+                        }
+                    } else {
+                        emit_cached_side_exit_state(
+                            function, region, layout, state, local_map, exit, None,
+                        )?;
+                    }
+                    let mut prepare_fallback = |function: &mut Function| {
+                        if deferred_fallback {
+                            emit_cached_side_exit_state(
+                                function, region, layout, state, local_map, exit, None,
+                            )
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    let known_direct = known_vector_config.and_then(|config| {
+                        direct
+                            .filter(|direct| vector_direct_available(layout, Some(*direct)))
+                            .and_then(|direct| {
+                                known_vector_direct_tail_merge(config, direct)
+                                    .map(|tail_merge| (config, direct, tail_merge))
+                            })
+                    });
+                    if let Some(config) = retained_config {
+                        emit_known_vector_config_execution(function, layout, config, status)?;
+                    } else if let Some((config, direct, tail_merge)) = known_direct {
+                        emit_known_vector_execution(
+                            function,
+                            layout,
+                            helpers,
+                            *insn,
+                            direct,
+                            config,
+                            tail_merge,
+                            vector_temps,
+                            status,
+                            &mut prepare_fallback,
+                            false,
+                            address_preloaded,
+                        )?;
+                    } else {
+                        emit_vector_execution(
+                            function,
+                            layout,
+                            helpers,
+                            *insn,
+                            *direct,
+                            vector_temps,
+                            status,
+                            &mut prepare_fallback,
+                            address_preloaded,
+                        )?;
+                    }
+
+                    function.instruction(&Instruction::LocalGet(status));
+                    function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
+                    function.instruction(&Instruction::I32Eq);
+                    function.instruction(&Instruction::If(BlockType::Empty));
+                    emit_cached_state_reconcile_after_direct_vector(
+                        function, state, local_map, exit,
                     )?;
+                    function.instruction(&Instruction::Else);
 
                     function.instruction(&Instruction::LocalGet(status));
                     function.instruction(&Instruction::I32Eqz);
@@ -3330,16 +4162,21 @@ fn emit_cached_body(
                     function.instruction(&Instruction::Return);
                     function.instruction(&Instruction::End);
 
-                    function.instruction(&Instruction::LocalGet(status));
-                    function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
-                    function.instruction(&Instruction::I32Eq);
-                    function.instruction(&Instruction::If(BlockType::Empty));
-                    emit_cached_state_reconcile_after_direct_vector(
-                        function, state, local_map, exit,
-                    )?;
-                    function.instruction(&Instruction::Else);
                     emit_cached_state_reload_after_vector(function, layout, state);
                     function.instruction(&Instruction::End);
+
+                    if vector_config_instruction(*insn) {
+                        emit_vector_unit_lmul1_refresh(function, layout, vector_temps);
+                        known_vector_config = match direct {
+                            Some(VectorDirect::ConfigImmediate { vtype, vl, .. }) => {
+                                KnownVectorConfig::decode(*vtype, *vl)
+                            }
+                            Some(VectorDirect::ConfigRetainFull { vtype, vlmax }) => {
+                                KnownVectorConfig::decode(*vtype, *vlmax)
+                            }
+                            _ => retained_config,
+                        };
+                    }
                 }
                 _ => {}
             }
@@ -3397,7 +4234,22 @@ fn emit_cached_body(
                 let copy_access = copy_plan
                     .as_ref()
                     .and_then(|plan| plan.load_access(ValueId(position)));
-                if let (Some(access), Some(copy)) =
+                let direct_access = direct_range.and_then(|(plan, temps)| {
+                    plan.direct_offset(region, *address)
+                        .map(|offset| (temps.load_linear, offset))
+                });
+                if let Some((base, offset)) = direct_access {
+                    function.instruction(&Instruction::LocalGet(base));
+                    function.instruction(&match kind {
+                        LoadKind::I8S => Instruction::I64Load8S(memarg(0, offset)),
+                        LoadKind::I16S => Instruction::I64Load16S(memarg(0, offset)),
+                        LoadKind::I32S => Instruction::I64Load32S(memarg(0, offset)),
+                        LoadKind::I64 => Instruction::I64Load(memarg(0, offset)),
+                        LoadKind::I8U => Instruction::I64Load8U(memarg(0, offset)),
+                        LoadKind::I16U => Instruction::I64Load16U(memarg(0, offset)),
+                        LoadKind::I32U => Instruction::I64Load32U(memarg(0, offset)),
+                    });
+                } else if let (Some(access), Some(copy)) =
                     (copy_access, memory_temps.and_then(|temps| temps.copy))
                 {
                     if copy_plan
@@ -3929,10 +4781,17 @@ fn emit_effectful(
     let vector_status = region
         .has_vector_helper()
         .then(|| alloc_local(&mut local_types, ValType::I32));
-    let vector_temps =
-        allocate_vector_temps(&mut local_types, region_has_direct_vector(region, layout));
+    let vector_temps = allocate_vector_temps(
+        &mut local_types,
+        region_has_direct_vector(region, layout),
+        region_has_unmasked_unit_stride(region, layout),
+        memory_temps.map(|temps| temps.context),
+        layout.sys.is_some(),
+    );
     let mut function = Function::new_with_locals_types(local_types);
     emit_memory_context_init(&mut function, layout, memory_temps);
+    emit_vector_memory_context_init(&mut function, layout, vector_temps, memory_temps);
+    emit_vector_unit_lmul1_refresh(&mut function, layout, vector_temps);
     // Validation guarantees operands precede their users. Marking all locals
     // as addressable makes the shared pure-value emitter issue LocalGet rather
     // than recursively duplicating an earlier computation.
@@ -4135,6 +4994,14 @@ fn emit_effectful(
                         emit_side_exit(function, region, layout, &local_map, &all_defined, exit)
                     })?;
                 }
+                Effect::VectorState {
+                    position: vector_position,
+                    exit,
+                } if *vector_position == position => {
+                    emit_vector_state(&mut function, layout, |function| {
+                        emit_side_exit(function, region, layout, &local_map, &all_defined, exit)
+                    })?;
+                }
                 Effect::Vector {
                     position: vector_position,
                     insn,
@@ -4143,6 +5010,9 @@ fn emit_effectful(
                     exit,
                 } if *vector_position == position => {
                     let status = vector_status.expect("vector effect status local");
+                    if vector_config_instruction(*insn) {
+                        emit_vector_unit_lmul1_invalidate(&mut function, vector_temps);
+                    }
                     emit_side_exit_state(
                         &mut function,
                         region,
@@ -4151,6 +5021,7 @@ fn emit_effectful(
                         &all_defined,
                         exit,
                     )?;
+                    let mut prepare_fallback = |_function: &mut Function| Ok(());
                     emit_vector_execution(
                         &mut function,
                         layout,
@@ -4159,6 +5030,8 @@ fn emit_effectful(
                         *direct,
                         vector_temps,
                         status,
+                        &mut prepare_fallback,
+                        false,
                     )?;
 
                     // Zero means the architectural instruction did not
@@ -4188,6 +5061,9 @@ fn emit_effectful(
                     );
                     function.instruction(&Instruction::Return);
                     function.instruction(&Instruction::End);
+                    if vector_config_instruction(*insn) {
+                        emit_vector_unit_lmul1_refresh(&mut function, layout, vector_temps);
+                    }
                 }
                 _ => {}
             }
@@ -4750,6 +5626,23 @@ fn emit_effectful_loop(
                         )
                     })?;
                 }
+                Effect::VectorState {
+                    position: vector_position,
+                    exit,
+                } if *vector_position == position => {
+                    emit_vector_state(&mut function, layout, |function| {
+                        emit_loop_side_exit(
+                            function,
+                            region,
+                            layout,
+                            exit,
+                            retired_local,
+                            &carry_map,
+                            &f_carry_map,
+                            fcsr_carry,
+                        )
+                    })?;
+                }
                 _ => {}
             }
         }
@@ -5141,6 +6034,39 @@ fn emit_fp_state(
         function.instruction(&Instruction::I64Or);
         function.instruction(&Instruction::I64Store(memarg(3, 0)));
     }
+    Ok(())
+}
+
+fn emit_vector_state(
+    function: &mut Function,
+    layout: JitLayout,
+    mut side_exit: impl FnMut(&mut Function) -> Result<(), EmitError>,
+) -> Result<(), EmitError> {
+    match layout.vector {
+        Some(VectorCapability::User) => return Ok(()),
+        Some(VectorCapability::System) => {}
+        None => {
+            return Err(EmitError(
+                "vector-state effect requires a vector capability".into(),
+            ));
+        }
+    }
+    if layout.mstatus_addr == 0 {
+        return Err(EmitError(
+            "full-system vector-state effect requires an mstatus capability".into(),
+        ));
+    }
+
+    const VS_MASK: i64 = 3 << 9;
+    function.instruction(&Instruction::I32Const(layout.mstatus_addr as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::I64Const(VS_MASK));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I64Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    side_exit(function)?;
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
     Ok(())
 }
 
@@ -5629,7 +6555,9 @@ fn emit_vector_call(
     function: &mut Function,
     helpers: HelperImports,
     insn: u32,
+    prepare_fallback: &mut dyn FnMut(&mut Function) -> Result<(), EmitError>,
 ) -> Result<(), EmitError> {
+    prepare_fallback(function)?;
     function.instruction(&Instruction::LocalGet(0));
     function.instruction(&Instruction::I32Const(insn as i32));
     function.instruction(&Instruction::Call(
@@ -5644,10 +6572,16 @@ fn vector_direct_available(layout: JitLayout, direct: Option<VectorDirect>) -> b
     layout.vector.is_some()
         && layout.vector_state.is_some()
         && match direct {
+            Some(VectorDirect::ConfigImmediate { .. } | VectorDirect::ConfigRetainFull { .. }) => {
+                true
+            }
             Some(
                 VectorDirect::Lane { .. }
                 | VectorDirect::SlideImmediate { up: false, .. }
                 | VectorDirect::SlideOne { up: false, .. }
+                | VectorDirect::Index { .. }
+                | VectorDirect::Reduction { .. }
+                | VectorDirect::MaskLogic { .. }
                 | VectorDirect::FloatSign { .. }
                 | VectorDirect::FloatBroadcast { .. }
                 | VectorDirect::FloatScalarInsert { .. }
@@ -5656,6 +6590,31 @@ fn vector_direct_available(layout: JitLayout, direct: Option<VectorDirect>) -> b
                 | VectorDirect::ScalarExtract { .. }
                 | VectorDirect::ScalarInsert { .. },
             ) => true,
+            Some(VectorDirect::WidenAddSub {
+                wide_left,
+                destination,
+                source2,
+                operand,
+                ..
+            }) => match operand {
+                VectorOperand::Vector(source1) => {
+                    destination != source1
+                        && source2 != source1
+                        && (wide_left || destination != source2)
+                }
+                VectorOperand::ScalarX(_) => wide_left || destination != source2,
+                VectorOperand::Immediate(_) => false,
+            },
+            Some(VectorDirect::WidenMultiplyAccumulate {
+                destination,
+                source2,
+                operand,
+                ..
+            }) => {
+                destination != source2
+                    && !matches!(operand, VectorOperand::Vector(source1) if destination == source1)
+                    && !matches!(operand, VectorOperand::Immediate(_))
+            }
             Some(
                 VectorDirect::SlideImmediate {
                     up: true,
@@ -5681,6 +6640,11 @@ fn vector_direct_available(layout: JitLayout, direct: Option<VectorDirect>) -> b
                 source,
                 ..
             }) => destination != source,
+            Some(VectorDirect::GatherVector {
+                destination,
+                source,
+                indices,
+            }) => destination != source && destination != indices,
             Some(VectorDirect::Compare {
                 destination,
                 source2,
@@ -5719,6 +6683,212 @@ fn vector_direct_available(layout: JitLayout, direct: Option<VectorDirect>) -> b
         && (layout.vector != Some(VectorCapability::System) || layout.mstatus_addr != 0)
 }
 
+fn vector_partial_vl_available(direct: VectorDirect) -> bool {
+    matches!(
+        direct,
+        VectorDirect::Lane { masked: false, .. }
+            | VectorDirect::SlideImmediate { .. }
+            | VectorDirect::GatherImmediate { .. }
+            | VectorDirect::GatherVector { .. }
+            | VectorDirect::Index { .. }
+    )
+}
+
+fn vector_config_instruction(insn: u32) -> bool {
+    insn & 0x7f == 0x57 && (insn >> 12) & 7 == 7
+}
+
+/// Resolve the ratified `vsetvli x0,x0,vtype` retain-vl form from a preceding
+/// exact configuration. The instruction is legal only when VLMAX is
+/// unchanged; in that case both the retained vl and the new vtype are exact.
+fn known_vector_retaining_config_transition(
+    previous: KnownVectorConfig,
+    insn: u32,
+) -> Option<KnownVectorConfig> {
+    if !vector_config_instruction(insn)
+        || insn >> 31 != 0
+        || (insn >> 7) & 0x1f != 0
+        || (insn >> 15) & 0x1f != 0
+    {
+        return None;
+    }
+    let vtype = u64::from((insn >> 20) & 0x7ff);
+    let next = KnownVectorConfig::decode(vtype, previous.vl)?;
+    (next.vlmax == previous.vlmax).then_some(next)
+}
+
+fn known_vector_register_aligned(register: u8, span: u8) -> bool {
+    register & (span - 1) == 0
+}
+
+/// Return whether a statically configured direct instruction needs the
+/// partial-vl tail merge. None means the existing guarded/helper lowering is
+/// still required. This mirrors `emit_vector_direct_guard` in ordinary Rust
+/// predicates so the generated hot path contains no repeated state decoder.
+fn known_vector_direct_tail_merge(config: KnownVectorConfig, direct: VectorDirect) -> Option<bool> {
+    let full_vl = config.vl == config.vlmax;
+    if !full_vl && (config.vl == 0 || config.span != 1 || !vector_partial_vl_available(direct)) {
+        return None;
+    }
+    let aligned = |register| known_vector_register_aligned(register, config.span);
+    let supported = match direct {
+        VectorDirect::Lane {
+            op,
+            masked,
+            destination,
+            source2,
+            operand,
+        } => {
+            aligned(destination)
+                && source2.is_none_or(aligned)
+                && !matches!(operand, VectorOperand::Vector(register) if !aligned(register))
+                && !(op == VectorLaneOp::Multiply && config.vsew == 0)
+                && !(matches!(
+                    op,
+                    VectorLaneOp::MinUnsigned
+                        | VectorLaneOp::MinSigned
+                        | VectorLaneOp::MaxUnsigned
+                        | VectorLaneOp::MaxSigned
+                ) && config.vsew == 3)
+                && (!masked || (full_vl && destination != 0))
+        }
+        VectorDirect::SlideImmediate {
+            destination,
+            source,
+            ..
+        }
+        | VectorDirect::GatherImmediate {
+            destination,
+            source,
+            ..
+        } => config.span == 1 && aligned(destination) && aligned(source),
+        VectorDirect::SlideOne {
+            destination,
+            source,
+            ..
+        } => full_vl && config.span == 1 && aligned(destination) && aligned(source),
+        VectorDirect::GatherVector {
+            destination,
+            source,
+            indices,
+        } => config.span == 1 && aligned(destination) && aligned(source) && aligned(indices),
+        VectorDirect::Index { destination } => {
+            aligned(destination) && (full_vl || config.span == 1)
+        }
+        VectorDirect::Reduction { source, .. } => full_vl && aligned(source),
+        VectorDirect::MaskLogic { .. } => full_vl,
+        VectorDirect::WidenAddSub { .. } | VectorDirect::WidenMultiplyAccumulate { .. } => {
+            full_vl && config.fractional_lmul && config.vsew < 3
+        }
+        VectorDirect::Compare {
+            op,
+            destination,
+            source2,
+            operand,
+            ..
+        } => {
+            let disjoint_from_mask = |source: u8| {
+                destination < source || destination >= source.saturating_add(config.span)
+            };
+            full_vl
+                && aligned(source2)
+                && disjoint_from_mask(source2)
+                && !matches!(operand, VectorOperand::Vector(register) if !aligned(register))
+                && !matches!(operand, VectorOperand::Vector(register) if !disjoint_from_mask(register))
+                && !(config.vsew == 3
+                    && matches!(
+                        op,
+                        VectorCompareOp::LessUnsigned
+                            | VectorCompareOp::LessEqualUnsigned
+                            | VectorCompareOp::GreaterUnsigned
+                    ))
+        }
+        VectorDirect::UnitStride {
+            masked,
+            width,
+            register,
+            ..
+        }
+        | VectorDirect::Strided {
+            masked,
+            width,
+            register,
+            ..
+        } => {
+            let memory = config.memory_config(width)?;
+            full_vl
+                && known_vector_register_aligned(register, memory.span)
+                && register.saturating_add(memory.span) <= 32
+                // v0 supplies the predicate throughout a masked transfer.
+                && (!masked || register != 0)
+        }
+        VectorDirect::ConfigImmediate { .. }
+        | VectorDirect::ConfigRetainFull { .. }
+        | VectorDirect::WholeRegisterMemory { .. }
+        | VectorDirect::WholeRegisterMove { .. }
+        | VectorDirect::ScalarExtract { .. }
+        | VectorDirect::ScalarInsert { .. }
+        | VectorDirect::FloatSign { .. }
+        | VectorDirect::FloatBroadcast { .. }
+        | VectorDirect::FloatScalarInsert { .. }
+        | VectorDirect::FloatScalarExtract { .. }
+        | VectorDirect::FloatSlideOne { .. } => false,
+    };
+    supported.then_some(!full_vl)
+}
+
+/// Integer RVV lowering has an exact, statically known scalar-state footprint.
+/// Cached emitters can therefore publish only its scalar inputs on the hot
+/// direct arm and defer the complete precise snapshot to the cold helper arm.
+fn vector_cached_direct_deferable(direct: Option<VectorDirect>) -> bool {
+    direct.is_some_and(|direct| {
+        !matches!(
+            direct,
+            VectorDirect::ConfigImmediate {
+                destination: 1..,
+                ..
+            } | VectorDirect::ScalarExtract { .. }
+                | VectorDirect::FloatSign { .. }
+                | VectorDirect::FloatBroadcast { .. }
+                | VectorDirect::FloatScalarInsert { .. }
+                | VectorDirect::FloatScalarExtract { .. }
+                | VectorDirect::FloatSlideOne { .. }
+        )
+    })
+}
+
+fn vector_direct_x_inputs(direct: VectorDirect) -> [Option<u8>; 2] {
+    match direct {
+        VectorDirect::Lane {
+            operand: VectorOperand::ScalarX(register),
+            ..
+        }
+        | VectorDirect::ScalarInsert {
+            source: register, ..
+        }
+        | VectorDirect::SlideOne {
+            scalar: register, ..
+        }
+        | VectorDirect::WidenAddSub {
+            operand: VectorOperand::ScalarX(register),
+            ..
+        }
+        | VectorDirect::WidenMultiplyAccumulate {
+            operand: VectorOperand::ScalarX(register),
+            ..
+        }
+        | VectorDirect::Compare {
+            operand: VectorOperand::ScalarX(register),
+            ..
+        } => [Some(register), None],
+        VectorDirect::UnitStride { base, .. } | VectorDirect::WholeRegisterMemory { base, .. } => {
+            [Some(base), None]
+        }
+        VectorDirect::Strided { base, stride, .. } => [Some(base), Some(stride)],
+        _ => [None, None],
+    }
+}
+
 fn emit_vector_group_alignment(function: &mut Function, register: u8, temps: VectorTemps) {
     function.instruction(&Instruction::I32Const(i32::from(register)));
     function.instruction(&Instruction::LocalGet(temps.span));
@@ -5739,7 +6909,10 @@ fn emit_vector_memory_guard(
     temps: VectorTemps,
     fractional_lmul: bool,
     constant_bytes: Option<u32>,
+    address_preloaded: bool,
+    cache_load_translation: bool,
 ) {
+    debug_assert!(!cache_load_translation || load);
     if let Some(width) = width {
         emit_vector_group_alignment(function, register, temps);
 
@@ -5760,9 +6933,11 @@ fn emit_vector_memory_guard(
         function.instruction(&Instruction::I32And);
     }
 
-    function.instruction(&Instruction::I32Const(layout.x_base as i32));
-    function.instruction(&Instruction::I64Load(memarg(3, u64::from(base) * 8)));
-    function.instruction(&Instruction::LocalSet(temps.address));
+    if !address_preloaded {
+        function.instruction(&Instruction::I32Const(layout.x_base as i32));
+        function.instruction(&Instruction::I64Load(memarg(3, u64::from(base) * 8)));
+        function.instruction(&Instruction::LocalSet(temps.address));
+    }
 
     if let Some((memory_base, memory_len)) = layout.mem {
         // With EEW==SEW and vl==VLMAX, group_bytes is the exact active memory
@@ -5798,11 +6973,104 @@ fn emit_vector_memory_guard(
     function.instruction(&Instruction::LocalGet(temps.address));
     function.instruction(&Instruction::I64Const((page_bytes - 1) as i64));
     function.instruction(&Instruction::I64And);
-    emit_vector_memory_bytes_i64(function, temps, fractional_lmul, constant_bytes);
-    function.instruction(&Instruction::I64Add);
-    function.instruction(&Instruction::I64Const(page_bytes as i64));
-    function.instruction(&Instruction::I64LeU);
+    if let Some(bytes) = constant_bytes {
+        if let Some(last_start) = page_bytes.checked_sub(u64::from(bytes)) {
+            function.instruction(&Instruction::I64Const(last_start as i64));
+            function.instruction(&Instruction::I64LeU);
+        } else {
+            function.instruction(&Instruction::Drop);
+            function.instruction(&Instruction::I32Const(0));
+        }
+    } else {
+        emit_vector_memory_bytes_i64(function, temps, fractional_lmul, None);
+        function.instruction(&Instruction::I64Add);
+        function.instruction(&Instruction::I64Const(page_bytes as i64));
+        function.instruction(&Instruction::I64LeU);
+    }
     function.instruction(&Instruction::I32And);
+
+    if cache_load_translation {
+        // A load translation remains valid for the lifetime of this generated
+        // invocation: mapping/context changes exit generated code, and code
+        // installation invalidates only store capabilities. Cache the proven
+        // virtual page and offset in otherwise-unused unit-stride scratches.
+        function.instruction(&Instruction::LocalGet(temps.address));
+        function.instruction(&Instruction::I64Const(i64::from(memory.page_shift)));
+        function.instruction(&Instruction::I64ShrU);
+        function.instruction(&Instruction::LocalSet(temps.element));
+
+        function.instruction(&Instruction::LocalGet(temps.element));
+        function.instruction(&Instruction::LocalGet(temps.last));
+        function.instruction(&Instruction::I64Eq);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        function.instruction(&Instruction::LocalGet(temps.address));
+        function.instruction(&Instruction::LocalGet(temps.stride));
+        function.instruction(&Instruction::I64Add);
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::LocalSet(temps.linear));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Else);
+
+        // Invalidate before replacing the cached offset. A failed row probe
+        // must never leave the preceding page paired with the new row's
+        // unrelated offset.
+        function.instruction(&Instruction::I64Const(-1));
+        function.instruction(&Instruction::LocalSet(temps.last));
+
+        function.instruction(&Instruction::LocalGet(temps.element));
+        if memory.index_hash_shift != 0 {
+            function.instruction(&Instruction::LocalGet(temps.element));
+            function.instruction(&Instruction::I64Const(i64::from(memory.index_hash_shift)));
+            function.instruction(&Instruction::I64ShrU);
+            function.instruction(&Instruction::I64Xor);
+        }
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I32Const(memory.index_mask as i32));
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::LocalSet(temps.index));
+
+        let row = memory.load;
+        function.instruction(&Instruction::I32Const(row.tags as i32));
+        function.instruction(&Instruction::LocalGet(temps.index));
+        function.instruction(&Instruction::I32Const(3));
+        function.instruction(&Instruction::I32Shl);
+        function.instruction(&Instruction::I32Add);
+        function.instruction(&Instruction::I64Load(memarg(3, 0)));
+        function.instruction(&Instruction::LocalGet(temps.address));
+        function.instruction(&Instruction::I64Const(page_mask as i64));
+        function.instruction(&Instruction::I64And);
+        if let Some(context) = temps.context {
+            function.instruction(&Instruction::LocalGet(context));
+        } else {
+            function.instruction(&Instruction::I32Const(memory.context_addr as i32));
+            function.instruction(&Instruction::I64Load(memarg(3, 0)));
+        }
+        function.instruction(&Instruction::I64Or);
+        function.instruction(&Instruction::I64Eq);
+        function.instruction(&Instruction::LocalSet(temps.chunk));
+
+        function.instruction(&Instruction::I32Const(row.offsets as i32));
+        function.instruction(&Instruction::LocalGet(temps.index));
+        function.instruction(&Instruction::I32Const(3));
+        function.instruction(&Instruction::I32Shl);
+        function.instruction(&Instruction::I32Add);
+        function.instruction(&Instruction::I64Load(memarg(3, 0)));
+        function.instruction(&Instruction::LocalSet(temps.stride));
+        function.instruction(&Instruction::LocalGet(temps.chunk));
+        function.instruction(&Instruction::If(BlockType::Empty));
+        function.instruction(&Instruction::LocalGet(temps.element));
+        function.instruction(&Instruction::LocalSet(temps.last));
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::LocalGet(temps.address));
+        function.instruction(&Instruction::LocalGet(temps.stride));
+        function.instruction(&Instruction::I64Add);
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::LocalSet(temps.linear));
+        function.instruction(&Instruction::LocalGet(temps.chunk));
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::I32And);
+        return;
+    }
 
     // Direct-map index from the complete virtual page, including the optional
     // architectural high-VPN hash used by the production fused JTLB.
@@ -5832,8 +7100,12 @@ fn emit_vector_memory_guard(
     function.instruction(&Instruction::LocalGet(temps.address));
     function.instruction(&Instruction::I64Const(page_mask as i64));
     function.instruction(&Instruction::I64And);
-    function.instruction(&Instruction::I32Const(memory.context_addr as i32));
-    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    if let Some(context) = temps.context {
+        function.instruction(&Instruction::LocalGet(context));
+    } else {
+        function.instruction(&Instruction::I32Const(memory.context_addr as i32));
+        function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    }
     function.instruction(&Instruction::I64Or);
     function.instruction(&Instruction::I64Eq);
     function.instruction(&Instruction::I32And);
@@ -5861,23 +7133,26 @@ fn emit_vector_strided_memory_guard(
     base: u8,
     stride: u8,
     temps: VectorTemps,
+    dynamic_config_checks: bool,
 ) {
-    emit_vector_group_alignment(function, register, temps);
-    let vsew = match width {
-        8 => 0,
-        16 => 1,
-        32 => 2,
-        64 => 3,
-        _ => unreachable!("decoded strided width"),
-    };
-    function.instruction(&Instruction::LocalGet(temps.vtype));
-    function.instruction(&Instruction::I64Const(3));
-    function.instruction(&Instruction::I64ShrU);
-    function.instruction(&Instruction::I64Const(7));
-    function.instruction(&Instruction::I64And);
-    function.instruction(&Instruction::I64Const(vsew));
-    function.instruction(&Instruction::I64Eq);
-    function.instruction(&Instruction::I32And);
+    if dynamic_config_checks {
+        emit_vector_group_alignment(function, register, temps);
+        let vsew = match width {
+            8 => 0,
+            16 => 1,
+            32 => 2,
+            64 => 3,
+            _ => unreachable!("decoded strided width"),
+        };
+        function.instruction(&Instruction::LocalGet(temps.vtype));
+        function.instruction(&Instruction::I64Const(3));
+        function.instruction(&Instruction::I64ShrU);
+        function.instruction(&Instruction::I64Const(7));
+        function.instruction(&Instruction::I64And);
+        function.instruction(&Instruction::I64Const(vsew));
+        function.instruction(&Instruction::I64Eq);
+        function.instruction(&Instruction::I32And);
+    }
 
     function.instruction(&Instruction::I32Const(layout.x_base as i32));
     function.instruction(&Instruction::I64Load(memarg(3, u64::from(base) * 8)));
@@ -5942,19 +7217,26 @@ fn emit_vector_strided_memory_guard(
         function.instruction(&Instruction::I32WrapI64);
         function.instruction(&Instruction::I32Add);
         function.instruction(&Instruction::LocalSet(temps.linear));
+        function.instruction(&Instruction::I64Const(-1));
+        function.instruction(&Instruction::LocalSet(temps.last));
         return;
     }
 
     let memory = layout.sys.expect("checked system vector memory capability");
     let page_bytes = 1u64 << memory.page_shift;
     let page_mask = !(page_bytes - 1);
-    function.instruction(&Instruction::LocalGet(temps.address));
-    function.instruction(&Instruction::I64Const(page_mask as i64));
-    function.instruction(&Instruction::I64And);
+    // At most two consecutive pages are handled directly. Both translations
+    // are proved before any element access, preserving all-or-helper fault
+    // semantics while covering common long positive-stride walks.
     function.instruction(&Instruction::LocalGet(temps.last));
-    function.instruction(&Instruction::I64Const(page_mask as i64));
-    function.instruction(&Instruction::I64And);
-    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::I64Const(i64::from(memory.page_shift)));
+    function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::LocalGet(temps.address));
+    function.instruction(&Instruction::I64Const(i64::from(memory.page_shift)));
+    function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::I64Sub);
+    function.instruction(&Instruction::I64Const(1));
+    function.instruction(&Instruction::I64LeU);
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::LocalGet(temps.last));
     function.instruction(&Instruction::I64Const((page_bytes - 1) as i64));
@@ -6007,6 +7289,57 @@ fn emit_vector_strided_memory_guard(
     function.instruction(&Instruction::I64Add);
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(temps.linear));
+
+    // Probe the last page as well (the same row when the range stays within
+    // one page). Save its translated page base for per-element selection.
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::I64Const(i64::from(memory.page_shift)));
+    function.instruction(&Instruction::I64ShrU);
+    if memory.index_hash_shift != 0 {
+        function.instruction(&Instruction::LocalGet(temps.last));
+        function.instruction(&Instruction::I64Const(i64::from(memory.page_shift)));
+        function.instruction(&Instruction::I64ShrU);
+        function.instruction(&Instruction::I64Const(i64::from(memory.index_hash_shift)));
+        function.instruction(&Instruction::I64ShrU);
+        function.instruction(&Instruction::I64Xor);
+    }
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Const(memory.index_mask as i32));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::LocalSet(temps.index));
+
+    function.instruction(&Instruction::I32Const(row.tags as i32));
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::I64Const(page_mask as i64));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I32Const(memory.context_addr as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::I32And);
+
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::I64Const(page_mask as i64));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I32Const(row.offsets as i32));
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::I64Add);
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalSet(temps.linear2));
+
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::I64Const(page_mask as i64));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::LocalSet(temps.last));
 }
 
 /// Leave the conservative direct-SIMD predicate on the stack. Policy bits are
@@ -6056,7 +7389,10 @@ fn emit_vector_direct_guard(
     direct: VectorDirect,
     temps: VectorTemps,
     fractional_lmul: bool,
+    full_vl: bool,
+    address_preloaded: bool,
 ) {
+    debug_assert!(!matches!(direct, VectorDirect::ConfigImmediate { .. }));
     // Decode the architectural group width in bytes. Integer LMUL encodings
     // 0..3 produce 16/32/64/128 bytes; fractional encodings 5..7 produce
     // 2/4/8 bytes. Encoding 4 is reserved and rejected below.
@@ -6114,7 +7450,8 @@ fn emit_vector_direct_guard(
     function.instruction(&Instruction::I64Eqz);
     function.instruction(&Instruction::I32And);
 
-    // vl == VLMAX == group_bytes >> vsew.
+    // The primary SIMD path requires vl == VLMAX. A secondary, explicitly
+    // tail-preserving path may accept vl <= VLMAX for one-register groups.
     function.instruction(&Instruction::I32Const(state.vl_addr as i32));
     function.instruction(&Instruction::I64Load(memarg(3, 0)));
     emit_vector_group_bytes_i64(function, temps, fractional_lmul);
@@ -6124,16 +7461,23 @@ fn emit_vector_direct_guard(
     function.instruction(&Instruction::I64Const(7));
     function.instruction(&Instruction::I64And);
     function.instruction(&Instruction::I64ShrU);
-    function.instruction(&Instruction::I64Eq);
+    function.instruction(&if full_vl {
+        Instruction::I64Eq
+    } else {
+        Instruction::I64LeU
+    });
     function.instruction(&Instruction::I32And);
 
     match direct {
         VectorDirect::Lane {
             op,
+            masked,
             destination,
             source2,
             operand,
         } => {
+            function.instruction(&Instruction::I32Const(i32::from(!masked)));
+            function.instruction(&Instruction::I32And);
             emit_vector_group_alignment(function, destination, temps);
             if let Some(source2) = source2 {
                 emit_vector_group_alignment(function, source2, temps);
@@ -6167,29 +7511,44 @@ fn emit_vector_direct_guard(
         }
         VectorDirect::UnitStride {
             load,
+            masked,
             width,
             register,
             base,
-        } => emit_vector_memory_guard(
-            function,
-            layout,
-            load,
-            Some(width),
-            register,
-            base,
-            temps,
-            fractional_lmul,
-            None,
-        ),
+        } => {
+            // Masked transfers are selected only by the exact known-config
+            // path, which supplies a statically proven EMUL and a scalar
+            // predicate loop. Keep the generic dynamic decoder on its helper.
+            function.instruction(&Instruction::I32Const(i32::from(!masked)));
+            function.instruction(&Instruction::I32And);
+            emit_vector_memory_guard(
+                function,
+                layout,
+                load,
+                Some(width),
+                register,
+                base,
+                temps,
+                fractional_lmul,
+                None,
+                address_preloaded,
+                false,
+            );
+        }
         VectorDirect::Strided {
             load,
+            masked,
             width,
             register,
             base,
             stride,
-        } => emit_vector_strided_memory_guard(
-            function, layout, state, load, width, register, base, stride, temps,
-        ),
+        } => {
+            function.instruction(&Instruction::I32Const(i32::from(!masked)));
+            function.instruction(&Instruction::I32And);
+            emit_vector_strided_memory_guard(
+                function, layout, state, load, width, register, base, stride, temps, true,
+            );
+        }
         VectorDirect::SlideImmediate {
             destination,
             source,
@@ -6214,6 +7573,49 @@ fn emit_vector_direct_guard(
             function.instruction(&Instruction::LocalGet(temps.span));
             function.instruction(&Instruction::I32Const(1));
             function.instruction(&Instruction::I32Eq);
+            function.instruction(&Instruction::I32And);
+        }
+        VectorDirect::GatherVector {
+            destination,
+            source,
+            indices,
+        } => {
+            emit_vector_group_alignment(function, destination, temps);
+            emit_vector_group_alignment(function, source, temps);
+            emit_vector_group_alignment(function, indices, temps);
+            function.instruction(&Instruction::LocalGet(temps.span));
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::I32Eq);
+            function.instruction(&Instruction::I32And);
+        }
+        VectorDirect::Index { destination } => {
+            emit_vector_group_alignment(function, destination, temps);
+
+            // One Wasm SIMD value covers every fractional group and LMUL=1.
+            // Wider groups need a per-chunk index bias and retain the helper.
+            function.instruction(&Instruction::LocalGet(temps.span));
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::I32Eq);
+            function.instruction(&Instruction::I32And);
+        }
+        VectorDirect::Reduction { source, .. } => {
+            emit_vector_group_alignment(function, source, temps);
+        }
+        VectorDirect::MaskLogic { .. } => {}
+        VectorDirect::WidenAddSub { .. } | VectorDirect::WidenMultiplyAccumulate { .. } => {
+            // A fractional narrow group (2/4/8 bytes) and its doubled-width
+            // destination both fit in one architectural 16-byte register.
+            // Wider configurations retain the helper until cross-register
+            // widening is lowered as a unit.
+            function.instruction(&Instruction::I32Const(i32::from(fractional_lmul)));
+            function.instruction(&Instruction::I32And);
+            function.instruction(&Instruction::LocalGet(temps.vtype));
+            function.instruction(&Instruction::I64Const(3));
+            function.instruction(&Instruction::I64ShrU);
+            function.instruction(&Instruction::I64Const(7));
+            function.instruction(&Instruction::I64And);
+            function.instruction(&Instruction::I64Const(3));
+            function.instruction(&Instruction::I64LtU);
             function.instruction(&Instruction::I32And);
         }
         VectorDirect::FloatSign {
@@ -6294,6 +7696,8 @@ fn emit_vector_direct_guard(
             }
         }
         VectorDirect::WholeRegisterMemory { .. }
+        | VectorDirect::ConfigImmediate { .. }
+        | VectorDirect::ConfigRetainFull { .. }
         | VectorDirect::WholeRegisterMove { .. }
         | VectorDirect::ScalarExtract { .. }
         | VectorDirect::ScalarInsert { .. }
@@ -6470,7 +7874,35 @@ fn emit_vector_lane_result_store(
     destination: u8,
     temps: VectorTemps,
     fractional_lmul: bool,
+    tail_merge: bool,
 ) {
+    if tail_merge {
+        function.instruction(&Instruction::LocalGet(temps.result));
+        emit_vector_register_address(function, state, destination, temps);
+        function.instruction(&Instruction::V128Load(memarg(4, 0)));
+        function.instruction(&Instruction::V128Const(i128::from_le_bytes([
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        ])));
+        function.instruction(&Instruction::I32Const(state.vl_addr as i32));
+        function.instruction(&Instruction::I64Load(memarg(3, 0)));
+        function.instruction(&Instruction::I64Const(1));
+        function.instruction(&Instruction::LocalGet(temps.vtype));
+        function.instruction(&Instruction::I64Const(3));
+        function.instruction(&Instruction::I64ShrU);
+        function.instruction(&Instruction::I64Const(7));
+        function.instruction(&Instruction::I64And);
+        function.instruction(&Instruction::I64Shl);
+        function.instruction(&Instruction::I64Mul);
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I8x16Splat);
+        function.instruction(&Instruction::I8x16LtU);
+        function.instruction(&Instruction::V128Bitselect);
+        function.instruction(&Instruction::LocalSet(temps.result));
+        emit_vector_register_address(function, state, destination, temps);
+        function.instruction(&Instruction::LocalGet(temps.result));
+        function.instruction(&Instruction::V128Store(memarg(4, 0)));
+        return;
+    }
     if !fractional_lmul {
         emit_vector_register_address(function, state, destination, temps);
         function.instruction(&Instruction::LocalGet(temps.result));
@@ -6511,17 +7943,111 @@ fn emit_vector_lane_result_store(
     function.instruction(&Instruction::End);
 }
 
+/// Merge a computed SIMD chunk with its old destination according to packed
+/// v0 predicate bits. Known-config selection currently uses this for SEW
+/// 16/32/64, whose per-chunk bit selectors fit in the corresponding Wasm lane.
+fn emit_vector_lane_mask_merge(
+    function: &mut Function,
+    state: VectorStateLayout,
+    destination: u8,
+    sew: u8,
+    temps: VectorTemps,
+) {
+    let lane_bytes = usize::from(sew / 8);
+    let lanes = 16 / lane_bytes;
+
+    if sew == 8 {
+        // Each 128-bit data chunk consumes two packed bytes from v0. Expand
+        // the low and high predicate bytes independently into byte lanes.
+        function.instruction(&Instruction::I32Const(state.regs_base as i32));
+        function.instruction(&Instruction::LocalGet(temps.chunk));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::I32Shl);
+        function.instruction(&Instruction::I32Add);
+        function.instruction(&Instruction::I32Load16U(memarg(1, 0)));
+        function.instruction(&Instruction::LocalSet(temps.index));
+
+        let mut low_selectors = [0u8; 16];
+        let mut high_selectors = [0u8; 16];
+        for lane in 0..8 {
+            low_selectors[lane] = 1 << lane;
+            high_selectors[8 + lane] = 1 << lane;
+        }
+        function.instruction(&Instruction::LocalGet(temps.index));
+        function.instruction(&Instruction::I8x16Splat);
+        function.instruction(&Instruction::V128Const(i128::from_le_bytes(low_selectors)));
+        function.instruction(&Instruction::V128And);
+        function.instruction(&Instruction::V128Const(0));
+        function.instruction(&Instruction::I8x16Ne);
+
+        function.instruction(&Instruction::LocalGet(temps.index));
+        function.instruction(&Instruction::I32Const(8));
+        function.instruction(&Instruction::I32ShrU);
+        function.instruction(&Instruction::I8x16Splat);
+        function.instruction(&Instruction::V128Const(i128::from_le_bytes(high_selectors)));
+        function.instruction(&Instruction::V128And);
+        function.instruction(&Instruction::V128Const(0));
+        function.instruction(&Instruction::I8x16Ne);
+        function.instruction(&Instruction::V128Or);
+        function.instruction(&Instruction::LocalSet(temps.mask));
+    } else {
+        let mut selector_bytes = [0u8; 16];
+        for lane in 0..lanes {
+            let selector = (1u64 << lane).to_le_bytes();
+            let offset = lane * lane_bytes;
+            selector_bytes[offset..offset + lane_bytes].copy_from_slice(&selector[..lane_bytes]);
+        }
+
+        function.instruction(&Instruction::I32Const(state.regs_base as i32));
+        function.instruction(&Instruction::I64Load(memarg(3, 0)));
+        function.instruction(&Instruction::LocalGet(temps.chunk));
+        function.instruction(&Instruction::I64ExtendI32U);
+        function.instruction(&Instruction::I64Const(lanes as i64));
+        function.instruction(&Instruction::I64Mul);
+        function.instruction(&Instruction::I64ShrU);
+        if sew == 64 {
+            function.instruction(&Instruction::I64x2Splat);
+        } else {
+            function.instruction(&Instruction::I32WrapI64);
+            function.instruction(&match sew {
+                16 => Instruction::I16x8Splat,
+                32 => Instruction::I32x4Splat,
+                _ => unreachable!("known masked SIMD lane width"),
+            });
+        }
+        function.instruction(&Instruction::V128Const(i128::from_le_bytes(selector_bytes)));
+        function.instruction(&Instruction::V128And);
+        function.instruction(&Instruction::V128Const(0));
+        function.instruction(&match sew {
+            16 => Instruction::I16x8Ne,
+            32 => Instruction::I32x4Ne,
+            64 => Instruction::I64x2Ne,
+            _ => unreachable!("known masked SIMD lane width"),
+        });
+        function.instruction(&Instruction::LocalSet(temps.mask));
+    }
+
+    function.instruction(&Instruction::LocalGet(temps.result));
+    emit_vector_register_address(function, state, destination, temps);
+    function.instruction(&Instruction::V128Load(memarg(4, 0)));
+    function.instruction(&Instruction::LocalGet(temps.mask));
+    function.instruction(&Instruction::V128Bitselect);
+    function.instruction(&Instruction::LocalSet(temps.result));
+}
+
 fn emit_vector_lane_body(
     function: &mut Function,
     layout: JitLayout,
     state: VectorStateLayout,
     op: VectorLaneOp,
+    masked: bool,
     destination: u8,
     source2: Option<u8>,
     operand: VectorOperand,
     sew: u8,
     temps: VectorTemps,
     fractional_lmul: bool,
+    tail_merge: bool,
 ) {
     let shift = matches!(
         op,
@@ -6553,7 +8079,17 @@ fn emit_vector_lane_body(
         emit_vector_lane_operator(function, op, sew);
     }
     function.instruction(&Instruction::LocalSet(temps.result));
-    emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul);
+    if masked {
+        emit_vector_lane_mask_merge(function, state, destination, sew, temps);
+    }
+    emit_vector_lane_result_store(
+        function,
+        state,
+        destination,
+        temps,
+        fractional_lmul,
+        tail_merge,
+    );
 
     function.instruction(&Instruction::LocalGet(temps.chunk));
     function.instruction(&Instruction::I32Const(1));
@@ -6590,6 +8126,7 @@ fn emit_vector_slide_immediate_body(
     sew: u8,
     temps: VectorTemps,
     fractional_lmul: bool,
+    tail_merge: bool,
 ) {
     let byte_offset = usize::from(offset) * usize::from(sew / 8);
     function.instruction(&Instruction::I32Const(0));
@@ -6601,7 +8138,14 @@ fn emit_vector_slide_immediate_body(
         if !up {
             function.instruction(&Instruction::V128Const(0));
             function.instruction(&Instruction::LocalSet(temps.result));
-            emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul);
+            emit_vector_lane_result_store(
+                function,
+                state,
+                destination,
+                temps,
+                fractional_lmul,
+                tail_merge,
+            );
         }
         return;
     }
@@ -6641,7 +8185,14 @@ fn emit_vector_slide_immediate_body(
     }
     function.instruction(&Instruction::I8x16Shuffle(lanes));
     function.instruction(&Instruction::LocalSet(temps.result));
-    emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul);
+    emit_vector_lane_result_store(
+        function,
+        state,
+        destination,
+        temps,
+        fractional_lmul,
+        tail_merge,
+    );
 }
 
 fn emit_vector_slide_one_scalar_store(
@@ -6720,7 +8271,7 @@ fn emit_vector_slide_one_body(
     }
     function.instruction(&Instruction::I8x16Shuffle(lanes));
     function.instruction(&Instruction::LocalSet(temps.result));
-    emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul);
+    emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul, false);
     if !up {
         emit_vector_slide_one_scalar_store(
             function,
@@ -6773,6 +8324,7 @@ fn emit_vector_gather_immediate_body(
     sew: u8,
     temps: VectorTemps,
     fractional_lmul: bool,
+    tail_merge: bool,
 ) {
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::LocalSet(temps.chunk));
@@ -6792,7 +8344,481 @@ fn emit_vector_gather_immediate_body(
         function.instruction(&Instruction::V128Const(0));
     }
     function.instruction(&Instruction::LocalSet(temps.result));
-    emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul);
+    emit_vector_lane_result_store(
+        function,
+        state,
+        destination,
+        temps,
+        fractional_lmul,
+        tail_merge,
+    );
+}
+
+fn emit_vector_gather_vector_body(
+    function: &mut Function,
+    state: VectorStateLayout,
+    destination: u8,
+    source: u8,
+    indices: u8,
+    sew: u8,
+    temps: VectorTemps,
+    fractional_lmul: bool,
+    partial_vl: bool,
+) {
+    let width = i32::from(sew / 8);
+    let width_shift = i64::from((sew / 8).trailing_zeros());
+    if !fractional_lmul {
+        function.instruction(&Instruction::I32Const(16));
+        function.instruction(&Instruction::LocalSet(temps.group_bytes));
+    }
+    if partial_vl {
+        function.instruction(&Instruction::I32Const(state.vl_addr as i32));
+        function.instruction(&Instruction::I64Load(memarg(3, 0)));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I32Const(width));
+        function.instruction(&Instruction::I32Mul);
+    } else {
+        function.instruction(&Instruction::LocalGet(temps.group_bytes));
+    }
+    function.instruction(&Instruction::LocalSet(temps.linear));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(temps.index));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+
+    function.instruction(&Instruction::I32Const(
+        state.regs_base.wrapping_add(u32::from(indices) * 16) as i32,
+    ));
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&match sew {
+        8 => Instruction::I64Load8U(memarg(0, 0)),
+        16 => Instruction::I64Load16U(memarg(1, 0)),
+        32 => Instruction::I64Load32U(memarg(2, 0)),
+        64 => Instruction::I64Load(memarg(3, 0)),
+        _ => unreachable!("validated vector SEW"),
+    });
+    function.instruction(&Instruction::LocalSet(temps.last));
+
+    function.instruction(&Instruction::I32Const(
+        state.regs_base.wrapping_add(u32::from(destination) * 16) as i32,
+    ));
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::LocalGet(temps.group_bytes));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(width_shift));
+    function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::I64LtU);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::I32Const(
+        state.regs_base.wrapping_add(u32::from(source) * 16) as i32,
+    ));
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::I64Const(width_shift));
+    function.instruction(&Instruction::I64Shl);
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&match sew {
+        8 => Instruction::I64Load8U(memarg(0, 0)),
+        16 => Instruction::I64Load16U(memarg(1, 0)),
+        32 => Instruction::I64Load32U(memarg(2, 0)),
+        64 => Instruction::I64Load(memarg(3, 0)),
+        _ => unreachable!("validated vector SEW"),
+    });
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I64Const(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&match sew {
+        8 => Instruction::I64Store8(memarg(0, 0)),
+        16 => Instruction::I64Store16(memarg(1, 0)),
+        32 => Instruction::I64Store32(memarg(2, 0)),
+        64 => Instruction::I64Store(memarg(3, 0)),
+        _ => unreachable!("validated vector SEW"),
+    });
+
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I32Const(width));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalTee(temps.index));
+    function.instruction(&Instruction::LocalGet(temps.linear));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::BrIf(0));
+    function.instruction(&Instruction::End);
+}
+
+fn emit_vector_index_body(
+    function: &mut Function,
+    state: VectorStateLayout,
+    destination: u8,
+    sew: u8,
+    temps: VectorTemps,
+    fractional_lmul: bool,
+    tail_merge: bool,
+) {
+    let mut bytes = [0u8; 16];
+    let width = usize::from(sew / 8);
+    for lane in 0..(16 / width) {
+        let value = (lane as u64).to_le_bytes();
+        bytes[lane * width..(lane + 1) * width].copy_from_slice(&value[..width]);
+    }
+    function.instruction(&Instruction::V128Const(i128::from_le_bytes(bytes)));
+    function.instruction(&Instruction::LocalSet(temps.result));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(temps.chunk));
+    function.instruction(&Instruction::LocalGet(temps.span));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    emit_vector_lane_result_store(
+        function,
+        state,
+        destination,
+        temps,
+        fractional_lmul,
+        tail_merge,
+    );
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(temps.result));
+    function.instruction(&Instruction::LocalSet(temps.splat));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(temps.splat));
+    function.instruction(&Instruction::LocalGet(temps.chunk));
+    function.instruction(&Instruction::I32Const((128 / i32::from(sew)) as i32));
+    function.instruction(&Instruction::I32Mul);
+    if sew == 64 {
+        function.instruction(&Instruction::I64ExtendI32U);
+        function.instruction(&Instruction::I64x2Splat);
+    } else {
+        function.instruction(&match sew {
+            8 => Instruction::I8x16Splat,
+            16 => Instruction::I16x8Splat,
+            32 => Instruction::I32x4Splat,
+            _ => unreachable!("validated vector SEW"),
+        });
+    }
+    function.instruction(&match sew {
+        8 => Instruction::I8x16Add,
+        16 => Instruction::I16x8Add,
+        32 => Instruction::I32x4Add,
+        64 => Instruction::I64x2Add,
+        _ => unreachable!("validated vector SEW"),
+    });
+    function.instruction(&Instruction::LocalSet(temps.result));
+    emit_vector_lane_result_store(function, state, destination, temps, false, false);
+    function.instruction(&Instruction::LocalGet(temps.chunk));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalTee(temps.chunk));
+    function.instruction(&Instruction::LocalGet(temps.span));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::BrIf(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+}
+
+fn emit_vector_reduction_simd_operator(function: &mut Function, op: VectorReductionOp) {
+    function.instruction(&match op {
+        VectorReductionOp::And => Instruction::V128And,
+        VectorReductionOp::Or => Instruction::V128Or,
+        VectorReductionOp::Xor => Instruction::V128Xor,
+    });
+}
+
+fn emit_vector_reduction_scalar_operator(function: &mut Function, op: VectorReductionOp) {
+    function.instruction(&match op {
+        VectorReductionOp::And => Instruction::I64And,
+        VectorReductionOp::Or => Instruction::I64Or,
+        VectorReductionOp::Xor => Instruction::I64Xor,
+    });
+}
+
+fn emit_vector_reduction_fractional_identity(
+    function: &mut Function,
+    op: VectorReductionOp,
+    temps: VectorTemps,
+) {
+    for bytes in [2u32, 4, 8] {
+        function.instruction(&Instruction::LocalGet(temps.group_bytes));
+        function.instruction(&Instruction::I32Const(bytes as i32));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        function.instruction(&Instruction::LocalGet(temps.result));
+        let low_mask = (1i128 << (bytes * 8)) - 1;
+        function.instruction(&Instruction::V128Const(low_mask));
+        function.instruction(&Instruction::V128And);
+        if op == VectorReductionOp::And {
+            function.instruction(&Instruction::V128Const(!low_mask));
+            function.instruction(&Instruction::V128Or);
+        }
+        function.instruction(&Instruction::LocalSet(temps.result));
+        function.instruction(&Instruction::End);
+    }
+}
+
+fn emit_vector_reduction_body(
+    function: &mut Function,
+    state: VectorStateLayout,
+    op: VectorReductionOp,
+    destination: u8,
+    source: u8,
+    seed: u8,
+    sew: u8,
+    temps: VectorTemps,
+    fractional_lmul: bool,
+) {
+    let identity = if op == VectorReductionOp::And { -1 } else { 0 };
+
+    function.instruction(&Instruction::I32Const(
+        state.regs_base.wrapping_add(u32::from(seed) * 16) as i32,
+    ));
+    function.instruction(&match sew {
+        8 => Instruction::I64Load8U(memarg(0, 0)),
+        16 => Instruction::I64Load16U(memarg(1, 0)),
+        32 => Instruction::I64Load32U(memarg(2, 0)),
+        64 => Instruction::I64Load(memarg(3, 0)),
+        _ => unreachable!("validated vector SEW"),
+    });
+    function.instruction(&Instruction::LocalSet(temps.last));
+
+    function.instruction(&Instruction::V128Const(identity));
+    function.instruction(&Instruction::LocalSet(temps.result));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(temps.chunk));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(temps.result));
+    emit_vector_register_address(function, state, source, temps);
+    function.instruction(&Instruction::V128Load(memarg(4, 0)));
+    emit_vector_reduction_simd_operator(function, op);
+    function.instruction(&Instruction::LocalSet(temps.result));
+    function.instruction(&Instruction::LocalGet(temps.chunk));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalTee(temps.chunk));
+    function.instruction(&Instruction::LocalGet(temps.span));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::BrIf(0));
+    function.instruction(&Instruction::End);
+
+    if fractional_lmul {
+        emit_vector_reduction_fractional_identity(function, op, temps);
+    }
+
+    for byte_shift in match sew {
+        8 => &[8usize, 4, 2, 1][..],
+        16 => &[8usize, 4, 2][..],
+        32 => &[8usize, 4][..],
+        64 => &[8usize][..],
+        _ => unreachable!("validated vector SEW"),
+    } {
+        let mut lanes = [16u8; 16];
+        for (index, lane) in lanes.iter_mut().enumerate().take(16 - byte_shift) {
+            *lane = (index + byte_shift) as u8;
+        }
+        function.instruction(&Instruction::LocalGet(temps.result));
+        function.instruction(&Instruction::LocalGet(temps.result));
+        function.instruction(&Instruction::V128Const(identity));
+        function.instruction(&Instruction::I8x16Shuffle(lanes));
+        emit_vector_reduction_simd_operator(function, op);
+        function.instruction(&Instruction::LocalSet(temps.result));
+    }
+
+    function.instruction(&Instruction::I32Const(
+        state.regs_base.wrapping_add(u32::from(destination) * 16) as i32,
+    ));
+    function.instruction(&Instruction::LocalGet(temps.result));
+    function.instruction(&match sew {
+        8 => Instruction::I8x16ExtractLaneU(0),
+        16 => Instruction::I16x8ExtractLaneU(0),
+        32 => Instruction::I32x4ExtractLane(0),
+        64 => Instruction::I64x2ExtractLane(0),
+        _ => unreachable!("validated vector SEW"),
+    });
+    if sew != 64 {
+        function.instruction(&Instruction::I64ExtendI32U);
+    }
+    function.instruction(&Instruction::LocalGet(temps.last));
+    emit_vector_reduction_scalar_operator(function, op);
+    function.instruction(&match sew {
+        8 => Instruction::I64Store8(memarg(0, 0)),
+        16 => Instruction::I64Store16(memarg(1, 0)),
+        32 => Instruction::I64Store32(memarg(2, 0)),
+        64 => Instruction::I64Store(memarg(3, 0)),
+        _ => unreachable!("validated vector SEW"),
+    });
+}
+
+fn emit_vector_widen_element_address(
+    function: &mut Function,
+    state: VectorStateLayout,
+    register: u8,
+    temps: VectorTemps,
+    wide: bool,
+) {
+    function.instruction(&Instruction::I32Const(
+        state.regs_base.wrapping_add(u32::from(register) * 16) as i32,
+    ));
+    function.instruction(&Instruction::LocalGet(temps.index));
+    if wide {
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::I32Shl);
+    }
+    function.instruction(&Instruction::I32Add);
+}
+
+fn emit_vector_widen_load(function: &mut Function, width: u8, signed: bool) {
+    function.instruction(&match (width, signed) {
+        (1, false) => Instruction::I64Load8U(memarg(0, 0)),
+        (1, true) => Instruction::I64Load8S(memarg(0, 0)),
+        (2, false) => Instruction::I64Load16U(memarg(1, 0)),
+        (2, true) => Instruction::I64Load16S(memarg(1, 0)),
+        (4, false) => Instruction::I64Load32U(memarg(2, 0)),
+        (4, true) => Instruction::I64Load32S(memarg(2, 0)),
+        (8, _) => Instruction::I64Load(memarg(3, 0)),
+        _ => unreachable!("validated widening width"),
+    });
+}
+
+fn emit_vector_widen_store(function: &mut Function, width: u8) {
+    function.instruction(&match width {
+        2 => Instruction::I64Store16(memarg(1, 0)),
+        4 => Instruction::I64Store32(memarg(2, 0)),
+        8 => Instruction::I64Store(memarg(3, 0)),
+        _ => unreachable!("validated widened width"),
+    });
+}
+
+fn emit_vector_widen_scalar_operand(
+    function: &mut Function,
+    layout: JitLayout,
+    register: u8,
+    sew: u8,
+    signed: bool,
+) {
+    function.instruction(&Instruction::I32Const(layout.x_base as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, u64::from(register) * 8)));
+    if signed {
+        function.instruction(&match sew {
+            8 => Instruction::I64Extend8S,
+            16 => Instruction::I64Extend16S,
+            32 => Instruction::I64Extend32S,
+            _ => unreachable!("narrow widening SEW"),
+        });
+    } else {
+        let mask = (1u64 << sew) - 1;
+        function.instruction(&Instruction::I64Const(mask as i64));
+        function.instruction(&Instruction::I64And);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_vector_widen_add_sub_body(
+    function: &mut Function,
+    layout: JitLayout,
+    state: VectorStateLayout,
+    signed: bool,
+    subtract: bool,
+    wide_left: bool,
+    destination: u8,
+    source2: u8,
+    operand: VectorOperand,
+    sew: u8,
+    temps: VectorTemps,
+) {
+    let narrow_width = sew / 8;
+    let wide_width = narrow_width * 2;
+    if let VectorOperand::ScalarX(register) = operand {
+        emit_vector_widen_scalar_operand(function, layout, register, sew, signed);
+        function.instruction(&Instruction::LocalSet(temps.last));
+    }
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(temps.index));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+
+    emit_vector_widen_element_address(function, state, source2, temps, wide_left);
+    emit_vector_widen_load(
+        function,
+        if wide_left { wide_width } else { narrow_width },
+        signed,
+    );
+    function.instruction(&Instruction::LocalSet(temps.address));
+    if let VectorOperand::Vector(register) = operand {
+        emit_vector_widen_element_address(function, state, register, temps, false);
+        emit_vector_widen_load(function, narrow_width, signed);
+        function.instruction(&Instruction::LocalSet(temps.last));
+    }
+
+    emit_vector_widen_element_address(function, state, destination, temps, true);
+    function.instruction(&Instruction::LocalGet(temps.address));
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&if subtract {
+        Instruction::I64Sub
+    } else {
+        Instruction::I64Add
+    });
+    emit_vector_widen_store(function, wide_width);
+
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I32Const(i32::from(narrow_width)));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalTee(temps.index));
+    function.instruction(&Instruction::LocalGet(temps.group_bytes));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::BrIf(0));
+    function.instruction(&Instruction::End);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_vector_widen_madd_body(
+    function: &mut Function,
+    layout: JitLayout,
+    state: VectorStateLayout,
+    source2_signed: bool,
+    operand_signed: bool,
+    destination: u8,
+    source2: u8,
+    operand: VectorOperand,
+    sew: u8,
+    temps: VectorTemps,
+) {
+    let narrow_width = sew / 8;
+    let wide_width = narrow_width * 2;
+    if let VectorOperand::ScalarX(register) = operand {
+        emit_vector_widen_scalar_operand(function, layout, register, sew, operand_signed);
+        function.instruction(&Instruction::LocalSet(temps.stride));
+    }
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(temps.index));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+
+    emit_vector_widen_element_address(function, state, source2, temps, false);
+    emit_vector_widen_load(function, narrow_width, source2_signed);
+    function.instruction(&Instruction::LocalSet(temps.address));
+    if let VectorOperand::Vector(register) = operand {
+        emit_vector_widen_element_address(function, state, register, temps, false);
+        emit_vector_widen_load(function, narrow_width, operand_signed);
+        function.instruction(&Instruction::LocalSet(temps.stride));
+    }
+    emit_vector_widen_element_address(function, state, destination, temps, true);
+    emit_vector_widen_load(function, wide_width, false);
+    function.instruction(&Instruction::LocalSet(temps.last));
+
+    emit_vector_widen_element_address(function, state, destination, temps, true);
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::LocalGet(temps.address));
+    function.instruction(&Instruction::LocalGet(temps.stride));
+    function.instruction(&Instruction::I64Mul);
+    function.instruction(&Instruction::I64Add);
+    emit_vector_widen_store(function, wide_width);
+
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I32Const(i32::from(narrow_width)));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalTee(temps.index));
+    function.instruction(&Instruction::LocalGet(temps.group_bytes));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::BrIf(0));
+    function.instruction(&Instruction::End);
 }
 
 fn emit_vector_float_sign_body(
@@ -6840,7 +8866,7 @@ fn emit_vector_float_sign_body(
         }
     }
     function.instruction(&Instruction::LocalSet(temps.result));
-    emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul);
+    emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul, false);
 
     function.instruction(&Instruction::LocalGet(temps.chunk));
     function.instruction(&Instruction::I32Const(1));
@@ -6907,7 +8933,7 @@ fn emit_vector_float_broadcast_body(
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::LocalSet(temps.chunk));
     function.instruction(&Instruction::Loop(BlockType::Empty));
-    emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul);
+    emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul, false);
     function.instruction(&Instruction::LocalGet(temps.chunk));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
@@ -6962,7 +8988,7 @@ fn emit_vector_float_slide_one_body(
     }
     function.instruction(&Instruction::I8x16Shuffle(lanes));
     function.instruction(&Instruction::LocalSet(temps.result));
-    emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul);
+    emit_vector_lane_result_store(function, state, destination, temps, fractional_lmul, false);
     if !up {
         function.instruction(&Instruction::I32Const(
             state.regs_base.wrapping_add(u32::from(destination) * 16) as i32,
@@ -7131,6 +9157,10 @@ fn emit_vector_compare_body(
     if !matches!(operand, VectorOperand::Vector(_)) {
         emit_vector_splat(function, layout, operand, sew, temps);
     }
+    function.instruction(&Instruction::LocalGet(temps.span));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::LocalSet(temps.chunk));
     emit_vector_register_address(function, state, source2, temps);
@@ -7165,6 +9195,214 @@ fn emit_vector_compare_body(
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::I32Or);
     function.instruction(&Instruction::I32Store16(memarg(1, 0)));
+    function.instruction(&Instruction::Else);
+    emit_vector_compare_wide_body(
+        function,
+        state,
+        op,
+        destination,
+        source2,
+        operand,
+        sew,
+        temps,
+    );
+    function.instruction(&Instruction::End);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_vector_compare_wide_body(
+    function: &mut Function,
+    state: VectorStateLayout,
+    op: VectorCompareOp,
+    destination: u8,
+    source2: u8,
+    operand: VectorOperand,
+    sew: u8,
+    temps: VectorTemps,
+) {
+    function.instruction(&Instruction::I64Const(0));
+    function.instruction(&Instruction::LocalSet(temps.address));
+    function.instruction(&Instruction::I64Const(0));
+    function.instruction(&Instruction::LocalSet(temps.stride));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(temps.chunk));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+
+    emit_vector_register_address(function, state, source2, temps);
+    function.instruction(&Instruction::V128Load(memarg(4, 0)));
+    emit_vector_operand(function, state, operand, temps);
+    emit_vector_compare_operator(function, op, sew);
+    emit_vector_compare_bitmask(function, sew);
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::LocalSet(temps.last));
+
+    function.instruction(&Instruction::LocalGet(temps.chunk));
+    function.instruction(&Instruction::I32Const(128 / i32::from(sew)));
+    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::LocalTee(temps.index));
+    function.instruction(&Instruction::I32Const(64));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(temps.address));
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Shl);
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::LocalSet(temps.address));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(temps.stride));
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I32Const(64));
+    function.instruction(&Instruction::I32Sub);
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Shl);
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::LocalSet(temps.stride));
+    function.instruction(&Instruction::End);
+
+    function.instruction(&Instruction::LocalGet(temps.chunk));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalTee(temps.chunk));
+    function.instruction(&Instruction::LocalGet(temps.span));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::BrIf(0));
+    function.instruction(&Instruction::End);
+
+    function.instruction(&Instruction::V128Const(0));
+    function.instruction(&Instruction::LocalGet(temps.address));
+    function.instruction(&Instruction::I64x2ReplaceLane(0));
+    function.instruction(&Instruction::LocalGet(temps.stride));
+    function.instruction(&Instruction::I64x2ReplaceLane(1));
+    function.instruction(&Instruction::LocalSet(temps.result));
+    emit_vector_active_bits_mask(function, state, temps);
+
+    let destination_address = state.regs_base.wrapping_add(u32::from(destination) * 16);
+    function.instruction(&Instruction::I32Const(destination_address as i32));
+    function.instruction(&Instruction::LocalGet(temps.result));
+    function.instruction(&Instruction::I32Const(destination_address as i32));
+    function.instruction(&Instruction::V128Load(memarg(4, 0)));
+    function.instruction(&Instruction::LocalGet(temps.splat));
+    function.instruction(&Instruction::V128Bitselect);
+    function.instruction(&Instruction::V128Store(memarg(4, 0)));
+}
+
+/// Construct a packed 128-bit mask with one bits for architectural element
+/// indices below vl. The direct mask-logic path uses it to preserve all tail
+/// predicate bits instead of relying on a particular tail-agnostic value.
+fn emit_vector_active_bits_mask(
+    function: &mut Function,
+    state: VectorStateLayout,
+    temps: VectorTemps,
+) {
+    function.instruction(&Instruction::I32Const(state.vl_addr as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::LocalTee(temps.last));
+    function.instruction(&Instruction::I64Const(64));
+    function.instruction(&Instruction::I64GeU);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::I64Const(-1));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I64Const(1));
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::I64Shl);
+    function.instruction(&Instruction::I64Const(1));
+    function.instruction(&Instruction::I64Sub);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalSet(temps.address));
+
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::I64Const(64));
+    function.instruction(&Instruction::I64LeU);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::I64Const(0));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::I64Const(128));
+    function.instruction(&Instruction::I64GeU);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::I64Const(-1));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I64Const(1));
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::I64Const(64));
+    function.instruction(&Instruction::I64Sub);
+    function.instruction(&Instruction::I64Shl);
+    function.instruction(&Instruction::I64Const(1));
+    function.instruction(&Instruction::I64Sub);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalSet(temps.stride));
+
+    function.instruction(&Instruction::V128Const(0));
+    function.instruction(&Instruction::LocalGet(temps.address));
+    function.instruction(&Instruction::I64x2ReplaceLane(0));
+    function.instruction(&Instruction::LocalGet(temps.stride));
+    function.instruction(&Instruction::I64x2ReplaceLane(1));
+    function.instruction(&Instruction::LocalSet(temps.splat));
+}
+
+fn emit_vector_mask_logic_body(
+    function: &mut Function,
+    state: VectorStateLayout,
+    op: VectorMaskOp,
+    destination: u8,
+    source2: u8,
+    source1: u8,
+    temps: VectorTemps,
+) {
+    function.instruction(&Instruction::I32Const(
+        state.regs_base.wrapping_add(u32::from(source2) * 16) as i32,
+    ));
+    function.instruction(&Instruction::V128Load(memarg(4, 0)));
+    function.instruction(&Instruction::I32Const(
+        state.regs_base.wrapping_add(u32::from(source1) * 16) as i32,
+    ));
+    function.instruction(&Instruction::V128Load(memarg(4, 0)));
+    match op {
+        VectorMaskOp::AndNot => {
+            function.instruction(&Instruction::V128Not);
+            function.instruction(&Instruction::V128And);
+        }
+        VectorMaskOp::And => {
+            function.instruction(&Instruction::V128And);
+        }
+        VectorMaskOp::Or => {
+            function.instruction(&Instruction::V128Or);
+        }
+        VectorMaskOp::Xor => {
+            function.instruction(&Instruction::V128Xor);
+        }
+        VectorMaskOp::OrNot => {
+            function.instruction(&Instruction::V128Not);
+            function.instruction(&Instruction::V128Or);
+        }
+        VectorMaskOp::Nand => {
+            function.instruction(&Instruction::V128And);
+            function.instruction(&Instruction::V128Not);
+        }
+        VectorMaskOp::Nor => {
+            function.instruction(&Instruction::V128Or);
+            function.instruction(&Instruction::V128Not);
+        }
+        VectorMaskOp::Xnor => {
+            function.instruction(&Instruction::V128Xor);
+            function.instruction(&Instruction::V128Not);
+        }
+    }
+    function.instruction(&Instruction::LocalSet(temps.result));
+    emit_vector_active_bits_mask(function, state, temps);
+
+    let destination_address = state.regs_base.wrapping_add(u32::from(destination) * 16);
+    function.instruction(&Instruction::I32Const(destination_address as i32));
+    function.instruction(&Instruction::LocalGet(temps.result));
+    function.instruction(&Instruction::I32Const(destination_address as i32));
+    function.instruction(&Instruction::V128Load(memarg(4, 0)));
+    function.instruction(&Instruction::LocalGet(temps.splat));
+    function.instruction(&Instruction::V128Bitselect);
+    function.instruction(&Instruction::V128Store(memarg(4, 0)));
 }
 
 fn emit_vector_linear_address(function: &mut Function, temps: VectorTemps) {
@@ -7259,14 +9497,97 @@ fn emit_vector_unit_stride_body(
     function.instruction(&Instruction::End);
 }
 
+/// Emit a unit-stride transfer whose exact effective LMUL was proved by a
+/// guarded vector-configuration fact. Static register chunks remove the
+/// dynamic inner loop without changing architectural memory ordering.
+fn emit_known_vector_unit_stride_body(
+    function: &mut Function,
+    state: VectorStateLayout,
+    load: bool,
+    register: u8,
+    memory: KnownVectorMemoryConfig,
+    temps: VectorTemps,
+) {
+    let register_address = |chunk: u8| {
+        state
+            .regs_base
+            .wrapping_add(u32::from(register.saturating_add(chunk)) * 16)
+    };
+    let emit_linear_address = |function: &mut Function, offset: i32| {
+        function.instruction(&Instruction::LocalGet(temps.linear));
+        if offset != 0 {
+            function.instruction(&Instruction::I32Const(offset));
+            function.instruction(&Instruction::I32Add);
+        }
+    };
+
+    if memory.fractional_lmul {
+        if load {
+            function.instruction(&Instruction::I32Const(register_address(0) as i32));
+            emit_linear_address(function, 0);
+        } else {
+            emit_linear_address(function, 0);
+            function.instruction(&Instruction::I32Const(register_address(0) as i32));
+        }
+        let (load_instruction, store_instruction) = match memory.group_bytes {
+            2 => (
+                Instruction::I32Load16U(memarg(1, 0)),
+                Instruction::I32Store16(memarg(1, 0)),
+            ),
+            4 => (
+                Instruction::I32Load(memarg(2, 0)),
+                Instruction::I32Store(memarg(2, 0)),
+            ),
+            8 => (
+                Instruction::I64Load(memarg(3, 0)),
+                Instruction::I64Store(memarg(3, 0)),
+            ),
+            _ => unreachable!("ratified fractional LMUL byte width"),
+        };
+        function.instruction(&load_instruction);
+        function.instruction(&store_instruction);
+        return;
+    }
+
+    for chunk in 0..memory.span {
+        let offset = i32::from(chunk) * 16;
+        if load {
+            function.instruction(&Instruction::I32Const(register_address(chunk) as i32));
+            emit_linear_address(function, offset);
+        } else {
+            emit_linear_address(function, offset);
+            function.instruction(&Instruction::I32Const(register_address(chunk) as i32));
+        }
+        function.instruction(&Instruction::V128Load(memarg(4, 0)));
+        function.instruction(&Instruction::V128Store(memarg(4, 0)));
+    }
+}
+
 fn emit_vector_strided_linear_address(function: &mut Function, temps: VectorTemps) {
-    function.instruction(&Instruction::LocalGet(temps.linear));
+    function.instruction(&Instruction::LocalGet(temps.address));
     function.instruction(&Instruction::LocalGet(temps.stride));
     function.instruction(&Instruction::LocalGet(temps.chunk));
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Mul);
+    function.instruction(&Instruction::I64Add);
+    function.instruction(&Instruction::LocalTee(temps.element));
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::I64LtU);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(temps.linear));
+    function.instruction(&Instruction::LocalGet(temps.element));
+    function.instruction(&Instruction::LocalGet(temps.address));
+    function.instruction(&Instruction::I64Sub);
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(temps.linear2));
+    function.instruction(&Instruction::LocalGet(temps.element));
+    function.instruction(&Instruction::LocalGet(temps.last));
+    function.instruction(&Instruction::I64Sub);
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::End);
 }
 
 fn emit_vector_strided_register_address(
@@ -7342,6 +9663,80 @@ fn emit_vector_strided_body(
     function.instruction(&Instruction::End);
 }
 
+/// Execute an ordinary masked vector load/store element by element after the
+/// caller has proved the complete address range and effective register group.
+/// Inactive loads preserve their destination element (an allowed agnostic
+/// result), while inactive stores perform no memory access at all.
+#[allow(clippy::too_many_arguments)]
+fn emit_vector_masked_memory_body(
+    function: &mut Function,
+    state: VectorStateLayout,
+    load: bool,
+    strided: bool,
+    width: u8,
+    register: u8,
+    temps: VectorTemps,
+) {
+    function.instruction(&Instruction::I32Const(state.vl_addr as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalSet(temps.index));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(temps.chunk));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+
+    // Packed predicate bit v0[element]. The exact known configuration bounds
+    // element below VLMAX, hence this byte read remains inside v0's 16 bytes.
+    function.instruction(&Instruction::I32Const(state.regs_base as i32));
+    function.instruction(&Instruction::LocalGet(temps.chunk));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32ShrU);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Load8U(memarg(0, 0)));
+    function.instruction(&Instruction::LocalGet(temps.chunk));
+    function.instruction(&Instruction::I32Const(7));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::I32ShrU);
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::If(BlockType::Empty));
+
+    if load {
+        emit_vector_strided_register_address(function, state, register, width, temps);
+        if strided {
+            emit_vector_strided_linear_address(function, temps);
+        } else {
+            function.instruction(&Instruction::LocalGet(temps.linear));
+            function.instruction(&Instruction::LocalGet(temps.chunk));
+            function.instruction(&Instruction::I32Const((width / 8).trailing_zeros() as i32));
+            function.instruction(&Instruction::I32Shl);
+            function.instruction(&Instruction::I32Add);
+        }
+    } else {
+        if strided {
+            emit_vector_strided_linear_address(function, temps);
+        } else {
+            function.instruction(&Instruction::LocalGet(temps.linear));
+            function.instruction(&Instruction::LocalGet(temps.chunk));
+            function.instruction(&Instruction::I32Const((width / 8).trailing_zeros() as i32));
+            function.instruction(&Instruction::I32Shl);
+            function.instruction(&Instruction::I32Add);
+        }
+        emit_vector_strided_register_address(function, state, register, width, temps);
+    }
+    emit_vector_strided_scalar_transfer(function, width);
+    function.instruction(&Instruction::End);
+
+    function.instruction(&Instruction::LocalGet(temps.chunk));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalTee(temps.chunk));
+    function.instruction(&Instruction::LocalGet(temps.index));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::BrIf(0));
+    function.instruction(&Instruction::End);
+}
+
 fn emit_vector_system_enabled_guard(function: &mut Function, layout: JitLayout) {
     if layout.vector == Some(VectorCapability::System) {
         function.instruction(&Instruction::I32Const(layout.mstatus_addr as i32));
@@ -7380,6 +9775,8 @@ fn emit_vector_whole_memory_guard(
         temps,
         false,
         Some(u32::from(registers) * 16),
+        false,
+        false,
     );
     emit_vector_system_enabled_guard(function, layout);
 }
@@ -7592,10 +9989,12 @@ fn emit_vector_direct_body(
     direct: VectorDirect,
     temps: VectorTemps,
     fractional_lmul: bool,
+    tail_merge: bool,
 ) {
     match direct {
         VectorDirect::Lane {
             op,
+            masked,
             destination,
             source2,
             operand,
@@ -7614,9 +10013,40 @@ fn emit_vector_direct_body(
                     layout,
                     state,
                     op,
+                    masked,
                     destination,
                     source2,
                     operand,
+                    sew,
+                    temps,
+                    fractional_lmul,
+                    tail_merge,
+                );
+                function.instruction(&Instruction::End);
+            }
+        }
+        VectorDirect::Reduction {
+            op,
+            destination,
+            source,
+            seed,
+        } => {
+            for (vsew, sew) in [(0, 8), (1, 16), (2, 32), (3, 64)] {
+                function.instruction(&Instruction::LocalGet(temps.vtype));
+                function.instruction(&Instruction::I64Const(3));
+                function.instruction(&Instruction::I64ShrU);
+                function.instruction(&Instruction::I64Const(7));
+                function.instruction(&Instruction::I64And);
+                function.instruction(&Instruction::I64Const(vsew));
+                function.instruction(&Instruction::I64Eq);
+                function.instruction(&Instruction::If(BlockType::Empty));
+                emit_vector_reduction_body(
+                    function,
+                    state,
+                    op,
+                    destination,
+                    source,
+                    seed,
                     sew,
                     temps,
                     fractional_lmul,
@@ -7624,16 +10054,110 @@ fn emit_vector_direct_body(
                 function.instruction(&Instruction::End);
             }
         }
-        VectorDirect::UnitStride { load, register, .. } => {
-            emit_vector_unit_stride_body(function, state, load, register, temps, fractional_lmul);
+        VectorDirect::MaskLogic {
+            op,
+            destination,
+            source2,
+            source1,
+        } => emit_vector_mask_logic_body(function, state, op, destination, source2, source1, temps),
+        VectorDirect::WidenAddSub {
+            signed,
+            subtract,
+            wide_left,
+            destination,
+            source2,
+            operand,
+        } => {
+            for (vsew, sew) in [(0, 8), (1, 16), (2, 32)] {
+                function.instruction(&Instruction::LocalGet(temps.vtype));
+                function.instruction(&Instruction::I64Const(3));
+                function.instruction(&Instruction::I64ShrU);
+                function.instruction(&Instruction::I64Const(7));
+                function.instruction(&Instruction::I64And);
+                function.instruction(&Instruction::I64Const(vsew));
+                function.instruction(&Instruction::I64Eq);
+                function.instruction(&Instruction::If(BlockType::Empty));
+                emit_vector_widen_add_sub_body(
+                    function,
+                    layout,
+                    state,
+                    signed,
+                    subtract,
+                    wide_left,
+                    destination,
+                    source2,
+                    operand,
+                    sew,
+                    temps,
+                );
+                function.instruction(&Instruction::End);
+            }
         }
-        VectorDirect::Strided {
+        VectorDirect::WidenMultiplyAccumulate {
+            source2_signed,
+            operand_signed,
+            destination,
+            source2,
+            operand,
+        } => {
+            for (vsew, sew) in [(0, 8), (1, 16), (2, 32)] {
+                function.instruction(&Instruction::LocalGet(temps.vtype));
+                function.instruction(&Instruction::I64Const(3));
+                function.instruction(&Instruction::I64ShrU);
+                function.instruction(&Instruction::I64Const(7));
+                function.instruction(&Instruction::I64And);
+                function.instruction(&Instruction::I64Const(vsew));
+                function.instruction(&Instruction::I64Eq);
+                function.instruction(&Instruction::If(BlockType::Empty));
+                emit_vector_widen_madd_body(
+                    function,
+                    layout,
+                    state,
+                    source2_signed,
+                    operand_signed,
+                    destination,
+                    source2,
+                    operand,
+                    sew,
+                    temps,
+                );
+                function.instruction(&Instruction::End);
+            }
+        }
+        VectorDirect::UnitStride {
             load,
+            masked,
             width,
             register,
             ..
         } => {
-            emit_vector_strided_body(function, state, load, width, register, temps);
+            if masked {
+                emit_vector_masked_memory_body(
+                    function, state, load, false, width, register, temps,
+                );
+            } else {
+                emit_vector_unit_stride_body(
+                    function,
+                    state,
+                    load,
+                    register,
+                    temps,
+                    fractional_lmul,
+                );
+            }
+        }
+        VectorDirect::Strided {
+            load,
+            masked,
+            width,
+            register,
+            ..
+        } => {
+            if masked {
+                emit_vector_masked_memory_body(function, state, load, true, width, register, temps);
+            } else {
+                emit_vector_strided_body(function, state, load, width, register, temps);
+            }
         }
         VectorDirect::SlideImmediate {
             up,
@@ -7660,6 +10184,7 @@ fn emit_vector_direct_body(
                     sew,
                     temps,
                     fractional_lmul,
+                    tail_merge,
                 );
                 function.instruction(&Instruction::End);
             }
@@ -7717,6 +10242,57 @@ fn emit_vector_direct_body(
                     sew,
                     temps,
                     fractional_lmul,
+                    tail_merge,
+                );
+                function.instruction(&Instruction::End);
+            }
+        }
+        VectorDirect::GatherVector {
+            destination,
+            source,
+            indices,
+        } => {
+            for (vsew, sew) in [(0, 8), (1, 16), (2, 32), (3, 64)] {
+                function.instruction(&Instruction::LocalGet(temps.vtype));
+                function.instruction(&Instruction::I64Const(3));
+                function.instruction(&Instruction::I64ShrU);
+                function.instruction(&Instruction::I64Const(7));
+                function.instruction(&Instruction::I64And);
+                function.instruction(&Instruction::I64Const(vsew));
+                function.instruction(&Instruction::I64Eq);
+                function.instruction(&Instruction::If(BlockType::Empty));
+                emit_vector_gather_vector_body(
+                    function,
+                    state,
+                    destination,
+                    source,
+                    indices,
+                    sew,
+                    temps,
+                    fractional_lmul,
+                    tail_merge,
+                );
+                function.instruction(&Instruction::End);
+            }
+        }
+        VectorDirect::Index { destination } => {
+            for (vsew, sew) in [(0, 8), (1, 16), (2, 32), (3, 64)] {
+                function.instruction(&Instruction::LocalGet(temps.vtype));
+                function.instruction(&Instruction::I64Const(3));
+                function.instruction(&Instruction::I64ShrU);
+                function.instruction(&Instruction::I64Const(7));
+                function.instruction(&Instruction::I64And);
+                function.instruction(&Instruction::I64Const(vsew));
+                function.instruction(&Instruction::I64Eq);
+                function.instruction(&Instruction::If(BlockType::Empty));
+                emit_vector_index_body(
+                    function,
+                    state,
+                    destination,
+                    sew,
+                    temps,
+                    fractional_lmul,
+                    tail_merge,
                 );
                 function.instruction(&Instruction::End);
             }
@@ -7837,6 +10413,8 @@ fn emit_vector_direct_body(
             }
         }
         VectorDirect::WholeRegisterMemory { .. }
+        | VectorDirect::ConfigImmediate { .. }
+        | VectorDirect::ConfigRetainFull { .. }
         | VectorDirect::WholeRegisterMove { .. }
         | VectorDirect::ScalarExtract { .. }
         | VectorDirect::ScalarInsert { .. }
@@ -7852,6 +10430,95 @@ fn emit_vector_direct_body(
 fn emit_vector_direct_finish(function: &mut Function, layout: JitLayout, state: VectorStateLayout) {
     emit_vector_system_dirty(function, layout);
     emit_profile_counter_add(function, state.simd_count_addr, 1);
+}
+
+fn emit_vector_config_enabled_guard(function: &mut Function, layout: JitLayout) {
+    match layout.vector {
+        Some(VectorCapability::User) => {
+            function.instruction(&Instruction::I32Const(1));
+        }
+        Some(VectorCapability::System) => {
+            function.instruction(&Instruction::I32Const(layout.mstatus_addr as i32));
+            function.instruction(&Instruction::I64Load(memarg(3, 0)));
+            function.instruction(&Instruction::I64Const(3 << 9));
+            function.instruction(&Instruction::I64And);
+            function.instruction(&Instruction::I64Eqz);
+            function.instruction(&Instruction::I32Eqz);
+        }
+        None => {
+            function.instruction(&Instruction::I32Const(0));
+        }
+    }
+}
+
+fn emit_vector_retain_full_guard(
+    function: &mut Function,
+    layout: JitLayout,
+    state: VectorStateLayout,
+    temps: VectorTemps,
+    vlmax: u64,
+) {
+    emit_vector_config_enabled_guard(function, layout);
+    function.instruction(&Instruction::I32Const(state.vtype_addr as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::LocalSet(temps.vtype));
+
+    // Current vtype must be legal. Policy bits do not affect VLMAX, while
+    // every high/reserved bit (including VILL) rejects the direct arm.
+    function.instruction(&Instruction::LocalGet(temps.vtype));
+    function.instruction(&Instruction::I64Const(!0xffi64));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I64Eqz);
+    function.instruction(&Instruction::I32And);
+
+    // Enumerate the architectural SEW/LMUL encodings with the required
+    // VLMAX. This is a fixed ISA table, not a guest-code or workload pattern.
+    function.instruction(&Instruction::I32Const(0));
+    for raw_vtype in 0u64..64 {
+        if KnownVectorConfig::decode(raw_vtype, 0).is_some_and(|config| config.vlmax == vlmax) {
+            function.instruction(&Instruction::LocalGet(temps.vtype));
+            function.instruction(&Instruction::I64Const(0x3f));
+            function.instruction(&Instruction::I64And);
+            function.instruction(&Instruction::I64Const(raw_vtype as i64));
+            function.instruction(&Instruction::I64Eq);
+            function.instruction(&Instruction::I32Or);
+        }
+    }
+    function.instruction(&Instruction::I32And);
+
+    function.instruction(&Instruction::I32Const(state.vl_addr as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::I64Const(vlmax as i64));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::I32And);
+}
+
+fn emit_vector_config_immediate_body(
+    function: &mut Function,
+    layout: JitLayout,
+    state: VectorStateLayout,
+    destination: u8,
+    vtype: u64,
+    vl: u64,
+) {
+    for (address, value) in [
+        (state.vtype_addr, vtype),
+        (state.vl_addr, vl),
+        (state.vstart_addr, 0),
+    ] {
+        function.instruction(&Instruction::I32Const(address as i32));
+        function.instruction(&Instruction::I64Const(value as i64));
+        function.instruction(&Instruction::I64Store(memarg(3, 0)));
+    }
+    if destination != 0 {
+        function.instruction(&Instruction::I32Const(layout.x_base as i32));
+        function.instruction(&Instruction::I64Const(vl as i64));
+        function.instruction(&Instruction::I64Store(memarg(
+            3,
+            u64::from(destination) * 8,
+        )));
+    }
+    emit_vector_direct_finish(function, layout, state);
 }
 
 fn emit_vector_system_dirty(function: &mut Function, layout: JitLayout) {
@@ -7898,17 +10565,247 @@ fn emit_vector_direct_class(
     direct: VectorDirect,
     temps: VectorTemps,
     fractional_lmul: bool,
+    prepare_fallback: &mut dyn FnMut(&mut Function) -> Result<(), EmitError>,
+    address_preloaded: bool,
 ) -> Result<(), EmitError> {
-    emit_vector_direct_guard(function, layout, state, direct, temps, fractional_lmul);
+    emit_vector_direct_guard(
+        function,
+        layout,
+        state,
+        direct,
+        temps,
+        fractional_lmul,
+        true,
+        address_preloaded,
+    );
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_vector_direct_body(function, layout, state, direct, temps, fractional_lmul);
+    emit_vector_direct_body(
+        function,
+        layout,
+        state,
+        direct,
+        temps,
+        fractional_lmul,
+        false,
+    );
     function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
     function.instruction(&Instruction::Else);
-    emit_vector_call(function, helpers, insn)?;
+    emit_vector_partial_class(
+        function,
+        layout,
+        helpers,
+        insn,
+        state,
+        direct,
+        temps,
+        fractional_lmul,
+        prepare_fallback,
+        address_preloaded,
+    )?;
     function.instruction(&Instruction::End);
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_vector_partial_class(
+    function: &mut Function,
+    layout: JitLayout,
+    helpers: HelperImports,
+    insn: u32,
+    state: VectorStateLayout,
+    direct: VectorDirect,
+    temps: VectorTemps,
+    fractional_lmul: bool,
+    prepare_fallback: &mut dyn FnMut(&mut Function) -> Result<(), EmitError>,
+    address_preloaded: bool,
+) -> Result<(), EmitError> {
+    if !vector_partial_vl_available(direct) {
+        emit_vector_call(function, helpers, insn, prepare_fallback)?;
+        return Ok(());
+    }
+    emit_vector_direct_guard(
+        function,
+        layout,
+        state,
+        direct,
+        temps,
+        fractional_lmul,
+        false,
+        address_preloaded,
+    );
+    function.instruction(&Instruction::LocalGet(temps.span));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::I32Const(state.vl_addr as i32));
+    function.instruction(&Instruction::I64Load(memarg(3, 0)));
+    function.instruction(&Instruction::I64Eqz);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_vector_direct_body(
+        function,
+        layout,
+        state,
+        direct,
+        temps,
+        fractional_lmul,
+        true,
+    );
+    function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
+    function.instruction(&Instruction::Else);
+    emit_vector_call(function, helpers, insn, prepare_fallback)?;
+    function.instruction(&Instruction::End);
+    Ok(())
+}
+
+fn emit_known_vector_execution(
+    function: &mut Function,
+    layout: JitLayout,
+    helpers: HelperImports,
+    insn: u32,
+    direct: VectorDirect,
+    config: KnownVectorConfig,
+    tail_merge: bool,
+    temps: Option<VectorTemps>,
+    status: u32,
+    prepare_fallback: &mut dyn FnMut(&mut Function) -> Result<(), EmitError>,
+    unit_shape_proven: bool,
+    address_preloaded: bool,
+) -> Result<(), EmitError> {
+    let state = layout
+        .vector_state
+        .ok_or_else(|| EmitError("known direct vector effect lacks architectural state".into()))?;
+    let temps = temps
+        .ok_or_else(|| EmitError("known direct vector effect lacks shared temporaries".into()))?;
+    if unit_shape_proven && !matches!(direct, VectorDirect::UnitStride { masked: false, .. }) {
+        return Err(EmitError(
+            "unit-shape proof applied to a non-unit vector effect".into(),
+        ));
+    }
+    if !unit_shape_proven {
+        function.instruction(&Instruction::I64Const(config.vtype as i64));
+        function.instruction(&Instruction::LocalSet(temps.vtype));
+        function.instruction(&Instruction::I32Const(i32::from(config.span)));
+        function.instruction(&Instruction::LocalSet(temps.span));
+        function.instruction(&Instruction::I32Const(i32::from(config.group_bytes)));
+        function.instruction(&Instruction::LocalSet(temps.group_bytes));
+    }
+
+    if let VectorDirect::UnitStride {
+        load,
+        width,
+        register,
+        base,
+        ..
+    }
+    | VectorDirect::Strided {
+        load,
+        width,
+        register,
+        base,
+        ..
+    } = direct
+    {
+        let memory = config.memory_config(width).ok_or_else(|| {
+            EmitError("known vector memory effect has an illegal effective LMUL".into())
+        })?;
+        if let Some(system_memory) = layout.sys {
+            validate_system_memory(system_memory)?;
+        }
+        if !unit_shape_proven {
+            function.instruction(&Instruction::I32Const(i32::from(memory.span)));
+            function.instruction(&Instruction::LocalSet(temps.span));
+            function.instruction(&Instruction::I32Const(i32::from(memory.group_bytes)));
+            function.instruction(&Instruction::LocalSet(temps.group_bytes));
+        }
+
+        function.instruction(&Instruction::I32Const(1));
+        match direct {
+            VectorDirect::UnitStride { .. } => emit_vector_memory_guard(
+                function,
+                layout,
+                load,
+                None,
+                register,
+                base,
+                temps,
+                memory.fractional_lmul,
+                Some(u32::from(memory.group_bytes)),
+                address_preloaded,
+                unit_shape_proven && load && address_preloaded,
+            ),
+            VectorDirect::Strided { stride, .. } => emit_vector_strided_memory_guard(
+                function, layout, state, load, width, register, base, stride, temps, false,
+            ),
+            _ => unreachable!("matched known vector memory operation"),
+        }
+        if !unit_shape_proven {
+            emit_vector_system_enabled_guard(function, layout);
+        }
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        if let VectorDirect::UnitStride {
+            load,
+            masked: false,
+            register,
+            ..
+        } = direct
+        {
+            emit_known_vector_unit_stride_body(function, state, load, register, memory, temps);
+            if unit_shape_proven {
+                emit_profile_counter_add(function, state.simd_count_addr, 1);
+            } else {
+                emit_vector_direct_finish(function, layout, state);
+            }
+        } else {
+            emit_vector_direct_body(
+                function,
+                layout,
+                state,
+                direct,
+                temps,
+                memory.fractional_lmul,
+                false,
+            );
+        }
+        function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
+        function.instruction(&Instruction::Else);
+        emit_vector_call(function, helpers, insn, prepare_fallback)?;
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::LocalSet(status));
+        return Ok(());
+    }
+
+    emit_vector_direct_body(
+        function,
+        layout,
+        state,
+        direct,
+        temps,
+        config.fractional_lmul,
+        tail_merge,
+    );
+    function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
+    function.instruction(&Instruction::LocalSet(status));
+    Ok(())
+}
+
+fn emit_known_vector_config_execution(
+    function: &mut Function,
+    layout: JitLayout,
+    config: KnownVectorConfig,
+    status: u32,
+) -> Result<(), EmitError> {
+    let state = layout
+        .vector_state
+        .ok_or_else(|| EmitError("known vector configuration lacks architectural state".into()))?;
+    emit_vector_config_immediate_body(function, layout, state, 0, config.vtype, config.vl);
+    function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
+    function.instruction(&Instruction::LocalSet(status));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_vector_execution(
     function: &mut Function,
     layout: JitLayout,
@@ -7917,6 +10814,90 @@ fn emit_vector_execution(
     direct: Option<VectorDirect>,
     temps: Option<VectorTemps>,
     status: u32,
+    prepare_fallback: &mut dyn FnMut(&mut Function) -> Result<(), EmitError>,
+    address_preloaded: bool,
+) -> Result<(), EmitError> {
+    let unit = direct
+        .filter(|direct| {
+            matches!(direct, VectorDirect::UnitStride { masked: false, .. })
+                && vector_direct_available(layout, Some(*direct))
+        })
+        .and_then(|direct| {
+            let VectorDirect::UnitStride { width, .. } = direct else {
+                unreachable!("filtered unit-stride direct operation")
+            };
+            let vsew = match width {
+                8 => 0u8,
+                16 => 1,
+                32 => 2,
+                64 => 3,
+                _ => return None,
+            };
+            let config = KnownVectorConfig::decode(u64::from(vsew) << 3, 16 >> vsew)?;
+            known_vector_direct_tail_merge(config, direct)
+                .map(|tail_merge| (config, direct, tail_merge, i32::from(vsew) + 1))
+        });
+    let Some((config, direct, tail_merge, expected_sew)) = unit else {
+        emit_vector_execution_dynamic(
+            function,
+            layout,
+            helpers,
+            insn,
+            direct,
+            temps,
+            status,
+            prepare_fallback,
+            address_preloaded,
+        )?;
+        return Ok(());
+    };
+    let temps = temps.ok_or_else(|| EmitError("unit-vector effect lacks temporaries".into()))?;
+    function.instruction(&Instruction::LocalGet(temps.unit_lmul1_sew.ok_or_else(
+        || EmitError("unit-vector effect lacks a configuration local".into()),
+    )?));
+    function.instruction(&Instruction::I32Const(expected_sew));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    emit_known_vector_execution(
+        function,
+        layout,
+        helpers,
+        insn,
+        direct,
+        config,
+        tail_merge,
+        Some(temps),
+        status,
+        prepare_fallback,
+        true,
+        address_preloaded,
+    )?;
+    function.instruction(&Instruction::Else);
+    emit_vector_execution_dynamic(
+        function,
+        layout,
+        helpers,
+        insn,
+        Some(direct),
+        Some(temps),
+        status,
+        prepare_fallback,
+        address_preloaded,
+    )?;
+    function.instruction(&Instruction::End);
+    Ok(())
+}
+
+fn emit_vector_execution_dynamic(
+    function: &mut Function,
+    layout: JitLayout,
+    helpers: HelperImports,
+    insn: u32,
+    direct: Option<VectorDirect>,
+    temps: Option<VectorTemps>,
+    status: u32,
+    prepare_fallback: &mut dyn FnMut(&mut Function) -> Result<(), EmitError>,
+    address_preloaded: bool,
 ) -> Result<(), EmitError> {
     if vector_direct_available(layout, direct) {
         let state = layout.vector_state.expect("checked direct vector state");
@@ -7924,6 +10905,45 @@ fn emit_vector_execution(
             temps.ok_or_else(|| EmitError("direct vector effect lacks temporaries".into()))?;
         let direct = direct.expect("checked direct vector candidate");
         match direct {
+            VectorDirect::ConfigRetainFull { vtype, vlmax } => {
+                emit_vector_retain_full_guard(function, layout, state, temps, vlmax);
+                function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+                emit_vector_config_immediate_body(function, layout, state, 0, vtype, vlmax);
+                function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
+                function.instruction(&Instruction::Else);
+                emit_vector_call(function, helpers, insn, prepare_fallback)?;
+                function.instruction(&Instruction::LocalSet(status));
+                // A successful cold helper owns the instruction's exact
+                // semantics, then exits this generated region. Consequently
+                // only the guarded full-VLMAX arm reaches following members,
+                // making their compile-time configuration fact sound.
+                function.instruction(&Instruction::LocalGet(status));
+                function.instruction(&Instruction::I32Const(1));
+                function.instruction(&Instruction::I32Eq);
+                function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+                function.instruction(&Instruction::I32Const(2));
+                function.instruction(&Instruction::Else);
+                function.instruction(&Instruction::LocalGet(status));
+                function.instruction(&Instruction::End);
+                function.instruction(&Instruction::End);
+            }
+            VectorDirect::ConfigImmediate {
+                destination,
+                vtype,
+                vl,
+            } => {
+                emit_vector_config_enabled_guard(function, layout);
+                function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+                emit_vector_config_immediate_body(function, layout, state, destination, vtype, vl);
+                function.instruction(&Instruction::I32Const(if destination == 0 {
+                    VECTOR_STATUS_DIRECT
+                } else {
+                    VECTOR_STATUS_DIRECT_SCALAR
+                }));
+                function.instruction(&Instruction::Else);
+                emit_vector_call(function, helpers, insn, prepare_fallback)?;
+                function.instruction(&Instruction::End);
+            }
             VectorDirect::WholeRegisterMemory {
                 load,
                 register,
@@ -7942,7 +10962,7 @@ fn emit_vector_execution(
                 );
                 function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
                 function.instruction(&Instruction::Else);
-                emit_vector_call(function, helpers, insn)?;
+                emit_vector_call(function, helpers, insn, prepare_fallback)?;
                 function.instruction(&Instruction::End);
             }
             VectorDirect::WholeRegisterMove {
@@ -7964,7 +10984,7 @@ fn emit_vector_execution(
                 );
                 function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
                 function.instruction(&Instruction::Else);
-                emit_vector_call(function, helpers, insn)?;
+                emit_vector_call(function, helpers, insn, prepare_fallback)?;
                 function.instruction(&Instruction::End);
             }
             VectorDirect::ScalarInsert {
@@ -7977,7 +10997,7 @@ fn emit_vector_execution(
                 emit_vector_scalar_insert_body(function, layout, state, destination, source, temps);
                 function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
                 function.instruction(&Instruction::Else);
-                emit_vector_call(function, helpers, insn)?;
+                emit_vector_call(function, helpers, insn, prepare_fallback)?;
                 function.instruction(&Instruction::End);
             }
             VectorDirect::ScalarExtract {
@@ -7997,7 +11017,7 @@ fn emit_vector_execution(
                 );
                 function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT_SCALAR));
                 function.instruction(&Instruction::Else);
-                emit_vector_call(function, helpers, insn)?;
+                emit_vector_call(function, helpers, insn, prepare_fallback)?;
                 function.instruction(&Instruction::End);
             }
             VectorDirect::FloatScalarInsert {
@@ -8018,7 +11038,7 @@ fn emit_vector_execution(
                 );
                 function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
                 function.instruction(&Instruction::Else);
-                emit_vector_call(function, helpers, insn)?;
+                emit_vector_call(function, helpers, insn, prepare_fallback)?;
                 function.instruction(&Instruction::End);
             }
             VectorDirect::FloatScalarExtract {
@@ -8039,7 +11059,7 @@ fn emit_vector_execution(
                 );
                 function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT_SCALAR));
                 function.instruction(&Instruction::Else);
-                emit_vector_call(function, helpers, insn)?;
+                emit_vector_call(function, helpers, insn, prepare_fallback)?;
                 function.instruction(&Instruction::End);
             }
             VectorDirect::Lane { .. }
@@ -8048,6 +11068,12 @@ fn emit_vector_execution(
             | VectorDirect::SlideImmediate { .. }
             | VectorDirect::SlideOne { .. }
             | VectorDirect::GatherImmediate { .. }
+            | VectorDirect::GatherVector { .. }
+            | VectorDirect::Index { .. }
+            | VectorDirect::Reduction { .. }
+            | VectorDirect::MaskLogic { .. }
+            | VectorDirect::WidenAddSub { .. }
+            | VectorDirect::WidenMultiplyAccumulate { .. }
             | VectorDirect::FloatSign { .. }
             | VectorDirect::FloatBroadcast { .. }
             | VectorDirect::FloatSlideOne { .. }
@@ -8061,9 +11087,18 @@ fn emit_vector_execution(
                     }
                 }
                 emit_vector_direct_state_load(function, state, temps);
-                emit_vector_direct_guard(function, layout, state, direct, temps, false);
+                emit_vector_direct_guard(
+                    function,
+                    layout,
+                    state,
+                    direct,
+                    temps,
+                    false,
+                    true,
+                    address_preloaded,
+                );
                 function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-                emit_vector_direct_body(function, layout, state, direct, temps, false);
+                emit_vector_direct_body(function, layout, state, direct, temps, false, false);
                 function.instruction(&Instruction::I32Const(VECTOR_STATUS_DIRECT));
                 function.instruction(&Instruction::Else);
                 // System-memory guards reuse `index` for the fused-TLB row.
@@ -8079,16 +11114,36 @@ fn emit_vector_execution(
                 function.instruction(&Instruction::I32GtU);
                 function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
                 emit_vector_direct_class(
-                    function, layout, helpers, insn, state, direct, temps, true,
+                    function,
+                    layout,
+                    helpers,
+                    insn,
+                    state,
+                    direct,
+                    temps,
+                    true,
+                    prepare_fallback,
+                    address_preloaded,
                 )?;
                 function.instruction(&Instruction::Else);
-                emit_vector_call(function, helpers, insn)?;
+                emit_vector_partial_class(
+                    function,
+                    layout,
+                    helpers,
+                    insn,
+                    state,
+                    direct,
+                    temps,
+                    false,
+                    prepare_fallback,
+                    address_preloaded,
+                )?;
                 function.instruction(&Instruction::End);
                 function.instruction(&Instruction::End);
             }
         }
     } else {
-        emit_vector_call(function, helpers, insn)?;
+        emit_vector_call(function, helpers, insn, prepare_fallback)?;
     }
     function.instruction(&Instruction::LocalSet(status));
     Ok(())
@@ -8336,10 +11391,11 @@ fn finish_module(function: Function, helpers: HelperImports, layout: JitLayout) 
 /// Finish a module whose public entries all name one register-resident
 /// dispatcher/body function. Keeping this distinct from `finish_multi_module`
 /// makes the function-index calculation explicit: helper imports precede the
-/// sole defined function, while linear memory is not in the function index
-/// space.
+/// public dispatcher, followed by any private cold fallback functions, while
+/// linear memory is not in the function index space.
 fn finish_shared_module(
     function: Function,
+    fallbacks: Vec<Function>,
     helpers: HelperImports,
     member_count: u32,
     export_members: bool,
@@ -8474,6 +11530,9 @@ fn finish_shared_module(
 
     let mut functions = FunctionSection::new();
     functions.function(0);
+    for _ in &fallbacks {
+        functions.function(0);
+    }
     module.section(&functions);
 
     let function_index = helpers.count();
@@ -8489,6 +11548,9 @@ fn finish_shared_module(
 
     let mut code = CodeSection::new();
     code.function(&function);
+    for fallback in &fallbacks {
+        code.function(fallback);
+    }
     module.section(&code);
     module.finish()
 }
@@ -9586,6 +12648,82 @@ mod tests {
     }
 
     #[test]
+    fn structured_member_range_outlines_only_proven_ordinary_accesses() {
+        let load_region = |count: usize| {
+            let mut builder = Builder::new(0x1000);
+            // x3 is deliberately outside the fixed structured resident bank,
+            // exercising the canonical materialized-root guard path.
+            let root = builder.read_x(3, 0x1000);
+            for index in 0..count {
+                let pc = 0x1000 + index as u64 * 4;
+                let offset = builder.const_i64((index * 8) as i64, pc);
+                let address = builder.binary(BinaryOp::I64Add, root, offset, pc);
+                let value = builder.load(address, LoadKind::I64, pc, index as u32);
+                builder.write_x(10 + index, value);
+            }
+            let next_pc = 0x1000 + count as u64 * 4;
+            let next = builder.const_i64(next_pc as i64, next_pc.saturating_sub(4));
+            builder.finish(next_pc, next, count as u32, ExitKind::Dispatch)
+        };
+
+        let two_loads = load_region(2);
+        assert!(member_range_plan(&two_loads).is_none());
+
+        let three_loads = load_region(3);
+        let plan = member_range_plan(&three_loads).expect("three common-root loads are eligible");
+        assert_eq!(plan.root_reg(&three_loads), Some(3));
+        assert_eq!(plan.min_offset, 0);
+        assert_eq!(plan.span, 24);
+        assert_eq!((plan.loads, plan.stores), (3, 0));
+
+        // Conditional stores retain their exact per-access lowering and do
+        // not count toward the minimum needed to outline an ordinary member.
+        let mut conditional_builder = Builder::new(0x2000);
+        let root = conditional_builder.read_x(3, 0x2000);
+        let value = conditional_builder.const_i64(7, 0x2000);
+        for (index, offset) in [0i64, 8].into_iter().enumerate() {
+            let pc = 0x2000 + index as u64 * 4;
+            let offset = conditional_builder.const_i64(offset, pc);
+            let address = conditional_builder.binary(BinaryOp::I64Add, root, offset, pc);
+            let _ = conditional_builder.load(address, LoadKind::I64, pc, index as u32);
+        }
+        let condition =
+            conditional_builder.reservation(ReservationOp::StoreConditional, root, 0x2008);
+        conditional_builder.store_conditional(condition, root, value, StoreKind::I64, 0x2008, 2);
+        let next = conditional_builder.const_i64(0x200c, 0x2008);
+        let conditional = conditional_builder.finish(0x200c, next, 3, ExitKind::Dispatch);
+        assert!(member_range_plan(&conditional).is_none());
+
+        let mut next_builder = Builder::new(0x100c);
+        let old = next_builder.read_x(1, 0x100c);
+        let one = next_builder.const_i64(1, 0x100c);
+        let value = next_builder.binary(BinaryOp::I64Add, old, one, 0x100c);
+        next_builder.write_x(1, value);
+        let next = next_builder.const_i64(0x1010, 0x100c);
+        let next_region = next_builder.finish(0x1010, next, 1, ExitKind::Dispatch);
+        let members = [(&three_loads, None), (&next_region, None)];
+        let bytes = emit_multi_entry_mode(
+            &members,
+            system_layout(true),
+            true,
+            MultiEntryState::RegisterStructured,
+        )
+        .expect("outlined structured module emits");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("outlined structured module validates");
+
+        let defined = Parser::new(0)
+            .parse_all(&bytes)
+            .find_map(|payload| match payload.expect("generated payload parses") {
+                Payload::FunctionSection(section) => Some(section.count()),
+                _ => None,
+            })
+            .expect("generated module has a function section");
+        assert_eq!(defined, 2, "one dispatcher plus one private fallback");
+    }
+
+    #[test]
     fn structured_state_keeps_only_the_fixed_rvc_bank_resident() {
         let member = |entry_pc, next_pc| {
             let mut builder = Builder::new(entry_pc);
@@ -9614,7 +12752,7 @@ mod tests {
 
         // x1 is loaded/committed once around the generated function. x3 has no
         // function-wide state local and is synchronized by both member bodies.
-        assert_eq!(count_i64_state_ops(&bytes, 1 * 8), (1, 1));
+        assert_eq!(count_i64_state_ops(&bytes, 8), (1, 1));
         assert_eq!(count_i64_state_ops(&bytes, 3 * 8), (2, 2));
     }
 
@@ -9677,17 +12815,21 @@ mod tests {
             .validate_all(&bytes)
             .expect("structured vector module validates");
 
+        // The hot direct arm publishes the scalar epoch outputs needed after
+        // the vector boundary. The cold helper arm contains the complete
+        // precise snapshot, so a static operator census sees two mutually
+        // exclusive stores for every current-member output.
         assert_eq!(
             count_direct_state_stores(&bytes, layout.x_base, 16 * 8, true),
-            1
+            2
         );
         assert_eq!(
             count_direct_state_stores(&bytes, layout.f_base, 31 * 8, true),
-            1
+            2
         );
         assert_eq!(
             count_direct_state_stores(&bytes, layout.fcsr_addr, 0, false),
-            1
+            2
         );
     }
 
@@ -9775,6 +12917,41 @@ mod tests {
     }
 
     #[test]
+    fn read_only_vector_state_effect_emits_without_a_vector_helper() {
+        let mut builder = Builder::new(0x1000);
+        builder.vector_state(0x1000, 0);
+        let vlenb = builder.const_i64(rv64_core::cpu::VLEN_BYTES as i64, 0x1000);
+        builder.write_x(10, vlenb);
+        let next = builder.const_i64(0x1004, 0x1000);
+        let region = builder.finish(0x1004, next, 1, ExitKind::Dispatch);
+
+        let mut user = JitLayout::bare();
+        user.vector = Some(VectorCapability::User);
+        let user_bytes = emit(&region, user, None).expect("user vector CSR module emits");
+        assert!(import_names(&user_bytes)
+            .iter()
+            .all(|(_, name)| name != "user_vector" && name != "system_vector"));
+        wasmparser::Validator::new()
+            .validate_all(&user_bytes)
+            .expect("user vector CSR module validates");
+
+        let mut system = system_layout(true);
+        system.vector = Some(VectorCapability::System);
+        system.mstatus_addr = 0x20_000;
+        let system_bytes = emit(&region, system, None).expect("system vector CSR module emits");
+        assert!(import_names(&system_bytes)
+            .iter()
+            .all(|(_, name)| name != "user_vector" && name != "system_vector"));
+        wasmparser::Validator::new()
+            .validate_all(&system_bytes)
+            .expect("system vector CSR module validates");
+
+        let mut missing = user;
+        missing.vector = None;
+        assert!(emit(&region, missing, None).is_err());
+    }
+
+    #[test]
     fn direct_vector_state_emits_valid_simd_with_helper_fallback() {
         let mut builder = Builder::new(0x1000);
         // vadd.vv v16,v8,v12
@@ -9803,13 +12980,112 @@ mod tests {
         let (loads, adds, stores) = simd_memory_ops(&direct_bytes);
         assert!(loads >= 2, "both vector operands must be loaded");
         assert_eq!(
-            adds, 2,
-            "integer and fractional LMUL arms each use i8x16.add"
+            adds, 4,
+            "full and tail-preserving integer/fractional arms each use i8x16.add"
         );
         assert!(stores >= 1, "the vector result must be stored");
         assert!(import_names(&direct_bytes)
             .iter()
             .any(|(module, name)| module == "env" && name == "user_vector"));
+    }
+
+    #[test]
+    fn known_vector_configuration_is_legal_and_conservative() {
+        let m1_e8 = KnownVectorConfig::decode(0xc0, 16).expect("e8,m1 is legal");
+        assert_eq!(m1_e8.vsew, 0);
+        assert_eq!(m1_e8.span, 1);
+        assert_eq!(m1_e8.group_bytes, 16);
+        assert_eq!(m1_e8.vlmax, 16);
+        assert_eq!(
+            known_vector_direct_tail_merge(
+                m1_e8,
+                VectorDirect::Lane {
+                    op: VectorLaneOp::Add,
+                    masked: false,
+                    destination: 16,
+                    source2: Some(8),
+                    operand: VectorOperand::Vector(12),
+                },
+            ),
+            Some(false),
+        );
+
+        let partial = KnownVectorConfig::decode(0xc0, 7).expect("partial e8,m1 is legal");
+        assert_eq!(
+            known_vector_direct_tail_merge(
+                partial,
+                VectorDirect::Lane {
+                    op: VectorLaneOp::Add,
+                    masked: false,
+                    destination: 16,
+                    source2: Some(8),
+                    operand: VectorOperand::Vector(12),
+                },
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            known_vector_direct_tail_merge(
+                partial,
+                VectorDirect::SlideOne {
+                    up: false,
+                    destination: 16,
+                    source: 8,
+                    scalar: 1,
+                },
+            ),
+            None,
+            "partial vslide1 remains on the architectural helper",
+        );
+
+        let mf2_e32 = KnownVectorConfig::decode(0xd7, 2).expect("e32,mf2 is legal");
+        assert!(mf2_e32.fractional_lmul);
+        assert_eq!(mf2_e32.group_bytes, 8);
+        assert!(
+            KnownVectorConfig::decode(0xdf, 1).is_none(),
+            "e64,mf2 is illegal"
+        );
+        assert!(KnownVectorConfig::decode(1 << 63, 0).is_none());
+    }
+
+    #[test]
+    fn cached_vector_region_specializes_configuration_established_by_vsetivli() {
+        let mut vector_builder = Builder::new(0x1000);
+        // vsetivli zero,16,e8,m1,ta,ma; vadd.vv v16,v8,v12
+        vector_builder.vector(0xcc08_7057, 0x1000, 0x1004, 0);
+        vector_builder.vector(0x0286_0857, 0x1004, 0x1008, 1);
+        let next = vector_builder.const_i64(0x1008, 0x1004);
+        let vector_region = vector_builder.finish(0x1008, next, 2, ExitKind::Dispatch);
+
+        let mut scalar_builder = Builder::new(0x1008);
+        let next = scalar_builder.const_i64(0x100c, 0x1008);
+        let scalar_region = scalar_builder.finish(0x100c, next, 1, ExitKind::Dispatch);
+
+        let mut layout = JitLayout::bare();
+        layout.mem = Some((4096, 65536));
+        layout.vector = Some(VectorCapability::User);
+        layout.vector_state = Some(VectorStateLayout {
+            regs_base: 0x20_000,
+            vl_addr: 0x20_200,
+            vtype_addr: 0x20_208,
+            vstart_addr: 0x20_210,
+            simd_count_addr: 0x20_218,
+        });
+        let bytes = emit_multi_entry_mode(
+            &[(&vector_region, None), (&scalar_region, None)],
+            layout,
+            true,
+            MultiEntryState::RegisterEager,
+        )
+        .expect("cached configured-vector module emits");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("configured-vector module validates");
+        assert_eq!(
+            simd_memory_ops(&bytes).1,
+            1,
+            "known e8 configuration emits only the selected direct body",
+        );
     }
 
     #[test]

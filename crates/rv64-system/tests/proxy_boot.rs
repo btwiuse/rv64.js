@@ -124,8 +124,10 @@ impl Harness {
                 self.stack.input(&frame);
             }
             self.proxy.pump(&mut self.stack, &mut self.egress);
-            for frame in self.stack.take_output() {
-                self.m.net_input(&frame);
+            let capacity = self.m.net_input_capacity();
+            for frame in self.stack.take_output_limit(capacity) {
+                let accepted = self.m.net_input(&frame);
+                debug_assert!(accepted);
             }
             if self.out.contains(needle) {
                 return true;

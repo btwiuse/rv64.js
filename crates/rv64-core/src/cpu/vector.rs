@@ -6,8 +6,10 @@
 
 use super::*;
 
-pub(super) const VLEN_BITS: usize = 128;
-pub(super) const VLEN_BYTES: usize = VLEN_BITS / 8;
+/// Architectural vector-register width implemented by this machine.
+pub const VLEN_BITS: usize = 128;
+/// Read-only `vlenb` CSR value for this machine.
+pub const VLEN_BYTES: usize = VLEN_BITS / 8;
 const VREG_COUNT: usize = 32;
 const VILL: u64 = 1 << 63;
 
@@ -21,7 +23,6 @@ pub struct VectorState {
     pub vstart: u64,
     pub vxrm: u8,
     pub vxsat: bool,
-    decoded: Option<VectorConfig>,
 }
 
 impl Default for VectorState {
@@ -35,7 +36,6 @@ impl Default for VectorState {
             vstart: 0,
             vxrm: 0,
             vxsat: false,
-            decoded: None,
         }
     }
 }
@@ -182,7 +182,11 @@ impl VectorConfig {
 impl VectorState {
     #[inline(always)]
     fn config(&self) -> Option<VectorConfig> {
-        self.decoded
+        // `vtype` is the architectural source of truth. Generated code may
+        // install a legal configuration directly, so retaining a second,
+        // interpreter-private decoded cache would let the two representations
+        // diverge at a JIT/helper boundary.
+        VectorConfig::decode(self.vtype)
     }
 
     fn install_config(
@@ -200,7 +204,6 @@ impl VectorState {
 
         if let Some(config) = legal {
             self.vtype = raw_type & 0xff;
-            self.decoded = Some(config);
             self.vl = if immediate_avl {
                 avl.min(config.vlmax as u64)
             } else if retain_vl {
@@ -213,7 +216,6 @@ impl VectorState {
         } else {
             self.vtype = VILL;
             self.vl = 0;
-            self.decoded = None;
         }
         self.vstart = 0;
         self.vl
@@ -4257,7 +4259,7 @@ mod tests {
         assert_eq!(cpu.x[2], 16);
 
         cpu.x[1] = 3;
-        cpu.exec_vector_op(vsetvli(2, 1, 0b0_1_000_000)).unwrap(); // e8,m1, tail agnostic
+        cpu.exec_vector_op(vsetvli(2, 1, 0b0100_0000)).unwrap(); // e8,m1, tail agnostic
         assert_eq!(cpu.vector.vl, 3);
 
         cpu.exec_vector_op(vsetvli(2, 1, 4)).unwrap(); // reserved LMUL

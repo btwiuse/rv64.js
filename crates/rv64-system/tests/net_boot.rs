@@ -144,7 +144,7 @@ impl Guest {
             }
             for frame in self.m.net_take_output() {
                 if let Some(reply) = respond(&frame) {
-                    self.m.net_input(&reply);
+                    let _ = self.m.net_input(&reply);
                     self.replied += 1;
                 }
                 self.sent.push(frame);

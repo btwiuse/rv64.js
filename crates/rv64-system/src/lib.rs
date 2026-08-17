@@ -513,7 +513,7 @@ impl Machine {
         if let Some(mac) = images.net {
             virtio.push(VirtioDev::new(Backend::Net {
                 mac,
-                inbox: Vec::new(),
+                inbox: Default::default(),
                 outbox: Vec::new(),
             }));
         }
@@ -597,13 +597,17 @@ impl Machine {
         out
     }
 
-    /// Deliver an inbound Ethernet frame to the guest's NIC. Silently ignored
-    /// when the machine has no network device.
-    pub fn net_input(&mut self, frame: &[u8]) {
-        if let Some(dev) = self.bus.net_dev() {
-            dev.net_input(frame);
-        }
+    /// Deliver an inbound Ethernet frame to the guest's NIC. Returns false if
+    /// there is no device or its bounded inbox cannot currently admit it.
+    pub fn net_input(&mut self, frame: &[u8]) -> bool {
+        let accepted = self.bus.net_dev().is_some_and(|dev| dev.net_input(frame));
         self.bus.poll_net_rx();
+        accepted
+    }
+
+    /// Number of inbound frames that can be admitted without loss.
+    pub fn net_input_capacity(&mut self) -> usize {
+        self.bus.net_dev().map_or(0, |dev| dev.net_input_capacity())
     }
 
     /// Collect the Ethernet frames the guest has transmitted, for the host to

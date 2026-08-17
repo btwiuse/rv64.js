@@ -24,7 +24,7 @@ implemented syscalls are compatibility stubs.
 
 Implemented and tested paths include:
 
-- RV64 I/M/A/F/D/C, Zicsr, and the privileged architecture
+- RV64GCV (VLEN=128, ELEN=64), Zicsr, and the privileged architecture
 - Sv39 and Sv48 virtual memory
 - WebAssembly JIT in both user-mode and full-system browser run loops
 - virtio console and block devices
@@ -173,6 +173,14 @@ only because response bodies cannot be transferred reliably between browsers.
 Browser execution slices yield through `MessageChannel`, avoiding the nested
 timer clamping that applies to repeated `setTimeout(..., 0)` calls.
 
+The public `jitStats()` method returns an exact cumulative snapshot on demand;
+`jitProfile()` returns detailed dispatch data only when profiling was enabled
+with `configureJit({ profile: true })`. The hosted demo samples `jitStats()`
+once per second while its page is visible. The library itself installs no JIT
+statistics timer and does no diagnostic polling, so embedders that never call
+these methods pay no observation overhead. `await` works for both local and
+Worker execution modes.
+
 Images may be `{ url }`, `Response`, `Uint8Array`, `ArrayBuffer`, or another
 array-buffer view. `RV64.create()` resolves all images and emits download
 progress before the `ready` event. `start()` runs cooperative execution slices;
@@ -185,17 +193,23 @@ The supported boot configurations are:
 - `firmware`: boot through an explicitly supplied firmware image.
 - `bare-metal`: load an image at an explicit address without Linux devices.
 
-The stable facade intentionally does not expose raw Wasm exports or JIT control
-methods. Architecture and emulator tests use the separately named
-`RV64Debug` API; applications should not depend on it.
+The stable facade intentionally does not expose raw Wasm exports or internal
+compiler helpers. It does expose bounded `setJitEnabled()`, `configureJit()`,
+`jitStats()`, and `jitProfile()` methods for applications that need explicit
+JIT control or observability. Architecture and emulator tests use the
+separately named `RV64Debug` API; applications should not depend on that API.
 
 Linux machines use the `fetch` HTTP/HTTPS backend by default. The Alpine image
 configures `http_proxy`/`https_proxy` only when that backend is selected,
 attaches the NIC at `10.0.2.15`, and trusts the per-VM proxy CA automatically.
-`apk update` works directly in Node
-and native builds. Browsers can fetch CORS-enabled destinations directly;
-Alpine's package CDN currently requires the optional request relay, supplied as
-`relayURL` or to the demo as `?relay=wss://your-relay.example`.
+`apk update` works directly in Node and native builds. The fetch proxy clocks
+response chunks from guest ACK progress and retains ingress until the virtio
+NIC can accept it, preventing pump-rate floods or silent drops during large
+downloads. Browsers can fetch CORS-enabled destinations directly; Alpine's
+package CDN currently requires the optional request relay, supplied as
+`relayURL` or to the demo as `?relay=wss://your-relay.example`. The browser
+relay path is validated with a complete `apk add -U python3` installation
+(`python` is not an Alpine package name).
 Networking can also be selected explicitly:
 
 ```js

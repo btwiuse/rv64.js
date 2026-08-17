@@ -360,6 +360,11 @@ async function evaluate(cdp, expression) {
   return response.result?.value;
 }
 
+function missingDefaultExecutionContext(error) {
+  return error instanceof Error &&
+    error.message.includes("Cannot find default execution context");
+}
+
 async function evaluateSession(cdp, sessionId, expression) {
   const response = await cdp.send("Runtime.evaluate", {
     expression,
@@ -546,6 +551,15 @@ function jitDelta(before, after) {
     sampledStaticT0ShortBypasses: delta("staticT0.shortSampleBypasses").toString(),
     sampledStaticT0ShortClears: delta("staticT0.shortSampleClears").toString(),
     zeroRetireDispatches: delta("generated.zeroRetireDispatches").toString(),
+    zeroRetireSuppressions: delta("generated.zeroRetireSuppressions").toString(),
+    dispatchEmptyMisses: delta("generated.dispatchEmptyMisses").toString(),
+    dispatchTagCollisions: delta("generated.dispatchTagCollisions").toString(),
+    dispatchReverifications: delta("generated.dispatchReverifications").toString(),
+    zeroRetireTracked: delta("generated.zeroRetireTracked").toString(),
+    zeroRetireUntracked: delta("generated.zeroRetireUntracked").toString(),
+    zeroRetireProfileResets: delta("generated.zeroRetireProfileResets").toString(),
+    zeroRetireProfiles: after.generated.zeroRetireProfiles,
+    zeroRetireSuppressedEntries: after.generated.zeroRetireSuppressedEntries,
     tlbFills: delta("generated.tlbFills").toString(),
     tlbFillKinds: Object.fromEntries([
       "loadHit", "loadEmpty", "loadContext", "loadCollision",
@@ -793,8 +807,11 @@ try {
   // a cold browser can legitimately stay on the initial target document for
   // longer than a normal static page load. Check and click atomically because
   // the initial about:blank execution context is replaced during navigation.
+  let missingExecutionContextRetries = 0;
   for (let attempt = 0; attempt < 2_400; attempt++) {
-    const started = await evaluate(pageCdp, `(() => {
+    let started = false;
+    try {
+      started = await evaluate(pageCdp, `(() => {
       const button = document.querySelector(${JSON.stringify(`button[data-vm="${vmId}"]`)});
       if (!button || !customElements.get("wanix-vm")) return false;
       const vm = document.querySelector(${JSON.stringify(`wanix-vm#${vmId}`)});
@@ -811,7 +828,16 @@ try {
       }
       button.click();
       return true;
-    })()`);
+      })()`);
+    } catch (error) {
+      // `/json/list` can expose the navigated page target a few milliseconds
+      // before Chrome creates its default JavaScript world. This is a browser
+      // attachment race before any guest or benchmark work exists; retry only
+      // that exact CDP condition. Navigation, renderer loss, guest failures,
+      // and measured-phase evaluation errors still fail immediately.
+      if (!missingDefaultExecutionContext(error)) throw error;
+      missingExecutionContextRetries++;
+    }
     if (started) break;
     if (attempt === 2_399) {
       const state = await evaluate(pageCdp, `(() => ({
@@ -937,6 +963,7 @@ try {
     finishedAt,
     hostCpuAffinity,
     browser: browserVersion,
+    browserStartup: { missingExecutionContextRetries },
     artifactStable: true,
     artifacts: artifactsBefore,
     guest: {

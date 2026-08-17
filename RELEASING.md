@@ -45,7 +45,9 @@ license and notices.
 
 The GitHub Pages site is code-only. Guest firmware, kernels, disks, and the
 compiled Wasm core are published under versioned `demo-images-vN` release tags
-so large generated binaries never enter Git history.
+so large generated binaries never enter Git history. Because the runtime Wasm
+is part of this bundle, a Wasm-only source change still requires a new demo
+asset version even when the guest kernel and disk inputs are unchanged.
 
 Demo assets are built and published only by GitHub Actions from a pushed tag.
 Do not upload locally built images. After the release-source commit is on
@@ -62,5 +64,13 @@ module in a clean runner; verifies checksums; boots Alpine and runs a real
 or validation does not create a release.
 
 Tags and releases are immutable inputs to the Pages site. Never move or replace
-an existing `demo-images-vN` tag. Use a new version when any asset changes, and
-update `web/site.mjs` plus the Pages workflow to consume it.
+an existing `demo-images-vN` tag. Use a new version when any asset changes.
+After the workflow has successfully published the new release, update
+`web/site-config.js` to consume its immutable URL; do not point Pages at an
+asset version that does not exist yet.
+
+The safe publication order is: merge the validated source commit to `main`,
+create the next `demo-images-vN` tag, wait for its validated release, update
+the Pages asset pin, and then create the intended `vN.N.N` library tag from the
+merged release source. Never publish either release from an unmerged review
+branch.

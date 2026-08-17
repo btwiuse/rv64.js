@@ -44,6 +44,64 @@ button { font: inherit; }
 .telemetry > div { display: grid; grid-template-columns: 2.5rem auto; gap: .5rem; }
 .telemetry-label { color: var(--green); font-weight: 700; letter-spacing: .06em; }
 
+.jit-panel {
+  margin-bottom: .75rem;
+  padding: .85rem 1rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: .75rem;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.jit-heading { display: flex; align-items: baseline; gap: .65rem; }
+.jit-kicker {
+  padding: .12rem .4rem;
+  border: 1px solid #6ee7a855;
+  border-radius: .3rem;
+  color: var(--green);
+  font-size: .72rem;
+  font-weight: 800;
+  letter-spacing: .08em;
+}
+#jit-state { color: var(--text); font-size: .9rem; }
+#jit-state-detail { color: var(--muted); font-size: .78rem; }
+.jit-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11.5rem, 1fr));
+  gap: .55rem;
+  margin: .75rem 0 0;
+}
+.jit-metrics > div {
+  min-width: 0;
+  padding: .65rem .7rem;
+  border: 1px solid #293140aa;
+  border-radius: .5rem;
+  background: #090c12aa;
+}
+.jit-metrics dt {
+  color: var(--green);
+  font-size: .68rem;
+  font-weight: 750;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+.jit-metrics dd {
+  overflow: hidden;
+  margin: .18rem 0 .08rem;
+  color: var(--text);
+  font-size: .78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.jit-metrics small {
+  display: block;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: .68rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .terminal-wrap { overflow: hidden; border: 1px solid var(--line); border-radius: .75rem; background: #030504; box-shadow: 0 2rem 6rem #0008; }
 .terminal-bar { display: flex; align-items: center; gap: .4rem; height: 2.5rem; padding: 0 .85rem; background: #181c23; }
 .terminal-bar span { width: .7rem; height: .7rem; border-radius: 50%; background: #46505f; }
@@ -66,5 +124,7 @@ footer { min-height: 5rem; border-top: 1px solid var(--line); color: var(--muted
   main { padding-block: 2.5rem; }
   .controls { flex-wrap: wrap; }
   .telemetry { width: 100%; margin-left: 0; }
+  .jit-heading { flex-wrap: wrap; }
+  #jit-state-detail { flex-basis: 100%; }
   #terminal { height: 25rem; }
 }

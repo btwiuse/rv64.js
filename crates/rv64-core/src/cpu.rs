@@ -4,7 +4,7 @@ use crate::decode::*;
 use crate::exception::Exception;
 
 mod vector;
-pub use vector::VectorState;
+pub use vector::{VectorState, VLEN_BITS, VLEN_BYTES};
 
 /// Why `step`/`run` returned control to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,18 @@ pub struct CompiledEntryMap {
     tags: *const u64,
     slot_mask: usize,
     stride_words: usize,
+    fold_shift: u32,
+    require_nonnegative_index: bool,
+}
+
+/// Fold a full guest PC into a power-of-two generated-entry table.  Using only
+/// low address bits makes equally aligned hot functions in independently
+/// randomized mappings alias deterministically; one high-bit fold preserves a
+/// single direct lookup while dispersing those mappings.
+#[inline(always)]
+pub const fn compiled_entry_slot(pc: u64, slot_mask: usize) -> usize {
+    let fold_shift = slot_mask.count_ones() + 1;
+    (((pc >> 1) ^ (pc >> fold_shift)) as usize) & slot_mask
 }
 
 impl CompiledEntryMap {
@@ -75,15 +87,41 @@ impl CompiledEntryMap {
             tags,
             slot_mask: slots - 1,
             stride_words,
+            fold_shift: slots.trailing_zeros() + 1,
+            require_nonnegative_index: false,
         }
+    }
+
+    /// Construct a strided dispatch-line view whose second word begins with
+    /// a signed 32-bit generated-function index. Matching negative entries are
+    /// interpreter fallbacks, not generated-code re-entry points.
+    ///
+    /// # Safety
+    ///
+    /// The requirements of [`Self::from_strided_pc_tags`] apply, every line
+    /// must contain at least two `u64` words, and the low 32 bits of the second
+    /// word must be the line's native-endian signed index.
+    pub unsafe fn from_strided_dispatch_lines(
+        tags: *const u64,
+        slots: usize,
+        stride_words: usize,
+    ) -> Self {
+        debug_assert!(stride_words >= 2);
+        let mut map = unsafe { Self::from_strided_pc_tags(tags, slots, stride_words) };
+        map.require_nonnegative_index = true;
+        map
     }
 
     #[inline(always)]
     pub fn contains(self, pc: u64) -> bool {
-        let slot = ((pc >> 1) as usize) & self.slot_mask;
+        let slot = (((pc >> 1) ^ (pc >> self.fold_shift)) as usize) & self.slot_mask;
         // SAFETY: guaranteed by `from_strided_pc_tags`; the JIT does not
         // mutate or reallocate its dispatch array during an interpreter call.
-        unsafe { self.tags.add(slot * self.stride_words).read() == pc }
+        unsafe {
+            let line = self.tags.add(slot * self.stride_words);
+            line.read() == pc
+                && (!self.require_nonnegative_index || line.add(1).cast::<i32>().read() >= 0)
+        }
     }
 }
 
@@ -3860,6 +3898,21 @@ mod tests {
     }
 
     #[test]
+    fn compiled_entry_slot_folds_equal_low_address_banks() {
+        let mask = 7;
+        let first = 0x7fff_1234_5000;
+        let alias = first + 16;
+        assert_eq!(
+            ((first >> 1) as usize) & mask,
+            ((alias >> 1) as usize) & mask
+        );
+        assert_ne!(
+            compiled_entry_slot(first, mask),
+            compiled_entry_slot(alias, mask),
+        );
+    }
+
+    #[test]
     fn integrated_compiled_map_stops_at_strided_direct_map_entry() {
         #[derive(Clone, Copy)]
         #[repr(C)]
@@ -3883,7 +3936,7 @@ mod tests {
             pc: u64::MAX,
             payload: 0,
         }; 8];
-        lines[((target >> 1) as usize) & (lines.len() - 1)].pc = target;
+        lines[compiled_entry_slot(target, lines.len() - 1)].pc = target;
         let compiled = unsafe {
             CompiledEntryMap::from_strided_pc_tags(
                 lines.as_ptr().cast::<u64>(),
@@ -3893,7 +3946,31 @@ mod tests {
         };
         assert!(compiled.contains(target));
         assert!(!compiled.contains(BASE + 4));
-
+        let active = unsafe {
+            CompiledEntryMap::from_strided_dispatch_lines(
+                lines.as_ptr().cast::<u64>(),
+                lines.len(),
+                core::mem::size_of::<TestLine>() / core::mem::size_of::<u64>(),
+            )
+        };
+        assert!(active.contains(target));
+        let mut sentinel_lines = [TestLine {
+            pc: u64::MAX,
+            payload: u64::MAX,
+        }; 8];
+        sentinel_lines[compiled_entry_slot(target, sentinel_lines.len() - 1)].pc = target;
+        let sentinel = unsafe {
+            CompiledEntryMap::from_strided_dispatch_lines(
+                sentinel_lines.as_ptr().cast::<u64>(),
+                sentinel_lines.len(),
+                core::mem::size_of::<TestLine>() / core::mem::size_of::<u64>(),
+            )
+        };
+        assert!(compiled.contains(target), "tag-only map retains sentinels");
+        assert!(
+            !sentinel.contains(target),
+            "active-entry map skips interpreter fallbacks"
+        );
         let mut cpu = Cpu::new();
         cpu.pc = BASE;
         let mut bus = FlatMemory::new(BASE, &mut mem);

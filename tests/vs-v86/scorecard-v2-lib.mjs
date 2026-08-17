@@ -299,6 +299,7 @@ const STAT_IDS = Object.freeze([
   134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145,
   146, 147, 148,
   149, 150, 151, 152,
+  153, 154, 155, 156, 157, 158, 159, 160, 161,
 ]);
 
 function safeBigInt(call) {
@@ -348,6 +349,17 @@ export function deltaRvCounters(before, after) {
         : null,
     dispatches: stat(1),
     systemEntries: stat(3),
+    dispatchFeedback: {
+      zeroRetireSuppressions: stat(153),
+      emptyMisses: stat(154),
+      tagCollisions: stat(155),
+      mappingReverifications: stat(156),
+      zeroRetireTracked: stat(157),
+      zeroRetireUntracked: stat(158),
+      zeroRetireProfileResets: stat(159),
+      activeZeroRetireProfiles: after.stats[160].toString(),
+      suppressedEntries: after.stats[161].toString(),
+    },
     mmu: {
       mappingInvalidations: stat(89),
       changedSatp: stat(90),

@@ -590,6 +590,26 @@ struct PagePolicyCandidate {
     pa_page: u64,
 }
 
+/// Runtime identity of one generated code entry.  The same virtual PC can name
+/// unrelated bytes in another address space or physical mapping.  Rebuilding
+/// a module over the same architectural entry does not erase its observed
+/// inability to retire the first instruction.
+type ZeroRetireKey = (u64, u64, u64); // (satp, pc, physical pc)
+
+// A generated entry which repeatedly returns without retiring its first
+// instruction can form a host-side retry storm: generated call -> exact T0
+// bridge -> generated call, millions of times.  Treat this as ordinary
+// adaptive deoptimization only after repeated runtime evidence.  The counter
+// is cumulative for one code identity so async module replacement and sparse
+// intervening dispatches cannot repeatedly erase the same failed decision.
+const ZERO_RETIRE_FAILURES: u16 = 1024;
+const ZERO_RETIRE_PROFILE_CAP: usize = 4096;
+
+fn zero_retire_count_crossed(count: &mut u16) -> bool {
+    *count = count.saturating_add(1);
+    *count >= ZERO_RETIRE_FAILURES
+}
+
 struct JitState {
     /// pc -> compiled block; None = tried and not translatable (blacklist).
     /// Authoritative store (iterated for per-page invalidation).
@@ -705,6 +725,11 @@ struct JitState {
     /// the exact byte/layout/state comparison in `page_template_plan` remains
     /// authoritative before a module can be instantiated or published.
     page_template_cached_offsets: FastHashMap<u64, FastHashSet<u16>>,
+    /// Cold feedback for generated entries which repeatedly make no guest
+    /// progress.  Suppression is per address space and exact code mapping; the
+    /// architectural interpreter remains the fallback.
+    zero_retire_counts: FastHashMap<ZeroRetireKey, u16>,
+    zero_retire_suppressed: FastHashSet<ZeroRetireKey>,
 }
 
 /// Sampled exit profile of one landed region function (JitState::region_exits).
@@ -780,6 +805,8 @@ impl JitState {
             policy_rejected: Default::default(),
             page_templates: Default::default(),
             page_template_cached_offsets: Default::default(),
+            zero_retire_counts: Default::default(),
+            zero_retire_suppressed: Default::default(),
             sb_gen: Default::default(),
             sb_queue: Vec::new(),
             sb_missed: Default::default(),
@@ -809,6 +836,8 @@ impl JitState {
         self.policy_rejected.clear();
         self.page_templates.clear();
         self.page_template_cached_offsets.clear();
+        self.zero_retire_counts.clear();
+        self.zero_retire_suppressed.clear();
         self.sb_gen.clear();
         self.sb_queue.clear();
         self.sb_missed.clear();
@@ -833,7 +862,74 @@ impl JitState {
     }
     #[inline]
     fn dslot(pc: u64) -> usize {
-        ((pc >> 1) as usize) & (DISPATCH_SIZE - 1)
+        rv64_core::cpu::compiled_entry_slot(pc, DISPATCH_SIZE - 1)
+    }
+
+    #[inline]
+    fn zero_retire_key(aspace: u64, pc: u64, physical_pc: u64) -> ZeroRetireKey {
+        (aspace, pc, physical_pc)
+    }
+
+    /// Record one zero-retirement invocation.  Returns true exactly when the
+    /// entry crosses the repeated-failure threshold and should be suppressed.
+    fn record_zero_retire(&mut self, aspace: u64, pc: u64, physical_pc: u64) -> bool {
+        let key = Self::zero_retire_key(aspace, pc, physical_pc);
+        if self.zero_retire_suppressed.contains(&key) {
+            return false;
+        }
+        if self.zero_retire_counts.len() >= ZERO_RETIRE_PROFILE_CAP
+            && !self.zero_retire_counts.contains_key(&key)
+        {
+            // This is a bounded, generational feedback cache.  Permanently
+            // refusing new identities after a transient boot working set fills
+            // it would disable the circuit breaker exactly when a later process
+            // needs it.  Suppressed identities live in the separate set.
+            self.zero_retire_counts.clear();
+            unsafe { ZERO_RETIRE_PROFILE_RESETS += 1 };
+        }
+        let count = self.zero_retire_counts.entry(key).or_insert(0);
+        if !zero_retire_count_crossed(count) {
+            return false;
+        }
+        self.zero_retire_counts.remove(&key);
+        self.zero_retire_suppressed.insert(key)
+    }
+
+    #[inline]
+    fn zero_retire_suppressed(&self, aspace: u64, pc: u64, block: JitBlock) -> bool {
+        !self.zero_retire_suppressed.is_empty()
+            && self
+                .zero_retire_suppressed
+                .contains(&Self::zero_retire_key(aspace, pc, block.pa))
+    }
+
+    fn invalidate_zero_retire_pc(&mut self, pc: u64) {
+        self.zero_retire_counts
+            .retain(|&(_, candidate, _), _| candidate != pc);
+        self.zero_retire_suppressed
+            .retain(|&(_, candidate, _)| candidate != pc);
+    }
+}
+
+#[cfg(test)]
+mod zero_retire_tests {
+    use super::{zero_retire_count_crossed, ZeroRetireKey, ZERO_RETIRE_FAILURES};
+
+    #[test]
+    fn requires_repeated_failures_before_deoptimization() {
+        let mut count = 0;
+        for _ in 0..ZERO_RETIRE_FAILURES - 1 {
+            assert!(!zero_retire_count_crossed(&mut count));
+        }
+        assert!(zero_retire_count_crossed(&mut count));
+    }
+
+    #[test]
+    fn identity_distinguishes_context_pc_and_mapping() {
+        let base: ZeroRetireKey = (0x8000_0000, 0x7fff_1234, 0x9000_1234);
+        assert_ne!(base, (0x8000_1000, base.1, base.2));
+        assert_ne!(base, (base.0, 0x7fff_5678, base.2));
+        assert_ne!(base, (base.0, base.1, 0x9000_5678));
     }
 }
 
@@ -1833,6 +1929,18 @@ static mut SB_STALE: u64 = 0;
 /// FP gate, first-instruction TLB miss, or a br_table slot the function
 /// doesn't own). Each one costs a call plus a single interpreted instruction.
 static mut ZERO_RETIRE: u64 = 0;
+/// Generated-entry identities adaptively suppressed after dense zero-progress
+/// feedback.  Exposed separately from raw zero-retire calls so benchmark and
+/// correctness gates can prove the circuit breaker was (or was not) active.
+static mut ZERO_RETIRE_SUPPRESSIONS: u64 = 0;
+static mut ZERO_RETIRE_TRACKED: u64 = 0;
+static mut ZERO_RETIRE_UNTRACKED: u64 = 0;
+static mut ZERO_RETIRE_PROFILE_RESETS: u64 = 0;
+/// Slow-path attribution for the direct generated-entry table.  These are
+/// updated only after the fast PC/generation test already missed.
+static mut DISPATCH_EMPTY_MISSES: u64 = 0;
+static mut DISPATCH_TAG_COLLISIONS: u64 = 0;
+static mut DISPATCH_REVERIFICATIONS: u64 = 0;
 /// Individual blocks compiled for a pc on a page that is already superblocked
 /// (i.e. code the page's superblock does not cover), and superblock compiles
 /// still awaiting their async module.
@@ -2277,6 +2385,19 @@ pub extern "C" fn jit_stat(which: u32) -> u64 {
             150 => system_cpu_stat(23),
             151 => system_cpu_stat(24),
             152 => JIT_VECTOR_SIMD,
+            153 => ZERO_RETIRE_SUPPRESSIONS,
+            154 => DISPATCH_EMPTY_MISSES,
+            155 => DISPATCH_TAG_COLLISIONS,
+            156 => DISPATCH_REVERIFICATIONS,
+            157 => ZERO_RETIRE_TRACKED,
+            158 => ZERO_RETIRE_UNTRACKED,
+            159 => ZERO_RETIRE_PROFILE_RESETS,
+            160 => SYS_JIT
+                .as_ref()
+                .map_or(0, |jit| jit.zero_retire_counts.len() as u64),
+            161 => SYS_JIT
+                .as_ref()
+                .map_or(0, |jit| jit.zero_retire_suppressed.len() as u64),
             _ => 0,
         }
     }
@@ -4478,7 +4599,7 @@ pub extern "C" fn virt_p9_reply() -> u32 {
 pub extern "C" fn virt_net_input() {
     let machine = unsafe { VIRT.as_mut().expect("call virt_boot() first") };
     let frame = unsafe { core::mem::take(&mut STAGING) };
-    machine.net_input(&frame);
+    let _ = machine.net_input(&frame);
 }
 
 #[allow(static_mut_refs)]
@@ -4494,8 +4615,13 @@ fn pump_virt_net(machine: &mut rv64_system::virt::VirtMachine) {
                 } else if SYS_WISP {
                     pump_wisp(stack);
                 }
-                for frame in stack.take_output() {
-                    machine.net_input(&frame);
+                let capacity = machine.net_input_capacity();
+                for frame in stack.take_output_limit(capacity) {
+                    let accepted = machine.net_input(&frame);
+                    debug_assert!(
+                        accepted,
+                        "reserved virtio-net capacity must remain available"
+                    );
                 }
             }
             None => {
@@ -6509,6 +6635,7 @@ fn run_system_jit(m: &mut impl SystemJitMachine, max_insns: u64) -> i32 {
                         unsafe { DIRTY_DROPPED += 1 };
                         dirty_vpages.insert(pc & !0xfff);
                         jit.cache.remove(&pc);
+                        jit.invalidate_zero_retire_pc(pc);
                         let slot = JitState::dslot(pc);
                         if jit.dispatch[slot].pc == pc {
                             jit.dispatch[slot].pc = NO_PC;
@@ -6597,6 +6724,15 @@ fn run_system_jit(m: &mut impl SystemJitMachine, max_insns: u64) -> i32 {
             {
                 line.idx
             } else {
+                unsafe {
+                    if line.pc == NO_PC {
+                        DISPATCH_EMPTY_MISSES += 1;
+                    } else if line.pc != pc {
+                        DISPATCH_TAG_COLLISIONS += 1;
+                    } else {
+                        DISPATCH_REVERIFICATIONS += 1;
+                    }
+                }
                 match jit.cache.get(&pc) {
                     Some(Some(b)) => {
                         let b = *b;
@@ -6632,7 +6768,10 @@ fn run_system_jit(m: &mut impl SystemJitMachine, max_insns: u64) -> i32 {
                         // Region functions (n == 0) carry SB_IDX_BIT in their
                         // dispatch line so the exit below can be attributed
                         // without a cache probe (blacklist -1 keeps its sign).
-                        let tagged = if b.n == 0 && b.idx >= 0 {
+                        let aspace = m.cpu().sys.as_ref().map_or(0, |sys| sys.satp);
+                        let tagged = if jit.zero_retire_suppressed(aspace, pc, b) {
+                            -1
+                        } else if b.n == 0 && b.idx >= 0 {
                             b.idx | SB_IDX_BIT
                         } else {
                             b.idx
@@ -6769,6 +6908,30 @@ fn run_system_jit(m: &mut impl SystemJitMachine, max_insns: u64) -> i32 {
             // spin re-calling it.
             if retired == 0 {
                 unsafe { ZERO_RETIRE += 1 };
+                let aspace = m.cpu().sys.as_ref().map_or(0, |sys| sys.satp);
+                let physical_pc = jit
+                    .cache
+                    .get(&pc)
+                    .and_then(Option::as_ref)
+                    .map(|block| block.pa)
+                    .or_else(|| m.probe_fetch(pc));
+                if let Some(physical_pc) = physical_pc {
+                    unsafe { ZERO_RETIRE_TRACKED += 1 };
+                    if jit.record_zero_retire(aspace, pc, physical_pc) {
+                        // Keep the authoritative compiled block: a different
+                        // address space or code mapping can still use it. Only
+                        // this verified architectural entry is redirected to
+                        // the exact interpreter.
+                        jit.dispatch[slot] = DispatchLine {
+                            pc,
+                            idx: -1,
+                            gen: map_gen,
+                        };
+                        unsafe { ZERO_RETIRE_SUPPRESSIONS += 1 };
+                    }
+                } else {
+                    unsafe { ZERO_RETIRE_UNTRACKED += 1 };
+                }
                 if dprof_sample {
                     let fcsr = m.cpu().fcsr;
                     let fs = m.cpu().sys.as_ref().map_or(3, |c| (c.mstatus >> 13) & 3);
@@ -7515,9 +7678,13 @@ fn run_system_jit(m: &mut impl SystemJitMachine, max_insns: u64) -> i32 {
             // The dispatch allocation stays stable and immutable during the
             // interpreter call: observation only updates policy maps/queues,
             // and async callbacks cannot run until this Wasm invocation
-            // returns. Its repr(C) PC tag is the first u64 in each line.
+            // returns. Its repr(C) PC tag is the first u64 in each line,
+            // followed by the signed generated-function index. Negative lines
+            // are interpreter fallbacks and must not stop Tier-0: treating a
+            // sentinel as generated can alternate two host calls around one
+            // guest instruction indefinitely.
             let compiled = unsafe {
-                rv64_core::CompiledEntryMap::from_strided_pc_tags(
+                rv64_core::CompiledEntryMap::from_strided_dispatch_lines(
                     jit.dispatch.as_ptr().cast::<u64>(),
                     jit.dispatch.len(),
                     core::mem::size_of::<DispatchLine>() / core::mem::size_of::<u64>(),
@@ -7678,7 +7845,7 @@ pub extern "C" fn sys_net_input() {
     let m = unsafe { SYS.as_mut().expect("call sys_boot() first") };
     unsafe {
         let frame = core::mem::take(&mut STAGING);
-        m.net_input(&frame);
+        let _ = m.net_input(&frame);
     }
 }
 
@@ -7697,8 +7864,13 @@ fn pump_net(m: &mut rv64_system::Machine) {
                 } else if SYS_WISP {
                     pump_wisp(stack);
                 }
-                for frame in stack.take_output() {
-                    m.net_input(&frame);
+                let capacity = m.net_input_capacity();
+                for frame in stack.take_output_limit(capacity) {
+                    let accepted = m.net_input(&frame);
+                    debug_assert!(
+                        accepted,
+                        "reserved virtio-net capacity must remain available"
+                    );
                 }
             }
             None => {

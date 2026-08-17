@@ -6,7 +6,7 @@
   <meta name="description" content="Boot RISC-V Linux in your browser with rv64.js" />
   <title>rv64.js — RISC-V Linux in your browser</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css" />
-  <link rel="stylesheet" href="./site.css?v=3" />
+  <link rel="stylesheet" href="./site.css?v=4" />
 </head>
 <body>
   <header>
@@ -16,7 +16,7 @@
 
   <main>
     <section class="hero">
-      <p class="eyebrow">Rust · WebAssembly · RV64GC</p>
+      <p class="eyebrow">Rust · WebAssembly · RV64GCV</p>
       <h1>Boot Alpine Linux in your browser.</h1>
       <p>
         No server-side emulator. The CPU, devices, and JIT execute locally in
@@ -31,6 +31,41 @@
         <div><span class="telemetry-label">CPU</span><span id="status" role="status">Ready · worker</span></div>
         <div><span class="telemetry-label">NET</span><span id="network-status" role="status">Network idle</span></div>
       </div>
+    </section>
+
+    <section class="jit-panel" aria-label="Live JIT telemetry">
+      <div class="jit-heading">
+        <span class="jit-kicker">JIT</span>
+        <strong id="jit-state" role="status">Waiting to boot</strong>
+        <span id="jit-state-detail">Statistics sampled once per second</span>
+      </div>
+      <dl class="jit-metrics">
+        <div>
+          <dt>Execution mix</dt>
+          <dd id="jit-coverage">—</dd>
+          <small id="jit-execution">—</small>
+        </div>
+        <div>
+          <dt>Code cache</dt>
+          <dd id="jit-code">—</dd>
+          <small id="jit-code-detail">—</small>
+        </div>
+        <div>
+          <dt>Compile pipeline</dt>
+          <dd id="jit-pipeline">—</dd>
+          <small id="jit-pipeline-detail">—</small>
+        </div>
+        <div>
+          <dt>Dispatch</dt>
+          <dd id="jit-dispatch">—</dd>
+          <small id="jit-dispatch-detail">—</small>
+        </div>
+        <div>
+          <dt>Fallbacks</dt>
+          <dd id="jit-fallback">—</dd>
+          <small id="jit-fallback-detail">—</small>
+        </div>
+      </dl>
     </section>
 
     <section class="terminal-wrap">
@@ -60,6 +95,6 @@ python3 -m http.server -d . 8000
     <a href="https://github.com/ibuildthecloud/rv64.js">Source on GitHub</a>
   </footer>
 
-  <script type="module" src="./site.mjs?v=12"></script>
+  <script type="module" src="./site.mjs?v=13"></script>
 </body>
 </html>

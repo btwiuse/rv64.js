@@ -631,6 +631,9 @@ for (const { sew, lmul, maximum, label } of legalConfigurations) {
     addCase(`vwaddu.vv/vtype-${label}`, V(0x30, true, 0, 8, 2, 16), {
       sew, lmul, vl: maximum,
     });
+    addCase(`vwmaccu.vx/vtype-${label}`, V(0x3c, true, 8, X_SCALAR, 6, 16), {
+      sew, lmul, vl: maximum,
+    });
     addCase(`vnsrl.wi/vtype-${label}`, V(0x2c, true, 0, 3, 3, 16), {
       sew, lmul, vl: maximum,
     });
@@ -997,10 +1000,17 @@ function byteMask(test, qemuCompatibility = false) {
     }
   }
   if (qemuCompatibility && test.name === "csrrw/vxsat") {
+    // QEMU 8.2 returns its unmasked stored value through rd on the next
+    // iteration. Compare only the architecturally defined vxsat bit there.
+    mask.fill(0, 8, 16);
+    mask[8] = 0x01;
     mask.fill(0, 32, 40);
     mask[32] = 0x01;
   }
   if (qemuCompatibility && test.name === "csrrw/vxrm") {
+    // vxrm itself has two defined bits; VCSR exposes them shifted by one.
+    mask.fill(0, 8, 16);
+    mask[8] = 0x03;
     mask.fill(0, 32, 40);
     mask[32] = 0x06;
   }
@@ -1064,7 +1074,7 @@ for (const profile of SEED_PROFILES) {
   }
   if (jitDifferential) {
     const jit = await runWasmJit(await readFile(elfPath));
-    const jitDifferences = compare(reference, jit.output);
+    const jitDifferences = compare(reference, jit.output, qemu82VectorCsrCompatibility);
     const eligibleCases = cases.filter((test) => {
       const opcode = test.instruction & 0x7f;
       const funct3 = (test.instruction >>> 12) & 7;

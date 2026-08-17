@@ -1,45 +1,71 @@
 # JIT Rewrite Status
 
-Last updated: 2026-08-14
+Last updated: 2026-08-16
 
 ## Current disposition
 
-The Boot JIT-lifecycle objective is **achieved**. On the exact final Wasm,
-scalar Boot is `1.057x` faster with JIT enabled than disabled (paired 95% CI
-`[1.042,1.065]`), and RV64GCV Boot is `1.079x` faster
-(`[1.069,1.085]`). Complete scalar and RV64GCV artifact A/B matrices show no
-scorecard-class regression; focused fifteen-pair reruns resolve the initially
-suspicious scalar Assignment and RV64GCV Huffman rows to parity. The exact
-benchmarked source rebuilds to the same artifact and passes the strict
-eight-stage correctness matrix.
+The final two-loss RV64GCV JIT objective is **achieved**. Exact measured Wasm
+`6dec2dc687f...` completes a measurement-valid authoritative **13/13** frozen
+RV64GCV scorecard against pinned copy/v86: ten wins and matches for Boot,
+Compile, and String Sort. String Sort is now 616.2 versus 638.4 ms
+(`1.0360x`), after being 1,243.7 ms in the preceding 12/13 milestone.
 
-The final authoritative scalar scorecard is now 12/13 non-losses against
-copy/v86: Boot moved from LOSS to MATCH, and Compile is the only remaining
-loss. The final authoritative RV64GCV scorecard has eight wins plus a Boot
-MATCH, or 9/13 non-losses; Compile, String Sort, FP Emulation, and Assignment
-remain losses. This does not complete the older all-row copy/v86 parity goal.
+The protected seven-pair WANIX `/shared/bench.py` browser gate also passes.
+Shell is 30,920.8 versus 31,327.8 ms, a paired-median `1.00455x` with exact
+bootstrap interval `[0.99973,1.01519]`; Python and SHA-256 improve, and shared
+9P is neutral. All fourteen fresh Chrome legs are correct, stable, and retain
+their exact artifact, generated-execution, and 9P work proofs.
 
-The implementation and exact evidence are recorded in
-[BOOT_JIT_PARITY_RESULT.md](BOOT_JIT_PARITY_RESULT.md).
+The same artifact's authoritative scalar scorecard remains **13/13** against
+copy/v86 and is also 13/13 against the historical RV64 JIT. The strict
+eight-stage release matrix passes without a skipped stage, including all
+8,814 interpreter and 8,814 hot-JIT RVV executions, 134 ISA tests, 109 Spike
+lockstep tests, 193 architecture signatures, direct/OpenSBI Linux, standalone
+Wasmtime, and virt-smoke.
+
+The complete current evidence, architecture-general mechanism audit, exact
+hashes, invalid-run ledger, scorecards, browser result, and correctness matrix
+are in
+[RV64GCV_JIT_13_OF_13_RESULT.md](RV64GCV_JIT_13_OF_13_RESULT.md). The preceding
+[RV64GCV_JIT_12_OF_13_RESULT.md](RV64GCV_JIT_12_OF_13_RESULT.md) and
+[BOOT_JIT_PARITY_RESULT.md](BOOT_JIT_PARITY_RESULT.md) remain historical
+milestones.
+
+### Post-scorecard runtime and network hardening
+
+The current release-candidate source builds Wasm
+`ff2ae56f3ad88bd3c1d929cd393ddbdfbe0ed0e3ec082220700e58df15b9bf29`.
+It follows the measured `6dec2dc687f...` artifact with transport backpressure,
+ACK-clocked HTTP response delivery, and on-demand demo telemetry; the published
+scorecard numbers above remain tied to `6dec2dc687f...` until this later build
+is independently reconfirmed.
+
+A clean Chrome 150 browser run through the Cloudflare HTTP relay completed
+`apk add -U python3` in 25.1 seconds: 17 requests, 17 responses, 17 completed
+streams, 17,964,829 downloaded bytes, and no network errors. The literal
+`python` request now returns normally with Alpine's expected package-not-found
+result instead of hanging. The library performs no telemetry polling unless an
+embedder calls `jitStats()` or opts into `jitProfile()` collection.
 
 ## RV64GCV lowering disposition
 
-The RV64GCV direct JIT-lowering milestone is **achieved**. The complete
+The RV64GCV direct JIT-lowering and 13/13 performance milestones are
+**achieved**. The complete
 mandatory RVV 1.0 surface for the selected VLEN=128/ELEN=64 machine remains an
 ordered DBT IR effect with typed user/system helper fallback, while broad
 exact instruction families now lower directly to Wasm SIMD or generated Wasm
 loops. Precise scalar/FP barriers, fault replay, `vstart`, privileged dirty
 state, and compiled-code invalidation are preserved. The strict release matrix
-passes, including all 8,724 interpreter and all 8,724 hot-JIT RVV differential
+passes, including all 8,814 interpreter and all 8,814 hot-JIT RVV differential
 executions.
 
 The original authoritative RV64GCV JIT scorecard was measurement-valid with
 78/78 eligible trials and an empty problem list. It won eight of thirteen rows
 against pinned copy/v86. Against helper-only JIT lowering it improves String
 Sort by `3.4587x`, FP Emulation by `1.7970x`, and Assignment by `1.2915x`.
-The later Boot lifecycle result supersedes those current scorecard numbers;
-the historical all-row RV64GCV/copy-v86 parity objective remains **not
-achieved**.
+The final 13/13 result supersedes those current scorecard numbers. String Sort
+is now a match at `1.0360x`; the browser Shell guard and scalar regression
+card also pass on the exact same measured Wasm.
 
 The complete implementation boundary, no-workload-identifier audit,
 correctness matrix, scorecards, hashes, and remaining performance gap are in

@@ -90,6 +90,7 @@ if command -v node >/dev/null 2>&1; then
     node tests/vs-v86/harness-selftest.mjs || FAILED=1
     node tests/vs-v86/amortized-cold-cost-selftest.mjs || FAILED=1
     node tests/analyze-wanix-pairs-selftest.mjs || FAILED=1
+    node tests/jit-telemetry-selftest.mjs || FAILED=1
     cargo build --release -q -p rv64-wasm --target wasm32-unknown-unknown || FAILED=1
     node tests/public-api.mjs || FAILED=1
     node tests/worker-api.mjs || FAILED=1

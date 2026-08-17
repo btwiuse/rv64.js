@@ -50,33 +50,34 @@ fn enum_body() -> Vec<u8> {
 
 fn sink_body() -> Vec<u8> {
     let mut function = Function::new_with_locals_types([ValType::I64, ValType::I32]);
-    let mut sink = function.instructions();
-    for group in 0..GROUPS {
-        let offset = ((group & 31) * 8) as u64;
-        sink.block(BlockType::Empty);
-        sink.loop_(BlockType::Empty);
-        sink.local_get(0);
-        sink.i64_const(group as i64);
-        sink.i64_add();
-        sink.local_tee(0);
-        sink.i32_const(4096);
-        sink.local_get(0);
-        sink.i64_store(memarg(3, offset));
-        sink.i32_const(4096);
-        sink.i64_load(memarg(3, offset));
-        sink.local_get(0);
-        sink.i64_eq();
-        sink.br_if(1);
-        sink.local_get(1);
-        sink.i32_const(1);
-        sink.i32_add();
-        sink.local_set(1);
-        sink.br(0);
-        sink.end();
+    {
+        let mut sink = function.instructions();
+        for group in 0..GROUPS {
+            let offset = ((group & 31) * 8) as u64;
+            sink.block(BlockType::Empty);
+            sink.loop_(BlockType::Empty);
+            sink.local_get(0);
+            sink.i64_const(group as i64);
+            sink.i64_add();
+            sink.local_tee(0);
+            sink.i32_const(4096);
+            sink.local_get(0);
+            sink.i64_store(memarg(3, offset));
+            sink.i32_const(4096);
+            sink.i64_load(memarg(3, offset));
+            sink.local_get(0);
+            sink.i64_eq();
+            sink.br_if(1);
+            sink.local_get(1);
+            sink.i32_const(1);
+            sink.i32_add();
+            sink.local_set(1);
+            sink.br(0);
+            sink.end();
+            sink.end();
+        }
         sink.end();
     }
-    sink.end();
-    drop(sink);
     function.into_raw_body()
 }
 

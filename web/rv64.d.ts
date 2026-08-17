@@ -117,6 +117,110 @@ export interface RV64Options {
   events?: RV64EventListeners;
 }
 
+export interface JitConfiguration {
+  policy?: "page" | "adaptive";
+  pageThreshold?: number;
+  privilegedPageThresholdMultiplier?: number;
+  pageQuantum?: number;
+  regionLeaderCap?: number;
+  regionPageCap?: number;
+  regionExtensionPageCap?: number;
+  measuredRegionMinStay?: number;
+  pageInflightLimit?: number;
+  multiPageEntryCap?: number;
+  multiPageControlPermille?: number;
+  regionTlbCacheMinAccesses?: number;
+  profileSampleShift?: number;
+  directDispatch?: boolean;
+  lazyState?: boolean;
+  pageRebuild?: boolean;
+  controlEntries?: boolean;
+  privilegedControlEntries?: boolean;
+  stablePageChain?: boolean;
+  controlProfile?: boolean;
+  crossPageCalls?: boolean;
+  measuredRegions?: boolean;
+  demoteRegions?: boolean;
+  cfgBlocks?: boolean;
+  structuredCfg?: boolean;
+  tlbFill?: boolean;
+  tlbHash?: boolean;
+  privilegeTlbRetention?: boolean;
+  regionTlbCache?: boolean;
+  regionChain?: boolean;
+  regionTailChain?: boolean;
+  profile?: boolean;
+}
+
+export type JitStringCounters = Readonly<Record<string, string>>;
+
+export interface JitGeneratedStats {
+  retired: string;
+  dispatches: string;
+  userEntries: string;
+  systemEntries: string;
+  zeroRetireDispatches: string;
+  zeroRetireSuppressions: string;
+  dispatchEmptyMisses: string;
+  dispatchTagCollisions: string;
+  dispatchReverifications: string;
+  zeroRetireTracked: string;
+  zeroRetireUntracked: string;
+  zeroRetireProfileResets: string;
+  zeroRetireProfiles: string;
+  zeroRetireSuppressedEntries: string;
+  tlbFills: string;
+  chainHops: string;
+  tlbFillKinds: JitStringCounters;
+}
+
+export interface JitStats {
+  generated: JitGeneratedStats;
+  mmu: JitStringCounters;
+  interpreter: JitStringCounters;
+  staticT0: Readonly<Record<string, string | number | boolean>>;
+  regions: JitStringCounters;
+  translation: JitStringCounters;
+  pagePolicy: JitStringCounters;
+  loader: Readonly<Record<string, number>>;
+  p9: Readonly<Record<string, number>>;
+  instructions: string;
+  accountedInstructions: string;
+  generatedCoverage: number;
+  generatedInstructionsPerDispatch: number;
+}
+
+export interface JitDispatchProfile {
+  pc: string;
+  calls: number;
+  retired: number;
+  instructionsPerCall: number;
+}
+
+export interface JitEdgeProfile {
+  source: string;
+  target: string;
+  transitions: number;
+  retired: number;
+  instructionsPerTransition: number;
+}
+
+export interface JitFallbackProfile {
+  key: string;
+  stretches: number;
+  interpretedInstructions: number;
+}
+
+export interface JitProfile {
+  generatedBlockCalls: string;
+  generatedBlockInstructions: string;
+  generatedRegionCalls: string;
+  generatedRegionInstructions: string;
+  dispatch: JitDispatchProfile[];
+  edges: JitEdgeProfile[];
+  fallback: JitFallbackProfile[];
+}
+
 export class RV64 {
   static create(options: RV64Options): Promise<RV64>;
   readonly running: boolean;
@@ -134,6 +238,14 @@ export class RV64 {
     event: K,
     listener: (event: RV64EventMap[K]) => void,
   ): () => void;
+  /** Enable or disable generated-code tiering without stopping the machine. */
+  setJitEnabled(enabled: boolean): void | Promise<void>;
+  /** Apply bounded JIT policy controls; omitted fields retain their values. */
+  configureJit(options: JitConfiguration): void | Promise<void>;
+  /** Return exact cumulative counters. No background polling is installed. */
+  jitStats(): JitStats | Promise<JitStats>;
+  /** Return opt-in profiling data configured with `profile: true`. */
+  jitProfile(limit?: number): JitProfile | Promise<JitProfile>;
   start(): Promise<void>;
   stop(): Promise<void>;
   reset(): Promise<void>;

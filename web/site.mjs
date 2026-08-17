@@ -1,6 +1,7 @@
-import { RV64 } from "./rv64.js?v=2";
+import { RV64 } from "./rv64.js?v=3";
 import { resolveAssetOverride } from "./asset-source.mjs";
 import { defaultAssetURL, defaultRelayURL } from "./site-config.js?v=2";
+import { summarizeJitStats } from "./jit-telemetry.mjs?v=1";
 import { Terminal } from "https://esm.sh/@xterm/xterm@6.0.0";
 import { FitAddon } from "https://esm.sh/@xterm/addon-fit@0.11.0";
 
@@ -38,6 +39,20 @@ terminal.write("Press Boot Alpine Linux to start.\r\n");
 new ResizeObserver(() => fitAddon.fit()).observe(terminalElement);
 const status = document.querySelector("#status");
 const networkStatus = document.querySelector("#network-status");
+const jitTelemetry = {
+  state: document.querySelector("#jit-state"),
+  detail: document.querySelector("#jit-state-detail"),
+  coverage: document.querySelector("#jit-coverage"),
+  execution: document.querySelector("#jit-execution"),
+  code: document.querySelector("#jit-code"),
+  codeDetail: document.querySelector("#jit-code-detail"),
+  pipeline: document.querySelector("#jit-pipeline"),
+  pipelineDetail: document.querySelector("#jit-pipeline-detail"),
+  dispatch: document.querySelector("#jit-dispatch"),
+  dispatchDetail: document.querySelector("#jit-dispatch-detail"),
+  fallback: document.querySelector("#jit-fallback"),
+  fallbackDetail: document.querySelector("#jit-fallback-detail"),
+};
 const boot = document.querySelector("#boot");
 const title = document.querySelector("#terminal-title");
 const decoder = new TextDecoder();
@@ -51,6 +66,51 @@ function cpuStatus(text) {
   status.textContent = `${text} · ${executionMode}`;
 }
 cpuStatus("Ready");
+
+function setJitState(state, detail) {
+  jitTelemetry.state.textContent = state;
+  jitTelemetry.detail.textContent = detail;
+  jitTelemetry.detail.title = detail;
+}
+
+function resetJitTelemetry(state = "Waiting to boot", detail = "Statistics sampled once per second") {
+  setJitState(state, detail);
+  for (const field of [
+    "coverage",
+    "execution",
+    "code",
+    "codeDetail",
+    "pipeline",
+    "pipelineDetail",
+    "dispatch",
+    "dispatchDetail",
+    "fallback",
+    "fallbackDetail",
+  ]) {
+    jitTelemetry[field].textContent = "—";
+    jitTelemetry[field].title = "";
+  }
+}
+
+function renderJitTelemetry(stats) {
+  const summary = summarizeJitStats(stats);
+  setJitState(summary.state, summary.detail);
+  for (const field of [
+    "coverage",
+    "execution",
+    "code",
+    "codeDetail",
+    "pipeline",
+    "pipelineDetail",
+    "dispatch",
+    "dispatchDetail",
+    "fallback",
+    "fallbackDetail",
+  ]) {
+    jitTelemetry[field].textContent = summary[field];
+    jitTelemetry[field].title = summary[field];
+  }
+}
 
 function write(data) {
   terminal.write(typeof data === "string" ? data : decoder.decode(data, { stream: true }));
@@ -122,6 +182,7 @@ async function start(presetName) {
   terminal.clear();
   networkStatus.textContent = "Network idle";
   networkStatus.title = "";
+  resetJitTelemetry("Loading", "Preparing the runtime and guest images");
   write(`[host] loading ${preset.label}…\n`);
   try {
     if (active) await active.destroy();
@@ -189,12 +250,37 @@ async function start(presetName) {
         stop: ({ reason }) => {
           if (reason === "powered-off") write("\n[host] guest powered off\n");
           cpuStatus(reason === "powered-off" ? "Powered off" : "Stopped");
+          if (myGeneration === generation) {
+            setJitState("Stopped", "Latest sampled counters retained below");
+          }
         },
       },
     });
     active = vm;
+    setJitState("Starting", "Waiting for the first JIT counter snapshot");
     const started = performance.now();
     let lastStatus = 0;
+    let lastJitSample = 0;
+    let jitSampleInFlight = false;
+
+    const sampleJit = () => {
+      if (jitSampleInFlight) return;
+      jitSampleInFlight = true;
+      Promise.resolve()
+        .then(() => vm.jitStats())
+        .then((stats) => {
+          if (myGeneration === generation && active === vm && vm.running) {
+            renderJitTelemetry(stats);
+          }
+        })
+        .catch((error) => {
+          if (myGeneration === generation && active === vm && vm.running) {
+            setJitState("Metrics unavailable", error.message);
+          }
+        })
+        .finally(() => { jitSampleInFlight = false; });
+    };
+
     const frame = () => {
       if (myGeneration !== generation || !active) return;
       if (!active.running) return;
@@ -203,6 +289,10 @@ async function start(presetName) {
         lastStatus = now;
         const insns = Number(active.instructions);
         cpuStatus(`${(insns / 1e6).toFixed(0)} Minsns · ${(insns / (now - started) / 1000).toFixed(1)} Minsn/s`);
+      }
+      if (now - lastJitSample >= 1_000 && document.visibilityState !== "hidden") {
+        lastJitSample = now;
+        sampleJit();
       }
       setTimeout(frame, 500);
     };
@@ -214,6 +304,7 @@ async function start(presetName) {
     write(`\n[host] unable to boot: ${error.message}\n\n`);
     write("For local setup, follow the commands below the terminal.\n");
     cpuStatus("Boot failed");
+    resetJitTelemetry("Unavailable", error.message);
     console.error(error);
   } finally {
     boot.disabled = false;

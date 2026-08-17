@@ -800,6 +800,10 @@ fn lift_one(
             metrics.uses_fp = true;
             StepOutcome::Continue
         }
+        // Read-only vector CSRs can remain in generated code. `vlenb` is a
+        // machine constant; the ordered state effect preserves the exact
+        // full-system VS=Off illegal-instruction boundary without dirtying VS.
+        0x73 if allow_vector && lift_vector_csr_read(b, insn, pc, retired) => StepOutcome::Continue,
         // User-mode floating-point CSRs. Full-system compilation keeps these
         // in T0 until mstatus.FS checking/dirtying is part of the typed ABI.
         0x73 if allow_fp && lift_fp_csr(b, insn, pc, retired, system_fp) => {
@@ -1319,6 +1323,20 @@ fn lift_fp_csr(b: &mut Builder, insn: u32, pc: u64, retired: u32, system_fp: boo
     true
 }
 
+fn lift_vector_csr_read(b: &mut Builder, insn: u32, pc: u64, retired: u32) -> bool {
+    const VLENB: u32 = 0xc22;
+    let f3 = funct3(insn);
+    let read_only = matches!(f3, 2 | 3 | 6 | 7) && rs1(insn) == 0;
+    if insn >> 20 != VLENB || !read_only {
+        return false;
+    }
+
+    b.vector_state(pc, retired);
+    let value = b.const_i64(rv64_core::cpu::VLEN_BYTES as i64, pc);
+    b.write_x(rd(insn), value);
+    true
+}
+
 /// RV64 NaN-boxing: a single-precision source whose upper bits are not all
 /// ones behaves as the canonical quiet NaN for computational instructions.
 fn unbox_f32(b: &mut Builder, value: ValueId, pc: u64) -> ValueId {
@@ -1622,6 +1640,45 @@ mod tests {
             .iter()
             .any(|value| matches!(value.op, Op::ReadX(16)) && value.guest_pc == 0x1014));
         assert!(lifted.ir.validate().is_ok());
+    }
+
+    #[test]
+    fn lifts_read_only_vlenb_with_an_exact_vector_state_boundary() {
+        let csrr_vlenb = enc_i(0x73, 10, 2, 0, 0xc22);
+        let code = bytes(&[csrr_vlenb, enc_i(0x13, 11, 0, 10, 1), 0x0000_0073]);
+
+        assert!(
+            lift_t1_with_vector(&code, 0x1000, 0x1000, false, FpMode::Disabled, false, false,)
+                .is_none()
+        );
+
+        let lifted =
+            lift_t1_with_vector(&code, 0x1000, 0x1000, false, FpMode::Disabled, false, true)
+                .expect("vector capability should lift vlenb and its scalar consumer");
+        assert_eq!(lifted.ir.retired, 2);
+        let Effect::VectorState { exit, .. } = &lifted.ir.effects[0] else {
+            panic!("vlenb must retain its full-system VS check")
+        };
+        assert_eq!(exit.guest_pc, 0x1000);
+        assert_eq!(exit.retired, 0);
+        assert!(lifted.ir.values.iter().any(
+            |value| matches!(value.op, Op::ConstI64(value) if value == rv64_core::cpu::VLEN_BYTES as i64)
+        ));
+        assert!(lifted.ir.outputs.iter().any(|&(reg, _)| reg == 10));
+        assert!(lifted.ir.outputs.iter().any(|&(reg, _)| reg == 11));
+        assert!(lifted.ir.validate().is_ok());
+
+        let illegal_write = bytes(&[enc_i(0x73, 10, 1, 0, 0xc22)]);
+        assert!(lift_t1_with_vector(
+            &illegal_write,
+            0x1000,
+            0x1000,
+            false,
+            FpMode::Disabled,
+            false,
+            true,
+        )
+        .is_none());
     }
 
     #[test]
