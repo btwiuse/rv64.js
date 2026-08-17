@@ -4,7 +4,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-out="${1:-$root/target/demo-images-v3}"
+out="${1:-$root/target/demo-images-v4}"
 mkdir -p "$out"
 
 "$root/web/prepare-images.sh"

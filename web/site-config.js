@@ -9,4 +9,4 @@ export const defaultRelayURL =
 // select another development origin; deployed pages accept only same-origin
 // overrides.
 export const defaultAssetURL =
-  "https://rv64-release-assets.darren-e4d.workers.dev/demo-images-v3";
+  "https://rv64-release-assets.darren-e4d.workers.dev/demo-images-v4";

@@ -96,9 +96,9 @@ jobs:
           node tests/jit-telemetry-selftest.mjs
           mkdir -p web/images/alpine
           curl --fail --location --retry 3 \
-            https://rv64-release-assets.darren-e4d.workers.dev/demo-images-v3/modern-Image \
+            https://rv64-release-assets.darren-e4d.workers.dev/demo-images-v4/modern-Image \
             --output web/images/alpine/Image
           curl --fail --location --retry 3 \
-            https://rv64-release-assets.darren-e4d.workers.dev/demo-images-v3/modern-alpine.ext4 \
+            https://rv64-release-assets.darren-e4d.workers.dev/demo-images-v4/modern-alpine.ext4 \
             --output web/images/alpine/alpine.ext4
           RV64_UNTIL=ALPINE_READY node examples/boot-linux.mjs
