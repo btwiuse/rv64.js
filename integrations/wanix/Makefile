@@ -2,6 +2,11 @@ RV64_DIR := ../..
 ADAPTER := adapter
 DIST := dist
 RV64_RUST_SOURCES := $(shell find $(RV64_DIR)/crates/rv64-core $(RV64_DIR)/crates/rv64-system $(RV64_DIR)/crates/rv64-dbt $(RV64_DIR)/crates/rv64-wasm -type f -name '*.rs')
+RELEASE_TAG := v0.2.0
+RELEASE_URL := https://github.com/ibuildthecloud/rv64.js/releases/download/$(RELEASE_TAG)
+RELEASE_JS_SHA256 := 6a8b1ce68a70f961d266e5a64923c6a0320b0b7c00be9554be2b49c59822de2d
+RELEASE_WASM_SHA256 := 693a337be080f67b9d0946e796062ff9ed50780f9b57092bb1a0616a8a43f114
+RELEASE_STAGE := $(DIST)/rv64-release
 LEGACY_TAG := v0.1.0
 LEGACY_RELEASE := https://github.com/ibuildthecloud/rv64.js/releases/download/$(LEGACY_TAG)
 LEGACY_JS_SHA256 := 54df79c8b35cf50bcee34c4af02d7eb02b09e0439b717ee75bb830e733595b12
@@ -18,11 +23,17 @@ adapter: $(DIST)/rv64-vm.wasm
 bundle: $(DIST)/rv64.tgz
 .PHONY: bundle
 
+bundle-workspace: $(DIST)/rv64-workspace.tgz
+.PHONY: bundle-workspace
+
 comparison: $(DIST)/rv64-legacy.tgz $(DIST)/rv64-jit.tgz $(DIST)/wanix-linux-rv64.tgz $(DIST)/wanix-linux-x86.tgz
 .PHONY: comparison
 
-$(DIST)/rv64.tgz: $(DIST)/rv64-vm.wasm $(DIST)/rv64_wasm.wasm $(RV64_DIR)/web/rv64.js
-	tar -czf $@ -C $(DIST) rv64-vm.wasm rv64_wasm.wasm -C $(abspath $(RV64_DIR)/web) rv64.js
+$(DIST)/rv64.tgz: $(DIST)/rv64-vm.wasm $(RELEASE_STAGE)/rv64_wasm.wasm $(RELEASE_STAGE)/rv64.js
+	tar -czf $(abspath $@) -C $(DIST) rv64-vm.wasm -C $(abspath $(RELEASE_STAGE)) rv64_wasm.wasm rv64.js
+
+$(DIST)/rv64-workspace.tgz: $(DIST)/rv64-vm.wasm $(DIST)/rv64_wasm.wasm $(RV64_DIR)/web/rv64.js
+	tar -czf $(abspath $@) -C $(DIST) rv64-vm.wasm rv64_wasm.wasm -C $(abspath $(RV64_DIR)/web) rv64.js
 
 $(DIST)/rv64-vm.wasm: $(wildcard $(ADAPTER)/*.go) $(ADAPTER)/p9-handler.js
 	mkdir -p $(DIST)
@@ -32,6 +43,18 @@ $(DIST)/rv64_wasm.wasm: $(RV64_RUST_SOURCES) $(RV64_DIR)/Cargo.toml $(RV64_DIR)/
 	mkdir -p $(DIST)
 	cargo build --manifest-path $(RV64_DIR)/Cargo.toml -p rv64-wasm --target wasm32-unknown-unknown --release
 	cp $(RV64_DIR)/target/wasm32-unknown-unknown/release/rv64_wasm.wasm $@
+
+$(RELEASE_STAGE)/rv64.js: Makefile
+	mkdir -p $(RELEASE_STAGE)
+	curl -fsSL $(RELEASE_URL)/rv64.js -o $@.download
+	printf '%s  %s\n' '$(RELEASE_JS_SHA256)' '$@.download' | sha256sum -c -
+	mv $@.download $@
+
+$(RELEASE_STAGE)/rv64_wasm.wasm: Makefile
+	mkdir -p $(RELEASE_STAGE)
+	curl -fsSL $(RELEASE_URL)/rv64_wasm.wasm -o $@.download
+	printf '%s  %s\n' '$(RELEASE_WASM_SHA256)' '$@.download' | sha256sum -c -
+	mv $@.download $@
 
 $(JIT_STAGE)/rv64-jit-vm.wasm: $(DIST)/rv64-vm.wasm
 	mkdir -p $(JIT_STAGE)

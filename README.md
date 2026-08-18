@@ -152,7 +152,8 @@ run rv64.js inside their own Worker.
 
 The self-contained [WANIX integration](integrations/wanix/README.md) builds an
 rv64 VM-driver archive and matching RISC-V Linux namespace without patching a
-WANIX checkout.
+WANIX checkout. Its normal bundle checksum-pins the official `v0.2.0` runtime;
+an explicit workspace target remains available for emulator development.
 
 Execution is local (on the calling thread) by default. Browser applications
 that need to keep their UI responsive can opt into a dedicated module Worker
