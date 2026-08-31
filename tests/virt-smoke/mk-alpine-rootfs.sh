@@ -34,7 +34,7 @@ apk --root "$ROOT" --arch riscv64 --no-scripts --no-cache \
     --repositories-file "$ROOT/etc/apk/repositories" \
     add alpine-base ca-certificates openssl
 
-mkdir -p "$ROOT/etc/profile.d" "$ROOT/run/rv64-proxy"
+mkdir -p "$ROOT/etc/profile.d" "$ROOT/run/rv64-proxy" "$ROOT/usr/local/sbin"
 cat > "$ROOT/etc/profile.d/rv64-proxy.sh" <<'EOF'
 if grep -qw 'rv64.network=fetch' /proc/cmdline 2>/dev/null; then
     export http_proxy=http://10.0.2.2:8080
