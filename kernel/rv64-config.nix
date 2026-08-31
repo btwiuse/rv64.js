@@ -58,6 +58,7 @@ with lib.kernel;
 
   # Console and dynamic /dev population. rv64.js implements one ns16550 UART.
   TTY = yes;
+  HVC_DRIVER = yes;
   UNIX98_PTYS = yes;
   SERIAL_8250 = yes;
   SERIAL_8250_CONSOLE = yes;
