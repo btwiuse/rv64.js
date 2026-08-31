@@ -1170,11 +1170,11 @@ mod tests {
         assert_eq!(dev.read(0x008), 3);
         dev.write(0x014, 0);
         assert_eq!(dev.read(0x010), 1, "console offers the size feature");
-        assert_eq!(dev.read(0x100), 80);
-        assert_eq!(dev.read(0x104), 24);
+        assert_eq!(dev.read_sized(0x100, 2), 80);
+        assert_eq!(dev.read_sized(0x102, 2), 24);
         dev.console_resize(120, 40);
-        assert_eq!(dev.read(0x100), 120);
-        assert_eq!(dev.read(0x104), 40);
+        assert_eq!(dev.read_sized(0x100, 2), 120);
+        assert_eq!(dev.read_sized(0x102, 2), 40);
         assert_eq!(dev.read(0x0fc), 1);
         assert!(dev.irq_pending());
     }
