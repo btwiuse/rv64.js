@@ -26,7 +26,8 @@ const vm = await RV64.create({
     mode: "linux-direct",
     kernel: await readFile(kernelPath),
     disk: await readFile(diskPath),
-    cmdline: "console=ttyS0 root=/dev/vda rw init=/rv64-init",
+    virtioConsole: true,
+    cmdline: "console=hvc0 root=/dev/vda rw init=/rv64-init",
   },
   events: {
     console(bytes) {
