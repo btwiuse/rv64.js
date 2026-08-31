@@ -51,12 +51,26 @@ cat > "$ROOT/rv64-init" <<'EOF'
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev 2>/dev/null || true
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+mkdir -p /run/rv64-proxy /tmp /dev/shm
+mount -t tmpfs tmpfs /run 2>/dev/null || true
+mount -t tmpfs tmpfs /tmp 2>/dev/null || true
+mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export TERM=xterm
 . /etc/profile.d/rv64-proxy.sh
 
 ip link set eth0 up
-ip addr add 10.0.2.15/24 dev eth0
-ip route add default via 10.0.2.2
+if grep -qw 'rv64.network=fetch' /proc/cmdline; then
+    ip addr add 10.0.2.15/24 dev eth0
+    ip route add default via 10.0.2.2
+else
+    # wsproxy mode: the guest sees a raw Ethernet link to the shared vnet
+    # gateway, so it must lease an address (and DNS) through DHCP like any
+    # other vnet guest instead of using the fetch-mode static address.
+    udhcpc -i eth0 -q -t 10 -n >/dev/null 2>&1 || true
+fi
 
 # The emulator exposes the exact ephemeral proxy CA through this private 9p
 # share before guest networking starts. apk can therefore use normal HTTPS
@@ -72,7 +86,10 @@ fi
 hostname rv64
 echo ALPINE_READY
 echo 'Networking is configured. Try: apk update && apk add nano'
-exec /bin/sh -l
+# The controlling terminal must be opened read-write (`<>`), not read-only
+# (`<`): tmux's server renders the screen by writing to the client's passed
+# stdin fd, which fails with EBADF on an O_RDONLY open.
+exec setsid -c /bin/sh -l <> /dev/hvc0 > /dev/hvc0 2>&1
 EOF
 chmod 0755 "$ROOT/rv64-init"
 
@@ -86,7 +103,6 @@ fakeroot mke2fs -q -t ext4 -d "$ROOT" -F -L rv64-alpine "$IMG" "${size_mb}M"
 # mke2fs -d cannot preserve fakeroot's synthetic device nodes. Install the
 # console node directly in ext4 so PID 1 has working standard streams before
 # devtmpfs is mounted.
-debugfs -w -R 'rm /dev/console' "$IMG" >/dev/null 2>&1 || true
-debugfs -w -R 'mknod /dev/console c 5 1' "$IMG" >/dev/null
+printf 'cd /dev\nmknod console c 5 1\n' | debugfs -w "$IMG" >/dev/null
 
 echo "assembled $IMG (${size_mb} MiB, Alpine $VERSION riscv64)"
