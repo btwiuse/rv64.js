@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "demo-images-v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
