@@ -73,7 +73,7 @@ hostname rv64
 stty rows 24 cols 80 </dev/ttyS0 2>/dev/null || true
 echo ALPINE_READY
 echo 'Networking is configured. Try: apk update && apk add nano'
-exec setsid -c /bin/sh -l </dev/ttyS0 >&0 2>&1
+exec setsid -c /bin/sh -l </dev/hvc0 >&0 2>&1
 EOF
 chmod 0755 "$ROOT/rv64-init"
 
