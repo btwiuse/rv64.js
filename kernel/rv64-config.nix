@@ -70,6 +70,7 @@ with lib.kernel;
   BLK_DEV = yes;
   NETDEVICES = yes;
   ETHERNET = yes;
+  VIRTIO = yes;
   VIRTIO_MENU = yes;
   VIRTIO_MMIO = yes;
   VIRTIO_BLK = yes;
