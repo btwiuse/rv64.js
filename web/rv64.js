@@ -1739,6 +1739,7 @@ export class RV64 {
     }
     this.console = Object.freeze({ send: (data) => this.#sendConsole(data) });
     this.export = Object.freeze({ send: (data) => this.#sendExport(data) });
+    this.serial = Object.freeze({ send: (data) => this.#sendSerial(data) });
     this.network = Object.freeze({
       mode: network.mode,
       get proxyURL() { return network.mode === "fetch" ? core.proxyURL() : undefined; },
@@ -2110,6 +2111,16 @@ export class RV64 {
     this.#input(bytes);
   }
 
+  // UART input, independent of the virtioConsole input routing: the 8250
+  // stays reachable for host-side services (WANIX hostexport) even when the
+  // primary console is the virtio console.
+  #sendSerial(data) {
+    this.#assertLive();
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    if (!(bytes instanceof Uint8Array)) throw new TypeError("serial data must be a string or Uint8Array");
+    this.#core.virtConsoleInput(bytes);
+  }
+
   resize(cols, rows) {
     this.#assertLive();
     if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) {
@@ -2209,6 +2220,7 @@ class RV64WorkerProxy {
       this.on(event, listener);
     }
     this.console = Object.freeze({ send: (data) => this.#sendConsole(data) });
+    this.serial = Object.freeze({ send: (data) => this.#sendSerial(data) });
     const proxy = this;
     this.network = Object.freeze({
       mode: networkMode,
@@ -2390,6 +2402,15 @@ class RV64WorkerProxy {
       throw new TypeError("console data must be a string or Uint8Array");
     }
     this.#worker.postMessage({ type: "console", value: bytes });
+  }
+
+  #sendSerial(data) {
+    this.#assertLive();
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    if (!(bytes instanceof Uint8Array)) {
+      throw new TypeError("serial data must be a string or Uint8Array");
+    }
+    this.#worker.postMessage({ type: "serial", value: bytes });
   }
 
   resize(cols, rows) {

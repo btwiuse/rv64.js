@@ -8,9 +8,12 @@ the sibling `rv64.js` and `rv64_wasm.wasm` runtime files. Bind the archive at
 the runtime beside its own executable, so independently named RV64 variants
 can coexist in one WANIX namespace.
 
-The adapter boots `boot/Image` directly, mounts the current WANIX namespace as
-the guest's `host9p` root, routes the interactive terminal through `ttyS0`, and
-uses the independent `hvc0` virtio console for WANIX host export.
+The adapter boots `boot/Image` directly and mounts the current WANIX namespace
+as the guest's `host9p` root. Mirroring the copy/v86 device layout, the
+interactive terminal runs on the `hvc0` virtio console (resizable: the
+term's `winch` signal is forwarded to `RV64.resize`, so `stty size` and
+SIGWINCH follow the panel), and the 8250 UART `ttyS0` carries the WANIX
+host-export stream.
 
 From the rv64.js checkout, build the runtime archive and both architecture-
 matched Linux namespace archives with:
@@ -20,7 +23,7 @@ make -C integrations/wanix bundle linux
 ```
 
 The normal `rv64.tgz` bundle uses the immutable official
-[`v0.2.0` release](https://github.com/ibuildthecloud/rv64.js/releases/tag/v0.2.0).
+[`v0.3.0` release](https://github.com/btwiuse/rv64.js/releases/tag/v0.3.0).
 The Makefile verifies the published `rv64.js` and `rv64_wasm.wasm` SHA-256
 values before packaging them with the locally built WANIX adapter. This keeps
 ordinary WANIX installations on a named release instead of silently depending
@@ -79,7 +82,7 @@ Serve the two files from `dist/` and bind them from otherwise stock WANIX:
 ```html
 <wanix-bind dst="." type="archive" src="/assets/wanix-linux-rv64.tgz"></wanix-bind>
 <wanix-bind dst="#vm/rv64" type="archive" src="/assets/rv64.tgz?v=0.2.0"></wanix-bind>
-<wanix-vm type="rv64" export="hvc0" mem="1G" term start></wanix-vm>
+<wanix-vm type="rv64" export="ttyS0" mem="1G" term start></wanix-vm>
 ```
 
 ## Why rv64.js 9P needed an adapter

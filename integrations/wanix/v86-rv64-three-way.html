@@ -240,7 +240,7 @@ for (;;) {
         <span class="status" id="rv64-legacy-status">ready to start</span>
         <button type="button" data-vm="rv64-legacy" aria-describedby="rv64-legacy-status">Start</button>
       </header>
-      <wanix-vm id="rv64-legacy" type="rv64-legacy" export="hvc0" mem="512M" term append="rv64.benchmark=1 loglevel=6">
+      <wanix-vm id="rv64-legacy" type="rv64-legacy" export="ttyS0" mem="512M" term append="rv64.benchmark=1 loglevel=6">
         <wanix-bind dst="." src="../extras/dist/wanix-linux-rv64.tgz" type="archive"></wanix-bind>
         <wanix-bind dst="usr/bin/wtop" src="wtop"></wanix-bind>
         <wanix-bind dst="usr/bin/wrepeat" src="wrepeat"></wanix-bind>
@@ -253,7 +253,7 @@ for (;;) {
         <span class="status" id="rv64-jit-status">ready to start</span>
         <button type="button" data-vm="rv64-jit" aria-describedby="rv64-jit-status">Start</button>
       </header>
-      <wanix-vm id="rv64-jit" type="rv64-jit" export="hvc0" mem="512M" term append="rv64.benchmark=1 loglevel=6">
+      <wanix-vm id="rv64-jit" type="rv64-jit" export="ttyS0" mem="512M" term append="rv64.benchmark=1 loglevel=6">
         <wanix-bind dst="." src="../extras/dist/wanix-linux-rv64.tgz" type="archive"></wanix-bind>
         <wanix-bind dst="usr/bin/wtop" src="wtop"></wanix-bind>
         <wanix-bind dst="usr/bin/wrepeat" src="wrepeat"></wanix-bind>

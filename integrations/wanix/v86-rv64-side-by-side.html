@@ -122,7 +122,7 @@ for (;;) {
 </wanix-bind>
   <wanix-bind dst="vm" src="#vm"></wanix-bind>
   <wanix-bind dst="#vm/v86" src="../v86/v86.tgz" type="archive"></wanix-bind>
-  <wanix-bind dst="#vm/rv64" src="../rv64/rv64.tgz?v=0.2.0" type="archive"></wanix-bind>
+  <wanix-bind dst="#vm/rv64" src="../rv64/rv64.tgz?v=0.3.0" type="archive"></wanix-bind>
 
   <main>
     <section>
@@ -135,8 +135,8 @@ for (;;) {
       <wanix-term path="#vm/x86/term" raw></wanix-term>
     </section>
     <section>
-      <h2>RISC-V Linux — rv64.js v0.2.0 via WANIX (shared at /shared)</h2>
-      <wanix-vm id="rv64" type="rv64" export="hvc0" mem="512M" term start>
+      <h2>RISC-V Linux — rv64.js v0.3.0 via WANIX (shared at /shared)</h2>
+      <wanix-vm id="rv64" type="rv64" export="ttyS0" mem="512M" term start>
         <wanix-bind dst="." src="../extras/dist/wanix-linux-rv64.tgz" type="archive"></wanix-bind>
         <wanix-bind dst="usr/bin/wtop" src="wtop"></wanix-bind>
         <wanix-bind dst="usr/bin/wrepeat" src="wrepeat"></wanix-bind>

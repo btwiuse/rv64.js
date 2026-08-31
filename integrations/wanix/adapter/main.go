@@ -9,6 +9,8 @@ import (
 	"log"
 	"os"
 	"path"
+	"strconv"
+	"strings"
 	"syscall/js"
 )
 
@@ -50,11 +52,13 @@ func main() {
 	events := map[string]any{
 		// A pure JavaScript callback avoids re-entering the Go Wasm runtime
 		// from the emulator's host_write import while generated code is live.
-		"console": consoleOutput,
-		"export": js.FuncOf(func(_ js.Value, args []js.Value) any {
+		// Mirror the copy/v86 layout: hvc0 (virtio console) is the interactive
+		// terminal and ttyS0 (8250 UART) is the WANIX host-export link.
+		"console": js.FuncOf(func(_ js.Value, args []js.Value) any {
 			exportOutput(args[0])
 			return nil
 		}),
+		"export": consoleOutput,
 		"error": js.FuncOf(func(_ js.Value, args []js.Value) any {
 			writeHost(sys, fmt.Sprintf("[rv64 adapter] VM error: %s\n", args[0].Call("toString").String()))
 			return nil
@@ -95,13 +99,18 @@ func main() {
 	}
 	writeHost(sys, "[rv64 adapter] emulator created; starting scheduler\n")
 	exportPort.Set("onmessage", js.FuncOf(func(_ js.Value, args []js.Value) any {
-		vm.Get("export").Call("send", args[0].Get("data"))
+		vm.Get("serial").Call("send", args[0].Get("data"))
 		return nil
 	}))
 	if _, err := await(vm.Call("start")); err != nil {
 		log.Fatal(err)
 	}
-	writeHost(sys, "[rv64 adapter] scheduler running; guest console is ttyS0\n")
+	// Default console size until the shell's wanix-term publishes a winch
+	// frame (the emulator's DRIVER_OK path already seeds 80x24, so this only
+	// covers the gap before the first resize).
+	vm.Call("resize", 80, 24)
+	go forwardWinch(vm)
+	writeHost(sys, "[rv64 adapter] scheduler running; guest console is hvc0\n")
 	js.Global().Get("self").Call("postMessage", map[string]any{
 		"vm": os.Getenv("vm"), "export": exportPort,
 	}, []any{exportPort})
@@ -184,6 +193,45 @@ func newExportChannel() (js.Value, func(js.Value)) {
 			js.CopyBytesToJS(out, buf[:n])
 			port1.Call("postMessage", out)
 			buf = buf[n:]
+		}
+	}
+}
+
+// forwardWinch mirrors the term device's winch signal into the guest: the
+// shell's wanix-term publishes "cols rows xpixel ypixel" frames on fit and
+// on every resize, and the virtio-console resize path (hvc_resize) turns
+// them into tty winsize updates and SIGWINCH for the foreground job. The
+// signal file replays the last frame to a new reader, so the first read
+// already carries the current size once one has been published.
+func forwardWinch(vm js.Value) {
+	// The VM task's namespace exposes its term at #task/self/term (the
+	// wanix-vm element binds it there); the winch signal file sits under
+	// it. Terminal tasks bind a bare "winch" at the root, VM tasks do
+	// not, so open the full path.
+	winch, err := os.Open("#task/self/term/winch")
+	if err != nil {
+		log.Println("winch open:", err)
+		return
+	}
+	defer winch.Close()
+	buf := make([]byte, 64)
+	for {
+		n, err := winch.Read(buf)
+		if n > 0 {
+			fields := strings.Fields(string(buf[:n]))
+			if len(fields) >= 2 {
+				cols, cerr := strconv.Atoi(fields[0])
+				rows, rerr := strconv.Atoi(fields[1])
+				if cerr == nil && rerr == nil && cols > 0 && rows > 0 {
+					// rv64's resize(cols, rows) writes the standard
+					// virtio_console_config order, so no swap is needed
+					// (unlike the copy/v86 bus handler).
+					vm.Call("resize", cols, rows)
+				}
+			}
+		}
+		if err != nil {
+			break
 		}
 	}
 }

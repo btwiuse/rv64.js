@@ -52,14 +52,15 @@ func parseFlags(args []string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	cmdline := "console=ttyS0 loglevel=3 init=/bin/init rw root=host9p rootfstype=9p rootflags=trans=virtio,version=9p2000.L,aname=,cache=none,msize=131072 rv64.network=fetch"
+	cmdline := "console=hvc0 loglevel=3 init=/bin/init rw root=host9p rootfstype=9p rootflags=trans=virtio,version=9p2000.L,aname=,cache=none,msize=131072 rv64.network=fetch"
 	if appendArgs != "" {
 		cmdline += " " + appendArgs
 	}
 	if export != "" {
-		// rv64 reserves ttyS0 for the interactive UART and exposes the WANIX
-		// host-export stream on the secondary virtio console.
-		cmdline += " export=hvc0"
+		// Mirror the copy/v86 layout: hvc0 (virtio console) is the interactive
+		// terminal and the 8250 UART (ttyS0) carries the WANIX host-export
+		// stream.
+		cmdline += " export=" + export
 	}
 	return config{
 		memoryMB:    bytes / (1024 * 1024),

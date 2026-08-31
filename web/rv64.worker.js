@@ -93,6 +93,8 @@ self.onmessage = (event) => {
     call(message);
   } else if (message?.type === "console") {
     vm?.console.send(message.value);
+  } else if (message?.type === "serial") {
+    vm?.serial.send(message.value);
   } else if (message?.type === "resize") {
     vm?.resize(message.cols, message.rows);
   } else if (message?.type === "network-receive") {

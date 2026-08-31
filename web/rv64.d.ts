@@ -228,6 +228,8 @@ export class RV64 {
   readonly instructions: bigint;
   readonly console: { send(data: string | Uint8Array): void };
   readonly export: { send(data: string | Uint8Array): void };
+  /** 8250 UART input, reachable even when the primary console is virtio. */
+  readonly serial: { send(data: string | Uint8Array): void };
   resize(cols: number, rows: number): void;
   readonly network: {
     readonly mode: NetworkConfig["mode"];

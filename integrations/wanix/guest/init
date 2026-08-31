@@ -25,6 +25,9 @@ done
 console_device=/dev/$console
 echo "WANIX guest init" >"$console_device"
 
+# tmux and other terminfo consumers refuse to start without a term name.
+export TERM=xterm
+
 mount -t sysfs none /sys
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts
