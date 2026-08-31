@@ -1254,6 +1254,12 @@ RV64Debug.prototype.virtConsoleInput = function (bytes) {
   this.ex.virt_console_input();
 };
 
+RV64Debug.prototype.virtioConsoleInput = function (bytes) {
+  const ptr = this.ex.staging_alloc(bytes.length);
+  new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
+  this.ex.virt_export_input();
+};
+
 RV64Debug.prototype.virtExportInput = function (bytes) {
   const ptr = this.ex.staging_alloc(bytes.length);
   new Uint8Array(this.ex.memory.buffer, ptr, bytes.length).set(bytes);
@@ -2060,7 +2066,9 @@ export class RV64 {
         }
         return poweredOff;
       };
-      this.#input = (bytes) => this.#core.virtConsoleInput(bytes);
+      this.#input = boot.virtioConsole
+        ? (bytes) => this.#core.virtioConsoleInput(bytes)
+        : (bytes) => this.#core.virtConsoleInput(bytes);
       this.#networkInput = (frame) => this.#core.virtNetInput(frame);
       this.#instructions = () => this.#core.virtInsnCount();
     } else {
@@ -2076,9 +2084,20 @@ export class RV64 {
   #tick(generation) {
     if (!this.#running || generation !== this.#generation) return;
     try {
-      if (this.#runSlice()) {
+      const before = this.#instructions();
+      const poweredOff = this.#runSlice();
+      const retired = this.#instructions() - before;
+      if (poweredOff) {
         this.#running = false;
         this.#emit("stop", { reason: "powered-off" });
+        return;
+      }
+      // The guest halts in WFI when idle (runSlice returns almost
+      // immediately). Yield with a backoff instead of busy-looping the
+      // event loop at 100% CPU; input delivery wakes it up on the next
+      // tick regardless, so the delay only bounds idle polling.
+      if (retired < 1_000n) {
+        setTimeout(() => this.#tick(generation), 10);
         return;
       }
       hostYield(() => this.#tick(generation));

@@ -183,6 +183,12 @@ impl VirtioDev {
             // A 16-entry ring can transmit once and then remain stopped even
             // after we publish the used entry; 256 is the conventional size.
             Backend::Net { .. } => 256,
+            // Console output can arrive as one burst (a full-screen tmux
+            // redraw). A 16-entry ring fills in a single render, after which
+            // the hvc driver only retries on its periodic khvcd poll — far too
+            // slow on this emulator and easily mistaken for a hang. Give the
+            // driver its full VIRTQUEUE_NUM (128) so bursts fit.
+            Backend::Console { .. } => 128,
             _ => 16,
         }
     }
@@ -293,6 +299,7 @@ impl VirtioDev {
                 self.int_status &= !val;
             }
             0x070 => {
+                let driver_ok = self.status & 0x04 != 0;
                 self.status = val;
                 if val == 0 {
                     // reset
@@ -304,6 +311,14 @@ impl VirtioDev {
                     {
                         requests.clear();
                         pending.clear();
+                    }
+                } else if !driver_ok && val & 0x04 != 0 {
+                    // The virtio_console driver only learns the console size
+                    // from a config-change interrupt (its non-multiport
+                    // config_work handler). Without an initial one, hvc0 keeps
+                    // a zero winsize and stty reports no size information.
+                    if matches!(self.backend, Backend::Console { .. }) {
+                        self.int_status |= 2;
                     }
                 }
             }
