@@ -503,6 +503,8 @@ impl Machine {
         let mut virtio = vec![VirtioDev::new(Backend::Console {
             rx_buf: Vec::new(),
             tx_out: Vec::new(),
+            cols: 80,
+            rows: 24,
         })];
         if let Some(disk) = images.disk {
             virtio.push(VirtioDev::new(Backend::Block { disk }));

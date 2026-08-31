@@ -21,7 +21,12 @@ pub struct ExternalP9Pending {
 /// Device backends the transport can host.
 pub enum Backend {
     /// virtio-console (device id 3). RX = queue 0, TX = queue 1.
-    Console { rx_buf: Vec<u8>, tx_out: Vec<u8> },
+    Console {
+        rx_buf: Vec<u8>,
+        tx_out: Vec<u8>,
+        cols: u16,
+        rows: u16,
+    },
     /// virtio-blk (device id 2), backed by an in-memory disk image.
     Block { disk: Vec<u8> },
     /// virtio-9p (device id 9): host filesystem sharing. One queue, carrying
@@ -102,7 +107,8 @@ pub struct VirtioDev {
     driver_features_sel: u32,
     queue_sel: u32,
     queues: [Queue; MAX_QUEUES],
-    /// bit 0: used-ring update pending
+    config_generation: u32,
+    /// bit 0: used-ring update pending, bit 1: configuration change.
     pub int_status: u32,
 }
 
@@ -121,6 +127,7 @@ impl VirtioDev {
             driver_features_sel: 0,
             queue_sel: 0,
             queues: Default::default(),
+            config_generation: 0,
             int_status: 0,
         }
     }
@@ -140,6 +147,9 @@ impl VirtioDev {
             // bit 32: VIRTIO_F_VERSION_1 — modern queue layout.
             1 => 1,
             0 => match self.backend {
+                // bit 0: VIRTIO_CONSOLE_F_SIZE — cols/rows in config space.
+                // Without it the Linux driver never reads the console size.
+                Backend::Console { .. } => 1,
                 // bit 0: VIRTIO_9P_MOUNT_TAG — config space carries the tag
                 // the guest mounts by. Without it the driver refuses to probe.
                 Backend::Fs { .. } | Backend::FsExternal { .. } => {
@@ -209,6 +219,21 @@ impl VirtioDev {
         }
     }
 
+    /// Push a new console size and notify the driver of the change.
+    pub fn console_resize(&mut self, cols: u16, rows: u16) {
+        if let Backend::Console {
+            cols: old_cols,
+            rows: old_rows,
+            ..
+        } = &mut self.backend
+        {
+            *old_cols = cols;
+            *old_rows = rows;
+            self.config_generation = self.config_generation.wrapping_add(1);
+            self.int_status |= 2;
+        }
+    }
+
     pub fn read(&mut self, offset: u64) -> u32 {
         match offset {
             0x000 => 0x7472_6976, // magic "virt"
@@ -220,7 +245,7 @@ impl VirtioDev {
             0x044 => self.q().ready,
             0x060 => self.int_status,
             0x070 => self.status,
-            0x0fc => 0, // config generation
+            0x0fc => self.config_generation, // config generation
             _ if offset >= 0x100 => {
                 let o = offset - 0x100;
                 u32::from_le_bytes([
@@ -306,7 +331,14 @@ impl VirtioDev {
     /// One byte of device-specific config space (`off` is relative to 0x100).
     fn config_u8(&self, off: u64) -> u8 {
         match &self.backend {
-            Backend::Console { .. } => 0, // cols/rows: unused
+            // struct virtio_console_config { le16 cols; le16 rows; ... }
+            Backend::Console { cols, rows, .. } => match off {
+                0 => cols.to_le_bytes()[0],
+                1 => cols.to_le_bytes()[1],
+                2 => rows.to_le_bytes()[0],
+                3 => rows.to_le_bytes()[1],
+                _ => 0,
+            },
             Backend::Block { disk } => {
                 // struct virtio_blk_config { le64 capacity; ... } in sectors.
                 let sectors = (disk.len() / SECTOR) as u64;
@@ -489,7 +521,7 @@ impl VirtioDev {
         ram_base: u64,
     ) -> ServiceResult {
         match &mut self.backend {
-            Backend::Console { rx_buf, tx_out } => {
+            Backend::Console { rx_buf, tx_out, .. } => {
                 if qi == 0 {
                     // RX: fill writable buffers with pending input.
                     if rx_buf.is_empty() {
@@ -1136,10 +1168,19 @@ mod tests {
         let mut dev = VirtioDev::new(Backend::Console {
             rx_buf: Vec::new(),
             tx_out: Vec::new(),
+            cols: 80,
+            rows: 24,
         });
         assert_eq!(dev.read(0x008), 3);
         dev.write(0x014, 0);
-        assert_eq!(dev.read(0x010), 0, "console offers no feature bits");
+        assert_eq!(dev.read(0x010), 1, "console offers the size feature");
+        assert_eq!(dev.read_sized(0x100, 2), 80);
+        assert_eq!(dev.read_sized(0x102, 2), 24);
+        dev.console_resize(120, 40);
+        assert_eq!(dev.read_sized(0x100, 2), 120);
+        assert_eq!(dev.read_sized(0x102, 2), 40);
+        assert_eq!(dev.read(0x0fc), 1);
+        assert!(dev.irq_pending());
     }
 
     #[test]
