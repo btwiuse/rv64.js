@@ -329,10 +329,10 @@ impl VirtioDev {
     fn config_u8(&self, off: u64) -> u8 {
         match &self.backend {
             Backend::Console { cols, rows, .. } => match off {
-                8 => cols.to_le_bytes()[0],
-                9 => cols.to_le_bytes()[1],
-                12 => rows.to_le_bytes()[0],
-                13 => rows.to_le_bytes()[1],
+                0 => cols.to_le_bytes()[0],
+                1 => cols.to_le_bytes()[1],
+                2 => rows.to_le_bytes()[0],
+                3 => rows.to_le_bytes()[1],
                 _ => 0,
             },
             Backend::Block { disk } => {
@@ -1170,11 +1170,11 @@ mod tests {
         assert_eq!(dev.read(0x008), 3);
         dev.write(0x014, 0);
         assert_eq!(dev.read(0x010), 1, "console offers the size feature");
-        assert_eq!(dev.read(0x108), 80);
-        assert_eq!(dev.read(0x10c), 24);
+        assert_eq!(dev.read(0x100), 80);
+        assert_eq!(dev.read(0x104), 24);
         dev.console_resize(120, 40);
-        assert_eq!(dev.read(0x108), 120);
-        assert_eq!(dev.read(0x10c), 40);
+        assert_eq!(dev.read(0x100), 120);
+        assert_eq!(dev.read(0x104), 40);
         assert_eq!(dev.read(0x0fc), 1);
         assert!(dev.irq_pending());
     }
