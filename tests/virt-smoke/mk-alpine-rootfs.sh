@@ -46,6 +46,25 @@ else
 fi
 EOF
 
+cat > "$ROOT/usr/local/sbin/rv64-resized" <<'EOF'
+#!/bin/sh
+while [ ! -c /dev/hvc0 ] || [ ! -c /dev/ttyS0 ]; do
+    sleep 1
+done
+exec 3<>/dev/hvc0
+while IFS=' ' read -r op rows cols extra <&3; do
+    [ "$op" = SIZE ] || continue
+    [ -z "$extra" ] || continue
+    case "$rows:$cols" in
+        *[!0-9:]*|:*|*:) continue ;;
+    esac
+    [ "$rows" -ge 1 ] 2>/dev/null && [ "$rows" -le 1000 ] || continue
+    [ "$cols" -ge 1 ] 2>/dev/null && [ "$cols" -le 1000 ] || continue
+    stty rows "$rows" cols "$cols" </dev/ttyS0 >/dev/null 2>&1 || :
+done
+EOF
+chmod 0755 "$ROOT/usr/local/sbin/rv64-resized"
+
 cat > "$ROOT/rv64-init" <<'EOF'
 #!/bin/sh
 mount -t proc proc /proc
@@ -70,9 +89,11 @@ if grep -qw 'rv64.network=fetch' /proc/cmdline && \
 fi
 
 hostname rv64
+stty rows 24 cols 80 </dev/ttyS0 2>/dev/null || true
+/usr/local/sbin/rv64-resized &
 echo ALPINE_READY
 echo 'Networking is configured. Try: apk update && apk add nano'
-exec /bin/sh -l
+exec setsid -c /bin/sh -l </dev/ttyS0 >&0 2>&1
 EOF
 chmod 0755 "$ROOT/rv64-init"
 

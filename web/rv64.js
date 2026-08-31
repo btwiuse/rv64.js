@@ -1260,6 +1260,10 @@ RV64Debug.prototype.virtExportInput = function (bytes) {
   this.ex.virt_export_input();
 };
 
+RV64Debug.prototype.virtConsoleResize = function (cols, rows) {
+  this.ex.virt_console_resize(cols, rows);
+};
+
 RV64Debug.prototype.virtNetInput = function (frame) {
   const ptr = this.ex.staging_alloc(frame.length);
   new Uint8Array(this.ex.memory.buffer, ptr, frame.length).set(frame);
@@ -2093,6 +2097,14 @@ export class RV64 {
     this.#input(bytes);
   }
 
+  resize(cols, rows) {
+    this.#assertLive();
+    if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) {
+      throw new RangeError("console size must be positive integers");
+    }
+    this.#core.virtConsoleResize(cols, rows);
+  }
+
   #sendExport(data) {
     this.#assertLive();
     const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
@@ -2365,6 +2377,14 @@ class RV64WorkerProxy {
       throw new TypeError("console data must be a string or Uint8Array");
     }
     this.#worker.postMessage({ type: "console", value: bytes });
+  }
+
+  resize(cols, rows) {
+    this.#assertLive();
+    if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) {
+      throw new RangeError("console size must be positive integers");
+    }
+    this.#worker.postMessage({ type: "resize", cols, rows });
   }
 
   #receiveNetwork(frame) {

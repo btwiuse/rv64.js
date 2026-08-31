@@ -4565,6 +4565,16 @@ pub extern "C" fn virt_export_input() {
     machine.virtio_console_input(&bytes);
 }
 
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn virt_console_resize(cols: u32, rows: u32) {
+    let machine = unsafe { VIRT.as_mut().expect("call virt_boot() first") };
+    machine.virtio_console_resize(
+        cols.min(u32::from(u16::MAX)) as u16,
+        rows.min(u32::from(u16::MAX)) as u16,
+    );
+}
+
 /// Move the next external 9P request into STAGING, returning its byte length.
 /// Zero means that no request is waiting for the host.
 #[no_mangle]

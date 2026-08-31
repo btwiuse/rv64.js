@@ -642,6 +642,8 @@ impl VirtMachine {
             virtio.push(VirtioDev::new(Backend::Console {
                 rx_buf: Vec::new(),
                 tx_out: Vec::new(),
+                cols: 80,
+                rows: 24,
             }));
         }
         if let Some(disk) = images.disk {
@@ -808,6 +810,21 @@ impl VirtMachine {
             let mut dev = self.bus.virtio.remove(index);
             dev.process(0, &mut self.bus.ram, RAM_BASE);
             self.bus.virtio.insert(index, dev);
+        }
+    }
+
+    pub fn virtio_console_resize(&mut self, cols: u16, rows: u16) {
+        if let Some((index, _)) = self
+            .bus
+            .virtio
+            .iter()
+            .enumerate()
+            .find(|(_, dev)| matches!(dev.backend, Backend::Console { .. }))
+        {
+            let mut dev = self.bus.virtio.remove(index);
+            dev.console_resize(cols, rows);
+            self.bus.virtio.insert(index, dev);
+            self.bus.refresh_plic();
         }
     }
 
