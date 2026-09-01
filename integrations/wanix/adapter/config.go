@@ -16,15 +16,17 @@ type config struct {
 	cmdline     string
 	jitDisabled bool
 	benchmark   bool
+	netdev      string
 }
 
 func parseFlags(args []string) (config, error) {
-	var mem, appendArgs, export string
+	var mem, appendArgs, export, netdev string
 	f := flag.NewFlagSet("rv64", flag.ContinueOnError)
 	f.StringVar(&mem, "m", "512M", "memory size")
 	f.StringVar(&mem, "mem", "512M", "memory size")
 	f.StringVar(&appendArgs, "append", "", "kernel command line additions")
 	f.StringVar(&export, "export", "", "guest device used for host export")
+	f.StringVar(&netdev, "netdev", "", "network device configuration (user,type=virtio,relay_url=...)")
 	if err := f.Parse(args); err != nil {
 		return config{}, err
 	}
@@ -52,7 +54,15 @@ func parseFlags(args []string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	cmdline := "console=hvc0 loglevel=3 init=/bin/init rw root=host9p rootfstype=9p rootflags=trans=virtio,version=9p2000.L,aname=,cache=none,msize=131072 rv64.network=fetch"
+	// rv64.network=fetch is the default zero-infrastructure backend. When a
+	// netdev arrives (host passes -netdev "user,type=virtio,relay_url=wss://…"
+	// from <wanix-vm netdev>), the adapter switches the emulator to the vnet
+	// wsproxy tunnel instead — same as the v86 plugin — and the guest should
+	// NOT hardcode the fetch proxy.
+	cmdline := "console=hvc0 loglevel=3 init=/bin/init rw root=host9p rootfstype=9p rootflags=trans=virtio,version=9p2000.L,aname=,cache=none,msize=131072"
+	if netdev == "" {
+		cmdline += " rv64.network=fetch"
+	}
 	if appendArgs != "" {
 		cmdline += " " + appendArgs
 	}
@@ -67,6 +77,7 @@ func parseFlags(args []string) (config, error) {
 		cmdline:     cmdline,
 		jitDisabled: jitDisabled,
 		benchmark:   benchmark,
+		netdev:      netdev,
 	}, nil
 }
 

@@ -68,11 +68,22 @@ func main() {
 			return nil
 		}),
 	}
+
+	// When the host passes a vnet netdev (e.g.
+	// -netdev "user,type=virtio,relay_url=wss://vnet…") the adapter drives the
+	// guest NIC through the same WebSocket layer-2 relay the v86 plugin uses
+	// (rv64.js network mode "wsproxy"). Without one it falls back to the
+	// zero-infrastructure fetch HTTP proxy.
+	network := map[string]any{"mode": "fetch", "relayURL": relayURL}
+	if url := parseNetdevRelayURL(cfg.netdev); url != "" {
+		network = map[string]any{"mode": "wsproxy", "url": url}
+	}
+
 	opts := map[string]any{
 		"wasm":      wasm,
 		"memoryMB":  cfg.memoryMB,
 		"execution": map[string]any{"mode": "local"},
-		"network":   map[string]any{"mode": "fetch", "relayURL": relayURL},
+		"network":   network,
 		"boot": map[string]any{
 			"mode": "linux-direct", "kernel": kernel, "cmdline": cfg.cmdline,
 			"p9":            map[string]any{"tag": "host9p", "handle": p9},
@@ -80,6 +91,7 @@ func main() {
 		},
 		"events": events,
 	}
+
 	vm, err := await(module.Get("RV64").Call("create", opts))
 	if err != nil {
 		log.Fatal(err)
@@ -117,6 +129,21 @@ func main() {
 
 	go copyStdin(vm)
 	select {}
+}
+
+// parseNetdevRelayURL extracts the relay_url from a qemu-style netdev
+// string ("user,type=virtio,relay_url=wss://…"), returning "" when no
+// netdev is given or it does not carry a relay_url. This lets the adapter
+// route a host-supplied vnet tunnel to the guest NIC via rv64's wsproxy
+// mode, mirroring the v86 plugin's user-mode-net on the shared gateway.
+func parseNetdevRelayURL(netdev string) string {
+	for _, part := range strings.Split(netdev, ",") {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 && kv[0] == "relay_url" && kv[1] != "" {
+			return kv[1]
+		}
+	}
+	return ""
 }
 
 func writeHost(sys js.Value, text string) {
