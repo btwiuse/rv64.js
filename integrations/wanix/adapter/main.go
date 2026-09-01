@@ -77,6 +77,14 @@ func main() {
 	network := map[string]any{"mode": "fetch", "relayURL": relayURL}
 	if url := parseNetdevRelayURL(cfg.netdev); url != "" {
 		network = map[string]any{"mode": "wsproxy", "url": url}
+		if mac := parseNetdevMac(cfg.netdev); mac != nil {
+			// A per-instance MAC (the host injects "mac=" into the netdev) lets
+			// the vnet DHCP pool give each concurrent guest a distinct IP
+			// instead of mapping every default MAC to one address.
+			u8 := js.Global().Get("Uint8Array").New(len(mac))
+			js.CopyBytesToJS(u8, mac)
+			network["mac"] = u8
+		}
 	}
 
 	opts := map[string]any{
@@ -144,6 +152,31 @@ func parseNetdevRelayURL(netdev string) string {
 		}
 	}
 	return ""
+}
+
+// parseNetdevMac extracts a "mac=xx:xx:xx:xx:xx:xx" value from the netdev
+// and returns it as a 6-byte slice, or nil when absent/unparseable.
+func parseNetdevMac(netdev string) []byte {
+	for _, part := range strings.Split(netdev, ",") {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 || kv[0] != "mac" {
+			continue
+		}
+		hexes := strings.Split(kv[1], ":")
+		if len(hexes) != 6 {
+			return nil
+		}
+		out := make([]byte, 6)
+		for i, h := range hexes {
+			v, err := strconv.ParseUint(h, 16, 8)
+			if err != nil {
+				return nil
+			}
+			out[i] = byte(v)
+		}
+		return out
+	}
+	return nil
 }
 
 func writeHost(sys js.Value, text string) {
