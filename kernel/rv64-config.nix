@@ -28,7 +28,6 @@ with lib.kernel;
   # spending guest time on a 250 Hz scheduler tick.
   CC_OPTIMIZE_FOR_SIZE = yes;
   HZ_100 = yes;
-  PREEMPT_NONE = yes;
   TINY_RCU = yes;
   MODULES = no;
 

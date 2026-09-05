@@ -2,7 +2,7 @@
   description = "rv64.js — RISC-V emulator in Rust/wasm that boots Linux in the browser";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -78,6 +78,10 @@
           };
           ignoreConfigErrors = false;
         }).overrideAttrs (old: {
+          postPatch = (old.postPatch or "") + ''
+            sed -i '/select VDSO_GETRANDOM if HAVE_GENERIC_VDSO && 64BIT/d' \
+              arch/riscv/Kconfig
+          '';
           # The Nix RISC-V install hook installs Image.gz, while the default
           # kernel build target produces only Image. Build the required
           # packaging artifact without changing the runtime kernel payload.
@@ -89,6 +93,7 @@
           # modules_install even though this resolved config has MODULES=n.
           postInstall = ''
             cp arch/riscv/boot/Image $out/Image
+            mkdir -p "$modules"
           '';
         });
         virtOpensbi = pkgs.pkgsCross.riscv64.opensbi;
