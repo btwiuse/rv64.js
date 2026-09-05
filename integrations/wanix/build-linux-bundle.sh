@@ -100,6 +100,6 @@ with tarfile.open(output, "w:gz") as archive:
         files.sort()
         for name in directories + files:
             path = os.path.join(current, name)
-            archive.add(path, os.path.relpath(path, root))
+            archive.add(path, os.path.relpath(path, root), recursive=False)
 PY
 echo "$guest_arch Linux namespace: $out"
