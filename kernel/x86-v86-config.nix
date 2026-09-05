@@ -52,6 +52,8 @@ with lib.kernel;
   VIRTIO_MENU = yes;
   VIRTIO_PCI = yes;
   VIRTIO_CONSOLE = yes;
+  VSOCKETS = yes;
+  VIRTIO_VSOCKETS = yes;
   NET = yes;
   PACKET = yes;
   UNIX = yes;
