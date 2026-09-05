@@ -41,6 +41,7 @@ esac
 
 out="${1:-$default_out}"
 docker_cmd="${DOCKER_CMD:-docker}"
+install_python="${INSTALL_PYTHON:-0}"
 tmp="$(mktemp -d "/tmp/wanix-$guest_arch-root.XXXXXX")"
 container="wanix-$guest_arch-root-$$"
 wanix_src="$tmp/wanix"
@@ -59,11 +60,12 @@ test -n "$kernel"
 mkdir -p "$rootfs"
 "$docker_cmd" export "$container" | tar -C "$rootfs" -xf -
 
-# apk itself runs in a native build-platform container while installing the
-# requested architecture's packages into the exported guest root. Package
-# scripts are disabled because their binaries cannot execute on the host.
-"$docker_cmd" run --rm --platform=linux/amd64 -v "$rootfs:/target" alpine:3.22 \
-    apk --root /target --arch "$apk_arch" --no-scripts add python3
+# Keep the default guest rootfs minimal, matching the existing x86 and RV64
+# archives. Python is an opt-in workload dependency for benchmark images.
+if [ "$install_python" = 1 ]; then
+    "$docker_cmd" run --rm --platform=linux/amd64 -v "$rootfs:/target" alpine:3.22 \
+        apk --root /target --arch "$apk_arch" --no-scripts add python3
+fi
 "$docker_cmd" run --rm --platform=linux/amd64 -v "$rootfs:/target" alpine:3.22 \
     chown -R "$(id -u):$(id -g)" /target
 
