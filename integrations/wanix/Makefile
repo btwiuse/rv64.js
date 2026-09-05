@@ -98,6 +98,9 @@ $(DIST)/wanix-linux-rv64.tgz: $(LINUX_COMMON_DEPS) wanix-riscv64.patch $(RV64_DI
 $(DIST)/wanix-linux-x86.tgz: $(LINUX_COMMON_DEPS) $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/x86-v86-config.nix
 	WANIX_GUEST_ARCH=x86 ./build-linux-bundle.sh $@
 
+$(DIST)/wanix-linux-arm64.tgz: $(LINUX_COMMON_DEPS) $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/arm64-config.nix
+	WANIX_GUEST_ARCH=arm64 ./build-linux-bundle.sh $@
+
 linux-rv64: $(DIST)/wanix-linux-rv64.tgz
 .PHONY: linux-rv64
 

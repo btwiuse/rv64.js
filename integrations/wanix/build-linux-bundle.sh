@@ -24,8 +24,17 @@ case "$guest_arch" in
         default_out="$here/dist/wanix-linux-x86.tgz"
         kernel="${WANIX_KERNEL:-${V86_KERNEL:-}}"
         ;;
+    arm64)
+        docker_platform=linux/arm64
+        apk_arch=aarch64
+        go_arch=arm64
+        kernel_attr=arm64-kernel
+        kernel_name=Image
+        default_out="$here/dist/wanix-linux-arm64.tgz"
+        kernel="${WANIX_KERNEL:-${ARM64_KERNEL:-}}"
+        ;;
     *)
-        echo "unsupported WANIX_GUEST_ARCH: $guest_arch (expected riscv64 or x86)" >&2
+        echo "unsupported WANIX_GUEST_ARCH: $guest_arch (expected riscv64, x86, or arm64)" >&2
         exit 2
         ;;
 esac
