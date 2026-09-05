@@ -97,7 +97,7 @@
           '';
         });
         virtOpensbi = pkgs.pkgsCross.riscv64.opensbi;
-        v86Kernel = (pkgs.pkgsi686Linux.linux_latest.override {
+        v86Kernel = (pkgs.pkgsCross.gnu32.linux_latest.override {
           defconfig = "allnoconfig";
           enableCommonConfig = false;
           autoModules = false;
@@ -111,6 +111,7 @@
           # inherited from linux_latest and expose the benchmark payload.
           postInstall = ''
             cp arch/x86/boot/bzImage $out/bzImage
+            mkdir -p "$modules"
           '';
         };
       in

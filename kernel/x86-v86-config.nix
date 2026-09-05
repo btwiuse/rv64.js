@@ -13,7 +13,6 @@ with lib.kernel;
   MODULES = no;
   CC_OPTIMIZE_FOR_SIZE = yes;
   HZ_100 = yes;
-  PREEMPT_NONE = yes;
   TINY_RCU = yes;
 
   PRINTK = yes;
