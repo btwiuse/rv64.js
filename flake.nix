@@ -97,6 +97,21 @@
           '';
         });
         virtOpensbi = pkgs.pkgsCross.riscv64.opensbi;
+        arm64Kernel = (pkgs.pkgsCross.aarch64-multiplatform.linux_latest.override {
+          defconfig = "allnoconfig";
+          enableCommonConfig = false;
+          autoModules = false;
+          preferBuiltin = true;
+          structuredExtraConfig = import ./kernel/arm64-config.nix {
+            inherit (pkgs) lib;
+          };
+          ignoreConfigErrors = false;
+        }).overrideAttrs {
+          postInstall = ''
+            cp arch/arm64/boot/Image $out/Image
+            mkdir -p "$modules"
+          '';
+        };
         v86Kernel = (pkgs.pkgsCross.gnu32.linux_latest.override {
           defconfig = "allnoconfig";
           enableCommonConfig = false;
@@ -119,6 +134,7 @@
         packages.virt-kernel = virtKernel;
         packages.virt-kernel-fast = virtKernelFast;
         packages.virt-opensbi = virtOpensbi;
+        packages.arm64-kernel = arm64Kernel;
         packages.v86-kernel = v86Kernel;
 
         devShells.default = pkgs.mkShell {
