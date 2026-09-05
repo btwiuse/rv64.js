@@ -77,6 +77,8 @@ with lib.kernel;
   VIRTIO_BLK = yes;
   VIRTIO_NET = yes;
   VIRTIO_CONSOLE = yes;
+  VSOCKETS = yes;
+  VIRTIO_VSOCKETS = yes;
 
   # Alpine root disk and the host-provided proxy-CA mount.
   EXT4_FS = yes;
