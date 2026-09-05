@@ -88,5 +88,18 @@ cp "$wanix_src/extras/linux/etc/"* "$rootfs/etc/"
 GOWORK=off GOOS=linux GOARCH="$go_arch" go build -C "$wanix_src" -o "$rootfs/bin/wexec" ./extras/wexec
 GOWORK=off GOOS=linux GOARCH="$go_arch" go build -C "$wanix_src" -o "$rootfs/bin/hostexport" ./extras/hostexport
 find "$rootfs" -name '._*' -type f -delete
-tar -C "$rootfs" -czf "$out" .
+ROOTFS="$rootfs" OUTPUT="$out" python3 - <<'PY'
+import os
+import tarfile
+
+root = os.environ["ROOTFS"]
+output = os.environ["OUTPUT"]
+with tarfile.open(output, "w:gz") as archive:
+    for current, directories, files in os.walk(root):
+        directories.sort()
+        files.sort()
+        for name in directories + files:
+            path = os.path.join(current, name)
+            archive.add(path, os.path.relpath(path, root))
+PY
 echo "$guest_arch Linux namespace: $out"
