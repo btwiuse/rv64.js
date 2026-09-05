@@ -87,5 +87,6 @@ cp "$wanix_src/extras/linux/bin/domctl" "$wanix_src/extras/linux/bin/post-dhcp" 
 cp "$wanix_src/extras/linux/etc/"* "$rootfs/etc/"
 GOWORK=off GOOS=linux GOARCH="$go_arch" go build -C "$wanix_src" -o "$rootfs/bin/wexec" ./extras/wexec
 GOWORK=off GOOS=linux GOARCH="$go_arch" go build -C "$wanix_src" -o "$rootfs/bin/hostexport" ./extras/hostexport
+find "$rootfs" -name '._*' -type f -delete
 tar -C "$rootfs" -czf "$out" .
 echo "$guest_arch Linux namespace: $out"
