@@ -41,7 +41,23 @@ esac
 
 out="${1:-$default_out}"
 docker_cmd="${DOCKER_CMD:-docker}"
+profile="${WANIX_ROOTFS_PROFILE:-minimal}"
 install_python="${INSTALL_PYTHON:-0}"
+case "$profile" in
+    minimal)
+        profile_packages=()
+        ;;
+    full)
+        profile_packages=(bash tmux vim curl ca-certificates docker podman)
+        if [ "$apk_arch" = x86 ]; then
+            profile_packages=(bash tmux vim curl ca-certificates docker podman)
+        fi
+        ;;
+    *)
+        echo "unsupported WANIX_ROOTFS_PROFILE: $profile (expected minimal or full)" >&2
+        exit 2
+        ;;
+esac
 tmp="$(mktemp -d "/tmp/wanix-$guest_arch-root.XXXXXX")"
 container="wanix-$guest_arch-root-$$"
 wanix_src="$tmp/wanix"
@@ -62,12 +78,16 @@ mkdir -p "$rootfs"
 
 # Keep the default guest rootfs minimal, matching the existing x86 and RV64
 # archives. Python is an opt-in workload dependency for benchmark images.
-if [ "$install_python" = 1 ]; then
+if [ "$install_python" = 1 ] || [ "${#profile_packages[@]}" -gt 0 ]; then
+    packages=("${profile_packages[@]}")
+    if [ "$install_python" = 1 ]; then
+        packages+=(python3)
+    fi
     "$docker_cmd" run --rm --platform=linux/amd64 -v "$rootfs:/target" alpine:3.22 \
-        apk --root /target --arch "$apk_arch" --no-scripts add python3
+        apk --root /target --initdb --arch "$apk_arch" --no-scripts --allow-untrusted --repository https://dl-cdn.alpinelinux.org/alpine/v3.22/main add "${packages[@]}"
 fi
 "$docker_cmd" run --rm --platform=linux/amd64 -v "$rootfs:/target" alpine:3.22 \
-    chown -R "$(id -u):$(id -g)" /target
+    find -H /target \( -type f -o -type d \) -exec chown "$(id -u):$(id -g)" {} + || true
 
 git clone --quiet https://github.com/tractordev/wanix.git "$wanix_src"
 git -C "$wanix_src" checkout --quiet "$wanix_ref"

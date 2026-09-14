@@ -35,6 +35,39 @@ with lib.kernel;
   INOTIFY_USER = yes;
   SYSVIPC = yes;
 
+  NAMESPACES = yes;
+  UTS_NS = yes;
+  IPC_NS = yes;
+  USER_NS = yes;
+  PID_NS = yes;
+  NET_NS = yes;
+  POSIX_MQUEUE = yes;
+  SECCOMP = yes;
+  SECCOMP_FILTER = yes;
+  BPF = yes;
+  BPF_SYSCALL = yes;
+
+  CGROUPS = yes;
+  CGROUP_SCHED = yes;
+  FAIR_GROUP_SCHED = yes;
+  CFS_BANDWIDTH = yes;
+  CGROUP_PIDS = yes;
+  MEMCG = yes;
+  BLK_CGROUP = yes;
+  CGROUP_DEVICE = yes;
+  CGROUP_BPF = yes;
+
+  OVERLAY_FS = yes;
+  BRIDGE = yes;
+  BRIDGE_NETFILTER = yes;
+  VETH = yes;
+  NETFILTER = yes;
+  NETFILTER_ADVANCED = yes;
+  NETFILTER_XTABLES = yes;
+  NF_CONNTRACK = yes;
+  NF_NAT = yes;
+  IP_NF_IPTABLES = yes;
+
   BLK_DEV_INITRD = yes;
   DEVTMPFS = yes;
   DEVTMPFS_MOUNT = yes;
