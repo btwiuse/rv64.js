@@ -24,6 +24,7 @@ with lib.kernel;
   BINFMT_ELF = yes;
   BINFMT_SCRIPT = yes;
   ELF_CORE = yes;
+  COMPAT_32BIT_TIME = yes;
   FUTEX = yes;
   EPOLL = yes;
   SIGNALFD = yes;
