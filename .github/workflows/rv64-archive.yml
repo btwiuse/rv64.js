@@ -66,6 +66,7 @@ jobs:
           tar -cf - -C dist rv64-vm.wasm rv64_wasm.wasm > dist/rv64.tgz
           tar -rf dist/rv64.tgz -C dist/rv64-release rv64.js
           gzip -n -f dist/rv64.tgz
+          mv dist/rv64.tgz.gz dist/rv64.tgz
 
       - name: Inspect archive contents
         working-directory: integrations/wanix
