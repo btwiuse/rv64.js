@@ -40,7 +40,7 @@
           ) {
             version = "7.2.6";
             src = linux726Source;
-            ignoreConfigErrors = true;
+            ignoreConfigErrors = false;
           };
         riscvLinux = linux726 pkgs.pkgsCross.riscv64;
         arm64Linux = linux726 pkgs.pkgsCross.aarch64-multiplatform;
@@ -55,7 +55,7 @@
             structuredExtraConfig = import config {
               inherit (pkgs) lib;
             };
-            ignoreConfigErrors = true;
+            ignoreConfigErrors = false;
           } // pkgs.lib.optionalAttrs (target != null) {
             inherit target;
           })).overrideAttrs (old: {
@@ -128,7 +128,7 @@
             NET_9P_VIRTIO = yes;
             "9P_FS" = yes;
           };
-          ignoreConfigErrors = true;
+          ignoreConfigErrors = false;
         };
         virtOpensbi = pkgs.pkgsCross.riscv64.opensbi;
       in
