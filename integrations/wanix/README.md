@@ -23,7 +23,7 @@ make -C integrations/wanix bundle linux
 ```
 
 The normal `rv64.tgz` bundle uses the immutable official
-[`v0.3.0` release](https://github.com/btwiuse/rv64.js/releases/tag/v0.3.0).
+[`v0.3.0` release](https://github.com/justwasm/rv64.js/releases/tag/v0.3.0).
 The Makefile verifies the published `rv64.js` and `rv64_wasm.wasm` SHA-256
 values before packaging them with the locally built WANIX adapter. This keeps
 ordinary WANIX installations on a named release instead of silently depending
