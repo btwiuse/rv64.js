@@ -47,21 +47,6 @@
           };
           configurePhase = builtins.replaceStrings [ "7.2.5" ] [ "7.2.6" ] (old.configurePhase or "");
           postInstall = builtins.replaceStrings [ "7.2.5" ] [ "7.2.6" ] (old.postInstall or "");
-          # 7.2.x adds new Kconfig prompts (notably under arch/riscv and
-          # drivers/net) that the allnoconfig contract does not pre-answer.
-          # oldconfig blocks on stdin; substitute olddefconfig so it falls
-          # back to defaults without a TTY.
-          postPatch = (old.postPatch or "") + ''
-            # The generic builder runs `make oldconfig` during configurePhase.
-            # Patch the kernel's toplevel Makefile so oldconfig becomes
-            # olddefconfig when invoked by kbuild, since we have no TTY to
-            # answer prompts interactively.
-            for f in Makefile scripts/kconfig/Makefile; do
-              if [ -f "$f" ]; then
-                sed -i 's|oldconfig|olddefconfig|g' "$f"
-              fi
-            done
-          '';
         });
         riscvLinux = linux726 pkgs.pkgsCross.riscv64.linux_latest;
         arm64Linux = linux726 pkgs.pkgsCross.aarch64-multiplatform.linux_latest;
@@ -110,12 +95,6 @@
           postPatch = (old.postPatch or "") + ''
             sed -i '/select VDSO_GETRANDOM if HAVE_GENERIC_VDSO && 64BIT/d' \
               arch/riscv/Kconfig
-          '';
-          # The Nix RISC-V install hook installs Image.gz, while the default
-          # kernel build target produces only Image. Build the required
-          # packaging artifact without changing the runtime kernel payload.
-          postBuild = (old.postBuild or "") + ''
-            make $makeFlags Image.gz
           '';
           # linux_latest's pre-override package is modular, so its computed
           # postInstall hook otherwise survives overrideAttrs and attempts a
