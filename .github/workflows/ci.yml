@@ -87,6 +87,7 @@ jobs:
           node tests/public-api.mjs
           node tests/worker-api.mjs
           node tests/site-asset-source.mjs
+          node tests/wanix-guest-release-contract.mjs
           node tests/direct-boot.mjs
           node tests/alpine-boot.mjs
           node tests/vs-v86/harness-selftest.mjs

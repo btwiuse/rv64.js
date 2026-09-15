@@ -58,7 +58,7 @@ jobs:
           mkdir -p integrations/wanix/dist/rv64-release
           curl --fail --location --retry 3 \
             -o integrations/wanix/dist/rv64-release/rv64.js \
-            "https://github.com/btwiuse/rv64.js/releases/download/${UPSTREAM}/rv64.js"
+            "https://github.com/justwasm/rv64.js/releases/download/${UPSTREAM}/rv64.js"
 
       - name: Bundle rv64.tgz
         working-directory: integrations/wanix
