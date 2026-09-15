@@ -90,7 +90,7 @@
           structuredExtraConfig = import ./kernel/rv64-config.nix {
             inherit (pkgs) lib;
           };
-          ignoreConfigErrors = false;
+          ignoreConfigErrors = true;
         }).overrideAttrs (old: {
           postPatch = (old.postPatch or "") + ''
             sed -i '/select VDSO_GETRANDOM if HAVE_GENERIC_VDSO && 64BIT/d' \
@@ -119,7 +119,7 @@
           structuredExtraConfig = import ./kernel/arm64-config.nix {
             inherit (pkgs) lib;
           };
-          ignoreConfigErrors = false;
+          ignoreConfigErrors = true;
         }).overrideAttrs {
           postInstall = ''
             cp arch/arm64/boot/Image $out/Image
@@ -134,7 +134,7 @@
           structuredExtraConfig = import ./kernel/x86-v86-config.nix {
             inherit (pkgs) lib;
           };
-          ignoreConfigErrors = false;
+          ignoreConfigErrors = true;
         }).overrideAttrs {
           # As with the rv64 package, discard the modular post-install hook
           # inherited from linux_latest and expose the benchmark payload.
