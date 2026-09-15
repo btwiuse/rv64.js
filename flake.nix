@@ -45,7 +45,14 @@
             url = "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.6.tar.xz";
             hash = "sha256-A5rvhPKwmUrto/T8/D0C7J16m7uQIOomTEP0Rshg9gY=";
           };
-          configurePhase = builtins.replaceStrings [ "7.2.5" ] [ "7.2.6" ] (old.configurePhase or "");
+          # 7.2.x adds new Kconfig prompts (notably under arch/riscv and
+          # drivers/net) that the allnoconfig contract does not pre-answer.
+          # oldconfig blocks on stdin; substitute olddefconfig so it falls
+          # back to defaults without a TTY.
+          configurePhase = builtins.replaceStrings
+            [ "7.2.5" "make \"''${makeFlags[@]}\" oldconfig" ]
+            [ "7.2.6" "make \"''${makeFlags[@]}\" olddefconfig" ]
+            (old.configurePhase or "");
           postInstall = builtins.replaceStrings [ "7.2.5" ] [ "7.2.6" ] (old.postInstall or "");
         });
         riscvLinux = linux726 pkgs.pkgsCross.riscv64.linux_latest;
