@@ -1,0 +1,95 @@
+name: WANIX guest release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing wanix-extras tag to populate
+        required: true
+        type: string
+      publish:
+        description: Upload archives to the selected release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wanix-guest-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}-${{ matrix.profile }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [riscv64, x86, arm64]
+        profile: [minimal, container, container-full]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+
+      - uses: actions/cache@v4
+        with:
+          path: /nix
+          key: wanix-kernel-${{ runner.os }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ hashFiles('flake.nix', 'flake.lock', 'kernel/**', 'integrations/wanix/**', 'tools/build-wanix-release-assets.sh') }}
+          restore-keys: wanix-kernel-${{ runner.os }}-${{ matrix.arch }}-
+
+      - name: Build and validate guest archive
+        run: |
+          chmod +x tools/build-wanix-release-assets.sh
+          tools/build-wanix-release-assets.sh \
+            "${{ matrix.arch }}" \
+            "${{ matrix.profile }}" \
+            "target/wanix-guests/${{ matrix.arch }}-${{ matrix.profile }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wanix-${{ matrix.arch }}-${{ matrix.profile }}
+          path: target/wanix-guests/${{ matrix.arch }}-${{ matrix.profile }}/wanix-linux-*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: target/wanix-guests
+          pattern: wanix-*
+          merge-multiple: true
+
+      - name: Verify release payload
+        run: |
+          shopt -s nullglob
+          assets=(target/wanix-guests/wanix-linux-*.tgz)
+          test "${#assets[@]}" -eq 9
+          sha256sum "${assets[@]}" | tee target/wanix-guests/SHA256SUMS
+
+      - name: Publish to wanix-extras release
+        env:
+          GH_TOKEN: ${{ secrets.WANIX_EXTRAS_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          test -n "$GH_TOKEN" || {
+            echo "WANIX_EXTRAS_TOKEN is required to publish outside this repository" >&2
+            exit 1
+          }
+          gh release view "$RELEASE_TAG" --repo btwiuse/wanix-extras >/dev/null
+          gh release upload "$RELEASE_TAG" \
+            target/wanix-guests/wanix-linux-*.tgz \
+            target/wanix-guests/SHA256SUMS \
+            --repo btwiuse/wanix-extras --clobber
