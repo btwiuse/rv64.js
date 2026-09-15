@@ -52,6 +52,9 @@ case "$profile" in
 esac
 
 mkdir -p "$output_dir/kernels"
+config_path="$(nix build --no-link --print-out-paths ".#$kernel_attr.configfile")"
+grep -qx 'CONFIG_IKCONFIG=y' "$config_path"
+grep -qx 'CONFIG_IKCONFIG_PROC=y' "$config_path"
 kernel_output="$(nix build --no-link --print-out-paths ".#$kernel_attr")"
 kernel_path="$kernel_output/$kernel_name"
 test -s "$kernel_path"

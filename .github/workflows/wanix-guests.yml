@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing wanix-extras tag to populate
+        description: Release tag to create or update in this repository
         required: true
         type: string
       publish:
@@ -24,7 +24,7 @@ jobs:
   build:
     name: ${{ matrix.arch }}-${{ matrix.profile }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -36,11 +36,13 @@ jobs:
 
       - uses: cachix/install-nix-action@v31
 
-      - uses: actions/cache@v4
+      - uses: actions/setup-go@v5
         with:
-          path: /nix
-          key: wanix-kernel-${{ runner.os }}-${{ matrix.arch }}-${{ matrix.profile }}-${{ hashFiles('flake.nix', 'flake.lock', 'kernel/**', 'integrations/wanix/**', 'tools/build-wanix-release-assets.sh') }}
-          restore-keys: wanix-kernel-${{ runner.os }}-${{ matrix.arch }}-
+          go-version: stable
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
 
       - name: Build and validate guest archive
         run: |
@@ -61,9 +63,9 @@ jobs:
     needs: build
     if: inputs.publish
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - uses: actions/download-artifact@v4
@@ -79,17 +81,19 @@ jobs:
           test "${#assets[@]}" -eq 9
           sha256sum "${assets[@]}" | tee target/wanix-guests/SHA256SUMS
 
-      - name: Publish to wanix-extras release
+      - name: Publish to this repository's release
         env:
-          GH_TOKEN: ${{ secrets.WANIX_EXTRAS_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          test -n "$GH_TOKEN" || {
-            echo "WANIX_EXTRAS_TOKEN is required to publish outside this repository" >&2
-            exit 1
-          }
-          gh release view "$RELEASE_TAG" --repo btwiuse/wanix-extras >/dev/null
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "WANIX guest images $RELEASE_TAG" \
+              --notes "Built and verified by GitHub Actions from $GITHUB_SHA."
+          fi
           gh release upload "$RELEASE_TAG" \
             target/wanix-guests/wanix-linux-*.tgz \
             target/wanix-guests/SHA256SUMS \
-            --repo btwiuse/wanix-extras --clobber
+            --repo "$GITHUB_REPOSITORY" --clobber
