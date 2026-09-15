@@ -45,15 +45,23 @@
             url = "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.6.tar.xz";
             hash = "sha256-A5rvhPKwmUrto/T8/D0C7J16m7uQIOomTEP0Rshg9gY=";
           };
+          configurePhase = builtins.replaceStrings [ "7.2.5" ] [ "7.2.6" ] (old.configurePhase or "");
+          postInstall = builtins.replaceStrings [ "7.2.5" ] [ "7.2.6" ] (old.postInstall or "");
           # 7.2.x adds new Kconfig prompts (notably under arch/riscv and
           # drivers/net) that the allnoconfig contract does not pre-answer.
           # oldconfig blocks on stdin; substitute olddefconfig so it falls
           # back to defaults without a TTY.
-          configurePhase = builtins.replaceStrings
-            [ "7.2.5" "make \"''${makeFlags[@]}\" oldconfig" ]
-            [ "7.2.6" "make \"''${makeFlags[@]}\" olddefconfig" ]
-            (old.configurePhase or "");
-          postInstall = builtins.replaceStrings [ "7.2.5" ] [ "7.2.6" ] (old.postInstall or "");
+          postPatch = (old.postPatch or "") + ''
+            # The generic builder runs `make oldconfig` during configurePhase.
+            # Patch the kernel's toplevel Makefile so oldconfig becomes
+            # olddefconfig when invoked by kbuild, since we have no TTY to
+            # answer prompts interactively.
+            for f in Makefile scripts/kconfig/Makefile; do
+              if [ -f "$f" ]; then
+                sed -i 's|oldconfig|olddefconfig|g' "$f"
+              fi
+            done
+          '';
         });
         riscvLinux = linux726 pkgs.pkgsCross.riscv64.linux_latest;
         arm64Linux = linux726 pkgs.pkgsCross.aarch64-multiplatform.linux_latest;
