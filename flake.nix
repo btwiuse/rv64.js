@@ -38,6 +38,20 @@
           configureFlags = (old.configureFlags or [ ]) ++ [ "--enable-commitlog" ];
         });
 
+        linux726 = kernel: kernel.overrideAttrs (old: {
+          version = "7.2.6";
+          ignoreConfigErrors = true;
+          src = pkgs.fetchurl {
+            url = "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.6.tar.xz";
+            hash = "sha256-A5rvhPKwmUrto/T8/D0C7J16m7uQIOomTEP0Rshg9gY=";
+          };
+          configurePhase = builtins.replaceStrings [ "7.2.5" ] [ "7.2.6" ] (old.configurePhase or "");
+          postInstall = builtins.replaceStrings [ "7.2.5" ] [ "7.2.6" ] (old.postInstall or "");
+        });
+        riscvLinux = linux726 pkgs.pkgsCross.riscv64.linux_latest;
+        arm64Linux = linux726 pkgs.pkgsCross.aarch64-multiplatform.linux_latest;
+        x86Linux = linux726 pkgs.pkgsCross.gnu32.linux_latest;
+
         # Modern-system smoke test (tests/virt-smoke): a stock riscv64 kernel
         # with virtio-blk/ext4 built in, and OpenSBI fw_dynamic, both booted by
         # the virt machine. Exposed as packages so the harness resolves them
@@ -47,7 +61,7 @@
         # otherwise stock, but make the boot-critical disk/NIC path built-in.
         # This image does not ship the kernel's module tree into the guest, so
         # packet sockets (used by DHCP clients) must be built in as well.
-        virtKernel = pkgs.pkgsCross.riscv64.linux_latest.override {
+        virtKernel = riscvLinux.override {
           structuredExtraConfig = with pkgs.lib.kernel; {
             VIRTIO = yes;
             VIRTIO_MMIO = yes;
@@ -68,7 +82,7 @@
         # A single-hart, opt-in kernel for exactly the hardware rv64.js
         # implements. Unlike the conformance kernel above, this starts from
         # allnoconfig and enables only the contract in kernel/rv64-config.nix.
-        virtKernelFast = (pkgs.pkgsCross.riscv64.linux_latest.override {
+        virtKernelFast = (riscvLinux.override {
           defconfig = "allnoconfig";
           enableCommonConfig = false;
           autoModules = false;
@@ -97,7 +111,7 @@
           '';
         });
         virtOpensbi = pkgs.pkgsCross.riscv64.opensbi;
-        arm64Kernel = (pkgs.pkgsCross.aarch64-multiplatform.linux_latest.override {
+        arm64Kernel = (arm64Linux.override {
           defconfig = "allnoconfig";
           enableCommonConfig = false;
           autoModules = false;
@@ -112,7 +126,7 @@
             mkdir -p "$modules"
           '';
         };
-        v86Kernel = (pkgs.pkgsCross.gnu32.linux_latest.override {
+        v86Kernel = (x86Linux.override {
           defconfig = "allnoconfig";
           enableCommonConfig = false;
           autoModules = false;
