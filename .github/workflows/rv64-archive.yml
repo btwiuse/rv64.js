@@ -38,10 +38,10 @@ jobs:
             . -> target
 
       - name: Build rv64-vm.wasm
+        working-directory: integrations/wanix/adapter
         run: |
           GOWORK=off GOOS=js GOARCH=wasm go build \
-            -o integrations/wanix/dist/rv64-vm.wasm \
-            ./integrations/wanix/adapter
+            -o ../../dist/rv64-vm.wasm .
 
       - name: Build rv64_wasm.wasm
         run: |
