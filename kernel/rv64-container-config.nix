@@ -55,6 +55,39 @@ with lib.kernel;
   INOTIFY_USER = yes;
   SYSVIPC = yes;
 
+  NAMESPACES = yes;
+  UTS_NS = yes;
+  IPC_NS = yes;
+  USER_NS = yes;
+  PID_NS = yes;
+  NET_NS = yes;
+  POSIX_MQUEUE = yes;
+  SECCOMP = yes;
+  SECCOMP_FILTER = yes;
+  BPF = yes;
+  BPF_SYSCALL = yes;
+
+  CGROUPS = yes;
+  CGROUP_SCHED = yes;
+  FAIR_GROUP_SCHED = yes;
+  CFS_BANDWIDTH = yes;
+  CGROUP_PIDS = yes;
+  MEMCG = yes;
+  BLK_CGROUP = yes;
+  CGROUP_DEVICE = yes;
+  CGROUP_BPF = yes;
+
+  OVERLAY_FS = yes;
+  BRIDGE = yes;
+  BRIDGE_NETFILTER = yes;
+  VETH = yes;
+  NETFILTER = yes;
+  NETFILTER_ADVANCED = yes;
+  NETFILTER_XTABLES = yes;
+  NF_CONNTRACK = yes;
+  NF_NAT = yes;
+  IP_NF_IPTABLES = yes;
+
   # Console and dynamic /dev population. rv64.js implements one ns16550 UART.
   TTY = yes;
   HVC_DRIVER = yes;
@@ -97,7 +130,6 @@ with lib.kernel;
   UNIX = yes;
   INET = yes;
   IPV6 = no;
-  NET_NS = no;
   INET_DIAG = no;
   PTP_1588_CLOCK = no;
   PPS = no;

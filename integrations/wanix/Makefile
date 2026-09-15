@@ -93,37 +93,64 @@ $(DIST)/rv64-legacy.tgz: $(LEGACY_STAGE)/rv64-legacy-vm.wasm $(LEGACY_STAGE)/rv6
 LINUX_COMMON_DEPS := build-linux-bundle.sh wanix-wexec-js.patch wanix-wexec-poll.patch wanix-wexec-signal.patch wanix-wexec-live-read.patch guest/init
 
 $(DIST)/wanix-linux-rv64.tgz: $(LINUX_COMMON_DEPS) wanix-riscv64.patch $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/rv64-config.nix
-	WANIX_GUEST_ARCH=riscv64 WANIX_ROOTFS_PROFILE=minimal ./build-linux-bundle.sh $@
+	WANIX_GUEST_ARCH=riscv64 WANIX_KERNEL_PROFILE=minimal WANIX_ROOTFS_PROFILE=minimal ./build-linux-bundle.sh $@
 
-$(DIST)/wanix-linux-rv64-full.tgz: $(LINUX_COMMON_DEPS) wanix-riscv64.patch $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/rv64-config.nix
-	WANIX_GUEST_ARCH=riscv64 WANIX_ROOTFS_PROFILE=full ./build-linux-bundle.sh $@
+$(DIST)/wanix-linux-rv64-container.tgz: $(LINUX_COMMON_DEPS) wanix-riscv64.patch $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/rv64-container-config.nix
+	WANIX_GUEST_ARCH=riscv64 WANIX_KERNEL_PROFILE=container WANIX_ROOTFS_PROFILE=minimal ./build-linux-bundle.sh $@
+
+$(DIST)/wanix-linux-rv64-container-full.tgz: $(LINUX_COMMON_DEPS) wanix-riscv64.patch $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/rv64-container-config.nix
+	WANIX_GUEST_ARCH=riscv64 WANIX_KERNEL_PROFILE=container WANIX_ROOTFS_PROFILE=full ./build-linux-bundle.sh $@
 
 $(DIST)/wanix-linux-x86.tgz: $(LINUX_COMMON_DEPS) $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/x86-v86-config.nix
-	WANIX_GUEST_ARCH=x86 WANIX_ROOTFS_PROFILE=minimal ./build-linux-bundle.sh $@
+	WANIX_GUEST_ARCH=x86 WANIX_KERNEL_PROFILE=minimal WANIX_ROOTFS_PROFILE=minimal ./build-linux-bundle.sh $@
 
-$(DIST)/wanix-linux-x86-full.tgz: $(LINUX_COMMON_DEPS) $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/x86-v86-config.nix
-	WANIX_GUEST_ARCH=x86 WANIX_ROOTFS_PROFILE=full ./build-linux-bundle.sh $@
+$(DIST)/wanix-linux-x86-container.tgz: $(LINUX_COMMON_DEPS) $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/x86-v86-container-config.nix
+	WANIX_GUEST_ARCH=x86 WANIX_KERNEL_PROFILE=container WANIX_ROOTFS_PROFILE=minimal ./build-linux-bundle.sh $@
+
+$(DIST)/wanix-linux-x86-container-full.tgz: $(LINUX_COMMON_DEPS) $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/x86-v86-container-config.nix
+	WANIX_GUEST_ARCH=x86 WANIX_KERNEL_PROFILE=container WANIX_ROOTFS_PROFILE=full ./build-linux-bundle.sh $@
 
 $(DIST)/wanix-linux-arm64.tgz: $(LINUX_COMMON_DEPS) $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/arm64-config.nix
-	WANIX_GUEST_ARCH=arm64 ./build-linux-bundle.sh $@
+	WANIX_GUEST_ARCH=arm64 WANIX_KERNEL_PROFILE=minimal WANIX_ROOTFS_PROFILE=minimal ./build-linux-bundle.sh $@
+
+$(DIST)/wanix-linux-arm64-container.tgz: $(LINUX_COMMON_DEPS) $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/arm64-container-config.nix
+	WANIX_GUEST_ARCH=arm64 WANIX_KERNEL_PROFILE=container WANIX_ROOTFS_PROFILE=minimal ./build-linux-bundle.sh $@
+
+$(DIST)/wanix-linux-arm64-container-full.tgz: $(LINUX_COMMON_DEPS) $(RV64_DIR)/flake.nix $(RV64_DIR)/kernel/arm64-container-config.nix
+	WANIX_GUEST_ARCH=arm64 WANIX_KERNEL_PROFILE=container WANIX_ROOTFS_PROFILE=full ./build-linux-bundle.sh $@
 
 linux-rv64: $(DIST)/wanix-linux-rv64.tgz
 .PHONY: linux-rv64
 
-linux-rv64-full: $(DIST)/wanix-linux-rv64-full.tgz
-.PHONY: linux-rv64-full
+linux-rv64-container: $(DIST)/wanix-linux-rv64-container.tgz
+.PHONY: linux-rv64-container
+
+linux-rv64-container-full: $(DIST)/wanix-linux-rv64-container-full.tgz
+.PHONY: linux-rv64-container-full
 
 linux-x86: $(DIST)/wanix-linux-x86.tgz
 .PHONY: linux-x86
 
-linux-x86-full: $(DIST)/wanix-linux-x86-full.tgz
-.PHONY: linux-x86-full
+linux-x86-container: $(DIST)/wanix-linux-x86-container.tgz
+.PHONY: linux-x86-container
 
-linux: linux-rv64 linux-x86
+linux-x86-container-full: $(DIST)/wanix-linux-x86-container-full.tgz
+.PHONY: linux-x86-container-full
+
+linux-arm64: $(DIST)/wanix-linux-arm64.tgz
+.PHONY: linux-arm64
+
+linux-arm64-container: $(DIST)/wanix-linux-arm64-container.tgz
+.PHONY: linux-arm64-container
+
+linux-arm64-container-full: $(DIST)/wanix-linux-arm64-container-full.tgz
+.PHONY: linux-arm64-container-full
+
+linux: linux-rv64 linux-x86 linux-arm64
 .PHONY: linux
 
-linux-full: linux-rv64-full
-.PHONY: linux-full
+linux-container: linux-rv64-container linux-x86-container linux-arm64-container
+.PHONY: linux-container
 
 clean:
 	rm -rf $(DIST)

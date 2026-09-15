@@ -1,25 +1,16 @@
 { lib }:
-
-# Linux configuration contract for the copy/v86 side of the matched boot
-# benchmark. It intentionally mirrors rv64-config.nix at the operating system
-# boundary while enabling only the architecture/console path v86 needs.
 with lib.kernel;
 {
-  # copy/v86 implements the 32-bit Pentium-Pro-era ISA, not x86-64 long
-  # mode. Alpine calls this package architecture "x86" and Go calls it 386.
-  X86_32 = yes;
-  M686 = yes;
-  SMP = no;
+  ARM64 = yes;
+  MMU = yes;
   MODULES = no;
   CC_OPTIMIZE_FOR_SIZE = yes;
   HZ_100 = yes;
-  TINY_RCU = yes;
 
   PRINTK = yes;
   BUG = yes;
   IKCONFIG = yes;
   IKCONFIG_PROC = yes;
-  KERNEL_GZIP = yes;
 
   BINFMT_ELF = yes;
   BINFMT_SCRIPT = yes;
@@ -43,24 +34,20 @@ with lib.kernel;
   SERIAL_8250 = yes;
   SERIAL_8250_CONSOLE = yes;
 
-  # WANIX exposes the live namespace as the guest's 9P root through v86's
-  # virtio-pci device. hvc0 carries the interactive console while ttyS0 is
-  # kept separate for hostexport's framed WANIX protocol.
   BLOCK = yes;
-  BLK_DEV = yes;
-  PCI = yes;
-  VIRTIO_MENU = yes;
-  VIRTIO_PCI = yes;
-  VIRTIO_CONSOLE = yes;
-  VSOCKETS = yes;
-  VIRTIO_VSOCKETS = yes;
   NET = yes;
   PACKET = yes;
   UNIX = yes;
   INET = yes;
   NETDEVICES = yes;
   ETHERNET = yes;
+  VIRTIO = yes;
+  VIRTIO_MENU = yes;
+  VIRTIO_MMIO = yes;
   VIRTIO_NET = yes;
+  VIRTIO_CONSOLE = yes;
+  VSOCKETS = yes;
+  VIRTIO_VSOCKETS = yes;
   NET_9P = yes;
   NET_9P_VIRTIO = yes;
   "9P_FS" = yes;
@@ -70,4 +57,37 @@ with lib.kernel;
   TMPFS = yes;
   TMPFS_POSIX_ACL = yes;
   TMPFS_XATTR = yes;
+
+  NAMESPACES = yes;
+  UTS_NS = yes;
+  IPC_NS = yes;
+  USER_NS = yes;
+  PID_NS = yes;
+  NET_NS = yes;
+  POSIX_MQUEUE = yes;
+  SECCOMP = yes;
+  SECCOMP_FILTER = yes;
+  BPF = yes;
+  BPF_SYSCALL = yes;
+
+  CGROUPS = yes;
+  CGROUP_SCHED = yes;
+  FAIR_GROUP_SCHED = yes;
+  CFS_BANDWIDTH = yes;
+  CGROUP_PIDS = yes;
+  MEMCG = yes;
+  BLK_CGROUP = yes;
+  CGROUP_DEVICE = yes;
+  CGROUP_BPF = yes;
+
+  OVERLAY_FS = yes;
+  BRIDGE = yes;
+  BRIDGE_NETFILTER = yes;
+  VETH = yes;
+  NETFILTER = yes;
+  NETFILTER_ADVANCED = yes;
+  NETFILTER_XTABLES = yes;
+  NF_CONNTRACK = yes;
+  NF_NAT = yes;
+  IP_NF_IPTABLES = yes;
 }

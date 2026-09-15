@@ -4,6 +4,16 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 rv64_dir="${RV64_DIR:-$(cd "$here/../.." && pwd)}"
 guest_arch="${WANIX_GUEST_ARCH:-riscv64}"
+kernel_profile="${WANIX_KERNEL_PROFILE:-minimal}"
+
+case "$kernel_profile" in
+    minimal|container)
+        ;;
+    *)
+        echo "unsupported WANIX_KERNEL_PROFILE: $kernel_profile (expected minimal or container)" >&2
+        exit 2
+        ;;
+esac
 
 case "$guest_arch" in
     riscv64)
@@ -38,6 +48,10 @@ case "$guest_arch" in
         exit 2
         ;;
 esac
+
+if [ "$kernel_profile" = container ]; then
+    kernel_attr+="-container"
+fi
 
 out="${1:-$default_out}"
 docker_cmd="${DOCKER_CMD:-docker}"

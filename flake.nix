@@ -18,49 +18,103 @@
           overlays = [ rust-overlay.overlays.default ];
         };
 
-        # Rust with the two cross targets the project needs:
-        # - wasm32-unknown-unknown: the browser build (rv64-wasm)
-        # - riscv64gc-unknown-linux-musl: guest test binaries (guests/*)
         rust = pkgs.rust-bin.stable."1.97.1".default.override {
           targets = [
             "wasm32-unknown-unknown"
             "riscv64gc-unknown-linux-musl"
           ];
         };
-
-        # Bare-metal RISC-V cross compiler for building the official
-        # riscv-tests ISA suite (tests/run-isa-tests.sh).
         riscvGcc = pkgs.pkgsCross.riscv64-embedded.buildPackages.gcc;
-
-        # Spike with commit logging enabled (tests/lockstep.py needs
-        # --log-commits, which is a compile-time option).
         spike = pkgs.spike.overrideAttrs (old: {
           configureFlags = (old.configureFlags or [ ]) ++ [ "--enable-commitlog" ];
         });
 
-        linux726 = kernel: kernel.overrideAttrs (old: {
-          version = "7.2.6";
-          ignoreConfigErrors = true;
-          src = pkgs.fetchurl {
-            url = "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.6.tar.xz";
-            hash = "sha256-A5rvhPKwmUrto/T8/D0C7J16m7uQIOomTEP0Rshg9gY=";
+        linux726Source = pkgs.fetchurl {
+          url = "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.6.tar.xz";
+          hash = "sha256-A5rvhPKwmUrto/T8/D0C7J16m7uQIOomTEP0Rshg9gY=";
+        };
+        linux726 = crossPkgs:
+          (crossPkgs.callPackage
+            "${pkgs.path}/pkgs/os-specific/linux/kernel/generic.nix"
+            { }
+          ) {
+            version = "7.2.6";
+            src = linux726Source;
+            ignoreConfigErrors = true;
           };
-          configurePhase = builtins.replaceStrings [ "7.2.5" ] [ "7.2.6" ] (old.configurePhase or "");
-          postInstall = builtins.replaceStrings [ "7.2.5" ] [ "7.2.6" ] (old.postInstall or "");
-        });
-        riscvLinux = linux726 pkgs.pkgsCross.riscv64.linux_latest;
-        arm64Linux = linux726 pkgs.pkgsCross.aarch64-multiplatform.linux_latest;
-        x86Linux = linux726 pkgs.pkgsCross.gnu32.linux_latest;
+        riscvLinux = linux726 pkgs.pkgsCross.riscv64;
+        arm64Linux = linux726 pkgs.pkgsCross.aarch64-multiplatform;
+        x86Linux = linux726 pkgs.pkgsCross.gnu32;
 
-        # Modern-system smoke test (tests/virt-smoke): a stock riscv64 kernel
-        # with virtio-blk/ext4 built in, and OpenSBI fw_dynamic, both booted by
-        # the virt machine. Exposed as packages so the harness resolves them
-        # reproducibly without hard-coded store paths.
-        # The distro kernel ships these as modules, which is too late when the
-        # root filesystem itself is an ext4 virtio-blk disk. Keep the kernel
-        # otherwise stock, but make the boot-critical disk/NIC path built-in.
-        # This image does not ship the kernel's module tree into the guest, so
-        # packet sockets (used by DHCP clients) must be built in as well.
+        kernelImage = { linux, config, imagePath, patch ? "", target ? null }:
+          (linux.override ({
+            defconfig = "allnoconfig";
+            enableCommonConfig = false;
+            autoModules = false;
+            preferBuiltin = true;
+            structuredExtraConfig = import config {
+              inherit (pkgs) lib;
+            };
+            ignoreConfigErrors = true;
+          } // pkgs.lib.optionalAttrs (target != null) {
+            inherit target;
+          })).overrideAttrs (old: {
+            postPatch = (old.postPatch or "") + patch;
+            postInstall = ''
+              cp ${imagePath} $out/Image
+              mkdir -p "$modules"
+            '';
+          });
+
+        rv64Patch = ''
+          sed -i '/select VDSO_GETRANDOM if HAVE_GENERIC_VDSO && 64BIT/d' \
+            arch/riscv/Kconfig
+        '';
+        rv64Kernel = kernelImage {
+          linux = riscvLinux;
+          config = ./kernel/rv64-config.nix;
+          imagePath = "arch/riscv/boot/Image";
+          patch = rv64Patch;
+          target = "Image.gz";
+        };
+        rv64ContainerKernel = kernelImage {
+          linux = riscvLinux;
+          config = ./kernel/rv64-container-config.nix;
+          imagePath = "arch/riscv/boot/Image";
+          patch = rv64Patch;
+          target = "Image.gz";
+        };
+        arm64Kernel = kernelImage {
+          linux = arm64Linux;
+          config = ./kernel/arm64-config.nix;
+          imagePath = "arch/arm64/boot/Image";
+        };
+        arm64ContainerKernel = kernelImage {
+          linux = arm64Linux;
+          config = ./kernel/arm64-container-config.nix;
+          imagePath = "arch/arm64/boot/Image";
+        };
+        x86Kernel = (kernelImage {
+          linux = x86Linux;
+          config = ./kernel/x86-v86-config.nix;
+          imagePath = "arch/x86/boot/bzImage";
+        }).overrideAttrs (old: {
+          postInstall = ''
+            cp arch/x86/boot/bzImage $out/bzImage
+            mkdir -p "$modules"
+          '';
+        });
+        x86ContainerKernel = (kernelImage {
+          linux = x86Linux;
+          config = ./kernel/x86-v86-container-config.nix;
+          imagePath = "arch/x86/boot/bzImage";
+        }).overrideAttrs (old: {
+          postInstall = ''
+            cp arch/x86/boot/bzImage $out/bzImage
+            mkdir -p "$modules"
+          '';
+        });
+
         virtKernel = riscvLinux.override {
           structuredExtraConfig = with pkgs.lib.kernel; {
             VIRTIO = yes;
@@ -70,86 +124,27 @@
             VIRTIO_CONSOLE = yes;
             EXT4_FS = yes;
             PACKET = yes;
-            # The proxy exposes its ephemeral public CA before networking via
-            # a fixed virtio-9p mount tag. This guest has no module tree, so the
-            # complete mount path must be available in the kernel itself.
             NET_9P = yes;
             NET_9P_VIRTIO = yes;
             "9P_FS" = yes;
           };
           ignoreConfigErrors = true;
         };
-        # A single-hart, opt-in kernel for exactly the hardware rv64.js
-        # implements. Unlike the conformance kernel above, this starts from
-        # allnoconfig and enables only the contract in kernel/rv64-config.nix.
-        virtKernelFast = (riscvLinux.override {
-          defconfig = "allnoconfig";
-          enableCommonConfig = false;
-          autoModules = false;
-          preferBuiltin = true;
-          structuredExtraConfig = import ./kernel/rv64-config.nix {
-            inherit (pkgs) lib;
-          };
-          ignoreConfigErrors = true;
-        }).overrideAttrs (old: {
-          postPatch = (old.postPatch or "") + ''
-            sed -i '/select VDSO_GETRANDOM if HAVE_GENERIC_VDSO && 64BIT/d' \
-              arch/riscv/Kconfig
-          '';
-          # linux_latest's pre-override package is modular, so its computed
-          # postInstall hook otherwise survives overrideAttrs and attempts a
-          # modules_install even though this resolved config has MODULES=n.
-          postInstall = ''
-            cp arch/riscv/boot/Image $out/Image
-            mkdir -p "$modules"
-          '';
-        });
         virtOpensbi = pkgs.pkgsCross.riscv64.opensbi;
-        arm64Kernel = (arm64Linux.override {
-          defconfig = "allnoconfig";
-          enableCommonConfig = false;
-          autoModules = false;
-          preferBuiltin = true;
-          structuredExtraConfig = import ./kernel/arm64-config.nix {
-            inherit (pkgs) lib;
-          };
-          ignoreConfigErrors = true;
-        }).overrideAttrs {
-          postInstall = ''
-            cp arch/arm64/boot/Image $out/Image
-            mkdir -p "$modules"
-          '';
-        };
-        v86Kernel = (x86Linux.override {
-          defconfig = "allnoconfig";
-          enableCommonConfig = false;
-          autoModules = false;
-          preferBuiltin = true;
-          structuredExtraConfig = import ./kernel/x86-v86-config.nix {
-            inherit (pkgs) lib;
-          };
-          ignoreConfigErrors = true;
-        }).overrideAttrs {
-          # As with the rv64 package, discard the modular post-install hook
-          # inherited from linux_latest and expose the benchmark payload.
-          postInstall = ''
-            cp arch/x86/boot/bzImage $out/bzImage
-            mkdir -p "$modules"
-          '';
-        };
       in
       {
         packages.virt-kernel = virtKernel;
-        packages.virt-kernel-fast = virtKernelFast;
+        packages.virt-kernel-fast = rv64Kernel;
+        packages.virt-kernel-fast-container = rv64ContainerKernel;
         packages.virt-opensbi = virtOpensbi;
         packages.arm64-kernel = arm64Kernel;
-        packages.v86-kernel = v86Kernel;
+        packages.arm64-kernel-container = arm64ContainerKernel;
+        packages.v86-kernel = x86Kernel;
+        packages.v86-kernel-container = x86ContainerKernel;
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rust
-
-            # native builds (TinyEMU oracle, Spike) + scripts
             gcc
             gnumake
             autoconf
@@ -157,33 +152,21 @@
             python3
             curl
             git
-
-            # JS harness for the wasm build (web/rv64.js, smoke tests)
             nodejs_20
-
-            # validation oracles
-            qemu # qemu-riscv64 (user) + qemu-system-riscv64
-            spike # riscv-isa-sim golden model (commit logging enabled above)
-            dtc # device-tree-compiler (Spike runtime dependency)
-
-            # wasm tooling: validate/disassemble JIT-emitted modules
-            wabt # wasm-validate, wasm2wat
-            binaryen # wasm-opt
-
-            # riscv-tests cross build
+            qemu
+            spike
+            dtc
+            wabt
+            binaryen
             riscvGcc
-
-            # modern-system bring-up (virt machine): OpenSBI + kernel + rootfs
-            cpio # initramfs packing
-            e2fsprogs # mke2fs/debugfs/resize2fs — guest disk images
-            util-linux # sfdisk/losetup helpers
-            zstd # image (de)compression
-
-            # Debian rootfs bring-up (build-essential in the guest)
-            debootstrap # build a riscv64 Debian rootfs (--foreign)
-            apk-tools # install Alpine riscv64 packages into an offline root
-            fakeroot # run debootstrap without real root
-            dpkg # dpkg-deb -x for offline .deb extraction
+            cpio
+            e2fsprogs
+            util-linux
+            zstd
+            debootstrap
+            apk-tools
+            fakeroot
+            dpkg
             gnutar
             gzip
             gnused
@@ -191,8 +174,6 @@
           ];
 
           shellHook = ''
-            # riscv64-embedded cross gcc uses the riscv64-none-elf- prefix;
-            # tests/run-isa-tests.sh honors RISCV_PREFIX.
             export RISCV_PREFIX=riscv64-none-elf-
             echo "rv64.js dev shell — run tests/run-all.sh for the full suite"
           '';
