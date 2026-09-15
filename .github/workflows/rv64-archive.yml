@@ -63,9 +63,9 @@ jobs:
       - name: Bundle rv64.tgz
         working-directory: integrations/wanix
         run: |
-          tar -czf dist/rv64.tgz \
-            -C dist rv64-vm.wasm \
-            -C dist/rv64-release rv64_wasm.wasm rv64.js
+          tar -cf - -C dist rv64-vm.wasm > dist/rv64.tgz
+          tar -rf dist/rv64.tgz -C dist/rv64-release rv64_wasm.wasm rv64.js
+          gzip -n -f dist/rv64.tgz
 
       - name: Inspect archive contents
         working-directory: integrations/wanix
