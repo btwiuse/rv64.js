@@ -43,6 +43,8 @@ out="${1:-$default_out}"
 docker_cmd="${DOCKER_CMD:-docker}"
 profile="${WANIX_ROOTFS_PROFILE:-minimal}"
 install_python="${INSTALL_PYTHON:-0}"
+alpine_tag="${ALPINE_TAG:-3.24}"
+alpine_image="alpine:${alpine_tag}"
 case "$profile" in
     minimal)
         profile_packages=()
@@ -71,8 +73,8 @@ if [ -z "$kernel" ]; then
 fi
 test -n "$kernel"
 
-"$docker_cmd" pull --platform="$docker_platform" alpine:3.22
-"$docker_cmd" create --platform="$docker_platform" --name "$container" alpine:3.22 true >/dev/null
+"$docker_cmd" pull --platform="$docker_platform" "$alpine_image"
+"$docker_cmd" create --platform="$docker_platform" --name "$container" "$alpine_image" true >/dev/null
 mkdir -p "$rootfs"
 "$docker_cmd" export "$container" | tar -C "$rootfs" -xf -
 
@@ -83,10 +85,13 @@ if [ "$install_python" = 1 ] || [ "${#profile_packages[@]}" -gt 0 ]; then
     if [ "$install_python" = 1 ]; then
         packages+=(python3)
     fi
-    "$docker_cmd" run --rm --platform=linux/amd64 -v "$rootfs:/target" alpine:3.22 \
-        apk --root /target --initdb --arch "$apk_arch" --no-scripts --allow-untrusted --repository https://dl-cdn.alpinelinux.org/alpine/v3.22/main add "${packages[@]}"
+    "$docker_cmd" run --rm --platform=linux/amd64 -v "$rootfs:/target" "$alpine_image" \
+        apk --root /target --initdb --arch "$apk_arch" --no-scripts --allow-untrusted \
+        --repository "https://dl-cdn.alpinelinux.org/alpine/v${alpine_tag%.*}/main" \
+        --repository "https://dl-cdn.alpinelinux.org/alpine/v${alpine_tag%.*}/community" \
+        add "${packages[@]}"
 fi
-"$docker_cmd" run --rm --platform=linux/amd64 -v "$rootfs:/target" alpine:3.22 \
+"$docker_cmd" run --rm --platform=linux/amd64 -v "$rootfs:/target" "$alpine_image" \
     find -H /target \( -type f -o -type d \) -exec chown "$(id -u):$(id -g)" {} + || true
 
 git clone --quiet https://github.com/tractordev/wanix.git "$wanix_src"
