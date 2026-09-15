@@ -69,5 +69,5 @@ ALPINE_TAG=3.24 \
   "$output_dir/wanix-linux-${archive_arch}${profile_suffix}.tgz"
 
 file "$output_dir/kernels/${archive_arch}${profile_suffix}-${kernel_name}"
-tar -tzf "$output_dir/wanix-linux-${archive_arch}${profile_suffix}.tgz" \
-  | grep -qx "boot/$kernel_name"
+tar -tf "$output_dir/wanix-linux-${archive_arch}${profile_suffix}.tgz" \
+  --wildcards "boot/$kernel_name" >/dev/null
